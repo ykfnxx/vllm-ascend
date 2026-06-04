@@ -91,6 +91,10 @@ from vllm.v1.worker.utils import AttentionGroup
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention.asu_kv_cache_manager import (
+    ASUFullKVCacheManagerFunctional,
+    is_asu_kv_cache_enabled,
+)
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
 
@@ -259,6 +263,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
+        self.asu_kv_cache_manager: ASUFullKVCacheManagerFunctional | None = None
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -2180,6 +2185,14 @@ class NPUModelRunner(GPUModelRunner):
                 assert isinstance(attn_metadata, list)
                 attn_metadata_dict = attn_metadata[ubid]
 
+            if hasattr(attn_metadata_i, "asu_kv_cache_manager"):
+                attn_metadata_i.asu_kv_cache_manager = self.asu_kv_cache_manager
+                attn_metadata_i.asu_num_reqs = num_reqs
+                if num_reqs == 1 and self.input_batch.req_ids:
+                    attn_metadata_i.asu_req_id = self.input_batch.req_ids[0]
+                else:
+                    attn_metadata_i.asu_req_id = None
+
             for layer_name in attn_group.layer_names:
                 attn_metadata_dict[layer_name] = attn_metadata_i
 
@@ -2665,6 +2678,13 @@ class NPUModelRunner(GPUModelRunner):
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
+
+        self.asu_kv_cache_manager = ASUFullKVCacheManagerFunctional.from_kv_caches(
+            kv_caches,
+            max_seq_len=self.max_model_len,
+            block_size=self.cache_config.block_size,
+            enabled=self.use_sparse and is_asu_kv_cache_enabled(),
+        )
 
         from vllm.v1.worker.utils import bind_kv_cache
 

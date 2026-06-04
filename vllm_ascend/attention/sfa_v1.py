@@ -22,6 +22,9 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.attention.asu_kv_cache_manager import (
+    ASUFullKVCacheManagerFunctional,
+)
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
@@ -149,6 +152,9 @@ class AscendSFAMetadata:
     num_decodes: int = 0
     num_decode_tokens: int = 0
     num_prefills: int = 0
+    asu_kv_cache_manager: ASUFullKVCacheManagerFunctional | None = None
+    asu_req_id: str | None = None
+    asu_num_reqs: int = 0
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -1024,6 +1030,96 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         return attn_output
 
+    def _use_asu_kv_cache(self, layer_name: str, attn_metadata: M) -> bool:
+        manager = getattr(attn_metadata, "asu_kv_cache_manager", None)
+        if manager is None or not manager.enabled:
+            return False
+        if not manager.has_layer(layer_name):
+            return False
+        if self.enable_dsa_cp:
+            return False
+        if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+            return False
+        if getattr(attn_metadata, "asu_num_reqs", 0) != 1:
+            return False
+        return attn_metadata.num_actual_tokens == 1
+
+    def _get_asu_actual_seq_len(self, attn_metadata: M) -> int:
+        if attn_metadata.seq_lens_cpu.numel() == 0:
+            raise RuntimeError("ASU decode requires seq_lens_cpu")
+        return int(attn_metadata.seq_lens_cpu.reshape(-1)[0].item())
+
+    def _prepare_asu_layer_context(self, layer_name: str, kv_cache, attn_metadata: M):
+        manager = attn_metadata.asu_kv_cache_manager
+        if manager is None:
+            raise RuntimeError("ASU KV cache manager is not attached")
+        context = manager.get_layer_context(layer_name)
+        actual_seq_len = self._get_asu_actual_seq_len(attn_metadata)
+        req_id = attn_metadata.asu_req_id or "__single_req__"
+
+        if context.req_id != req_id or context.actual_seq_len == 0 or actual_seq_len < context.actual_seq_len:
+            managed_prefix_len = max(0, actual_seq_len - attn_metadata.num_actual_tokens)
+            manager.reset_single_request(
+                req_id=req_id,
+                actual_seq_len=actual_seq_len,
+                managed_prefix_len=managed_prefix_len,
+                original_block_table=attn_metadata.block_table[:1],
+            )
+        elif actual_seq_len > context.actual_seq_len:
+            manager.mark_decode_token(actual_seq_len - 1)
+
+        return context
+
+    def _execute_asu_sparse_flash_attention_process(
+        self,
+        layer_name,
+        ql_nope,
+        q_pe,
+        kv_cache,
+        topk_indices,
+        attn_metadata,
+        actual_seq_lengths_query,
+        actual_seq_lengths_key,
+    ):
+        context = self._prepare_asu_layer_context(layer_name, kv_cache, attn_metadata)
+        original_kv_cache_0, original_kv_cache_1 = context.original_kv_cache_views(kv_cache)
+
+        resolved_kv_slots = torch.ops._C_ascend.npu_asu_resolve_kv_slots_single_req(
+            original_topk_indices=topk_indices,
+            actual_seq_len=context.actual_seq_len,
+            managed_prefix_len=context.managed_prefix_len,
+            token_state=context.token_state,
+            asu_record_addr=context.asu_record_addr,
+            hbm_slot_of_token=context.hbm_slot_of_token,
+            slot_owner_token=context.slot_owner_token,
+            free_slot_stack=context.free_slot_stack,
+            free_slot_count=context.free_slot_count,
+            original_block_table=attn_metadata.block_table[:1],
+            original_kv_cache_0=original_kv_cache_0,
+            original_kv_cache_1=original_kv_cache_1,
+            managed_kv_cache_0=context.managed_kv_cache_0,
+            managed_kv_cache_1=context.managed_kv_cache_1,
+            block_size=context.block_size,
+        )
+
+        attn_output = torch.ops._C_ascend.npu_sparse_flash_attention_asu(
+            query=ql_nope,
+            managed_key=context.managed_kv_cache_0,
+            managed_value=context.managed_kv_cache_0,
+            sparse_indices=topk_indices,
+            resolved_kv_slots=resolved_kv_slots,
+            scale_value=self.scale,
+            sparse_block_size=1,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_kv=actual_seq_lengths_key,
+            query_rope=q_pe,
+            managed_key_rope=context.managed_kv_cache_1,
+            layout_query="TND",
+            layout_kv="TND",
+            sparse_mode=3,
+        )
+        return attn_output
+
     def forward(
         self,
         layer_name,
@@ -1212,9 +1308,21 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key=actual_seq_lengths_key,
         )
 
-        attn_output = self._execute_sparse_flash_attention_process(
-            ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
-        )
+        if self._use_asu_kv_cache(layer_name, attn_metadata):
+            attn_output = self._execute_asu_sparse_flash_attention_process(
+                layer_name,
+                ql_nope,
+                q_pe,
+                kv_cache,
+                topk_indices,
+                attn_metadata,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
+            )
+        else:
+            attn_output = self._execute_sparse_flash_attention_process(
+                ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+            )
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
