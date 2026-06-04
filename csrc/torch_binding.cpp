@@ -30,6 +30,7 @@
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
 #include "apply_top_k_top_p_custom/apply_top_k_top_p_custom_torch_adpt.h"
+#include "asu_kv_resolver/asu_kv_resolver_torch_adpt.h"
 #include "batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h"
 #include "dispatch_gmm_combine_decode/dispatch_gmm_combine_decode_torch_adpt.h"
@@ -805,6 +806,26 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                           int sparse_mode=3) -> Tensor"
     );
     ops.impl("npu_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention);
+
+    ops.def(
+        "npu_asu_resolve_kv_slots_single_req(Tensor original_topk_indices,"
+        "                                    int actual_seq_len,"
+        "                                    int managed_prefix_len,"
+        "                                    Tensor! token_state,"
+        "                                    Tensor asu_record_addr,"
+        "                                    Tensor! hbm_slot_of_token,"
+        "                                    Tensor! slot_owner_token,"
+        "                                    Tensor free_slot_stack,"
+        "                                    Tensor! free_slot_count,"
+        "                                    Tensor original_block_table,"
+        "                                    Tensor original_kv_cache_0,"
+        "                                    Tensor original_kv_cache_1,"
+        "                                    Tensor! managed_kv_cache_0,"
+        "                                    Tensor! managed_kv_cache_1,"
+        "                                    int block_size) -> Tensor"
+    );
+    ops.impl("npu_asu_resolve_kv_slots_single_req", torch::kPrivateUse1,
+             &vllm_ascend::npu_asu_resolve_kv_slots_single_req);
 
     ops.def(
         "dispatch_ffn_combine(Tensor x, Tensor[] weight1, Tensor[] weight2, Tensor expert_idx,"

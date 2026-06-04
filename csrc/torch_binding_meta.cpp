@@ -249,6 +249,42 @@ at::Tensor npu_sparse_flash_attention_meta(
     at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
     return output;
 }
+
+at::Tensor npu_asu_resolve_kv_slots_single_req_meta(
+    const at::Tensor &original_topk_indices,
+    int64_t actual_seq_len,
+    int64_t managed_prefix_len,
+    at::Tensor &token_state,
+    const at::Tensor &asu_record_addr,
+    at::Tensor &hbm_slot_of_token,
+    at::Tensor &slot_owner_token,
+    const at::Tensor &free_slot_stack,
+    at::Tensor &free_slot_count,
+    const at::Tensor &original_block_table,
+    const at::Tensor &original_kv_cache_0,
+    const at::Tensor &original_kv_cache_1,
+    at::Tensor &managed_kv_cache_0,
+    at::Tensor &managed_kv_cache_1,
+    int64_t block_size)
+{
+    (void)actual_seq_len;
+    (void)managed_prefix_len;
+    (void)token_state;
+    (void)asu_record_addr;
+    (void)hbm_slot_of_token;
+    (void)slot_owner_token;
+    (void)free_slot_stack;
+    (void)free_slot_count;
+    (void)original_block_table;
+    (void)original_kv_cache_0;
+    (void)original_kv_cache_1;
+    (void)managed_kv_cache_0;
+    (void)managed_kv_cache_1;
+    (void)block_size;
+    return at::empty(original_topk_indices.sizes(),
+                     original_topk_indices.options().dtype(at::kInt));
+}
+
 std::tuple<at::Tensor, at::Tensor> matmul_allreduce_add_rmsnorm_meta(
     const at::Tensor &x1,
     const at::Tensor &x2,
@@ -598,6 +634,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
     // Sparse flash attention
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
+    // ASU KV resolver
+    ops.impl("npu_asu_resolve_kv_slots_single_req",
+             &vllm_ascend::meta::npu_asu_resolve_kv_slots_single_req_meta);
     // MoE dispatch-ffn-combine
     ops.impl("dispatch_ffn_combine", &vllm_ascend::meta::dispatch_ffn_combine_meta);
     // matmul allreduce add rmsnorm
