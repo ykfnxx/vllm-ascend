@@ -44,7 +44,8 @@ public:
     __aicore__ inline void InitVec0GlobalTensor(const GlobalTensor<int32_t> &kvValidSizeGm,
                                                 const GlobalTensor<KV_T> &kvMergeGm,
                                                 const GlobalTensor<KV_T> &keyRopeGm, const GlobalTensor<KV_T> &keyGm,
-                                                const GlobalTensor<int32_t> &blkTableGm);
+                                                const GlobalTensor<int32_t> &blkTableGm,
+                                                const GlobalTensor<int32_t> &resolvedSlotsGm);
     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<KV_T> vec1ResGm,
                                                 GlobalTensor<int32_t> actualSeqLengthsQGm,
                                                 GlobalTensor<int32_t> actualSeqLengthsKVGm, GlobalTensor<T> lseMaxFdGm,
@@ -63,10 +64,14 @@ public:
     __aicore__ inline void MergeKv(const RunInfo &runInfo);
     __aicore__ inline int64_t GetKeyGmOffset(int64_t realS2Idx, const RunInfo &runInfo, int64_t s2IdLimit);
     __aicore__ inline int64_t GetKeyRopeGmOffset(int64_t realS2Idx, const RunInfo &runInfo, int64_t s2IdLimit);
+    __aicore__ inline int64_t GetManagedKeyGmOffset(int64_t managedS2Idx, const RunInfo &runInfo);
+    __aicore__ inline int64_t GetResolvedSlot(int64_t s2GmOffset, int64_t topkGmBaseOffset,
+                                              const RunInfo &runInfo);
     __aicore__ inline void GetRealS2Idx(int64_t s2GmOffset, int64_t &realS2Idx, int64_t topkGmBaseOffset,
                                         const RunInfo &runInfo);
     __aicore__ inline void CopyInKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx1,
-                                    int64_t realS2Idx2, const RunInfo &runInfo);
+                                    int64_t realS2Idx2, int64_t resolvedS2Idx1, int64_t resolvedS2Idx2,
+                                    const RunInfo &runInfo);
     __aicore__ inline void CopyOutMrgeResult(int64_t mte2Size, int64_t mte3Size, int64_t s2StartGmOffset,
                                              int64_t mergeMte3Idx, const RunInfo &runInfo);
     __aicore__ inline void SetInfInBlk(const LocalTensor<T> &mmResUb, uint32_t dealRowCount, uint32_t columnCount,
@@ -74,7 +79,8 @@ public:
     __aicore__ inline void SetMidInf(const LocalTensor<T> &mmResUb, uint32_t dealRowCount, uint32_t columnCount,
                                      uint64_t startId, uint64_t endId);
     __aicore__ inline void CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx,
-                                          int64_t keyBNBOffset,int64_t s2IdLimit, const RunInfo &runInfo);
+                                          int64_t resolvedS2Idx, int64_t keyBNBOffset, int64_t s2IdLimit,
+                                          const RunInfo &runInfo);
     // ================================Vector1==========================================
     __aicore__ inline void ProcessVec1SingleBuf(const RunInfo &info, const MSplitInfo &mSplitInfo);
     __aicore__ inline void DealBmm1ResBaseBlock(const RunInfo &info, const MSplitInfo &mSplitInfo, uint32_t startRow,
@@ -123,6 +129,7 @@ private:
     static constexpr bool FLASH_DECODE = SFAT::flashDecode;
     static constexpr SFA_LAYOUT LAYOUT_T = SFAT::layout;
     static constexpr SFA_LAYOUT KV_LAYOUT_T = SFAT::kvLayout;
+    static constexpr bool ASU_RESOLVED_SLOT = SFAT::asuResolvedSlot;
 
     static constexpr uint64_t MERGE_CACHE_GM_BUF_NUM = 4;
     static constexpr uint64_t SYNC_INPUT_BUF1_FLAG = 2;
@@ -163,6 +170,7 @@ private:
     GlobalTensor<KV_T> keyRopeGm_;
     GlobalTensor<KV_T> keyGm_;
     GlobalTensor<int32_t> topkGm_;
+    GlobalTensor<int32_t> resolvedSlotsGm_;
     GlobalTensor<int32_t> kvValidSizeGm_;
 
     // ================================Local Buffer====================================
@@ -255,12 +263,14 @@ SFAVectorService<SFAT>::InitMm2ResInt32GmGlobalTensor(GlobalTensor<int32_t> mm2R
 template <typename SFAT>
 __aicore__ inline void SFAVectorService<SFAT>::InitVec0GlobalTensor(
     const GlobalTensor<int32_t> &kvValidSizeGm, const GlobalTensor<KV_T> &kvMergeGm,
-    const GlobalTensor<KV_T> &keyRopeGm, const GlobalTensor<KV_T> &keyGm, const GlobalTensor<int32_t> &blkTableGm)
+    const GlobalTensor<KV_T> &keyRopeGm, const GlobalTensor<KV_T> &keyGm,
+    const GlobalTensor<int32_t> &blkTableGm, const GlobalTensor<int32_t> &resolvedSlotsGm)
 {
     this->kvMergeGm_ = kvMergeGm;
     this->keyRopeGm_ = keyRopeGm;
     this->keyGm_ = keyGm;
     this->blkTableGm_ = blkTableGm;
+    this->resolvedSlotsGm_ = resolvedSlotsGm;
     this->kvValidSizeGm_ = kvValidSizeGm;
 }
 
@@ -722,6 +732,21 @@ __aicore__ inline void SFAVectorService<SFAT>::GetRealS2Idx(int64_t s2GmOffset, 
 }
 
 template <typename SFAT>
+__aicore__ inline int64_t SFAVectorService<SFAT>::GetResolvedSlot(int64_t s2GmOffset, int64_t topkGmBaseOffset,
+                                                                  const RunInfo &runInfo)
+{
+    int64_t topkGmIdx = (s2GmOffset + runInfo.s2Idx * constInfo.s2BaseSize) / constInfo.sparseBlockSize;
+    if (unlikely(topkGmIdx >= constInfo.sparseBlockCount)) {
+        return -1;
+    }
+    int64_t offsetInSparseBlock =
+        static_cast<int64_t>((s2GmOffset + runInfo.s2Idx * constInfo.s2BaseSize) % constInfo.sparseBlockSize);
+    return resolvedSlotsGm_.GetValue(topkGmBaseOffset + topkGmIdx) *
+               static_cast<int64_t>(constInfo.sparseBlockSize) +
+           offsetInSparseBlock;
+}
+
+template <typename SFAT>
 __aicore__ inline int64_t SFAVectorService<SFAT>::GetKeyGmOffset(int64_t realS2Idx,
                                                                  const RunInfo &runInfo, int64_t s2IdLimit)
 {
@@ -745,6 +770,16 @@ __aicore__ inline int64_t SFAVectorService<SFAT>::GetKeyGmOffset(int64_t realS2I
 }
 
 template <typename SFAT>
+__aicore__ inline int64_t SFAVectorService<SFAT>::GetManagedKeyGmOffset(int64_t managedS2Idx,
+                                                                        const RunInfo &runInfo)
+{
+    if (managedS2Idx < 0) {
+        return -1;
+    }
+    return (runInfo.tensorBOffset + managedS2Idx * constInfo.kvHeadNum * constInfo.headDim) / constInfo.headDim;
+}
+
+template <typename SFAT>
 __aicore__ inline int64_t SFAVectorService<SFAT>::GetKeyRopeGmOffset(int64_t realS2Idx,
                                                                  const RunInfo &runInfo, int64_t s2IdLimit)
 {
@@ -761,8 +796,10 @@ __aicore__ inline int64_t SFAVectorService<SFAT>::GetKeyRopeGmOffset(int64_t rea
 template <typename SFAT>
 __aicore__ inline void
 SFAVectorService<SFAT>::CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx,
-                                       int64_t keyBNBOffset,int64_t s2IdLimit, const RunInfo &runInfo)
+                                       int64_t resolvedS2Idx, int64_t keyBNBOffset, int64_t s2IdLimit,
+                                       const RunInfo &runInfo)
 {
+    (void)resolvedS2Idx;
     if (keyBNBOffset < 0) {
         return;
     }
@@ -785,22 +822,37 @@ SFAVectorService<SFAT>::CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int6
 
 template <typename SFAT>
 __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
-                                                        int64_t realS2Idx1, int64_t realS2Idx2, const RunInfo &runInfo)
+                                                        int64_t realS2Idx1, int64_t realS2Idx2,
+                                                        int64_t resolvedS2Idx1, int64_t resolvedS2Idx2,
+                                                        const RunInfo &runInfo)
 {
     int64_t s2IdLimit = runInfo.curActualSeqLenOri;
     if (constInfo.sparseMode == 3) {
         s2IdLimit = runInfo.curActualSeqLenOri - runInfo.actS1Size + runInfo.gS1Idx / constInfo.gSize + 1;
     }
 
-    int64_t keyOffset1 = GetKeyGmOffset(realS2Idx1, runInfo, s2IdLimit);
-    int64_t keyOffset2 = GetKeyGmOffset(realS2Idx2, runInfo, s2IdLimit);
+    int64_t keyOffset1 = 0;
+    int64_t keyOffset2 = 0;
+    if constexpr (ASU_RESOLVED_SLOT) {
+        keyOffset1 = (realS2Idx1 < 0 || realS2Idx1 >= s2IdLimit) ? -1 : GetManagedKeyGmOffset(resolvedS2Idx1, runInfo);
+        keyOffset2 = (realS2Idx2 < 0 || realS2Idx2 >= s2IdLimit) ? -1 : GetManagedKeyGmOffset(resolvedS2Idx2, runInfo);
+    } else {
+        keyOffset1 = GetKeyGmOffset(realS2Idx1, runInfo, s2IdLimit);
+        keyOffset2 = GetKeyGmOffset(realS2Idx2, runInfo, s2IdLimit);
+    }
     if (unlikely(keyOffset1 < 0 && keyOffset2 < 0)) {
         return;
     }
 
     int64_t keySrcStride = 0;
     int64_t keyRopeSrcStride = 0;
-    if constexpr (PAGE_ATTENTION) {
+    if constexpr (ASU_RESOLVED_SLOT) {
+        keySrcStride = ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
+                        (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize) * constInfo.headDim * sizeof(KV_T);
+        keyRopeSrcStride = ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
+                            (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize) *
+                             constInfo.headDimRope * sizeof(KV_T);
+    } else if constexpr (PAGE_ATTENTION) {
         int64_t blkTableSrcStride =
         ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
         (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize);
@@ -820,8 +872,8 @@ __aicore__ inline void SFAVectorService<SFAT>::CopyInKv(int64_t &mte2Size, int64
         (!PAGE_ATTENTION && (keyRopeSrcStride >= INT32_MAX || keyRopeSrcStride < 0)) ||
         realS2Idx1 + constInfo.sparseBlockSize >= s2IdLimit ||
         realS2Idx2 + constInfo.sparseBlockSize >= s2IdLimit)) {
-        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx1, keyOffset1, s2IdLimit, runInfo);
-        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, keyOffset2, s2IdLimit, runInfo);
+        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx1, resolvedS2Idx1, keyOffset1, s2IdLimit, runInfo);
+        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, resolvedS2Idx2, keyOffset2, s2IdLimit, runInfo);
     } else {
         DataCopyExtParams intriParams;
         intriParams.blockLen = constInfo.sparseBlockSize * constInfo.headDim * sizeof(KV_T);
@@ -892,6 +944,8 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
     int64_t mte3Size = 0;
     int64_t s2IdxArray0 = -1;
     int64_t s2IdxArray1 = -1;
+    int64_t resolvedS2IdxArray0 = -1;
+    int64_t resolvedS2IdxArray1 = -1;
     bool needWaitMte3ToMte2 = true;
     SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
     SetFlag<AscendC::HardEvent::MTE3_MTE2>(1);
@@ -906,6 +960,11 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
             needWaitMte3ToMte2 = false;
         }
         GetRealS2Idx(s2GmOffsetArray, s2IdxArray0, topkGmBaseOffset, runInfo);
+        if constexpr (ASU_RESOLVED_SLOT) {
+            resolvedS2IdxArray0 = GetResolvedSlot(s2GmOffsetArray, topkGmBaseOffset, runInfo);
+        } else {
+            resolvedS2IdxArray0 = s2IdxArray0;
+        }
         if (unlikely(s2IdxArray0 < 0)) {
             CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo);
             SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
@@ -913,7 +972,14 @@ __aicore__ inline void SFAVectorService<SFAT>::MergeKv(const RunInfo &runInfo)
             break;
         }
         GetRealS2Idx(s2GmOffsetArray + constInfo.sparseBlockSize, s2IdxArray1, topkGmBaseOffset, runInfo);
-        CopyInKv(mte2Size, mte3Size, mergeMte3Idx, s2IdxArray0, s2IdxArray1, runInfo);
+        if constexpr (ASU_RESOLVED_SLOT) {
+            resolvedS2IdxArray1 =
+                GetResolvedSlot(s2GmOffsetArray + constInfo.sparseBlockSize, topkGmBaseOffset, runInfo);
+        } else {
+            resolvedS2IdxArray1 = s2IdxArray1;
+        }
+        CopyInKv(mte2Size, mte3Size, mergeMte3Idx, s2IdxArray0, s2IdxArray1,
+                 resolvedS2IdxArray0, resolvedS2IdxArray1, runInfo);
         if ((mte2Size - mte3Size + 2 * constInfo.sparseBlockSize > 32) ||
             s2GmOffsetArray + 2 * constInfo.sparseBlockSize >= s2GmLimit) {
             CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo);

@@ -40,6 +40,7 @@ static const std::string KEY_NAME = "key";
 static const std::string VALUE_NAME = "value";
 static const std::string BLOCK_TABLE_NAME = "block_table";
 static const std::string SPARSE_INDICES_NAME = "sparse_indices";
+static const std::string RESOLVED_KV_SLOTS_NAME = "resolved_kv_slots";
 static const std::string QUERY_ROPE_NAME = "query_rope";
 static const std::string KEY_ROPE_NAME = "key_rope";
 static const std::string ATTEN_OUT_NAME = "attention_out";
@@ -51,7 +52,8 @@ const std::map<std::string, std::vector<ge::DataType>> DTYPE_SUPPORT_MAP = {
     {QUERY_ROPE_NAME,             {ge::DT_FLOAT16, ge::DT_BF16}},
     {KEY_ROPE_NAME,               {ge::DT_FLOAT16, ge::DT_BF16}},
     {ATTEN_OUT_NAME,              {ge::DT_FLOAT16, ge::DT_BF16}},
-    {SPARSE_INDICES_NAME,         {ge::DT_INT32}}
+    {SPARSE_INDICES_NAME,         {ge::DT_INT32}},
+    {RESOLVED_KV_SLOTS_NAME,      {ge::DT_INT32}}
 };
 
 const std::map<std::string, std::vector<SFALayout>> LAYOUT_SUPPORT_MAP = {
@@ -476,6 +478,23 @@ ge::graphStatus TilingSparseFlashAttention(gert::TilingContext *context)
     return tiling.DoOpTiling(&sfaInfo);
 }
 
+ge::graphStatus TilingSparseFlashAttentionAsu(gert::TilingContext *context)
+{
+    SFATilingInfo sfaInfo;
+    SFAInfoParser sfaInfoParser(context, true);
+    if (sfaInfoParser.Parse(sfaInfo) != ge::GRAPH_SUCCESS) {
+        return ge::GRAPH_FAILED;
+    }
+
+    SFATilingCheck tilingChecker(sfaInfo);
+    if (tilingChecker.Process() != ge::GRAPH_SUCCESS) {
+        return ge::GRAPH_FAILED;
+    }
+
+    SFAMlaTiling tiling(context);
+    return tiling.DoOpTiling(&sfaInfo);
+}
+
 ge::graphStatus TilingPrepareForSparseFlashAttention(gert::TilingParseContext *context)
 {
     (void)context;
@@ -699,11 +718,23 @@ ge::graphStatus SFATilingCheck::CheckSingleParaSparseIndices() const
     return ge::GRAPH_SUCCESS;
 }
 
+ge::graphStatus SFATilingCheck::CheckSingleParaResolvedKvSlots() const
+{
+    if (!sfaInfo_.asuResolvedSlots) {
+        return ge::GRAPH_SUCCESS;
+    }
+    if (ge::GRAPH_SUCCESS != CheckDtypeSupport(opParamInfo_.resolvedKvSlots.desc, RESOLVED_KV_SLOTS_NAME)) {
+        return ge::GRAPH_FAILED;
+    }
+    return ge::GRAPH_SUCCESS;
+}
+
 ge::graphStatus SFATilingCheck::CheckSinglePara() const
 {
     if (ge::GRAPH_SUCCESS != CheckSingleParaQuery() ||
         ge::GRAPH_SUCCESS != CheckSingleParaKey() ||
-        ge::GRAPH_SUCCESS != CheckSingleParaSparseIndices() || 
+        ge::GRAPH_SUCCESS != CheckSingleParaSparseIndices() ||
+        ge::GRAPH_SUCCESS != CheckSingleParaResolvedKvSlots() ||
         ge::GRAPH_SUCCESS != CheckSingleParaNumHeads() ||
         ge::GRAPH_SUCCESS != CheckSingleParaKvHeadNums() ||
         ge::GRAPH_SUCCESS != CheckSingleParaSparseMode() ||
@@ -810,8 +841,10 @@ ge::graphStatus SFATilingCheck::CheckParaExistenceMlaNoquant() const
     }
     std::map<std::string, const void *> mlaNoquantParamExistMap = {
         {"actualSeqLengths", opParamInfo_.actualSeqLengths.tensor},
-        {"blockTable", opParamInfo_.blockTable.tensor},
     };
+    if (!sfaInfo_.asuResolvedSlots) {
+        mlaNoquantParamExistMap["blockTable"] = opParamInfo_.blockTable.tensor;
+    }
     std::map<std::string, const void *> mlaNoquantParamNotExistMap = {};
     if (CheckExistenceByMap(mlaNoquantParamExistMap, mlaNoquantParamNotExistMap) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
@@ -858,12 +891,18 @@ void SFATilingCheck::SetSFAShapeCompare()
     keyShapeCmp_ = opParamInfo_.key.shape->GetStorageShape();
     valueShapeCmp_ = opParamInfo_.value.shape->GetStorageShape();
     attenOutShapeCmp_ = opParamInfo_.attenOut.shape->GetStorageShape();
+    if (sfaInfo_.asuResolvedSlots) {
+        resolvedSlotsShapeCmp_ = opParamInfo_.resolvedKvSlots.shape->GetStorageShape();
+    }
     queryRopeShapeCmp_ = opParamInfo_.queryRope.tensor->GetStorageShape();
     keyRopeShapeCmp_ = opParamInfo_.keyRope.tensor->GetStorageShape();
 }
 
 ge::graphStatus SFATilingCheck::CheckBlockTable() const
 {
+    if (sfaInfo_.asuResolvedSlots) {
+        return ge::GRAPH_SUCCESS;
+    }
     if (kvStorageMode_ != KvStorageMode::PAGE_ATTENTION) {
         OPS_ERR_IF(opParamInfo_.blockTable.tensor != nullptr,
             OPS_LOG_E(opName_, "when the layout_kv is %s, %s should be null",
@@ -915,6 +954,20 @@ ge::graphStatus SFATilingCheck::CheckTopkShape()
     return CompareShape(shapeParams, topkShapeCmp_, topkLayout_, SPARSE_INDICES_NAME);
 }
 
+ge::graphStatus SFATilingCheck::CheckResolvedKvSlotsShape()
+{
+    if (!sfaInfo_.asuResolvedSlots) {
+        return ge::GRAPH_SUCCESS;
+    }
+    SFATilingShapeCompareParam shapeParams;
+    shapeParams.B = bSize_;
+    shapeParams.N = n2Size_;
+    shapeParams.S = s1Size_;
+    shapeParams.D = sparseBlockCount_;
+    shapeParams.T = qTSize_;
+    return CompareShape(shapeParams, resolvedSlotsShapeCmp_, topkLayout_, RESOLVED_KV_SLOTS_NAME);
+}
+
 ge::graphStatus SFATilingCheck::CheckAttenOutShape()
 {
     SFATilingShapeCompareParam shapeParams;
@@ -951,7 +1004,8 @@ ge::graphStatus SFATilingCheck::CheckQRope()
 
 ge::graphStatus SFATilingCheck::CheckTopK()
 {
-    if (ge::GRAPH_SUCCESS != CheckTopkShape()) {
+    if (ge::GRAPH_SUCCESS != CheckTopkShape() ||
+        ge::GRAPH_SUCCESS != CheckResolvedKvSlotsShape()) {
         return ge::GRAPH_FAILED;
     }
     return ge::GRAPH_SUCCESS;
@@ -1361,6 +1415,14 @@ ge::graphStatus SFAInfoParser::CheckRequiredInOutExistence() const
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(opParamInfo_.sparseIndices.desc == nullptr, OPS_LOG_E(opName_, "Desc of tensor sparseIndices is nullptr"),
                return ge::GRAPH_FAILED);
+    if (asuResolvedSlots_) {
+        OPS_ERR_IF(opParamInfo_.resolvedKvSlots.shape == nullptr,
+                   OPS_LOG_E(opName_, "Shape of tensor resolvedKvSlots is nullptr"),
+                   return ge::GRAPH_FAILED);
+        OPS_ERR_IF(opParamInfo_.resolvedKvSlots.desc == nullptr,
+                   OPS_LOG_E(opName_, "Desc of tensor resolvedKvSlots is nullptr"),
+                   return ge::GRAPH_FAILED);
+    }
     OPS_ERR_IF(opParamInfo_.attenOut.shape == nullptr, OPS_LOG_E(opName_, "Shape of tensor output is nullptr"),
                return ge::GRAPH_FAILED);
     OPS_ERR_IF(opParamInfo_.attenOut.desc == nullptr, OPS_LOG_E(opName_, "Desc of tensor output is nullptr"),
@@ -1456,15 +1518,26 @@ ge::graphStatus SFAInfoParser::GetNpuInfo()
 
 void SFAInfoParser::GetOptionalInputParaInfo()
 {
-    opParamInfo_.blockTable.tensor = context_->GetOptionalInputTensor(BLOCK_TABLE_INPUT_INDEX);
-    opParamInfo_.actualSeqLengthsQ.tensor = context_->GetOptionalInputTensor(ACT_SEQ_LEN_Q_INPUT_INDEX);
-    opParamInfo_.actualSeqLengthsQ.desc = context_->GetOptionalInputDesc(ACT_SEQ_LEN_Q_INPUT_INDEX);
-    opParamInfo_.actualSeqLengths.tensor = context_->GetOptionalInputTensor(ACT_SEQ_LEN_KV_INPUT_INDEX);
-    opParamInfo_.actualSeqLengths.desc = context_->GetOptionalInputDesc(ACT_SEQ_LEN_KV_INPUT_INDEX);
-    opParamInfo_.queryRope.tensor = context_->GetOptionalInputTensor(QUERY_ROPE_INPUT_INDEX);
-    opParamInfo_.queryRope.desc = context_->GetOptionalInputDesc(QUERY_ROPE_INPUT_INDEX);
-    opParamInfo_.keyRope.tensor = context_->GetOptionalInputTensor(KEY_ROPE_INPUT_INDEX);
-    opParamInfo_.keyRope.desc = context_->GetOptionalInputDesc(KEY_ROPE_INPUT_INDEX);
+    if (asuResolvedSlots_) {
+        opParamInfo_.actualSeqLengthsQ.tensor = context_->GetOptionalInputTensor(ASU_ACT_SEQ_LEN_Q_INPUT_INDEX);
+        opParamInfo_.actualSeqLengthsQ.desc = context_->GetOptionalInputDesc(ASU_ACT_SEQ_LEN_Q_INPUT_INDEX);
+        opParamInfo_.actualSeqLengths.tensor = context_->GetOptionalInputTensor(ASU_ACT_SEQ_LEN_KV_INPUT_INDEX);
+        opParamInfo_.actualSeqLengths.desc = context_->GetOptionalInputDesc(ASU_ACT_SEQ_LEN_KV_INPUT_INDEX);
+        opParamInfo_.queryRope.tensor = context_->GetOptionalInputTensor(ASU_QUERY_ROPE_INPUT_INDEX);
+        opParamInfo_.queryRope.desc = context_->GetOptionalInputDesc(ASU_QUERY_ROPE_INPUT_INDEX);
+        opParamInfo_.keyRope.tensor = context_->GetOptionalInputTensor(MANAGED_KEY_ROPE_INPUT_INDEX);
+        opParamInfo_.keyRope.desc = context_->GetOptionalInputDesc(MANAGED_KEY_ROPE_INPUT_INDEX);
+    } else {
+        opParamInfo_.blockTable.tensor = context_->GetOptionalInputTensor(BLOCK_TABLE_INPUT_INDEX);
+        opParamInfo_.actualSeqLengthsQ.tensor = context_->GetOptionalInputTensor(ACT_SEQ_LEN_Q_INPUT_INDEX);
+        opParamInfo_.actualSeqLengthsQ.desc = context_->GetOptionalInputDesc(ACT_SEQ_LEN_Q_INPUT_INDEX);
+        opParamInfo_.actualSeqLengths.tensor = context_->GetOptionalInputTensor(ACT_SEQ_LEN_KV_INPUT_INDEX);
+        opParamInfo_.actualSeqLengths.desc = context_->GetOptionalInputDesc(ACT_SEQ_LEN_KV_INPUT_INDEX);
+        opParamInfo_.queryRope.tensor = context_->GetOptionalInputTensor(QUERY_ROPE_INPUT_INDEX);
+        opParamInfo_.queryRope.desc = context_->GetOptionalInputDesc(QUERY_ROPE_INPUT_INDEX);
+        opParamInfo_.keyRope.tensor = context_->GetOptionalInputTensor(KEY_ROPE_INPUT_INDEX);
+        opParamInfo_.keyRope.desc = context_->GetOptionalInputDesc(KEY_ROPE_INPUT_INDEX);
+    }
 }
 
 void SFAInfoParser::GetInputParaInfo()
@@ -1477,6 +1550,10 @@ void SFAInfoParser::GetInputParaInfo()
     opParamInfo_.value.shape = context_->GetInputShape(VALUE_INPUT_INDEX);
     opParamInfo_.sparseIndices.desc = context_->GetInputDesc(SPARSE_INDICES_INPUT_INDEX);
     opParamInfo_.sparseIndices.shape = context_->GetInputShape(SPARSE_INDICES_INPUT_INDEX);
+    if (asuResolvedSlots_) {
+        opParamInfo_.resolvedKvSlots.desc = context_->GetInputDesc(RESOLVED_KV_SLOTS_INPUT_INDEX);
+        opParamInfo_.resolvedKvSlots.shape = context_->GetInputShape(RESOLVED_KV_SLOTS_INPUT_INDEX);
+    }
     GetOptionalInputParaInfo();
 }
 
@@ -1717,6 +1794,9 @@ void SFAInfoParser::SetSFAShape()
     keyShape_ = opParamInfo_.key.shape->GetStorageShape();
     valueShape_ = opParamInfo_.value.shape->GetStorageShape();
     sparseIndicesShape_ = opParamInfo_.sparseIndices.shape->GetStorageShape();
+    if (asuResolvedSlots_) {
+        resolvedSlotsShape_ = opParamInfo_.resolvedKvSlots.shape->GetStorageShape();
+    }
     queryRopeShape_ = opParamInfo_.queryRope.tensor->GetStorageShape();
 }
 
@@ -1746,6 +1826,7 @@ void SFAInfoParser::GenerateInfo(SFATilingInfo &sfaInfo)
     sfaInfo.platformInfo = platformInfo_;
     sfaInfo.opParamInfo = opParamInfo_;
     sfaInfo.socVersion = socVersion_;
+    sfaInfo.asuResolvedSlots = asuResolvedSlots_;
 
     sfaInfo.bSize = bSize_;
     sfaInfo.n1Size = n1Size_;
@@ -1841,5 +1922,8 @@ ge::graphStatus SFAInfoParser::Parse(SFATilingInfo &sfaInfo)
 
 IMPL_OP_OPTILING(SparseFlashAttention)
     .Tiling(TilingSparseFlashAttention)
+    .TilingParse<SparseFlashAttentionCompileInfo>(TilingPrepareForSparseFlashAttention);
+IMPL_OP_OPTILING(SparseFlashAttentionAsu)
+    .Tiling(TilingSparseFlashAttentionAsu)
     .TilingParse<SparseFlashAttentionCompileInfo>(TilingPrepareForSparseFlashAttention);
 } // namespace optiling

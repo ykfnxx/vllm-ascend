@@ -808,6 +808,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention);
 
     ops.def(
+        "npu_sparse_flash_attention_asu(Tensor query, Tensor managed_key, Tensor managed_value,"
+        "                               Tensor sparse_indices, Tensor resolved_kv_slots,"
+        "                               float scale_value, int sparse_block_size, *,"
+        "                               Tensor? actual_seq_lengths_query=None,"
+        "                               Tensor? actual_seq_lengths_kv=None, Tensor? query_rope=None,"
+        "                               Tensor? managed_key_rope=None, str layout_query='TND',"
+        "                               str layout_kv='TND', int sparse_mode=3) -> Tensor"
+    );
+    ops.impl("npu_sparse_flash_attention_asu", torch::kPrivateUse1,
+             &vllm_ascend::npu_sparse_flash_attention_asu);
+
+    ops.def(
         "npu_asu_resolve_kv_slots_single_req(Tensor original_topk_indices,"
         "                                    int actual_seq_len,"
         "                                    int managed_prefix_len,"

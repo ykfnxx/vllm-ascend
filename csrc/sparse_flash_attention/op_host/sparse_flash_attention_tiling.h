@@ -33,6 +33,11 @@ constexpr uint32_t ACT_SEQ_LEN_Q_INPUT_INDEX = 5;
 constexpr uint32_t ACT_SEQ_LEN_KV_INPUT_INDEX = 6;
 constexpr uint32_t QUERY_ROPE_INPUT_INDEX = 7;
 constexpr uint32_t KEY_ROPE_INPUT_INDEX = 8;
+constexpr uint32_t RESOLVED_KV_SLOTS_INPUT_INDEX = 4;
+constexpr uint32_t ASU_ACT_SEQ_LEN_Q_INPUT_INDEX = 5;
+constexpr uint32_t ASU_ACT_SEQ_LEN_KV_INPUT_INDEX = 6;
+constexpr uint32_t ASU_QUERY_ROPE_INPUT_INDEX = 7;
+constexpr uint32_t MANAGED_KEY_ROPE_INPUT_INDEX = 8;
 // Outputs Index
 constexpr uint32_t OUTPUT_INDEX = 0;
 // Attributes Index
@@ -107,6 +112,7 @@ struct SFAParaInfo {
     SFARequiredParaInfo key = {nullptr, nullptr};
     SFARequiredParaInfo value = {nullptr, nullptr};
     SFARequiredParaInfo sparseIndices = {nullptr, nullptr};
+    SFARequiredParaInfo resolvedKvSlots = {nullptr, nullptr};
     SFAOptionalParaInfo blockTable = {nullptr, nullptr};
     SFAOptionalParaInfo actualSeqLengthsQ = {nullptr, nullptr};
     SFAOptionalParaInfo actualSeqLengths = {nullptr, nullptr};
@@ -175,6 +181,7 @@ TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionSingleCoreTensorSizeMla, single
 TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionInnerSplitParams, innerSplitParams);
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(SparseFlashAttention, SparseFlashAttentionTilingDataMla)
+REGISTER_TILING_DATA_CLASS(SparseFlashAttentionAsu, SparseFlashAttentionTilingDataMla)
 
 template <typename T> inline T Align(T num, T rnd)
 {
@@ -227,6 +234,7 @@ struct SFATilingInfo {
     int64_t sparseBlockCount = 0;
 
     bool pageAttentionFlag = false;
+    bool asuResolvedSlots = false;
     int64_t blockSize = 0;
     uint32_t blockTypeSize = 0;
     uint32_t maxBlockNumPerBatch = 0;
@@ -376,6 +384,7 @@ private:
     ge::graphStatus CheckSingleParaSparseMode() const;
     ge::graphStatus CheckSingleParaSparseBlockSize() const;
     ge::graphStatus CheckSingleParaSparseIndices() const;
+    ge::graphStatus CheckSingleParaResolvedKvSlots() const;
     ge::graphStatus CheckSinglePara() const;
     ge::graphStatus CheckMultiParaConsistency() const;
     ge::graphStatus CheckRopeExistence();
@@ -403,6 +412,7 @@ private:
     ge::graphStatus CheckVAndKRope();
     ge::graphStatus CheckTopK();
     ge::graphStatus CheckTopkShape();
+    ge::graphStatus CheckResolvedKvSlotsShape();
     ge::graphStatus CheckBlockTable() const;
     ge::graphStatus CheckDTypeConsistency(const ge::DataType &actualDtype,
     const ge::DataType &expectDtype, const std::string &name) const;
@@ -469,6 +479,7 @@ private:
     gert::Shape keyShapeCmp_{};
     gert::Shape valueShapeCmp_{};
     gert::Shape topkShapeCmp_{};
+    gert::Shape resolvedSlotsShapeCmp_{};
     gert::Shape queryRopeShapeCmp_{};
     gert::Shape keyRopeShapeCmp_{};
     gert::Shape attenOutShapeCmp_{};
@@ -476,7 +487,9 @@ private:
 
 class SFAInfoParser {
 public:
-    explicit SFAInfoParser(const gert::TilingContext *context) : context_(context) {}
+    explicit SFAInfoParser(const gert::TilingContext *context,
+                           bool asuResolvedSlots = false)
+        : context_(context), asuResolvedSlots_(asuResolvedSlots) {}
     ~SFAInfoParser() = default;
 
     ge::graphStatus CheckRequiredInOutExistence() const;
@@ -527,6 +540,7 @@ public:
     uint32_t GetAxisNum(const gert::Shape &shape, const SFAAxis &axis,const SFALayout &layout) const;
 
     const gert::TilingContext *context_ = nullptr;
+    bool asuResolvedSlots_ = false;
 
     const char *opName_;
     fe::PlatFormInfos *platformInfo_;
@@ -576,6 +590,7 @@ public:
     gert::Shape keyShape_{};
     gert::Shape valueShape_{};
     gert::Shape sparseIndicesShape_{};
+    gert::Shape resolvedSlotsShape_{};
     gert::Shape queryRopeShape_{};
     gert::Shape keyRopeShape_{};
 };

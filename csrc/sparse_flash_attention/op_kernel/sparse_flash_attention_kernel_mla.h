@@ -63,8 +63,9 @@ public:
 
     __aicore__ inline SparseFlashAttentionMla(){};
     __aicore__ inline void Init(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *value,
-                                __gm__ uint8_t *sparseIndices, __gm__ uint8_t *actualSeqLengthsQ,
-                                __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *blockTable,
+                                __gm__ uint8_t *sparseIndices, __gm__ uint8_t *resolvedKvSlots,
+                                __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
+                                __gm__ uint8_t *blockTable,
                                 __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope,
                                 __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace,
                                 const SparseFlashAttentionTilingDataMla *__restrict tiling,
@@ -78,6 +79,7 @@ private:
     static constexpr bool FLASH_DECODE = SFAT::flashDecode;
     static constexpr SFA_LAYOUT LAYOUT_T = SFAT::layout;
     static constexpr SFA_LAYOUT KV_LAYOUT_T = SFAT::kvLayout;
+    static constexpr bool ASU_RESOLVED_SLOT = SFAT::asuResolvedSlot;
 
     static constexpr uint32_t PRELOAD_NUM = 2;
     static constexpr uint32_t N_BUFFER_M_BASIC_SIZE = 256;
@@ -141,6 +143,7 @@ private:
     GlobalTensor<OUT_T> attentionOutGm;
     GlobalTensor<int32_t> blockTableGm;
     GlobalTensor<int32_t> topKGm;
+    GlobalTensor<int32_t> resolvedSlotsGm;
 
     GlobalTensor<int32_t> actualSeqLengthsQGm;
     GlobalTensor<int32_t> actualSeqLengthsKVGm;
@@ -375,8 +378,9 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::UpdateInner(uint32_t &s2En
 template <typename SFAT>
 __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query,
                        __gm__ uint8_t *key, __gm__ uint8_t *value,
-                       __gm__ uint8_t *sparseIndices, __gm__ uint8_t *actualSeqLengthsQ,
-                       __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *blockTable,
+                       __gm__ uint8_t *sparseIndices, __gm__ uint8_t *resolvedKvSlots,
+                       __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
+                       __gm__ uint8_t *blockTable,
                        __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope,
                        __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace,
                        const SparseFlashAttentionTilingDataMla *__restrict tiling,
@@ -420,6 +424,9 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
         blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
     }
     topKGm.SetGlobalBuffer((__gm__ int32_t *)sparseIndices);
+    if constexpr (ASU_RESOLVED_SLOT) {
+        resolvedSlotsGm.SetGlobalBuffer((__gm__ int32_t *)resolvedKvSlots);
+    }
 
     uint64_t offset = 0;
     mm1ResGm.SetGlobalBuffer(
@@ -458,7 +465,8 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
         vectorService.InitParams(constInfo, tilingData);
         vectorService.InitMm2ResInt32GmGlobalTensor(mm2ResInt32Gm);
         if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
-            vectorService.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, kRopeGm, keyGm, blockTableGm);
+            vectorService.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, kRopeGm, keyGm, blockTableGm,
+                                               resolvedSlotsGm);
         }
         vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, actualSeqLengthsQGm,
                                            actualSeqLengthsKVGm, lseMaxFdGm, lseSumFdGm, topKGm);
@@ -470,7 +478,8 @@ __aicore__ inline void SparseFlashAttentionMla<SFAT>::Init(__gm__ uint8_t *query
         matmulService.InitMm1GlobalTensor(queryGm, qRopeGm, keyGm, kRopeGm, mm1ResGm);
         matmulService.InitMm2GlobalTensor(vec1ResGm, valueGm, mm2ResGm, attentionOutGm);
         matmulService.InitPageAttentionInfo(kvMergeGm_, blockTableGm, topKGm,
-                                            constInfo.kvCacheBlockSize, constInfo.maxBlockNumPerBatch);
+                                            resolvedSlotsGm, constInfo.kvCacheBlockSize,
+                                            constInfo.maxBlockNumPerBatch);
     }
     if (pipe != nullptr) {
         InitBuffers();

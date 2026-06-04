@@ -59,6 +59,49 @@ at::Tensor npu_sparse_flash_attention(
         sparse_mode,
         output);
     return output;
-}    
+}
+
+at::Tensor npu_sparse_flash_attention_asu(
+    const at::Tensor &query, const at::Tensor &managed_key,
+    const at::Tensor &managed_value, const at::Tensor &sparse_indices,
+    const at::Tensor &resolved_kv_slots, double scale_value,
+    int64_t sparse_block_size,
+    const c10::optional<at::Tensor> &actual_seq_lengths_query,
+    const c10::optional<at::Tensor> &actual_seq_lengths_kv,
+    const c10::optional<at::Tensor> &query_rope,
+    const c10::optional<at::Tensor> &managed_key_rope,
+    c10::string_view layout_query, c10::string_view layout_kv,
+    int64_t sparse_mode)
+{
+    std::string layout_query_str = std::string(layout_query);
+    std::string layout_kv_str = std::string(layout_kv);
+
+    for (size_t i = 0; i < query.sizes().size(); i++) {
+        TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
+                                       "than 0, but shape[", i, "] is ", query.size(i));
+    }
+    at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
+    char *layout_query_ptr = const_cast<char *>(layout_query_str.c_str());
+    char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
+
+    EXEC_NPU_CMD(
+        aclnnSparseFlashAttentionAsu,
+        query,
+        managed_key,
+        managed_value,
+        sparse_indices,
+        resolved_kv_slots,
+        actual_seq_lengths_query,
+        actual_seq_lengths_kv,
+        query_rope,
+        managed_key_rope,
+        scale_value,
+        sparse_block_size,
+        layout_query_ptr,
+        layout_kv_ptr,
+        sparse_mode,
+        output);
+    return output;
+}
 }
 #endif

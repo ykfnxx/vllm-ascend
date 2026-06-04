@@ -250,6 +250,38 @@ at::Tensor npu_sparse_flash_attention_meta(
     return output;
 }
 
+at::Tensor npu_sparse_flash_attention_asu_meta(
+    const at::Tensor &query, const at::Tensor &managed_key,
+    const at::Tensor &managed_value, const at::Tensor &sparse_indices,
+    const at::Tensor &resolved_kv_slots, double scale_value,
+    int64_t sparse_block_size,
+    const c10::optional<at::Tensor> &actual_seq_lengths_query,
+    const c10::optional<at::Tensor> &actual_seq_lengths_kv,
+    const c10::optional<at::Tensor> &query_rope,
+    const c10::optional<at::Tensor> &managed_key_rope,
+    c10::string_view layout_query, c10::string_view layout_kv,
+    int64_t sparse_mode)
+{
+    (void)managed_key;
+    (void)managed_value;
+    (void)sparse_indices;
+    (void)resolved_kv_slots;
+    (void)scale_value;
+    (void)sparse_block_size;
+    (void)actual_seq_lengths_query;
+    (void)actual_seq_lengths_kv;
+    (void)query_rope;
+    (void)managed_key_rope;
+    (void)layout_query;
+    (void)layout_kv;
+    (void)sparse_mode;
+    for (size_t i = 0; i < query.sizes().size(); i++) {
+        TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
+                                       "than 0, but shape[", i, "] is ", query.size(i));
+    }
+    return at::empty(query.sizes(), query.options().dtype(query.dtype()));
+}
+
 at::Tensor npu_asu_resolve_kv_slots_single_req_meta(
     const at::Tensor &original_topk_indices,
     int64_t actual_seq_len,
@@ -634,6 +666,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
     // Sparse flash attention
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
+    ops.impl("npu_sparse_flash_attention_asu",
+             &vllm_ascend::meta::npu_sparse_flash_attention_asu_meta);
     // ASU KV resolver
     ops.impl("npu_asu_resolve_kv_slots_single_req",
              &vllm_ascend::meta::npu_asu_resolve_kv_slots_single_req_meta);
