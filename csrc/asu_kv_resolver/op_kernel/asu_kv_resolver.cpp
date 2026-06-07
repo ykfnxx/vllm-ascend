@@ -150,31 +150,33 @@ extern "C" __global__ __aicore__ void asu_kv_resolver(
 {
     (void)workspace;
     GET_TILING_DATA(tilingData, tiling);
-    if constexpr (DTYPE_ORIGINAL_KV_CACHE_0 == DT_FLOAT16) {
-        AsuKvResolverKernel<half> kernel;
-        kernel.Init(originalTopkIndices, tokenState, asuRecordAddr,
-                    hbmSlotOfToken, slotOwnerToken, freeSlotStack,
-                    freeSlotCount, originalBlockTable, originalKvCache0,
-                    originalKvCache1, managedKvCache0, managedKvCache1,
-                    resolvedKvSlots, &tilingData);
-        kernel.Process();
-    } else if constexpr (DTYPE_ORIGINAL_KV_CACHE_0 == DT_BF16) {
+    if (TILING_KEY_IS(1)) {
+        if constexpr (DTYPE_ORIGINAL_KV_CACHE_0 == DT_FLOAT16) {
+            AsuKvResolverKernel<half> kernel;
+            kernel.Init(originalTopkIndices, tokenState, asuRecordAddr,
+                        hbmSlotOfToken, slotOwnerToken, freeSlotStack,
+                        freeSlotCount, originalBlockTable, originalKvCache0,
+                        originalKvCache1, managedKvCache0, managedKvCache1,
+                        resolvedKvSlots, &tilingData);
+            kernel.Process();
+        } else if constexpr (DTYPE_ORIGINAL_KV_CACHE_0 == DT_BF16) {
 #if !(defined(__NPU_ARCH__) && __NPU_ARCH__ == 3003)
-        AsuKvResolverKernel<bfloat16_t> kernel;
-        kernel.Init(originalTopkIndices, tokenState, asuRecordAddr,
-                    hbmSlotOfToken, slotOwnerToken, freeSlotStack,
-                    freeSlotCount, originalBlockTable, originalKvCache0,
-                    originalKvCache1, managedKvCache0, managedKvCache1,
-                    resolvedKvSlots, &tilingData);
-        kernel.Process();
+            AsuKvResolverKernel<bfloat16_t> kernel;
+            kernel.Init(originalTopkIndices, tokenState, asuRecordAddr,
+                        hbmSlotOfToken, slotOwnerToken, freeSlotStack,
+                        freeSlotCount, originalBlockTable, originalKvCache0,
+                        originalKvCache1, managedKvCache0, managedKvCache1,
+                        resolvedKvSlots, &tilingData);
+            kernel.Process();
 #endif
-    } else {
-        AsuKvResolverKernel<float> kernel;
-        kernel.Init(originalTopkIndices, tokenState, asuRecordAddr,
-                    hbmSlotOfToken, slotOwnerToken, freeSlotStack,
-                    freeSlotCount, originalBlockTable, originalKvCache0,
-                    originalKvCache1, managedKvCache0, managedKvCache1,
-                    resolvedKvSlots, &tilingData);
-        kernel.Process();
+        } else {
+            AsuKvResolverKernel<float> kernel;
+            kernel.Init(originalTopkIndices, tokenState, asuRecordAddr,
+                        hbmSlotOfToken, slotOwnerToken, freeSlotStack,
+                        freeSlotCount, originalBlockTable, originalKvCache0,
+                        originalKvCache1, managedKvCache0, managedKvCache1,
+                        resolvedKvSlots, &tilingData);
+            kernel.Process();
+        }
     }
 }
