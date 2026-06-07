@@ -1,24 +1,24 @@
 /**
  * This program is free software, you can redistribute it and/or modify it.
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  */
- 
+
 /*!
- * \file sparse_flash_attention_def.cpp
+ * \file sparse_flash_attention_asu_def.cpp
  * \brief
  */
 
 #include "register/op_def_registry.h"
 
 namespace ops {
-class SparseFlashAttention : public OpDef {
+class SparseFlashAttentionAsu : public OpDef {
 public:
-    explicit SparseFlashAttention(const char *name) : OpDef(name)
+    explicit SparseFlashAttentionAsu(const char *name) : OpDef(name)
     {
         this->Input("query")
             .ParamType(REQUIRED)
@@ -40,8 +40,8 @@ public:
             .DataType({ge::DT_INT32, ge::DT_INT32})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .AutoContiguous();
-        this->Input("block_table")
-            .ParamType(OPTIONAL)
+        this->Input("resolved_kv_slots")
+            .ParamType(REQUIRED)
             .DataType({ge::DT_INT32, ge::DT_INT32})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .AutoContiguous();
@@ -60,7 +60,7 @@ public:
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .AutoContiguous();
-        this->Input("key_rope")
+        this->Input("managed_key_rope")
             .ParamType(OPTIONAL)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
@@ -71,8 +71,8 @@ public:
             .Format({ge::FORMAT_ND, ge::FORMAT_ND});
         this->Attr("scale_value").AttrType(REQUIRED).Float(1.0);
         this->Attr("sparse_block_size").AttrType(REQUIRED).Int(1);
-        this->Attr("layout_query").AttrType(OPTIONAL).String("BSND");
-        this->Attr("layout_kv").AttrType(OPTIONAL).String("BSND");
+        this->Attr("layout_query").AttrType(OPTIONAL).String("TND");
+        this->Attr("layout_kv").AttrType(OPTIONAL).String("TND");
         this->Attr("sparse_mode").AttrType(OPTIONAL).Int(3);
         OpAICoreConfig aicore_config;
         aicore_config.DynamicCompileStaticFlag(true)
@@ -86,5 +86,5 @@ public:
         this->AICore().AddConfig("ascend910_93", aicore_config);
     }
 };
-OP_ADD(SparseFlashAttention);
+OP_ADD(SparseFlashAttentionAsu);
 } // namespace ops

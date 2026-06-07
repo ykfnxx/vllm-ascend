@@ -9,11 +9,11 @@
  */
 
 /*!
- * \file sparse_flash_attention_tiling.h
+ * \file sparse_flash_attention_asu_tiling.h
  * \brief
  */
-#ifndef SPARSE_FLASH_ATTENTION_TILING_H
-#define SPARSE_FLASH_ATTENTION_TILING_H
+#ifndef SPARSE_FLASH_ATTENTION_ASU_TILING_H
+#define SPARSE_FLASH_ATTENTION_ASU_TILING_H
 
 #include <sstream>
 #include <graph/utils/type_utils.h>
@@ -33,6 +33,11 @@ constexpr uint32_t ACT_SEQ_LEN_Q_INPUT_INDEX = 5;
 constexpr uint32_t ACT_SEQ_LEN_KV_INPUT_INDEX = 6;
 constexpr uint32_t QUERY_ROPE_INPUT_INDEX = 7;
 constexpr uint32_t KEY_ROPE_INPUT_INDEX = 8;
+constexpr uint32_t RESOLVED_KV_SLOTS_INPUT_INDEX = 4;
+constexpr uint32_t ASU_ACT_SEQ_LEN_Q_INPUT_INDEX = 5;
+constexpr uint32_t ASU_ACT_SEQ_LEN_KV_INPUT_INDEX = 6;
+constexpr uint32_t ASU_QUERY_ROPE_INPUT_INDEX = 7;
+constexpr uint32_t MANAGED_KEY_ROPE_INPUT_INDEX = 8;
 // Outputs Index
 constexpr uint32_t OUTPUT_INDEX = 0;
 // Attributes Index
@@ -52,15 +57,15 @@ constexpr uint32_t NUM_BYTES_FLOAT = 4;
 constexpr uint32_t NUM_BYTES_FLOAT16 = 2;
 constexpr uint32_t NUM_BYTES_BF16 = 2;
 constexpr uint32_t BYTE_BLOCK = 32;
-const uint32_t SFA_MAX_AIC_CORE_NUM = 26;
+const uint32_t SFA_ASU_MAX_AIC_CORE_NUM = 26;
 
-enum class SFALayout : uint32_t {
+enum class SFAAsuLayout : uint32_t {
     BSND = 0,
     TND = 1,
     PA_BSND = 2
 };
 
-struct SFATilingShapeCompareParam {
+struct SFAAsuTilingShapeCompareParam {
     int64_t B = 1;
     int64_t S = 1;
     int64_t N = 1;
@@ -71,17 +76,17 @@ struct SFATilingShapeCompareParam {
     int64_t Bn = 1;
 };
 
-enum class KvStorageMode : uint32_t {
+enum class SFAAsuKvStorageMode : uint32_t {
     BATCH_CONTINUOUS = 0,
     PAGE_ATTENTION = 1
 };
 
-enum class SFAPerfMode : uint32_t {
+enum class SFAAsuPerfMode : uint32_t {
     C_TEMPLATE_MODE = 0,
     V_TEMPLATE_MODE
 };
 
-enum class SFAAxis : uint32_t {
+enum class SFAAsuAxis : uint32_t {
     B = 0,
     S = 1,
     N = 2,
@@ -92,27 +97,28 @@ enum class SFAAxis : uint32_t {
     Bs = 7, // block size
 };
 
-struct SFARequiredParaInfo {
+struct SFAAsuRequiredParaInfo {
     const gert::CompileTimeTensorDesc *desc;
     const gert::StorageShape *shape;
 };
 
-struct SFAOptionalParaInfo {
+struct SFAAsuOptionalParaInfo {
     const gert::CompileTimeTensorDesc *desc;
     const gert::Tensor *tensor;
 };
 
-struct SFAParaInfo {
-    SFARequiredParaInfo query = {nullptr, nullptr};
-    SFARequiredParaInfo key = {nullptr, nullptr};
-    SFARequiredParaInfo value = {nullptr, nullptr};
-    SFARequiredParaInfo sparseIndices = {nullptr, nullptr};
-    SFAOptionalParaInfo blockTable = {nullptr, nullptr};
-    SFAOptionalParaInfo actualSeqLengthsQ = {nullptr, nullptr};
-    SFAOptionalParaInfo actualSeqLengths = {nullptr, nullptr};
-    SFAOptionalParaInfo queryRope = {nullptr, nullptr};
-    SFAOptionalParaInfo keyRope = {nullptr, nullptr};
-    SFARequiredParaInfo attenOut = {nullptr, nullptr};
+struct SFAAsuParaInfo {
+    SFAAsuRequiredParaInfo query = {nullptr, nullptr};
+    SFAAsuRequiredParaInfo key = {nullptr, nullptr};
+    SFAAsuRequiredParaInfo value = {nullptr, nullptr};
+    SFAAsuRequiredParaInfo sparseIndices = {nullptr, nullptr};
+    SFAAsuRequiredParaInfo resolvedKvSlots = {nullptr, nullptr};
+    SFAAsuOptionalParaInfo blockTable = {nullptr, nullptr};
+    SFAAsuOptionalParaInfo actualSeqLengthsQ = {nullptr, nullptr};
+    SFAAsuOptionalParaInfo actualSeqLengths = {nullptr, nullptr};
+    SFAAsuOptionalParaInfo queryRope = {nullptr, nullptr};
+    SFAAsuOptionalParaInfo keyRope = {nullptr, nullptr};
+    SFAAsuRequiredParaInfo attenOut = {nullptr, nullptr};
 
     const char *layoutQuery = nullptr;
     const char *layoutKV = nullptr;
@@ -121,12 +127,16 @@ struct SFAParaInfo {
     const int64_t *sparseMode = nullptr;
 };
 
+struct SparseFlashAttentionAsuCompileInfo {
+    int64_t core_num;
+};
+
 struct InnerSplitParams {
     uint32_t s1GBaseSize = 1;
     uint32_t s2BaseSize = 1;
 };
 
-BEGIN_TILING_DATA_DEF(SparseFlashAttentionBaseParamsMla)
+BEGIN_TILING_DATA_DEF(SparseFlashAttentionAsuBaseParamsMla)
 TILING_DATA_FIELD_DEF(uint32_t, batchSize)
 TILING_DATA_FIELD_DEF(uint32_t, seqSize)
 TILING_DATA_FIELD_DEF(uint32_t, qSeqSize)
@@ -141,40 +151,40 @@ TILING_DATA_FIELD_DEF(uint32_t, sparseMode)
 TILING_DATA_FIELD_DEF(int64_t, sparseBlockSize)
 TILING_DATA_FIELD_DEF(uint32_t, sparseBlockCount)
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionBaseParamsMlaOp, SparseFlashAttentionBaseParamsMla)
+REGISTER_TILING_DATA_CLASS(SparseFlashAttentionAsuBaseParamsMlaOp, SparseFlashAttentionAsuBaseParamsMla)
 
-BEGIN_TILING_DATA_DEF(SparseFlashAttentionSingleCoreParamsMla)
+BEGIN_TILING_DATA_DEF(SparseFlashAttentionAsuSingleCoreParamsMla)
 TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum);
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionSingleCoreParamsMlaOp, SparseFlashAttentionSingleCoreParamsMla)
+REGISTER_TILING_DATA_CLASS(SparseFlashAttentionAsuSingleCoreParamsMlaOp, SparseFlashAttentionAsuSingleCoreParamsMla)
 
-BEGIN_TILING_DATA_DEF(SparseFlashAttentionSingleCoreTensorSizeMla)
+BEGIN_TILING_DATA_DEF(SparseFlashAttentionAsuSingleCoreTensorSizeMla)
 TILING_DATA_FIELD_DEF(uint32_t, mmResUbSize);
 TILING_DATA_FIELD_DEF(uint32_t, bmm2ResUbSize);
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionSingleCoreTensorSizeMlaOp, SparseFlashAttentionSingleCoreTensorSizeMla)
+REGISTER_TILING_DATA_CLASS(SparseFlashAttentionAsuSingleCoreTensorSizeMlaOp, SparseFlashAttentionAsuSingleCoreTensorSizeMla)
 
-BEGIN_TILING_DATA_DEF(SparseFlashAttentionSplitKVParamsMla)
+BEGIN_TILING_DATA_DEF(SparseFlashAttentionAsuSplitKVParamsMla)
 TILING_DATA_FIELD_DEF(uint32_t, s2)
 TILING_DATA_FIELD_DEF(uint32_t, accumOutSize)   // FD workspace
 TILING_DATA_FIELD_DEF(uint32_t, logSumExpSize)  // FD workspace
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionSplitKVParamsMlaOp, SparseFlashAttentionSplitKVParamsMla)
+REGISTER_TILING_DATA_CLASS(SparseFlashAttentionAsuSplitKVParamsMlaOp, SparseFlashAttentionAsuSplitKVParamsMla)
 
-BEGIN_TILING_DATA_DEF(SparseFlashAttentionInnerSplitParams)
+BEGIN_TILING_DATA_DEF(SparseFlashAttentionAsuInnerSplitParams)
 TILING_DATA_FIELD_DEF(uint32_t, mBaseSize)
 TILING_DATA_FIELD_DEF(uint32_t, s2BaseSize)
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(SparseFlashAttentionInnerSplitParamsOp, SparseFlashAttentionInnerSplitParams)
+REGISTER_TILING_DATA_CLASS(SparseFlashAttentionAsuInnerSplitParamsOp, SparseFlashAttentionAsuInnerSplitParams)
 
-BEGIN_TILING_DATA_DEF(SparseFlashAttentionTilingDataMla)
-TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionBaseParamsMla, baseParams);
-TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionSplitKVParamsMla, splitKVParams);
-TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionSingleCoreParamsMla, singleCoreParams);
-TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionSingleCoreTensorSizeMla, singleCoreTensorSize);
-TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionInnerSplitParams, innerSplitParams);
+BEGIN_TILING_DATA_DEF(SparseFlashAttentionAsuTilingDataMla)
+TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionAsuBaseParamsMla, baseParams);
+TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionAsuSplitKVParamsMla, splitKVParams);
+TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionAsuSingleCoreParamsMla, singleCoreParams);
+TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionAsuSingleCoreTensorSizeMla, singleCoreTensorSize);
+TILING_DATA_FIELD_DEF_STRUCT(SparseFlashAttentionAsuInnerSplitParams, innerSplitParams);
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(SparseFlashAttention, SparseFlashAttentionTilingDataMla)
+REGISTER_TILING_DATA_CLASS(SparseFlashAttentionAsu, SparseFlashAttentionAsuTilingDataMla)
 
 template <typename T> inline T Align(T num, T rnd)
 {
@@ -182,7 +192,7 @@ template <typename T> inline T Align(T num, T rnd)
 }
 
 template <typename T>
-std::string SFAShape2String(const T &shape)
+std::string SFAAsuShape2String(const T &shape)
 {
     std::ostringstream oss;
     oss << "[";
@@ -196,16 +206,16 @@ std::string SFAShape2String(const T &shape)
     return oss.str();
 }
 
-static std::string GetShapeStr(gert::Shape shape);
-static std::string SFADataTypeToSerialString(ge::DataType type);
-std::string SFATensorDesc2String(const gert::StorageShape *shape, const gert::CompileTimeTensorDesc *tensor);
-std::string SFADebugTilingContext(const gert::TilingContext *context);
-std::string SFALayoutToSerialString(SFALayout layout);
+static std::string GetAsuShapeStr(gert::Shape shape);
+static std::string SFAAsuDataTypeToSerialString(ge::DataType type);
+std::string SFAAsuTensorDesc2String(const gert::StorageShape *shape, const gert::CompileTimeTensorDesc *tensor);
+std::string SFAAsuDebugTilingContext(const gert::TilingContext *context);
+std::string SFAAsuLayoutToSerialString(SFAAsuLayout layout);
 
-struct SFATilingInfo {
+struct SFAAsuTilingInfo {
     const char *opName = nullptr;
     fe::PlatFormInfos *platformInfo = nullptr;
-    SFAParaInfo opParamInfo;
+    SFAAsuParaInfo opParamInfo;
 
     // Base Param
     platform_ascendc::SocVersion socVersion = platform_ascendc::SocVersion::ASCEND910B;
@@ -227,6 +237,7 @@ struct SFATilingInfo {
     int64_t sparseBlockCount = 0;
 
     bool pageAttentionFlag = false;
+    bool asuResolvedSlots = false;
     int64_t blockSize = 0;
     uint32_t blockTypeSize = 0;
     uint32_t maxBlockNumPerBatch = 0;
@@ -247,12 +258,12 @@ struct SFATilingInfo {
     ge::DataType inputKvType = ge::DT_FLOAT16;
     ge::DataType outputType = ge::DT_FLOAT16;
 
-    KvStorageMode kvStorageMode = KvStorageMode::BATCH_CONTINUOUS;
+    SFAAsuKvStorageMode kvStorageMode = SFAAsuKvStorageMode::BATCH_CONTINUOUS;
 
-    SFALayout qLayout = SFALayout::BSND;
-    SFALayout topkLayout = SFALayout::BSND;
-    SFALayout outLayout = SFALayout::BSND;
-    SFALayout kvLayout = SFALayout::BSND;
+    SFAAsuLayout qLayout = SFAAsuLayout::BSND;
+    SFAAsuLayout topkLayout = SFAAsuLayout::BSND;
+    SFAAsuLayout outLayout = SFAAsuLayout::BSND;
+    SFAAsuLayout kvLayout = SFAAsuLayout::BSND;
 
     ge::DataType inputQRopeType = ge::DT_FLOAT16;
     ge::DataType inputKRopeType = ge::DT_FLOAT16;
@@ -260,10 +271,10 @@ struct SFATilingInfo {
     uint64_t l2CacheSize = 0;
 };
 
-class SFAMlaTiling {
+class SFAAsuMlaTiling {
 public:
-    explicit SFAMlaTiling(gert::TilingContext *context) : context_(context) {}
-    ge::graphStatus DoOpTiling(SFATilingInfo *sfaInfo);
+    explicit SFAAsuMlaTiling(gert::TilingContext *context) : context_(context) {}
+    ge::graphStatus DoOpTiling(SFAAsuTilingInfo *sfaInfo);
 
 private:
     ge::graphStatus SetBlockDim(uint32_t blockDim);
@@ -307,7 +318,7 @@ private:
     bool splitKVFlag_ = false;
 
     uint32_t coreNum_ = 0;
-    SFAPerfMode perfMode_ = SFAPerfMode::V_TEMPLATE_MODE;
+    SFAAsuPerfMode perfMode_ = SFAAsuPerfMode::V_TEMPLATE_MODE;
     uint32_t kvSplitPart_ = 1;
     size_t mmResUbSize_ = 0;
     size_t bmm2ResUbSize_ = 0;
@@ -326,7 +337,7 @@ private:
     uint32_t aivNum_ = 0;
     size_t libapiSize_ = 0;
 
-    SparseFlashAttentionTilingDataMla tilingData_;
+    SparseFlashAttentionAsuTilingDataMla tilingData_;
     uint32_t blockDim_{0};
     uint64_t workspaceSize_{0};
     uint64_t tilingKey_{0};
@@ -335,13 +346,13 @@ private:
     uint32_t mBaseSize_ = 128;
     uint32_t mFdBaseSize_ = 8;
 
-    SFATilingInfo *sfaInfo_ = nullptr;
+    SFAAsuTilingInfo *sfaInfo_ = nullptr;
 };
 
-class SFATilingCheck {
+class SFAAsuTilingCheck {
 public:
-    explicit SFATilingCheck(const SFATilingInfo &sfaInfo) : sfaInfo_(sfaInfo) {};
-    ~SFATilingCheck() = default;
+    explicit SFAAsuTilingCheck(const SFAAsuTilingInfo &sfaInfo) : sfaInfo_(sfaInfo) {};
+    ~SFAAsuTilingCheck() = default;
     virtual ge::graphStatus Process();
 private:
     void Init();
@@ -355,15 +366,15 @@ private:
         const T &actualValue, const std::string &name) const;
     ge::graphStatus CheckDimNumSupport(const gert::StorageShape *shape,
         const std::vector<size_t> &expectDimNumList, const std::string &name) const;
-    ge::graphStatus CheckDimNumInLayoutSupport(const SFALayout &layout,
+    ge::graphStatus CheckDimNumInLayoutSupport(const SFAAsuLayout &layout,
         const gert::StorageShape *shape, const std::string &name) const;
-    void LogErrorLayoutSupport(const std::vector<SFALayout> &expectLayoutList,
-        const SFALayout &actualLayout, const std::string &name) const;
+    void LogErrorLayoutSupport(const std::vector<SFAAsuLayout> &expectLayoutList,
+        const SFAAsuLayout &actualLayout, const std::string &name) const;
     ge::graphStatus GetExpectedShape(gert::Shape &shapeExpected,
-    const SFATilingShapeCompareParam &param, const SFALayout &layout) const;
-    ge::graphStatus CompareShape(SFATilingShapeCompareParam &param,
-        const gert::Shape &shape, const SFALayout &layout, const std::string &name) const;
-    ge::graphStatus CheckLayoutSupport(const SFALayout &actualLayout, const std::string &name) const;
+    const SFAAsuTilingShapeCompareParam &param, const SFAAsuLayout &layout) const;
+    ge::graphStatus CompareShape(SFAAsuTilingShapeCompareParam &param,
+        const gert::Shape &shape, const SFAAsuLayout &layout, const std::string &name) const;
+    ge::graphStatus CheckLayoutSupport(const SFAAsuLayout &actualLayout, const std::string &name) const;
     ge::graphStatus CheckSingleParaQuery() const;
     ge::graphStatus CheckSingleParaKey() const;
     ge::graphStatus CheckSingleParaValue() const;
@@ -376,6 +387,7 @@ private:
     ge::graphStatus CheckSingleParaSparseMode() const;
     ge::graphStatus CheckSingleParaSparseBlockSize() const;
     ge::graphStatus CheckSingleParaSparseIndices() const;
+    ge::graphStatus CheckSingleParaResolvedKvSlots() const;
     ge::graphStatus CheckSinglePara() const;
     ge::graphStatus CheckMultiParaConsistency() const;
     ge::graphStatus CheckRopeExistence();
@@ -392,7 +404,7 @@ private:
     ge::graphStatus CheckParaExistenceMla() const;
     ge::graphStatus CheckParaExistence();
     ge::graphStatus GetActualSeqLenSize(uint32_t &size, const gert::Tensor *tensor,
-        const SFALayout &layout, const std::string &name);
+        const SFAAsuLayout &layout, const std::string &name);
     void SetSFAShapeCompare();
     ge::graphStatus CheckQRope();
     ge::graphStatus CheckQRopeShape();
@@ -403,6 +415,7 @@ private:
     ge::graphStatus CheckVAndKRope();
     ge::graphStatus CheckTopK();
     ge::graphStatus CheckTopkShape();
+    ge::graphStatus CheckResolvedKvSlotsShape();
     ge::graphStatus CheckBlockTable() const;
     ge::graphStatus CheckDTypeConsistency(const ge::DataType &actualDtype,
     const ge::DataType &expectDtype, const std::string &name) const;
@@ -428,8 +441,8 @@ private:
 private:
     const char *opName_;
     fe::PlatFormInfos *platformInfo_;
-    SFAParaInfo opParamInfo_;
-    const SFATilingInfo &sfaInfo_;
+    SFAAsuParaInfo opParamInfo_;
+    const SFAAsuTilingInfo &sfaInfo_;
 
     uint32_t bSize_ = 0;
     uint32_t n1Size_ = 0;
@@ -442,14 +455,14 @@ private:
     uint32_t ropeHeadDim_ = 0;
     uint32_t qTSize_ = 0;
     uint32_t kvTSize_ = 0;
-    KvStorageMode kvStorageMode_ = KvStorageMode::BATCH_CONTINUOUS;
+    SFAAsuKvStorageMode kvStorageMode_ = SFAAsuKvStorageMode::BATCH_CONTINUOUS;
     uint32_t sparseBlockCount_ = 0;
     int64_t sparseBlockSize_ = 0;
 
-    SFALayout qLayout_ = SFALayout::BSND;
-    SFALayout topkLayout_ = SFALayout::BSND;
-    SFALayout outLayout_ = SFALayout::BSND;
-    SFALayout kvLayout_ = SFALayout::BSND;
+    SFAAsuLayout qLayout_ = SFAAsuLayout::BSND;
+    SFAAsuLayout topkLayout_ = SFAAsuLayout::BSND;
+    SFAAsuLayout outLayout_ = SFAAsuLayout::BSND;
+    SFAAsuLayout kvLayout_ = SFAAsuLayout::BSND;
 
     uint32_t maxBlockNumPerBatch_ = 0;
     int64_t blockSize_ = 0;
@@ -469,22 +482,25 @@ private:
     gert::Shape keyShapeCmp_{};
     gert::Shape valueShapeCmp_{};
     gert::Shape topkShapeCmp_{};
+    gert::Shape resolvedSlotsShapeCmp_{};
     gert::Shape queryRopeShapeCmp_{};
     gert::Shape keyRopeShapeCmp_{};
     gert::Shape attenOutShapeCmp_{};
 };
 
-class SFAInfoParser {
+class SFAAsuInfoParser {
 public:
-    explicit SFAInfoParser(const gert::TilingContext *context) : context_(context) {}
-    ~SFAInfoParser() = default;
+    explicit SFAAsuInfoParser(const gert::TilingContext *context,
+                           bool asuResolvedSlots = false)
+        : context_(context), asuResolvedSlots_(asuResolvedSlots) {}
+    ~SFAAsuInfoParser() = default;
 
     ge::graphStatus CheckRequiredInOutExistence() const;
     ge::graphStatus CheckRequiredAttrExistence() const;
     ge::graphStatus CheckRequiredParaExistence() const;
 
     ge::graphStatus GetActualSeqLenSize(uint32_t &size, const gert::Tensor *tensor,
-        SFALayout &layout, const std::string &name);
+        SFAAsuLayout &layout, const std::string &name);
     ge::graphStatus GetActualSeqLenQSize(uint32_t &size);
     ge::graphStatus GetOpName();
     ge::graphStatus GetNpuInfo();
@@ -518,19 +534,20 @@ public:
     ge::graphStatus GetGSize();
     ge::graphStatus GetSparseBlockCount();
     ge::graphStatus GetActualseqInfo();
-    void GenerateInfo(SFATilingInfo &sfaInfo);
-    ge::graphStatus Parse(SFATilingInfo &sfaInfo);
+    void GenerateInfo(SFAAsuTilingInfo &sfaInfo);
+    ge::graphStatus Parse(SFAAsuTilingInfo &sfaInfo);
 
 public:
-    bool HasAxis(const SFAAxis &axis, const SFALayout &layout, const gert::Shape &shape) const;
-    size_t GetAxisIdx(const SFAAxis &axis, const SFALayout &layout) const;
-    uint32_t GetAxisNum(const gert::Shape &shape, const SFAAxis &axis,const SFALayout &layout) const;
+    bool HasAxis(const SFAAsuAxis &axis, const SFAAsuLayout &layout, const gert::Shape &shape) const;
+    size_t GetAxisIdx(const SFAAsuAxis &axis, const SFAAsuLayout &layout) const;
+    uint32_t GetAxisNum(const gert::Shape &shape, const SFAAsuAxis &axis,const SFAAsuLayout &layout) const;
 
     const gert::TilingContext *context_ = nullptr;
+    bool asuResolvedSlots_ = false;
 
     const char *opName_;
     fe::PlatFormInfos *platformInfo_;
-    SFAParaInfo opParamInfo_;
+    SFAAsuParaInfo opParamInfo_;
     static constexpr int64_t invalidDimValue_ = std::numeric_limits<int64_t>::min();
 
     uint32_t bSize_ = 0;
@@ -544,13 +561,13 @@ public:
     uint32_t ropeHeadDim_ = 0;
     uint32_t qTSize_ = 0;
     uint32_t kvTSize_ = 0;
-    KvStorageMode kvStorageMode_ = KvStorageMode::BATCH_CONTINUOUS;
+    SFAAsuKvStorageMode kvStorageMode_ = SFAAsuKvStorageMode::BATCH_CONTINUOUS;
     uint32_t sparseBlockCount_ = 0;
 
-    SFALayout qLayout_ = SFALayout::BSND;
-    SFALayout topkLayout_ = SFALayout::BSND;
-    SFALayout outLayout_ = SFALayout::BSND;
-    SFALayout kvLayout_ = SFALayout::BSND;
+    SFAAsuLayout qLayout_ = SFAAsuLayout::BSND;
+    SFAAsuLayout topkLayout_ = SFAAsuLayout::BSND;
+    SFAAsuLayout outLayout_ = SFAAsuLayout::BSND;
+    SFAAsuLayout kvLayout_ = SFAAsuLayout::BSND;
 
     uint32_t maxBlockNumPerBatch_ = 0;
     uint32_t blockSize_ = 0;
@@ -576,8 +593,12 @@ public:
     gert::Shape keyShape_{};
     gert::Shape valueShape_{};
     gert::Shape sparseIndicesShape_{};
+    gert::Shape resolvedSlotsShape_{};
     gert::Shape queryRopeShape_{};
     gert::Shape keyRopeShape_{};
 };
+
+ge::graphStatus TilingSparseFlashAttentionAsu(gert::TilingContext *context);
+ge::graphStatus TilingPrepareForSparseFlashAttentionAsu(gert::TilingParseContext *context);
 } // namespace optiling
-#endif // SPARSE_FLASH_ATTENTION_TILING_H
+#endif // SPARSE_FLASH_ATTENTION_ASU_TILING_H

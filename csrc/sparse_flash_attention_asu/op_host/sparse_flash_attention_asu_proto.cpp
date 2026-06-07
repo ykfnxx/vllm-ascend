@@ -1,6 +1,6 @@
 /**
  * This program is free software, you can redistribute it and/or modify it.
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * This file is a part of the CANN Open Software.
  * Licensed under CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -9,7 +9,7 @@
  */
 
 /*!
- * \file sparse_flash_attention_proto.cpp
+ * \file sparse_flash_attention_asu_proto.cpp
  * \brief
  */
 
@@ -22,9 +22,9 @@ using namespace ge;
 namespace ops {
 constexpr size_t QUERY_INPUT_INDEX = 0;
 
-ge::graphStatus InferShapeSparseFlashAttention(gert::InferShapeContext *context)
+ge::graphStatus InferShapeSparseFlashAttentionAsu(gert::InferShapeContext *context)
 {
-    OPS_ERR_IF(context == nullptr, OPS_LOG_E("SparseFlashAttention", "InferShapeContext is nullptr"),
+    OPS_ERR_IF(context == nullptr, OPS_LOG_E("SparseFlashAttentionAsu", "InferShapeContext is nullptr"),
                return ge::GRAPH_FAILED);
     const gert::Shape *queryShape = context->GetInputShape(QUERY_INPUT_INDEX);
     OPS_LOG_E_IF_NULL(context, queryShape, return ge::GRAPH_FAILED)
@@ -34,15 +34,16 @@ ge::graphStatus InferShapeSparseFlashAttention(gert::InferShapeContext *context)
     return GRAPH_SUCCESS;
 }
 
-ge::graphStatus InferDataTypeSparseFlashAttention(gert::InferDataTypeContext *context)
+ge::graphStatus InferDataTypeSparseFlashAttentionAsu(gert::InferDataTypeContext *context)
 {
-    OPS_ERR_IF(context == nullptr, OPS_LOG_E("SparseFlashAttention", "InferShapeContext is nullptr"),
+    OPS_ERR_IF(context == nullptr, OPS_LOG_E("SparseFlashAttentionAsu", "InferShapeContext is nullptr"),
                return ge::GRAPH_FAILED);
     const auto inputDataType = context->GetInputDataType(QUERY_INPUT_INDEX);
     context->SetOutputDataType(0, inputDataType);
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP(SparseFlashAttention).InferShape(InferShapeSparseFlashAttention).InferDataType(InferDataTypeSparseFlashAttention);
+IMPL_OP(SparseFlashAttentionAsu)
+    .InferShape(InferShapeSparseFlashAttentionAsu)
+    .InferDataType(InferDataTypeSparseFlashAttentionAsu);
 } // namespace ops
-  

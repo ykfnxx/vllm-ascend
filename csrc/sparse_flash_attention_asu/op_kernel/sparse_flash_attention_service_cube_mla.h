@@ -117,7 +117,8 @@ public:
                                                GlobalTensor<MM_OUT_T> mm2ResGm, GlobalTensor<OUT_T> attentionOutGm);
     __aicore__ inline void InitPageAttentionInfo(const GlobalTensor<KV_T>& kvMergeGm,
                                                  GlobalTensor<int32_t> blockTableGm, GlobalTensor<int32_t> topKGm,
-                                                 uint32_t blockSize, uint32_t maxBlockNumPerBatch);
+                                                 GlobalTensor<int32_t> resolvedSlotsGm, uint32_t blockSize,
+                                                 uint32_t maxBlockNumPerBatch);
     __aicore__ inline void InitBuffers(TPipe *pipe);
     __aicore__ inline void UpdateKey(GlobalTensor<KV_T> keyGm);
     __aicore__ inline void UpdateValue(GlobalTensor<KV_T> valueGm);
@@ -126,7 +127,7 @@ public:
     __aicore__ inline void FreeEventID();
     __aicore__ inline void CalcTopKBlockInfo(const RunInfo &info, uint32_t &curTopKIdx,
                                              uint64_t &curOffsetInSparseBlock, uint32_t curSeqIdx,
-                                             uint32_t &copyRowCnt, int64_t &idInTopK);
+                                             uint32_t &copyRowCnt, int64_t &idInTopK, int64_t &slotInTopK);
     __aicore__ inline void ComputeMm1(const RunInfo &info, const MSplitInfo mSplitInfo);
     __aicore__ inline void ComputeMm2(const RunInfo &info, const MSplitInfo mSplitInfo);
 
@@ -136,6 +137,7 @@ private:
     static constexpr bool FLASH_DECODE = SFAT::flashDecode;
     static constexpr SFA_LAYOUT LAYOUT_T = SFAT::layout;
     static constexpr SFA_LAYOUT KV_LAYOUT_T = SFAT::kvLayout;
+    static constexpr bool ASU_RESOLVED_SLOT = SFAT::asuResolvedSlot;
 
     static constexpr uint32_t M_SPLIT_SIZE = 128;
     static constexpr uint32_t N_SPLIT_SIZE = 128;
@@ -190,6 +192,7 @@ private:
     // block_table
     GlobalTensor<int32_t> blockTableGm;
     GlobalTensor<int32_t> topKGm;
+    GlobalTensor<int32_t> resolvedSlotsGm;
 
     TBuf<TPosition::A1> bufQPL1;
     TBuf<TPosition::A1> bufKVL1;
@@ -237,6 +240,7 @@ private:
                                         uint32_t kSplitSize, uint32_t mSize, uint32_t kSize);
     __aicore__ inline void LoadDataMm1B(LocalTensor<KV_T> &bL0Tensor, LocalTensor<KV_T> &bL1Tensor, uint32_t idx,
                                         uint32_t kSplitSize, uint32_t kSize, uint32_t nSize);
+    __aicore__ inline int64_t GetResolvedSlot(const RunInfo &info, uint32_t topKIdx, uint64_t curOffsetInSparseBlock);
 };
 
 template <typename SFAT> __aicore__ inline void SFAMatmulService<SFAT>::InitParams(const ConstInfo &constInfo)
@@ -273,10 +277,12 @@ SFAMatmulService<SFAT>::InitMm2GlobalTensor(GlobalTensor<KV_T> vec1ResGm, Global
 template <typename SFAT>
 __aicore__ inline void
 SFAMatmulService<SFAT>::InitPageAttentionInfo(const GlobalTensor<KV_T>& kvMergeGm, GlobalTensor<int32_t> blockTableGm,
-		                              GlobalTensor<int32_t> topKGm, uint32_t blockSize, uint32_t maxBlockNumPerBatch)
+                                              GlobalTensor<int32_t> topKGm, GlobalTensor<int32_t> resolvedSlotsGm,
+                                              uint32_t blockSize, uint32_t maxBlockNumPerBatch)
 {
     this->blockTableGm = blockTableGm;
     this->topKGm = topKGm;
+    this->resolvedSlotsGm = resolvedSlotsGm;
     this->kvCacheBlockSize = blockSize;
     this->maxBlockNumPerBatch = maxBlockNumPerBatch;
     this->kvMergeGm_ = kvMergeGm;
@@ -507,8 +513,17 @@ __aicore__ inline void SFAMatmulService<SFAT>::CopyInMm2BToL1(
 }
 
 template <typename SFAT>
+__aicore__ inline int64_t SFAMatmulService<SFAT>::GetResolvedSlot(
+    const RunInfo &info, uint32_t topKIdx, uint64_t curOffsetInSparseBlock)
+{
+    (void)curOffsetInSparseBlock;
+    return resolvedSlotsGm.GetValue(info.topKBaseOffset + topKIdx);
+}
+
+template <typename SFAT>
 __aicore__ inline void SFAMatmulService<SFAT>::CalcTopKBlockInfo(
-    const RunInfo &info, uint32_t &curTopKIdx, uint64_t &curOffsetInSparseBlock, uint32_t curSeqIdx, uint32_t &copyRowCnt, int64_t &idInTopK)
+    const RunInfo &info, uint32_t &curTopKIdx, uint64_t &curOffsetInSparseBlock, uint32_t curSeqIdx,
+    uint32_t &copyRowCnt, int64_t &idInTopK, int64_t &slotInTopK)
 {
     uint64_t blockBegin = idInTopK * constInfo.sparseBlockSize;
     uint64_t blockEnd = (blockBegin + constInfo.sparseBlockSize > info.threshold) ?
@@ -533,6 +548,11 @@ __aicore__ inline void SFAMatmulService<SFAT>::CalcTopKBlockInfo(
             uint64_t blockLen = blockEnd - blockBegin;
             curTopKIdx = topkidx;
             idInTopK = sparseIndices;
+            if constexpr (ASU_RESOLVED_SLOT) {
+                slotInTopK = GetResolvedSlot(info, curTopKIdx, 0);
+            } else {
+                slotInTopK = idInTopK;
+            }
             curOffsetInSparseBlock = 0;
             copyRowCnt = blockLen;
             break;
@@ -569,11 +589,16 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
     uint64_t curOffsetInSparseBlock = info.curOffsetInSparseBlock;
     uint32_t copyRowCnt = 0;
     int64_t idInTopK = topKGm.GetValue(info.topKBaseOffset + curTopKIdx);
+    int64_t slotInTopK = idInTopK;
+    if constexpr (ASU_RESOLVED_SLOT) {
+        slotInTopK = GetResolvedSlot(info, curTopKIdx, curOffsetInSparseBlock);
+    }
 
     uint32_t curTopKIdxTmp = 0;
     uint64_t curOffsetInSparseBlockTmp = 0;
     uint32_t copyRowCntTmp = 0;
     int64_t idInTopKTmp = 0;
+    int64_t slotInTopKTmp = 0;
 
     for (uint32_t nL1 = 0; nL1 < nL1Loops; nL1++) {
         if (nL1 == (nL1Loops - 1)) {
@@ -584,6 +609,7 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
         curOffsetInSparseBlockTmp = curOffsetInSparseBlock;
         copyRowCntTmp = copyRowCnt;
         idInTopKTmp = idInTopK;
+        slotInTopKTmp = slotInTopK;
 
         for (uint32_t kL1 = 0; kL1 < kL1Loops; kL1++) {
             kvL1BufIter++;
@@ -596,6 +622,7 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
                 curOffsetInSparseBlock = curOffsetInSparseBlockTmp;
                 copyRowCnt = copyRowCntTmp;
                 idInTopK = idInTopKTmp;
+                slotInTopK = slotInTopKTmp;
                 if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
                     if (kL1 == 0) {
                         Nd2NzParams nd2nzPara;
@@ -643,7 +670,8 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
                     }
                 } else {
                     while (copyFinishRowCnt < nL1Size) {
-                        CalcTopKBlockInfo(info, curTopKIdx, curOffsetInSparseBlock, curSeqIdx, copyRowCnt, idInTopK);
+                        CalcTopKBlockInfo(info, curTopKIdx, curOffsetInSparseBlock, curSeqIdx, copyRowCnt, idInTopK,
+                                          slotInTopK);
                         if (copyFinishRowCnt + copyRowCnt > nL1Size) {
                             copyRowCnt = nL1Size - copyFinishRowCnt;
                         }
@@ -652,7 +680,9 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
                             Position startPos;
                             startPos.bIdx = info.bIdx;
                             startPos.n2Idx = info.n2Idx;
-                            startPos.s2Idx = idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock;
+                            startPos.s2Idx = (ASU_RESOLVED_SLOT ? slotInTopK : idInTopK) *
+                                                 constInfo.sparseBlockSize +
+                                             curOffsetInSparseBlock;
                             startPos.dIdx = kL1 * 256;
                             Position ropeStartPos = startPos;
                             ropeStartPos.dIdx = kL1 * 32;
@@ -684,15 +714,16 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm1(const RunInfo &info, c
                         } else {
                             uint64_t keyOffset = info.tensorBOffset;
                             uint64_t kRopeOffset = info.tensorBRopeOffset;
+                            int64_t kvSlot = ASU_RESOLVED_SLOT ? slotInTopK : idInTopK;
                             if constexpr (KV_LAYOUT_T == SFA_LAYOUT::BSND || KV_LAYOUT_T == SFA_LAYOUT::TND) {
-                                keyOffset += (idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
+                                keyOffset += (kvSlot * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
                                              constInfo.kvHeadNum * constInfo.headDim;
-                                kRopeOffset += (idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
+                                kRopeOffset += (kvSlot * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
                                                constInfo.kvHeadNum * constInfo.headDimRope;
                             } else {
-                                keyOffset += (idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
+                                keyOffset += (kvSlot * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
                                              constInfo.headDim;
-                                kRopeOffset += (idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
+                                kRopeOffset += (kvSlot * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
                                                constInfo.headDimRope;
                             }
 
@@ -849,6 +880,10 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
         uint64_t curOffsetInSparseBlock = info.curOffsetInSparseBlock;
         uint32_t copyRowCnt = 0;
         int64_t idInTopK = topKGm.GetValue(info.topKBaseOffset + curTopKIdx);
+        int64_t slotInTopK = idInTopK;
+        if constexpr (ASU_RESOLVED_SLOT) {
+            slotInTopK = GetResolvedSlot(info, curTopKIdx, curOffsetInSparseBlock);
+        }
 
         for (uint32_t k1 = 0; k1 < kL1Loops; k1++) {
             if (k1 == (kL1Loops - 1)) {
@@ -887,7 +922,8 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
                              nd2nzPara);
                 } else {
                     while (copyFinishRowCnt < kL0Size) {
-                        CalcTopKBlockInfo(info, curTopKIdx, curOffsetInSparseBlock, curSeqIdx, copyRowCnt, idInTopK);
+                        CalcTopKBlockInfo(info, curTopKIdx, curOffsetInSparseBlock, curSeqIdx, copyRowCnt, idInTopK,
+                                          slotInTopK);
 
                         if (copyFinishRowCnt + copyRowCnt > kL0Size) {
                             copyRowCnt = kL0Size - copyFinishRowCnt;
@@ -897,7 +933,9 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
                             Position startPos;
                             startPos.bIdx = info.bIdx;
                             startPos.n2Idx = info.n2Idx;
-                            startPos.s2Idx = idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock;
+                            startPos.s2Idx = (ASU_RESOLVED_SLOT ? slotInTopK : idInTopK) *
+                                                 constInfo.sparseBlockSize +
+                                             curOffsetInSparseBlock;
                             startPos.dIdx =
                                 nL1 * N_SPLIT_SIZE;
                             PAShape shape;
@@ -912,11 +950,12 @@ __aicore__ inline void SFAMatmulService<SFAT>::ComputeMm2(const RunInfo &info, c
                             DataCopyPA<KV_T, KV_LAYOUT_T>(subvTensor, valueGm, blockTableGm, shape, startPos);
                         } else {
                             uint64_t valueOffset = info.tensorBOffset;
+                            int64_t kvSlot = ASU_RESOLVED_SLOT ? slotInTopK : idInTopK;
                             if constexpr (KV_LAYOUT_T == SFA_LAYOUT::BSND || KV_LAYOUT_T == SFA_LAYOUT::TND) {
-                                valueOffset += (idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
+                                valueOffset += (kvSlot * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
                                                constInfo.kvHeadNum * constInfo.headDim;
                             } else {
-                                valueOffset += (idInTopK * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
+                                valueOffset += (kvSlot * constInfo.sparseBlockSize + curOffsetInSparseBlock) *
                                                constInfo.headDim;
                             }
 

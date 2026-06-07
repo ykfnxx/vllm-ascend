@@ -13,19 +13,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#ifndef SPARSE_FLASH_ATTENTION_TORCH_ADPT_H
-#define SPARSE_FLASH_ATTENTION_TORCH_ADPT_H
+#ifndef SPARSE_FLASH_ATTENTION_ASU_TORCH_ADPT_H
+#define SPARSE_FLASH_ATTENTION_ASU_TORCH_ADPT_H
 namespace vllm_ascend {
 
-at::Tensor npu_sparse_flash_attention(
-    const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
-    const at::Tensor &sparse_indices, double scale_value, int64_t sparse_block_size,
-    const c10::optional<at::Tensor> &block_table,
+at::Tensor npu_sparse_flash_attention_asu(
+    const at::Tensor &query, const at::Tensor &managed_key,
+    const at::Tensor &managed_value, const at::Tensor &sparse_indices,
+    const at::Tensor &resolved_kv_slots, double scale_value,
+    int64_t sparse_block_size,
     const c10::optional<at::Tensor> &actual_seq_lengths_query,
     const c10::optional<at::Tensor> &actual_seq_lengths_kv,
     const c10::optional<at::Tensor> &query_rope,
-    const c10::optional<at::Tensor> &key_rope, c10::string_view layout_query,
-    c10::string_view layout_kv,
+    const c10::optional<at::Tensor> &managed_key_rope,
+    c10::string_view layout_query, c10::string_view layout_kv,
     int64_t sparse_mode)
 {
     std::string layout_query_str = std::string(layout_query);
@@ -35,23 +36,21 @@ at::Tensor npu_sparse_flash_attention(
         TORCH_CHECK(query.size(i) > 0, "All values within query's shape should be greater "
                                        "than 0, but shape[", i, "] is ", query.size(i));
     }
-    // construct the output tensor
     at::Tensor output = at::empty(query.sizes(), query.options().dtype(query.dtype()));
-    // convert str
     char *layout_query_ptr = const_cast<char *>(layout_query_str.c_str());
     char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
 
     EXEC_NPU_CMD(
-        aclnnSparseFlashAttention,
+        aclnnSparseFlashAttentionAsu,
         query,
-        key,
-        value,
+        managed_key,
+        managed_value,
         sparse_indices,
-        block_table,
+        resolved_kv_slots,
         actual_seq_lengths_query,
         actual_seq_lengths_kv,
         query_rope,
-        key_rope,
+        managed_key_rope,
         scale_value,
         sparse_block_size,
         layout_query_ptr,
@@ -59,6 +58,6 @@ at::Tensor npu_sparse_flash_attention(
         sparse_mode,
         output);
     return output;
-}    
+}
 }
 #endif
