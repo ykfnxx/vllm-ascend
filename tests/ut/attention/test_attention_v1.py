@@ -11,6 +11,39 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.utils import AscendDeviceType
 
 
+class TestAscendCommonAttentionMetadata(TestBase):
+
+    def test_unpadded_preserves_offload_kv_cache_v0_metadata(self):
+        metadata = AscendCommonAttentionMetadata(
+            query_start_loc=torch.tensor([0, 1, 2]),
+            query_start_loc_cpu=torch.tensor([0, 1, 2]),
+            seq_lens=torch.tensor([2, 2]),
+            seq_lens_cpu=torch.tensor([2, 2]),
+            num_computed_tokens_cpu=torch.tensor([1, 1]),
+            num_reqs=2,
+            num_actual_tokens=2,
+            max_query_len=1,
+            block_table_tensor=torch.zeros((2, 1), dtype=torch.int32),
+            slot_mapping=torch.tensor([0, 1]),
+            causal=True,
+            actual_seq_lengths_q=[1, 1],
+            positions=torch.tensor([1, 1]),
+            attn_state=AscendAttentionState.DecodeOnly,
+            max_seq_len=2,
+            req_ids=["req-a", "req-b"],
+            token_req_indices_cpu=torch.tensor([0, 1], dtype=torch.int32),
+            token_positions_cpu=torch.tensor([1, 1], dtype=torch.int64),
+            prefill_lens_cpu=torch.tensor([1, 1], dtype=torch.int32),
+        )
+
+        unpadded = metadata.unpadded(num_actual_tokens=1, num_actual_reqs=1)
+
+        self.assertEqual(unpadded.req_ids, ["req-a"])
+        self.assertTrue(torch.equal(unpadded.token_req_indices_cpu, torch.tensor([0], dtype=torch.int32)))
+        self.assertTrue(torch.equal(unpadded.token_positions_cpu, torch.tensor([1], dtype=torch.int64)))
+        self.assertTrue(torch.equal(unpadded.prefill_lens_cpu, torch.tensor([1], dtype=torch.int32)))
+
+
 class TestAscendAttentionBackend(TestBase):
 
     def setUp(self):

@@ -109,6 +109,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
+    # Enable v0 MicroKV-backed KV cache offload validation in the SFA eager path.
+    "VLLM_ASCEND_KV_OFFLOAD_V0_VALIDATE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KV_OFFLOAD_V0_VALIDATE", "0"))
+    ),
+    # Unix domain socket used by the MicroKV daemon.
+    "MICROKV_SOCKET": lambda: os.getenv("MICROKV_SOCKET", "/tmp/microkv.sock"),
+    # Per-request-per-layer bypass cache capacity for v0 validation slots.
+    "VLLM_ASCEND_KV_OFFLOAD_V0_CAPACITY": lambda: int(os.getenv("VLLM_ASCEND_KV_OFFLOAD_V0_CAPACITY", "4096")),
 }
 
 # end-env-vars-definition

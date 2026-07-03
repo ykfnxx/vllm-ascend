@@ -46,6 +46,7 @@ def set_ascend_forward_context(
     skip_compiled: bool = False,
     max_tokens_across_pcp: int = 0,
     draft_attn_metadatas=None,
+    offload_kv_cache_v0=None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -66,6 +67,7 @@ def set_ascend_forward_context(
     with set_forward_context(**forward_context_kwargs):
         forward_context = get_forward_context()
         forward_context.draft_attn_metadatas = draft_attn_metadatas
+        forward_context.offload_kv_cache_v0 = offload_kv_cache_v0
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
@@ -307,6 +309,7 @@ class _ExtraForwardContextProxy:
         "num_accept_tokens",
         "in_profile_run",
         "padded_num_tokens",
+        "offload_kv_cache_v0",
     )
 
     def check_extra_attr(self, name: str):

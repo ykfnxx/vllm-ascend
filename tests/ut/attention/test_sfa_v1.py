@@ -199,9 +199,9 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common_attn_metadata.num_reqs = 10
         common_attn_metadata.num_actual_tokens = 100
         common_attn_metadata.query_start_loc = torch.tensor(
-            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
+            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
         common_attn_metadata.query_start_loc_cpu = torch.tensor(
-            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
+            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
         common_attn_metadata.slot_mapping = torch.randn(100, 4, 1024)
         common_attn_metadata.seq_lens_cpu = torch.tensor([2] * 10)
         common_attn_metadata.positions = torch.randn(100)
@@ -211,6 +211,11 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common_attn_metadata.cos = None
         common_attn_metadata.sin = None
         common_attn_metadata.num_input_tokens = 100
+        common_attn_metadata.max_query_len = 10
+        common_attn_metadata.req_ids = ["req-0", "req-1"]
+        common_attn_metadata.token_req_indices_cpu = torch.tensor([0, 1], dtype=torch.int32)
+        common_attn_metadata.token_positions_cpu = torch.tensor([0, 0], dtype=torch.int64)
+        common_attn_metadata.prefill_lens_cpu = torch.tensor([1, 1], dtype=torch.int32)
 
         mock_get_cos_and_sin_mla.return_value = (torch.randn(100),
                                                  torch.randn(100))
@@ -223,6 +228,13 @@ class TestAscendSFAMetadataBuilder(TestBase):
         assert isinstance(metadata, AscendSFAMetadata)
         assert metadata.num_actual_tokens == common_attn_metadata.num_actual_tokens
         assert metadata.slot_mapping.shape == (100, 4, 1024)
+        assert metadata.num_decodes == 0
+        assert metadata.num_decode_tokens == 0
+        assert metadata.num_prefills == 10
+        assert metadata.req_ids == ["req-0", "req-1"]
+        assert torch.equal(metadata.token_req_indices_cpu, torch.tensor([0, 1], dtype=torch.int32))
+        assert torch.equal(metadata.token_positions_cpu, torch.tensor([0, 0], dtype=torch.int64))
+        assert torch.equal(metadata.prefill_lens_cpu, torch.tensor([1, 1], dtype=torch.int32))
 
     @patch("vllm_ascend.attention.sfa_v1.get_current_vllm_config")
     @patch("vllm_ascend.attention.sfa_v1.get_cos_and_sin_mla")
@@ -257,9 +269,9 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common_attn_metadata.num_reqs = 10
         common_attn_metadata.num_actual_tokens = 100
         common_attn_metadata.query_start_loc = torch.tensor(
-            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
+            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
         common_attn_metadata.query_start_loc_cpu = torch.tensor(
-            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90])
+            [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
         common_attn_metadata.slot_mapping = torch.randn(100, 4, 1024)
         common_attn_metadata.seq_lens_cpu = torch.tensor([2] * 10)
         common_attn_metadata.positions = torch.randn(100)
@@ -269,6 +281,7 @@ class TestAscendSFAMetadataBuilder(TestBase):
         common_attn_metadata.cos = None
         common_attn_metadata.sin = None
         common_attn_metadata.num_input_tokens = 100
+        common_attn_metadata.max_query_len = 10
 
         mock_get_cos_and_sin_mla.return_value = (torch.randn(100),
                                                  torch.randn(100))
@@ -280,3 +293,93 @@ class TestAscendSFAMetadataBuilder(TestBase):
 
         assert isinstance(attn_metadata, AscendSFAMetadata)
         assert attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+
+
+class TestAscendSFAOffloadKVCacheV0Wiring(TestBase):
+
+    @patch("vllm_ascend.attention.sfa_v1.maybe_save_kv_layer_to_connector")
+    @patch("vllm_ascend.attention.sfa_v1.get_weight_prefetch_method")
+    @patch("vllm_ascend.attention.sfa_v1.wait_for_kv_layer_from_connector")
+    @patch("vllm_ascend.attention.sfa_v1.torch_npu.npu_scatter_nd_update_")
+    @patch("vllm_ascend.attention.sfa_v1._EXTRA_CTX")
+    def test_forward_calls_mock_lookup_between_indexer_and_sfa(
+        self,
+        mock_extra_ctx,
+        mock_scatter_update,
+        mock_wait_for_kv,
+        mock_get_weight_prefetch_method,
+        mock_save_kv,
+    ):
+        manager = MagicMock()
+        call_order = []
+        sfa_topk_indices = []
+        topk_indices = torch.tensor([[[0]]], dtype=torch.int32)
+        mock_extra_ctx.offload_kv_cache_v0 = manager
+        mock_extra_ctx.capturing = False
+        manager.persist_prefill_kv_to_microkv.side_effect = lambda **kwargs: call_order.append("persist")
+        manager.mock_lookup_and_validate.side_effect = lambda **kwargs: call_order.append("lookup")
+
+        prefetch_method = MagicMock()
+        mock_get_weight_prefetch_method.return_value = prefetch_method
+
+        impl = object.__new__(AscendSFAImpl)
+        impl.enable_dsa_cp = False
+        impl.enable_dsa_cp_with_layer_shard = False
+        impl.enable_dsa_cp_with_o_proj_tp = False
+        impl.enable_mlapo = False
+        impl.use_sparse_c8_indexer = False
+        impl.is_kv_producer = False
+        impl.q_lora_rank = 2
+        impl.kv_lora_rank = 2
+        impl.qk_rope_head_dim = 1
+        impl.fused_qkv_a_proj = MagicMock(return_value=(torch.ones(1, 5), None))
+        impl.q_a_layernorm = MagicMock(side_effect=lambda x: x)
+        impl.indexer_select_pre_process = MagicMock(return_value=(torch.ones(1, 3), None))
+        impl.exec_kv = MagicMock(return_value=(None, None))
+        impl._q_proj_and_k_up_proj = MagicMock(return_value=(torch.ones(1, 1, 2), torch.ones(1, 1, 1)))
+        impl.rope_single = MagicMock(side_effect=lambda q_pe, cos, sin: q_pe)
+        impl._get_full_kv = MagicMock(side_effect=lambda k_li, attn_metadata: k_li)
+        impl.indexer_select_post_process = MagicMock(
+            side_effect=lambda **kwargs: call_order.append("indexer") or topk_indices
+        )
+        def execute_sparse_flash_attention(*args):
+            call_order.append("sfa")
+            sfa_topk_indices.append(args[3])
+            return torch.ones(1, 3)
+
+        impl._execute_sparse_flash_attention_process = MagicMock(side_effect=execute_sparse_flash_attention)
+        impl._v_up_proj = MagicMock(return_value=torch.ones(1, 3))
+        impl.o_proj = MagicMock(return_value=(torch.ones(1, 3), None))
+        impl.o_proj.weight = torch.ones(1, 3)
+
+        metadata = AscendSFAMetadata(
+            num_actual_tokens=1,
+            slot_mapping=torch.tensor([0], dtype=torch.int64),
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
+            cum_query_lens=torch.tensor([1], dtype=torch.int32),
+            block_table=torch.tensor([[0]], dtype=torch.int32),
+            sin=torch.zeros(1, 1),
+            cos=torch.zeros(1, 1),
+            num_input_tokens=1,
+            attn_state=AscendAttentionState.DecodeOnly,
+            num_decode_tokens=1,
+            req_ids=["req-a"],
+            token_req_indices_cpu=torch.tensor([0], dtype=torch.int32),
+            token_positions_cpu=torch.tensor([1], dtype=torch.int64),
+            prefill_lens_cpu=torch.tensor([1], dtype=torch.int32),
+        )
+        kv_cache = (
+            torch.zeros(1, 1, 1, 2),
+            torch.zeros(1, 1, 1, 1),
+            torch.zeros(1, 1, 3),
+        )
+        output = torch.zeros(1, 3)
+
+        impl.forward("model.layers.0.self_attn", torch.ones(1, 3), kv_cache, metadata, output=output)
+
+        self.assertEqual(call_order, ["persist", "indexer", "lookup", "sfa"])
+        self.assertIs(sfa_topk_indices[0], topk_indices)
+        manager.persist_prefill_kv_to_microkv.assert_called_once()
+        manager.mock_lookup_and_validate.assert_called_once()
+        self.assertIs(impl._execute_sparse_flash_attention_process.call_args.args[3], topk_indices)

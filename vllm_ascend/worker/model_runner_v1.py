@@ -90,8 +90,10 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup
 
 # yapf: enable
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.offload_kv_cache_v0 import OffloadKVCacheV0Manager
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
 
 # yapf conflicts with isort for this block
@@ -360,6 +362,16 @@ class NPUModelRunner(GPUModelRunner):
         self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
 
         self.use_aclgraph = self._use_aclgraph()
+        self.offload_kv_cache_v0: OffloadKVCacheV0Manager | None = None
+        if envs.VLLM_ASCEND_KV_OFFLOAD_V0_VALIDATE:
+            if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and not self.model_config.enforce_eager:
+                raise ValueError("VLLM_ASCEND_KV_OFFLOAD_V0_VALIDATE requires eager mode")
+            from microkv import KVStoreClient
+
+            self.offload_kv_cache_v0 = OffloadKVCacheV0Manager(
+                client=KVStoreClient(envs.MICROKV_SOCKET),
+                capacity=envs.VLLM_ASCEND_KV_OFFLOAD_V0_CAPACITY,
+            )
 
         eplb_config = self.ascend_config.eplb_config
         self.dynamic_eplb = eplb_config.dynamic_eplb
@@ -421,6 +433,10 @@ class NPUModelRunner(GPUModelRunner):
         self.long_seq_metadata = None
         self.query_lens: torch.Tensor | None = None
         self.cpu_slot_mapping = None
+        self.offload_kv_cache_v0_req_ids: list[str] | None = None
+        self.offload_kv_cache_v0_token_req_indices_cpu: torch.Tensor | None = None
+        self.offload_kv_cache_v0_token_positions_cpu: torch.Tensor | None = None
+        self.offload_kv_cache_v0_prefill_lens_cpu: torch.Tensor | None = None
         self.sampling_done_event: torch.npu.Event | None = None
 
         # self.cudagraph_batch_sizes sorts in ascending order.
@@ -654,6 +670,16 @@ class NPUModelRunner(GPUModelRunner):
             self.query_lens = torch.from_numpy(self.pcp_manager.num_scheduled_tokens_padded)
         else:
             self.query_lens = torch.from_numpy(num_scheduled_tokens)
+        self.offload_kv_cache_v0_req_ids = self.input_batch.req_ids[:num_reqs].copy()
+        self.offload_kv_cache_v0_token_req_indices_cpu = torch.from_numpy(
+            req_indices[:total_num_scheduled_tokens].astype(np.int32, copy=True)
+        )
+        self.offload_kv_cache_v0_token_positions_cpu = torch.from_numpy(
+            positions_np[:total_num_scheduled_tokens].astype(np.int64, copy=True)
+        )
+        self.offload_kv_cache_v0_prefill_lens_cpu = torch.from_numpy(
+            self.input_batch.num_prompt_tokens[:num_reqs].astype(np.int32, copy=True)
+        )
 
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -1348,6 +1374,7 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
+                offload_kv_cache_v0=self.offload_kv_cache_v0,
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -2131,6 +2158,10 @@ class NPUModelRunner(GPUModelRunner):
             attn_state=self.attn_state,
             decode_token_per_req=self.decode_token_per_req,
             prefill_context_parallel_metadata=self.long_seq_metadata,
+            req_ids=self.offload_kv_cache_v0_req_ids,
+            token_req_indices_cpu=self.offload_kv_cache_v0_token_req_indices_cpu,
+            token_positions_cpu=self.offload_kv_cache_v0_token_positions_cpu,
+            prefill_lens_cpu=self.offload_kv_cache_v0_prefill_lens_cpu,
         )
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:

@@ -162,6 +162,13 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # Metadata for Prefill Context Parallelism (PCP) operations.
     prefill_context_parallel_metadata: AscendPrefillContextParallelMetadata | None = None
 
+    # v0 KV offload debug metadata. These are CPU-side request/token mappings used
+    # only by the eager SFA validation path.
+    req_ids: list[str] | None = None
+    token_req_indices_cpu: torch.Tensor | None = None
+    token_positions_cpu: torch.Tensor | None = None
+    prefill_lens_cpu: torch.Tensor | None = None
+
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.
@@ -188,6 +195,14 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             max_seq_len=self.max_seq_len,
+            req_ids=self.req_ids[:num_actual_reqs] if self.req_ids is not None else None,
+            token_req_indices_cpu=(
+                self.token_req_indices_cpu[:num_actual_tokens] if self.token_req_indices_cpu is not None else None
+            ),
+            token_positions_cpu=(
+                self.token_positions_cpu[:num_actual_tokens] if self.token_positions_cpu is not None else None
+            ),
+            prefill_lens_cpu=self.prefill_lens_cpu[:num_actual_reqs] if self.prefill_lens_cpu is not None else None,
         )
 
 

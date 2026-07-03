@@ -31,6 +31,7 @@ from vllm_ascend.attention.utils import (
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     maybe_save_kv_layer_to_connector,
+    split_decodes_and_prefills,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
@@ -149,6 +150,10 @@ class AscendSFAMetadata:
     num_decodes: int = 0
     num_decode_tokens: int = 0
     num_prefills: int = 0
+    req_ids: list[str] | None = None
+    token_req_indices_cpu: torch.Tensor | None = None
+    token_positions_cpu: torch.Tensor | None = None
+    prefill_lens_cpu: torch.Tensor | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -235,6 +240,10 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
         seq_lens = common_attn_metadata.seq_lens[:num_reqs]
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
+        num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=self.decode_threshold,
+        )
 
         cos, sin = get_cos_and_sin_mla(input_positions, True)
 
@@ -331,6 +340,13 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             sin=sin[:num_input_tokens],
             cos=cos[:num_input_tokens],
             dsa_cp_context=dsa_cp_context,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_prefills=num_prefills,
+            req_ids=common_attn_metadata.req_ids,
+            token_req_indices_cpu=common_attn_metadata.token_req_indices_cpu,
+            token_positions_cpu=common_attn_metadata.token_positions_cpu,
+            prefill_lens_cpu=common_attn_metadata.prefill_lens_cpu,
         )
 
     def build_for_graph_capture(
@@ -1209,6 +1225,21 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
 
+        offload_kv_cache_v0 = _EXTRA_CTX.offload_kv_cache_v0
+        if offload_kv_cache_v0 is not None:
+            if self.enable_dsa_cp:
+                raise ValueError("KV offload v0 validation does not support DSA CP")
+            if self.use_sparse_c8_indexer:
+                raise ValueError("KV offload v0 validation does not support Sparse C8 indexer")
+            if _EXTRA_CTX.capturing:
+                raise ValueError("KV offload v0 validation requires eager mode")
+            offload_kv_cache_v0.persist_prefill_kv_to_microkv(
+                layer_name=layer_name,
+                kv_cache=kv_cache,
+                slot_mapping=slot_mapping,
+                attn_metadata=attn_metadata,
+            )
+
         topk_indices = self.indexer_select_post_process(
             x=hidden_states,
             q_c=q_c,
@@ -1219,6 +1250,14 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query=actual_seq_lengths_query,
             actual_seq_lengths_key=actual_seq_lengths_key,
         )
+
+        if offload_kv_cache_v0 is not None:
+            offload_kv_cache_v0.mock_lookup_and_validate(
+                layer_name=layer_name,
+                kv_cache=kv_cache,
+                topk_indices=topk_indices,
+                attn_metadata=attn_metadata,
+            )
 
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
