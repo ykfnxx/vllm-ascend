@@ -213,3 +213,6 @@ csrc/output/
 
 # claude code skills
 .claude/skills/*
+
+# local research notes
+note/
