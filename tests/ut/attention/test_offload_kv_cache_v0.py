@@ -17,6 +17,7 @@ class FakeMicroKVClient:
 
     def __init__(self):
         self.store = {}
+        self.get_calls = 0
 
     def batch_put(self, cache_type, keys, values):
         for key, value in zip(keys, values, strict=True):
@@ -24,6 +25,7 @@ class FakeMicroKVClient:
         return True
 
     def batch_get(self, cache_type, keys):
+        self.get_calls += 1
         return [self.store.get((cache_type, key)) for key in keys]
 
 
@@ -83,6 +85,7 @@ class SimpleMetadata:
     token_req_indices_cpu: torch.Tensor
     token_positions_cpu: torch.Tensor
     prefill_lens_cpu: torch.Tensor
+    seq_lens_cpu: torch.Tensor | None = None
     block_table: torch.Tensor | None = None
     attn_state: str = "DecodeOnly"
     num_actual_tokens: int = 0
@@ -174,6 +177,9 @@ class OffloadKVCacheV0Test(unittest.TestCase):
         self.assertEqual(put_stats.written_items, 3)
         self.assertEqual(manager.get_slot_id("req-a", 7, 2), 2)
         self.assertEqual(stats.checked_items, 1)
+        self.assertEqual(stats.loaded_items, 0)
+        self.assertEqual(stats.hbm_hit_items, 1)
+        self.assertEqual(client.get_calls, 0)
         self.assertEqual(stats.mismatch_items, 0)
         self.assertEqual(len(lookup_op.calls), 1)
         self.assertEqual(lookup_op.calls[0]["req_num"], 1)
@@ -228,11 +234,88 @@ class OffloadKVCacheV0Test(unittest.TestCase):
 
         self.assertEqual(stats.checked_items, 1)
         self.assertEqual(stats.loaded_items, 1)
+        self.assertEqual(stats.microkv_loaded_items, 1)
         self.assertEqual(manager.get_slot_id("req-a", 0, 2), 2)
         self.assertEqual(len(maintain_op.calls), 1)
         self.assertEqual(maintain_op.calls[0]["req_num"], 1)
         self.assertEqual(maintain_op.calls[0]["seed"], 19)
         self.assertTrue(torch.equal(maintain_op.calls[0]["last_query_slots"], torch.tensor([[2, 2, 2, 2]], dtype=torch.int32)))
+
+    def test_decode_tail_token_loads_from_native_kv_cache_with_real_lookup(self):
+        client = FakeMicroKVClient()
+        lookup_op = FakeLookupOp()
+        manager = OffloadKVCacheV0Manager(
+            client=client,
+            lookup_op=lookup_op,
+            maintain_op=FakeMaintainOp(),
+            index_size=16,
+            slot_count=6,
+            resident_slot_count=2,
+            free_slot_count=4,
+            query_count=4,
+        )
+        metadata = SimpleMetadata(
+            req_ids=["req-a"],
+            token_req_indices_cpu=torch.tensor([0], dtype=torch.int32),
+            token_positions_cpu=torch.tensor([4], dtype=torch.int64),
+            prefill_lens_cpu=torch.tensor([2], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([4], dtype=torch.int32),
+            block_table=torch.tensor([[0]], dtype=torch.int32),
+            num_decode_tokens=1,
+        )
+
+        stats = manager.validate_topk_with_real_hbm_index_ops(
+            "model.layers.0.self_attn",
+            make_kv_cache(),
+            torch.tensor([[[3]]], dtype=torch.int32),
+            metadata,
+        )
+
+        self.assertEqual(stats.checked_items, 1)
+        self.assertEqual(stats.loaded_items, 1)
+        self.assertEqual(stats.native_loaded_items, 1)
+        self.assertEqual(stats.tail_items, 1)
+        self.assertEqual(stats.microkv_loaded_items, 0)
+        self.assertEqual(stats.mismatch_items, 0)
+        self.assertEqual(client.get_calls, 0)
+        self.assertGreaterEqual(manager.get_slot_id("req-a", 0, 3), 0)
+
+    def test_decode_tail_token_outside_seq_len_is_skipped_before_lookup(self):
+        client = FakeMicroKVClient()
+        lookup_op = FakeLookupOp()
+        manager = OffloadKVCacheV0Manager(
+            client=client,
+            lookup_op=lookup_op,
+            maintain_op=FakeMaintainOp(),
+            index_size=16,
+            slot_count=6,
+            resident_slot_count=2,
+            free_slot_count=4,
+            query_count=4,
+        )
+        metadata = SimpleMetadata(
+            req_ids=["req-a"],
+            token_req_indices_cpu=torch.tensor([0], dtype=torch.int32),
+            token_positions_cpu=torch.tensor([4], dtype=torch.int64),
+            prefill_lens_cpu=torch.tensor([2], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([4], dtype=torch.int32),
+            block_table=torch.tensor([[0]], dtype=torch.int32),
+            num_decode_tokens=1,
+        )
+
+        stats = manager.validate_topk_with_real_hbm_index_ops(
+            "model.layers.0.self_attn",
+            make_kv_cache(),
+            torch.tensor([[[4]]], dtype=torch.int32),
+            metadata,
+        )
+
+        self.assertEqual(stats.checked_items, 0)
+        self.assertEqual(stats.skipped_items, 1)
+        self.assertEqual(stats.loaded_items, 0)
+        self.assertEqual(stats.missing_items, 0)
+        self.assertEqual(client.get_calls, 0)
+        self.assertEqual(len(lookup_op.calls), 0)
 
     def test_microkv_miss_raises_after_real_lookup(self):
         manager = OffloadKVCacheV0Manager(

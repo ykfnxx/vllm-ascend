@@ -47,6 +47,10 @@ class LookupValidationStats:
     checked_items: int = 0
     skipped_items: int = 0
     loaded_items: int = 0
+    microkv_loaded_items: int = 0
+    native_loaded_items: int = 0
+    hbm_hit_items: int = 0
+    tail_items: int = 0
     evicted_items: int = 0
     missing_items: int = 0
     mismatch_items: int = 0
@@ -296,7 +300,8 @@ class OffloadKVCacheV0Manager:
             if cache_key in self._disabled_caches:
                 continue
             prefill_len = int(attn_metadata.prefill_lens_cpu[req_index].item())
-            valid_query_tokens = self._collect_valid_query_tokens(topk_indices_cpu, decode_token_indices, prefill_len)
+            seq_len = self._get_seq_len(attn_metadata, req_index, prefill_len)
+            valid_query_tokens = self._collect_valid_query_tokens(topk_indices_cpu, decode_token_indices, seq_len)
             if not valid_query_tokens:
                 continue
             if len(valid_query_tokens) > self.query_count:
@@ -307,6 +312,9 @@ class OffloadKVCacheV0Manager:
                 )
 
             state = self.get_or_create_bypass_cache(req_id, layer_id, kv_cache[0], kv_cache[1])
+            slots_before_lookup = {
+                token_pos: int(state.index[0, token_pos].item()) for token_pos in valid_query_tokens
+            }
             query_index = self._prepare_query_index(state, valid_query_tokens)
             slot_out = self._call_lookup(state, query_index)
             token_pos_to_slot = self._load_query_tokens_to_bypass_cache(
@@ -317,6 +325,13 @@ class OffloadKVCacheV0Manager:
                 slot_out=slot_out,
                 k_nope_cache_template=kv_cache[0],
                 k_pe_cache_template=kv_cache[1],
+                k_nope_flat=k_nope_flat,
+                k_pe_flat=k_pe_flat,
+                block_table_cpu=block_table_cpu,
+                block_size=block_size,
+                req_index=req_index,
+                prefill_len=prefill_len,
+                slots_before_lookup=slots_before_lookup,
                 stats=stats,
             )
 
@@ -324,7 +339,7 @@ class OffloadKVCacheV0Manager:
                 for head_index in range(topk_indices_cpu.shape[1]):
                     for topk_rank in range(topk_indices_cpu.shape[2]):
                         token_pos = int(topk_indices_cpu[decode_token_index, head_index, topk_rank].item())
-                        if token_pos < 0 or token_pos >= prefill_len or token_pos >= self.index_size:
+                        if token_pos < 0 or token_pos >= seq_len or token_pos >= self.index_size:
                             stats.skipped_items += 1
                             continue
                         offload_slot_id = token_pos_to_slot.get(token_pos)
@@ -332,8 +347,7 @@ class OffloadKVCacheV0Manager:
                             stats.skipped_items += 1
                             continue
 
-                        block_id = int(block_table_cpu[req_index, token_pos // block_size].item())
-                        original_slot = block_id * block_size + token_pos % block_size
+                        original_slot = self._get_original_slot(block_table_cpu, req_index, token_pos, block_size)
                         original_k_nope = k_nope_flat[original_slot]
                         original_k_pe = k_pe_flat[original_slot]
                         bypass_k_nope = state.k_nope_cache[offload_slot_id]
@@ -369,7 +383,7 @@ class OffloadKVCacheV0Manager:
         self,
         topk_indices_cpu: torch.Tensor,
         decode_token_indices: list[int],
-        prefill_len: int,
+        seq_len: int,
     ) -> list[int]:
         valid_query_tokens: list[int] = []
         seen_tokens: set[int] = set()
@@ -377,12 +391,24 @@ class OffloadKVCacheV0Manager:
             flattened_topk = topk_indices_cpu[decode_token_index].reshape(-1)
             for token_pos_tensor in flattened_topk:
                 token_pos = int(token_pos_tensor.item())
-                if token_pos < 0 or token_pos >= prefill_len or token_pos >= self.index_size:
+                if token_pos < 0 or token_pos >= seq_len or token_pos >= self.index_size:
                     continue
                 if token_pos not in seen_tokens:
                     seen_tokens.add(token_pos)
                     valid_query_tokens.append(token_pos)
         return valid_query_tokens
+
+    @staticmethod
+    def _get_seq_len(attn_metadata: Any, req_index: int, prefill_len: int) -> int:
+        seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            return prefill_len
+        return int(seq_lens_cpu[req_index].item())
+
+    @staticmethod
+    def _get_original_slot(block_table_cpu: torch.Tensor, req_index: int, token_pos: int, block_size: int) -> int:
+        block_id = int(block_table_cpu[req_index, token_pos // block_size].item())
+        return block_id * block_size + token_pos % block_size
 
     def _prepare_query_index(self, state: HBMIndexLayerState, valid_query_tokens: list[int]) -> torch.Tensor:
         pad_token = valid_query_tokens[0]
@@ -423,33 +449,65 @@ class OffloadKVCacheV0Manager:
         slot_out: torch.Tensor,
         k_nope_cache_template: torch.Tensor,
         k_pe_cache_template: torch.Tensor,
+        k_nope_flat: torch.Tensor,
+        k_pe_flat: torch.Tensor,
+        block_table_cpu: torch.Tensor,
+        block_size: int,
+        req_index: int,
+        prefill_len: int,
+        slots_before_lookup: dict[int, int],
         stats: LookupValidationStats,
     ) -> dict[int, int]:
-        keys = [self.make_key(req_id, layer_id, token_pos) for token_pos in valid_query_tokens]
-        records = self.client.batch_get(self.cache_type, keys)
+        microkv_tokens = [
+            token_pos
+            for token_pos in valid_query_tokens
+            if slots_before_lookup.get(token_pos, NOT_FOUND) < 0 and token_pos < prefill_len
+        ]
+        if microkv_tokens:
+            keys = [self.make_key(req_id, layer_id, token_pos) for token_pos in microkv_tokens]
+            records_by_token = dict(
+                zip(microkv_tokens, self.client.batch_get(self.cache_type, keys), strict=True)
+            )
+        else:
+            records_by_token = {}
+
         token_pos_to_slot: dict[int, int] = {}
         for query_offset, token_pos in enumerate(valid_query_tokens):
-            record = records[query_offset]
-            if record is None:
-                stats.missing_items += 1
-                self._disabled_caches.add((req_id, layer_id))
-                if self.strict:
-                    raise MicroKVRecordError(
-                        "KV offload v0.1 MicroKV miss after real lookup: "
-                        f"req_id={req_id}, layer_id={layer_id}, token_pos={token_pos}"
-                    )
+            slot_id = int(slot_out[0, query_offset].item())
+            if slots_before_lookup.get(token_pos, NOT_FOUND) >= 0:
+                token_pos_to_slot[token_pos] = slot_id
+                stats.hbm_hit_items += 1
                 continue
 
-            loaded_k_nope, loaded_k_pe = unpack_mla_token_record(
-                record,
-                expected_k_nope_shape=tuple(k_nope_cache_template.shape[2:]),
-                expected_k_pe_shape=tuple(k_pe_cache_template.shape[2:]),
-                expected_dtype=k_nope_cache_template.dtype,
-                device=k_nope_cache_template.device,
-            )
-            slot_id = int(slot_out[0, query_offset].item())
-            state.k_nope_cache[slot_id].copy_(loaded_k_nope)
-            state.k_pe_cache[slot_id].copy_(loaded_k_pe)
+            if token_pos < prefill_len:
+                record = records_by_token.get(token_pos)
+                if record is None:
+                    stats.missing_items += 1
+                    self._disabled_caches.add((req_id, layer_id))
+                    if self.strict:
+                        raise MicroKVRecordError(
+                            "KV offload v0.1 MicroKV miss after real lookup: "
+                            f"req_id={req_id}, layer_id={layer_id}, token_pos={token_pos}"
+                        )
+                    continue
+
+                loaded_k_nope, loaded_k_pe = unpack_mla_token_record(
+                    record,
+                    expected_k_nope_shape=tuple(k_nope_cache_template.shape[2:]),
+                    expected_k_pe_shape=tuple(k_pe_cache_template.shape[2:]),
+                    expected_dtype=k_nope_cache_template.dtype,
+                    device=k_nope_cache_template.device,
+                )
+                state.k_nope_cache[slot_id].copy_(loaded_k_nope)
+                state.k_pe_cache[slot_id].copy_(loaded_k_pe)
+                stats.microkv_loaded_items += 1
+            else:
+                original_slot = self._get_original_slot(block_table_cpu, req_index, token_pos, block_size)
+                state.k_nope_cache[slot_id].copy_(k_nope_flat[original_slot])
+                state.k_pe_cache[slot_id].copy_(k_pe_flat[original_slot])
+                stats.native_loaded_items += 1
+                stats.tail_items += 1
+
             token_pos_to_slot[token_pos] = slot_id
             stats.loaded_items += 1
         return token_pos_to_slot
