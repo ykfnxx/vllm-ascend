@@ -115,7 +115,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     ),
     # Unix domain socket used by the MicroKV daemon.
     "MICROKV_SOCKET": lambda: os.getenv("MICROKV_SOCKET", "/tmp/microkv.sock"),
-    # Per-request-per-layer bypass cache capacity for v0 validation slots.
+    # Deprecated: v0.1 real-op validation uses the fixed ASU HBM index SLOT_COUNT.
     "VLLM_ASCEND_KV_OFFLOAD_V0_CAPACITY": lambda: int(os.getenv("VLLM_ASCEND_KV_OFFLOAD_V0_CAPACITY", "4096")),
 }
 

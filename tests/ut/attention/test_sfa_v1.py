@@ -302,7 +302,7 @@ class TestAscendSFAOffloadKVCacheV0Wiring(TestBase):
     @patch("vllm_ascend.attention.sfa_v1.wait_for_kv_layer_from_connector")
     @patch("vllm_ascend.attention.sfa_v1.torch_npu.npu_scatter_nd_update_")
     @patch("vllm_ascend.attention.sfa_v1._EXTRA_CTX")
-    def test_forward_calls_mock_lookup_between_indexer_and_sfa(
+    def test_forward_calls_real_ops_lookup_between_indexer_and_sfa(
         self,
         mock_extra_ctx,
         mock_scatter_update,
@@ -317,7 +317,7 @@ class TestAscendSFAOffloadKVCacheV0Wiring(TestBase):
         mock_extra_ctx.offload_kv_cache_v0 = manager
         mock_extra_ctx.capturing = False
         manager.persist_prefill_kv_to_microkv.side_effect = lambda **kwargs: call_order.append("persist")
-        manager.mock_lookup_and_validate.side_effect = lambda **kwargs: call_order.append("lookup")
+        manager.validate_topk_with_real_hbm_index_ops.side_effect = lambda **kwargs: call_order.append("lookup")
 
         prefetch_method = MagicMock()
         mock_get_weight_prefetch_method.return_value = prefetch_method
@@ -381,5 +381,5 @@ class TestAscendSFAOffloadKVCacheV0Wiring(TestBase):
         self.assertEqual(call_order, ["persist", "indexer", "lookup", "sfa"])
         self.assertIs(sfa_topk_indices[0], topk_indices)
         manager.persist_prefill_kv_to_microkv.assert_called_once()
-        manager.mock_lookup_and_validate.assert_called_once()
+        manager.validate_topk_with_real_hbm_index_ops.assert_called_once()
         self.assertIs(impl._execute_sparse_flash_attention_process.call_args.args[3], topk_indices)

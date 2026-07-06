@@ -1252,7 +1252,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
 
         if offload_kv_cache_v0 is not None:
-            offload_kv_cache_v0.mock_lookup_and_validate(
+            offload_kv_cache_v0.validate_topk_with_real_hbm_index_ops(
                 layer_name=layer_name,
                 kv_cache=kv_cache,
                 topk_indices=topk_indices,

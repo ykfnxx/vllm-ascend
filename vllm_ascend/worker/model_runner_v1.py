@@ -370,7 +370,6 @@ class NPUModelRunner(GPUModelRunner):
 
             self.offload_kv_cache_v0 = OffloadKVCacheV0Manager(
                 client=KVStoreClient(envs.MICROKV_SOCKET),
-                capacity=envs.VLLM_ASCEND_KV_OFFLOAD_V0_CAPACITY,
             )
 
         eplb_config = self.ascend_config.eplb_config
