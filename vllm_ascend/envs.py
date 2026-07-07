@@ -121,6 +121,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KV_OFFLOAD_V0_MAX_PINNED_REQS": lambda: int(
         os.getenv("VLLM_ASCEND_KV_OFFLOAD_V0_MAX_PINNED_REQS", "0")
     ),
+    # Use pure-Python reference HBM index lookup/maintain ops instead of the real
+    # torch.ops._C_ascend.asu_hbm_index_* kernels. For bring-up before the new ops
+    # are registered; SFA / lightning indexer still run on real kernels.
+    "VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS", "0"))
+    ),
     # Unix domain socket used by the MicroKV daemon.
     "MICROKV_SOCKET": lambda: os.getenv("MICROKV_SOCKET", "/tmp/microkv.sock"),
     # Deprecated: v0.1 real-op validation uses the fixed ASU HBM index SLOT_COUNT.

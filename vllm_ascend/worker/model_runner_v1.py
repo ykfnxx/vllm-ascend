@@ -371,11 +371,28 @@ class NPUModelRunner(GPUModelRunner):
                 raise ValueError("VLLM_ASCEND_KV_OFFLOAD_V0_COMPACT_SFA requires MAX_PINNED_REQS > 0")
             from microkv import KVStoreClient
 
+            lookup_op = None
+            maintain_op = None
+            if envs.VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS:
+                from vllm_ascend.attention.offload_kv_cache_v0_ref_ops import (
+                    ref_hbm_index_lookup,
+                    ref_hbm_index_maintain,
+                )
+
+                lookup_op = ref_hbm_index_lookup
+                maintain_op = ref_hbm_index_maintain
+                logger.warning(
+                    "KV offload v0 using pure-Python reference HBM index ops "
+                    "(VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS=1); not for performance."
+                )
+
             self.offload_kv_cache_v0 = OffloadKVCacheV0Manager(
                 client=KVStoreClient(envs.MICROKV_SOCKET),
                 compact_sfa_enabled=envs.VLLM_ASCEND_KV_OFFLOAD_V0_COMPACT_SFA,
                 max_pinned_reqs=envs.VLLM_ASCEND_KV_OFFLOAD_V0_MAX_PINNED_REQS,
                 block_size=self.block_size,
+                lookup_op=lookup_op,
+                maintain_op=maintain_op,
             )
 
         eplb_config = self.ascend_config.eplb_config
