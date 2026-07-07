@@ -94,6 +94,7 @@ from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.offload_kv_cache_v0 import OffloadKVCacheV0Manager
+from vllm_ascend.attention.offload_kv_cache_v0_ownership import inflated_tensor_size
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
 
 # yapf conflicts with isort for this block
@@ -2648,6 +2649,8 @@ class NPUModelRunner(GPUModelRunner):
             cache size of each layer
         """
         kv_cache_config = deepcopy(kv_cache_config)
+        if self.offload_kv_cache_v0 is not None and self.offload_kv_cache_v0.compact_sfa_enabled:
+            self._reserve_offload_blocks_in_kv_cache_config(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
@@ -2665,7 +2668,19 @@ class NPUModelRunner(GPUModelRunner):
         if self.offload_kv_cache_v0 is not None and self.offload_kv_cache_v0.compact_sfa_enabled:
             first_layer_kv_cache = next(iter(kv_caches.values()))
             assert isinstance(first_layer_kv_cache, tuple)
-            self.offload_kv_cache_v0.register_static_offload_block_pool(int(first_layer_kv_cache[0].shape[0]))
+            total_blocks = int(first_layer_kv_cache[0].shape[0])
+            reserved_blocks = self.offload_kv_cache_v0.offload_reserved_blocks()
+            # The offload pool is carved out of the tail of the physical K/V tensor.
+            # Its first block id must equal the scheduler-visible block count so that
+            # the normal vLLM allocator (block ids [0, num_blocks)) can never hand out
+            # an offload block. This is the enforcement that makes ownership real, not
+            # just asserted.
+            assert total_blocks == kv_cache_config.num_blocks + reserved_blocks, (
+                f"offload tensor blocks {total_blocks} != scheduler blocks "
+                f"{kv_cache_config.num_blocks} + reserved {reserved_blocks}"
+            )
+            self.offload_kv_cache_v0.register_static_offload_block_pool(total_blocks)
+            assert self.offload_kv_cache_v0._free_offload_block_rows, "no offload rows registered"
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
         if self.speculative_config and (
@@ -2741,6 +2756,37 @@ class NPUModelRunner(GPUModelRunner):
 
         head_size_v = kv_cache_spec.head_size_v if hasattr(kv_cache_spec, "head_size_v") else kv_cache_spec.head_size
         return kv_cache_spec.head_size, head_size_v
+
+    def _reserve_offload_blocks_in_kv_cache_config(self, kv_cache_config: KVCacheConfig) -> None:
+        """Carve offload pinned blocks out of the normal K/V allocator.
+
+        The scheduler-side ``KVCacheManager`` keeps using ``kv_cache_config.num_blocks``
+        (already built in the engine process before this config reaches the worker), so
+        it only ever allocates block ids in ``[0, num_blocks)``. Here we inflate each
+        attention layer's physical K/V tensor by ``reserved_blocks`` extra blocks at the
+        tail; those tail blocks are owned by the offload manager and never handed out by
+        the scheduler. This turns ownership into physical enforcement instead of a
+        post-hoc assertion: normal K/V writes cannot land on offload storage.
+        """
+        assert self.offload_kv_cache_v0 is not None
+        reserved_blocks = self.offload_kv_cache_v0.offload_reserved_blocks()
+        layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        inflated_any = False
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            page_size_bytes: int | None = None
+            for layer_name in kv_cache_tensor.shared_by:
+                spec = layer_kv_cache_spec.get(layer_name)
+                if isinstance(spec, AttentionSpec):
+                    page_size_bytes = int(spec.page_size_bytes)
+                    break
+            if page_size_bytes is None:
+                continue
+            kv_cache_tensor.size = inflated_tensor_size(
+                int(kv_cache_tensor.size), page_size_bytes, reserved_blocks
+            )
+            inflated_any = True
+        if not inflated_any:
+            raise ValueError("KV offload compact SFA found no attention K/V tensor to reserve offload blocks from")
 
     def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """

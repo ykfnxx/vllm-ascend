@@ -353,12 +353,49 @@ class NPUWorker(WorkerBase):
             "isolate vLLM in its own container."
         )
         self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
+        self.available_kv_cache_memory_bytes = self._reserve_offload_kv_cache_memory(
+            self.available_kv_cache_memory_bytes
+        )
         logger.debug(profile_result)
         logger.info_once(
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
         )
 
         return int(self.available_kv_cache_memory_bytes)
+
+    def _reserve_offload_kv_cache_memory(self, available_kv_cache_memory_bytes: float) -> float:
+        """Set aside HBM for the offload pinned block pool before the engine sizes the
+        KV cache. The engine turns the returned budget into ``kv_cache_config.num_blocks``
+        for the scheduler; the worker later inflates its physical K/V tensors by the same
+        number of blocks, so the reserved memory is given back as the offload tail and the
+        total HBM footprint is unchanged. See
+        ``NPUModelRunner._reserve_offload_blocks_in_kv_cache_config``."""
+        offload_manager = getattr(self.model_runner, "offload_kv_cache_v0", None)
+        if offload_manager is None or not offload_manager.compact_sfa_enabled:
+            return available_kv_cache_memory_bytes
+
+        from vllm.v1.kv_cache_interface import AttentionSpec
+
+        from vllm_ascend.attention.offload_kv_cache_v0_ownership import offload_reserved_bytes
+
+        reserved_blocks = offload_manager.offload_reserved_blocks()
+        kv_cache_spec = self.model_runner.get_kv_cache_spec()
+        page_size_bytes_total = sum(
+            int(spec.page_size_bytes) for spec in kv_cache_spec.values() if isinstance(spec, AttentionSpec)
+        )
+        if page_size_bytes_total <= 0:
+            raise ValueError("KV offload compact SFA found no attention KV cache spec to reserve offload memory from")
+
+        reserved_bytes = offload_reserved_bytes(reserved_blocks, page_size_bytes_total)
+        remaining = available_kv_cache_memory_bytes - reserved_bytes
+        if remaining <= 0:
+            raise ValueError(
+                "KV offload compact SFA offload pool leaves no memory for normal K/V blocks: "
+                f"available={int(available_kv_cache_memory_bytes)} bytes, "
+                f"reserved={reserved_bytes} bytes "
+                f"(reserved_blocks={reserved_blocks}, page_size_bytes_total={page_size_bytes_total})"
+            )
+        return remaining
 
     def execute_model(
         self,

@@ -63,10 +63,38 @@ def compact_blocks_per_req(slot_count: int, block_size: int) -> int:
     return (slot_count + block_size - 1) // block_size
 
 
-def build_static_offload_blocks(total_blocks: int, max_pinned_reqs: int, blocks_per_req: int) -> list[int]:
-    reserved_blocks = max_pinned_reqs * blocks_per_req
+def offload_reserved_blocks(max_pinned_reqs: int, blocks_per_req: int) -> int:
+    reserved_blocks = int(max_pinned_reqs) * int(blocks_per_req)
     if reserved_blocks <= 0:
-        raise ValueError("offload reserved blocks must be positive")
+        raise ValueError(
+            f"offload reserved blocks must be positive, got max_pinned_reqs={max_pinned_reqs}, "
+            f"blocks_per_req={blocks_per_req}"
+        )
+    return reserved_blocks
+
+
+def offload_reserved_bytes(reserved_blocks: int, page_size_bytes_total: int) -> int:
+    if reserved_blocks <= 0:
+        raise ValueError(f"reserved_blocks must be positive, got {reserved_blocks}")
+    if page_size_bytes_total <= 0:
+        raise ValueError(f"page_size_bytes_total must be positive, got {page_size_bytes_total}")
+    return int(reserved_blocks) * int(page_size_bytes_total)
+
+
+def inflated_tensor_size(size_bytes: int, page_size_bytes: int, reserved_blocks: int) -> int:
+    if size_bytes <= 0:
+        raise ValueError(f"size_bytes must be positive, got {size_bytes}")
+    if page_size_bytes <= 0:
+        raise ValueError(f"page_size_bytes must be positive, got {page_size_bytes}")
+    if size_bytes % page_size_bytes != 0:
+        raise ValueError(
+            f"tensor size {size_bytes} is not a multiple of page_size_bytes {page_size_bytes}"
+        )
+    return int(size_bytes) + offload_reserved_bytes(reserved_blocks, page_size_bytes)
+
+
+def build_static_offload_blocks(total_blocks: int, max_pinned_reqs: int, blocks_per_req: int) -> list[int]:
+    reserved_blocks = offload_reserved_blocks(max_pinned_reqs, blocks_per_req)
     if reserved_blocks >= total_blocks:
         raise ValueError(
             "offload reserved blocks must leave at least one normal K/V block: "

@@ -13,6 +13,7 @@ from vllm_ascend.attention.offload_kv_cache_v0_ownership import (
     build_compact_block_table_row,
     build_static_offload_blocks,
     compact_blocks_per_req,
+    offload_reserved_blocks,
     physical_slot_for_compact_slot,
 )
 
@@ -220,6 +221,10 @@ class OffloadKVCacheV0Manager:
         self._block_owner_registry: BlockOwnershipRegistry | None = None
         self._free_offload_block_rows: list[list[int]] = []
         self._req_offload_block_rows: dict[str, list[int]] = {}
+
+    def offload_reserved_blocks(self) -> int:
+        """Number of offload pinned blocks carved out of the normal K/V allocator."""
+        return offload_reserved_blocks(self.max_pinned_reqs, self.compact_blocks_per_req)
 
     def make_key(self, req_id: str, layer_id: int, token_pos: int) -> bytes:
         return make_microkv_mla_token_key(req_id, layer_id, token_pos)
