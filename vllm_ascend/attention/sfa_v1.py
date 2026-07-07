@@ -26,6 +26,7 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
+from vllm_ascend.attention.offload_kv_cache_v0 import parse_layer_id
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     ascend_chunked_prefill_workspace_size,
@@ -1226,6 +1227,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata.reshape_cache_event.record()
 
         offload_kv_cache_v0 = _EXTRA_CTX.offload_kv_cache_v0
+        # Only log the offload stats for layer 0 to avoid per-layer spam.
+        offload_log = offload_kv_cache_v0 is not None and parse_layer_id(layer_name) == 0
         if offload_kv_cache_v0 is not None:
             if self.enable_dsa_cp:
                 raise ValueError("KV offload v0 validation does not support DSA CP")
@@ -1233,12 +1236,19 @@ class AscendSFAImpl(MLAAttentionImpl):
                 raise ValueError("KV offload v0 validation does not support Sparse C8 indexer")
             if _EXTRA_CTX.capturing:
                 raise ValueError("KV offload v0 validation requires eager mode")
-            offload_kv_cache_v0.persist_prefill_kv_to_microkv(
+            persist_stats = offload_kv_cache_v0.persist_prefill_kv_to_microkv(
                 layer_name=layer_name,
                 kv_cache=kv_cache,
                 slot_mapping=slot_mapping,
                 attn_metadata=attn_metadata,
             )
+            if offload_log:
+                logger.info(
+                    "[kv-offload] persist layer=%s written=%d skipped=%d",
+                    layer_name,
+                    persist_stats.written_items,
+                    persist_stats.skipped_items,
+                )
 
         topk_indices = self.indexer_select_post_process(
             x=hidden_states,
@@ -1267,15 +1277,35 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sfa_topk_indices = compact_sfa_inputs.topk_indices
                 sfa_attn_metadata = replace(attn_metadata, block_table=compact_sfa_inputs.block_table)
                 sfa_actual_seq_lengths_key = compact_sfa_inputs.actual_seq_lengths_kv
+                if offload_log:
+                    logger.info(
+                        "[kv-offload] compact layer=%s block_table=%s compact_seq_len=%d topk=%s",
+                        layer_name,
+                        tuple(compact_sfa_inputs.block_table.shape),
+                        int(compact_sfa_inputs.actual_seq_lengths_kv.max().item())
+                        if compact_sfa_inputs.actual_seq_lengths_kv.numel() > 0
+                        else 0,
+                        tuple(compact_sfa_inputs.topk_indices.shape),
+                    )
             elif offload_kv_cache_v0.compact_sfa_enabled is True and int(attn_metadata.num_decode_tokens) != 0:
                 raise ValueError("KV offload v0.1.1 compact SFA only supports DecodeOnly")
             else:
-                offload_kv_cache_v0.validate_topk_with_real_hbm_index_ops(
+                validate_stats = offload_kv_cache_v0.validate_topk_with_real_hbm_index_ops(
                     layer_name=layer_name,
                     kv_cache=kv_cache,
                     topk_indices=topk_indices,
                     attn_metadata=attn_metadata,
                 )
+                if offload_log:
+                    logger.info(
+                        "[kv-offload] validate layer=%s checked=%d loaded=%d missing=%d mismatch=%d max_abs_err=%.3g",
+                        layer_name,
+                        validate_stats.checked_items,
+                        validate_stats.loaded_items,
+                        validate_stats.missing_items,
+                        validate_stats.mismatch_items,
+                        validate_stats.max_abs_error,
+                    )
 
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope,
