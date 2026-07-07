@@ -113,6 +113,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KV_OFFLOAD_V0_VALIDATE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_KV_OFFLOAD_V0_VALIDATE", "0"))
     ),
+    # Enable v0.1.1 compact SFA inputs backed by vLLM-owned offload blocks.
+    "VLLM_ASCEND_KV_OFFLOAD_V0_COMPACT_SFA": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KV_OFFLOAD_V0_COMPACT_SFA", "0"))
+    ),
+    # Maximum number of concurrently pinned requests in the compact offload pool.
+    "VLLM_ASCEND_KV_OFFLOAD_V0_MAX_PINNED_REQS": lambda: int(
+        os.getenv("VLLM_ASCEND_KV_OFFLOAD_V0_MAX_PINNED_REQS", "0")
+    ),
     # Unix domain socket used by the MicroKV daemon.
     "MICROKV_SOCKET": lambda: os.getenv("MICROKV_SOCKET", "/tmp/microkv.sock"),
     # Deprecated: v0.1 real-op validation uses the fixed ASU HBM index SLOT_COUNT.

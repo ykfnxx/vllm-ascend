@@ -8,6 +8,14 @@ from typing import Any
 
 import torch
 
+from vllm_ascend.attention.offload_kv_cache_v0_ownership import (
+    BlockOwnershipRegistry,
+    build_compact_block_table_row,
+    build_static_offload_blocks,
+    compact_blocks_per_req,
+    physical_slot_for_compact_slot,
+)
+
 
 KV_MLA_TOKEN = 0
 INDEX_SIZE = 128 * 1024
@@ -61,9 +69,16 @@ class HBMIndexLayerState:
     free_head: torch.Tensor
     query_index: torch.Tensor
     last_query_slots: torch.Tensor
-    k_nope_cache: torch.Tensor
-    k_pe_cache: torch.Tensor
+    k_nope_cache: torch.Tensor | None
+    k_pe_cache: torch.Tensor | None
     resident_initialized: bool = False
+
+
+@dataclass
+class CompactSFAInputs:
+    topk_indices: torch.Tensor
+    block_table: torch.Tensor
+    actual_seq_lengths_kv: torch.Tensor
 
 
 def parse_layer_id(layer_name: str) -> int:
@@ -177,6 +192,9 @@ class OffloadKVCacheV0Manager:
         query_count: int = QUERY_COUNT,
         capacity: int | None = None,
         slot_table_size: int | None = None,
+        compact_sfa_enabled: bool = False,
+        max_pinned_reqs: int = 0,
+        block_size: int = 128,
     ) -> None:
         self.client = client
         self.cache_type = cache_type
@@ -190,11 +208,18 @@ class OffloadKVCacheV0Manager:
         self.query_count = query_count
         self.capacity = self.slot_count
         self.slot_table_size = self.index_size
+        self.compact_sfa_enabled = compact_sfa_enabled
+        self.max_pinned_reqs = max_pinned_reqs
+        self.block_size = block_size
+        self.compact_blocks_per_req = compact_blocks_per_req(self.slot_count, block_size)
         self.lookup_op = lookup_op
         self.maintain_op = maintain_op
         self.maintain_seed = maintain_seed
         self._caches: dict[tuple[str, int], HBMIndexLayerState] = {}
         self._disabled_caches: set[tuple[str, int]] = set()
+        self._block_owner_registry: BlockOwnershipRegistry | None = None
+        self._free_offload_block_rows: list[list[int]] = []
+        self._req_offload_block_rows: dict[str, list[int]] = {}
 
     def make_key(self, req_id: str, layer_id: int, token_pos: int) -> bytes:
         return make_microkv_mla_token_key(req_id, layer_id, token_pos)
@@ -266,6 +291,131 @@ class OffloadKVCacheV0Manager:
         attn_metadata: Any,
     ) -> LookupValidationStats:
         return self.validate_topk_with_real_hbm_index_ops(layer_name, kv_cache, topk_indices, attn_metadata)
+
+    def register_static_offload_block_pool(self, total_blocks: int) -> None:
+        offload_blocks = build_static_offload_blocks(
+            total_blocks=total_blocks,
+            max_pinned_reqs=self.max_pinned_reqs,
+            blocks_per_req=self.compact_blocks_per_req,
+        )
+        self._block_owner_registry = BlockOwnershipRegistry(
+            total_blocks=total_blocks,
+            offload_blocks=offload_blocks,
+        )
+        self._free_offload_block_rows = [
+            offload_blocks[start : start + self.compact_blocks_per_req]
+            for start in range(0, len(offload_blocks), self.compact_blocks_per_req)
+        ]
+        self._req_offload_block_rows.clear()
+
+    def release_request(self, req_id: str) -> None:
+        row = self._req_offload_block_rows.pop(req_id, None)
+        if row is not None:
+            self._free_offload_block_rows.append(row)
+
+        cache_keys = [cache_key for cache_key in self._caches if cache_key[0] == req_id]
+        for cache_key in cache_keys:
+            self._caches.pop(cache_key, None)
+            self._disabled_caches.discard(cache_key)
+
+    def prepare_compact_sfa_inputs(
+        self,
+        layer_name: str,
+        kv_cache: tuple[torch.Tensor, ...],
+        topk_indices: torch.Tensor,
+        attn_metadata: Any,
+        actual_seq_lengths_kv: torch.Tensor,
+    ) -> CompactSFAInputs:
+        if not self.compact_sfa_enabled:
+            raise ValueError("compact SFA path is not enabled")
+        total_blocks = int(kv_cache[0].shape[0])
+        if self._block_owner_registry is None:
+            self.register_static_offload_block_pool(total_blocks)
+        self._assert_original_kv_metadata(attn_metadata)
+
+        layer_id = parse_layer_id(layer_name)
+        topk_indices_cpu = topk_indices.detach().cpu()
+        compact_topk_indices_cpu = topk_indices_cpu.clone()
+        num_decode_tokens = int(attn_metadata.num_decode_tokens)
+        if num_decode_tokens == 0:
+            return CompactSFAInputs(
+                topk_indices=topk_indices,
+                block_table=attn_metadata.block_table,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+            )
+
+        decode_indices_by_req: dict[int, list[int]] = {}
+        for decode_token_index in range(num_decode_tokens):
+            req_index = int(attn_metadata.token_req_indices_cpu[decode_token_index].item())
+            decode_indices_by_req.setdefault(req_index, []).append(decode_token_index)
+
+        compact_block_table_rows: list[torch.Tensor] = []
+        compact_actual_seq_lengths = actual_seq_lengths_kv.clone()
+        for req_index, decode_token_indices in decode_indices_by_req.items():
+            req_id = attn_metadata.req_ids[req_index]
+            offload_block_row = self._get_or_allocate_offload_block_row(req_id)
+            compact_block_table_rows.append(
+                torch.tensor(
+                    offload_block_row,
+                    dtype=attn_metadata.block_table.dtype,
+                    device=attn_metadata.block_table.device,
+                )
+            )
+            compact_actual_seq_lengths[req_index] = self.compact_blocks_per_req * self.block_size
+
+            prefill_len = int(attn_metadata.prefill_lens_cpu[req_index].item())
+            valid_query_tokens = self._collect_compact_query_tokens(topk_indices_cpu, decode_token_indices, prefill_len)
+            if len(valid_query_tokens) > self.query_count:
+                raise ValueError(
+                    "KV offload v0.1.1 query count exceeds real op QUERY_COUNT: "
+                    f"req_id={req_id}, layer_id={layer_id}, count={len(valid_query_tokens)}, "
+                    f"limit={self.query_count}"
+                )
+
+            state = self.get_or_create_hbm_index_state(req_id, layer_id, kv_cache[0].device)
+            query_index = self._prepare_query_index(state, valid_query_tokens)
+            slot_out = self._call_lookup(state, query_index)
+            token_pos_to_slot = self._load_query_tokens_to_compact_cache(
+                req_id=req_id,
+                layer_id=layer_id,
+                valid_query_tokens=valid_query_tokens,
+                slot_out=slot_out,
+                offload_block_row=offload_block_row,
+                kv_cache=kv_cache,
+            )
+            for decode_token_index in decode_token_indices:
+                flattened_topk = compact_topk_indices_cpu[decode_token_index].reshape(-1)
+                for topk_offset, token_pos_tensor in enumerate(topk_indices_cpu[decode_token_index].reshape(-1)):
+                    token_pos = int(token_pos_tensor.item())
+                    flattened_topk[topk_offset] = token_pos_to_slot[token_pos]
+
+            state.last_query_slots.copy_(slot_out)
+            if int(state.free_head[0].item()) > 0:
+                self._call_maintain(state)
+
+        compact_topk_indices = compact_topk_indices_cpu.to(device=topk_indices.device, dtype=topk_indices.dtype)
+        compact_block_table = torch.stack(compact_block_table_rows, dim=0)
+        return CompactSFAInputs(
+            topk_indices=compact_topk_indices,
+            block_table=compact_block_table,
+            actual_seq_lengths_kv=compact_actual_seq_lengths,
+        )
+
+    def _assert_original_kv_metadata(self, attn_metadata: Any) -> None:
+        assert self._block_owner_registry is not None
+        block_table_blocks = [
+            int(block_id)
+            for block_id in attn_metadata.block_table.detach().cpu().reshape(-1)
+            if int(block_id) >= 0
+        ]
+        self._block_owner_registry.assert_original_kv_blocks(block_table_blocks)
+
+        slot_mapping_blocks = [
+            int(slot_id) // self.block_size
+            for slot_id in attn_metadata.slot_mapping.detach().cpu().reshape(-1)
+            if int(slot_id) >= 0
+        ]
+        self._block_owner_registry.assert_original_kv_blocks(slot_mapping_blocks)
 
     def validate_topk_with_real_hbm_index_ops(
         self,
@@ -384,6 +534,28 @@ class OffloadKVCacheV0Manager:
                     valid_query_tokens.append(token_pos)
         return valid_query_tokens
 
+    def _collect_compact_query_tokens(
+        self,
+        topk_indices_cpu: torch.Tensor,
+        decode_token_indices: list[int],
+        prefill_len: int,
+    ) -> list[int]:
+        valid_query_tokens: list[int] = []
+        seen_tokens: set[int] = set()
+        for decode_token_index in decode_token_indices:
+            flattened_topk = topk_indices_cpu[decode_token_index].reshape(-1)
+            for token_pos_tensor in flattened_topk:
+                token_pos = int(token_pos_tensor.item())
+                if token_pos < 0 or token_pos >= prefill_len or token_pos >= self.index_size:
+                    raise ValueError(
+                        "KV offload v0.1.1 compact SFA topk token is outside supported prefill range: "
+                        f"token_pos={token_pos}, prefill_len={prefill_len}, index_size={self.index_size}"
+                    )
+                if token_pos not in seen_tokens:
+                    seen_tokens.add(token_pos)
+                    valid_query_tokens.append(token_pos)
+        return valid_query_tokens
+
     def _prepare_query_index(self, state: HBMIndexLayerState, valid_query_tokens: list[int]) -> torch.Tensor:
         pad_token = valid_query_tokens[0]
         state.query_index.fill_(pad_token)
@@ -448,10 +620,47 @@ class OffloadKVCacheV0Manager:
                 device=k_nope_cache_template.device,
             )
             slot_id = int(slot_out[0, query_offset].item())
+            assert state.k_nope_cache is not None
+            assert state.k_pe_cache is not None
             state.k_nope_cache[slot_id].copy_(loaded_k_nope)
             state.k_pe_cache[slot_id].copy_(loaded_k_pe)
             token_pos_to_slot[token_pos] = slot_id
             stats.loaded_items += 1
+        return token_pos_to_slot
+
+    def _load_query_tokens_to_compact_cache(
+        self,
+        req_id: str,
+        layer_id: int,
+        valid_query_tokens: list[int],
+        slot_out: torch.Tensor,
+        offload_block_row: list[int],
+        kv_cache: tuple[torch.Tensor, ...],
+    ) -> dict[int, int]:
+        keys = [self.make_key(req_id, layer_id, token_pos) for token_pos in valid_query_tokens]
+        records = self.client.batch_get(self.cache_type, keys)
+        k_nope_flat = kv_cache[0].view(-1, *kv_cache[0].shape[2:])
+        k_pe_flat = kv_cache[1].view(-1, *kv_cache[1].shape[2:])
+        token_pos_to_slot: dict[int, int] = {}
+        for query_offset, token_pos in enumerate(valid_query_tokens):
+            record = records[query_offset]
+            if record is None:
+                raise MicroKVRecordError(
+                    "KV offload v0.1.1 MicroKV miss after compact lookup: "
+                    f"req_id={req_id}, layer_id={layer_id}, token_pos={token_pos}"
+                )
+            loaded_k_nope, loaded_k_pe = unpack_mla_token_record(
+                record,
+                expected_k_nope_shape=tuple(kv_cache[0].shape[2:]),
+                expected_k_pe_shape=tuple(kv_cache[1].shape[2:]),
+                expected_dtype=kv_cache[0].dtype,
+                device=kv_cache[0].device,
+            )
+            slot_id = int(slot_out[0, query_offset].item())
+            physical_slot = physical_slot_for_compact_slot(slot_id, self.block_size, offload_block_row)
+            k_nope_flat[physical_slot].copy_(loaded_k_nope)
+            k_pe_flat[physical_slot].copy_(loaded_k_pe)
+            token_pos_to_slot[token_pos] = slot_id
         return token_pos_to_slot
 
     def _write_resident_prefill_token(
@@ -470,13 +679,67 @@ class OffloadKVCacheV0Manager:
         if token_pos >= resident_count:
             return
 
-        state = self.get_or_create_bypass_cache(req_id, layer_id, k_nope_cache_template, k_pe_cache_template)
         slot_id = token_pos
+        if self.compact_sfa_enabled:
+            if self._block_owner_registry is None:
+                self.register_static_offload_block_pool(int(k_nope_cache_template.shape[0]))
+            state = self.get_or_create_hbm_index_state(req_id, layer_id, k_nope_cache_template.device)
+            offload_block_row = self._get_or_allocate_offload_block_row(req_id)
+            physical_slot = physical_slot_for_compact_slot(slot_id, self.block_size, offload_block_row)
+            k_nope_cache_template.view(-1, *k_nope_cache_template.shape[2:])[physical_slot].copy_(
+                k_nope_flat[original_slot]
+            )
+            k_pe_cache_template.view(-1, *k_pe_cache_template.shape[2:])[physical_slot].copy_(k_pe_flat[original_slot])
+        else:
+            state = self.get_or_create_bypass_cache(req_id, layer_id, k_nope_cache_template, k_pe_cache_template)
+            assert state.k_nope_cache is not None
+            assert state.k_pe_cache is not None
+            state.k_nope_cache[slot_id].copy_(k_nope_flat[original_slot])
+            state.k_pe_cache[slot_id].copy_(k_pe_flat[original_slot])
         state.index[0, token_pos] = slot_id
         state.slot_to_index[0, slot_id] = token_pos
-        state.k_nope_cache[slot_id].copy_(k_nope_flat[original_slot])
-        state.k_pe_cache[slot_id].copy_(k_pe_flat[original_slot])
         state.resident_initialized = True
+
+    def _get_or_allocate_offload_block_row(self, req_id: str) -> list[int]:
+        row = self._req_offload_block_rows.get(req_id)
+        if row is not None:
+            return row
+        if not self._free_offload_block_rows:
+            raise ValueError(f"no offload pinned blocks available for req_id={req_id}")
+        row = self._free_offload_block_rows.pop(0)
+        assert self._block_owner_registry is not None
+        self._req_offload_block_rows[req_id] = build_compact_block_table_row(self._block_owner_registry, row)
+        return self._req_offload_block_rows[req_id]
+
+    def get_or_create_hbm_index_state(
+        self,
+        req_id: str,
+        layer_id: int,
+        device: torch.device,
+    ) -> HBMIndexLayerState:
+        cache_key = (req_id, layer_id)
+        cache = self._caches.get(cache_key)
+        if cache is not None:
+            return cache
+
+        free_slots = torch.arange(
+            self.resident_slot_count,
+            self.resident_slot_count + self.free_slot_count,
+            dtype=torch.int32,
+            device=device,
+        ).view(1, self.free_slot_count)
+        cache = HBMIndexLayerState(
+            index=torch.full((1, self.index_size), NOT_FOUND, dtype=torch.int32, device=device),
+            slot_to_index=torch.full((1, self.slot_count), NOT_FOUND, dtype=torch.int32, device=device),
+            free_slots=free_slots,
+            free_head=torch.zeros((1,), dtype=torch.int32, device=device),
+            query_index=torch.empty((1, self.query_count), dtype=torch.int32, device=device),
+            last_query_slots=torch.empty((1, self.query_count), dtype=torch.int32, device=device),
+            k_nope_cache=None,
+            k_pe_cache=None,
+        )
+        self._caches[cache_key] = cache
+        return cache
 
     def get_or_create_bypass_cache(
         self,

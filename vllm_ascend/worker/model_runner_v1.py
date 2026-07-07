@@ -363,13 +363,18 @@ class NPUModelRunner(GPUModelRunner):
 
         self.use_aclgraph = self._use_aclgraph()
         self.offload_kv_cache_v0: OffloadKVCacheV0Manager | None = None
-        if envs.VLLM_ASCEND_KV_OFFLOAD_V0_VALIDATE:
+        if envs.VLLM_ASCEND_KV_OFFLOAD_V0_VALIDATE or envs.VLLM_ASCEND_KV_OFFLOAD_V0_COMPACT_SFA:
             if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and not self.model_config.enforce_eager:
-                raise ValueError("VLLM_ASCEND_KV_OFFLOAD_V0_VALIDATE requires eager mode")
+                raise ValueError("KV offload v0 requires eager mode")
+            if envs.VLLM_ASCEND_KV_OFFLOAD_V0_COMPACT_SFA and envs.VLLM_ASCEND_KV_OFFLOAD_V0_MAX_PINNED_REQS <= 0:
+                raise ValueError("VLLM_ASCEND_KV_OFFLOAD_V0_COMPACT_SFA requires MAX_PINNED_REQS > 0")
             from microkv import KVStoreClient
 
             self.offload_kv_cache_v0 = OffloadKVCacheV0Manager(
                 client=KVStoreClient(envs.MICROKV_SOCKET),
+                compact_sfa_enabled=envs.VLLM_ASCEND_KV_OFFLOAD_V0_COMPACT_SFA,
+                max_pinned_reqs=envs.VLLM_ASCEND_KV_OFFLOAD_V0_MAX_PINNED_REQS,
+                block_size=self.block_size,
             )
 
         eplb_config = self.ascend_config.eplb_config
@@ -1159,6 +1164,9 @@ class NPUModelRunner(GPUModelRunner):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
                 self._update_states(scheduler_output)
+                if self.offload_kv_cache_v0 is not None:
+                    for req_id in scheduler_output.finished_req_ids:
+                        self.offload_kv_cache_v0.release_request(req_id)
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -2654,6 +2662,10 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        if self.offload_kv_cache_v0 is not None and self.offload_kv_cache_v0.compact_sfa_enabled:
+            first_layer_kv_cache = next(iter(kv_caches.values()))
+            assert isinstance(first_layer_kv_cache, tuple)
+            self.offload_kv_cache_v0.register_static_offload_block_pool(int(first_layer_kv_cache[0].shape[0]))
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
         if self.speculative_config and (

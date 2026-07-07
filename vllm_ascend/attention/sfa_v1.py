@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, TypeVar
 
 import scipy  # type: ignore
@@ -1251,16 +1251,40 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_key=actual_seq_lengths_key,
         )
 
+        sfa_topk_indices = topk_indices
+        sfa_attn_metadata = attn_metadata
+        sfa_actual_seq_lengths_key = actual_seq_lengths_key
         if offload_kv_cache_v0 is not None:
-            offload_kv_cache_v0.validate_topk_with_real_hbm_index_ops(
-                layer_name=layer_name,
-                kv_cache=kv_cache,
-                topk_indices=topk_indices,
-                attn_metadata=attn_metadata,
-            )
+            state_name = getattr(attn_metadata.attn_state, "name", str(attn_metadata.attn_state))
+            if offload_kv_cache_v0.compact_sfa_enabled is True and state_name == "DecodeOnly":
+                compact_sfa_inputs = offload_kv_cache_v0.prepare_compact_sfa_inputs(
+                    layer_name=layer_name,
+                    kv_cache=kv_cache,
+                    topk_indices=topk_indices,
+                    attn_metadata=attn_metadata,
+                    actual_seq_lengths_kv=actual_seq_lengths_key,
+                )
+                sfa_topk_indices = compact_sfa_inputs.topk_indices
+                sfa_attn_metadata = replace(attn_metadata, block_table=compact_sfa_inputs.block_table)
+                sfa_actual_seq_lengths_key = compact_sfa_inputs.actual_seq_lengths_kv
+            elif offload_kv_cache_v0.compact_sfa_enabled is True and int(attn_metadata.num_decode_tokens) != 0:
+                raise ValueError("KV offload v0.1.1 compact SFA only supports DecodeOnly")
+            else:
+                offload_kv_cache_v0.validate_topk_with_real_hbm_index_ops(
+                    layer_name=layer_name,
+                    kv_cache=kv_cache,
+                    topk_indices=topk_indices,
+                    attn_metadata=attn_metadata,
+                )
 
         attn_output = self._execute_sparse_flash_attention_process(
-            ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+            ql_nope,
+            q_pe,
+            kv_cache,
+            sfa_topk_indices,
+            sfa_attn_metadata,
+            actual_seq_lengths_query,
+            sfa_actual_seq_lengths_key,
         )
 
         attn_output = self._v_up_proj(attn_output)
