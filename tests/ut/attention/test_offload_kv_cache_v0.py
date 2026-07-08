@@ -17,6 +17,7 @@ class FakeMicroKVClient:
 
     def __init__(self):
         self.store = {}
+        self.batch_get_keys = []
 
     def batch_put(self, cache_type, keys, values):
         for key, value in zip(keys, values, strict=True):
@@ -24,6 +25,7 @@ class FakeMicroKVClient:
         return True
 
     def batch_get(self, cache_type, keys):
+        self.batch_get_keys.append((cache_type, list(keys)))
         return [self.store.get((cache_type, key)) for key in keys]
 
 
@@ -387,6 +389,64 @@ class OffloadKVCacheV0Test(unittest.TestCase):
                 metadata,
             )
         self.assertEqual(len(lookup_op.calls), 0)
+
+    def test_compact_materializes_generated_tokens_from_original_kv_cache(self):
+        client = FakeMicroKVClient()
+        lookup_op = FakeLookupOp()
+        maintain_op = FakeMaintainOp()
+        manager = OffloadKVCacheV0Manager(
+            client=client,
+            lookup_op=lookup_op,
+            maintain_op=maintain_op,
+            index_size=16,
+            slot_count=4,
+            resident_slot_count=2,
+            free_slot_count=2,
+            query_count=4,
+            compact_sfa_enabled=True,
+            max_pinned_reqs=1,
+            block_size=2,
+        )
+        k_nope = torch.arange(8, dtype=torch.float32).view(4, 2, 1, 1)
+        k_pe = (torch.arange(8, dtype=torch.float32) + 100).view(4, 2, 1, 1)
+        kv_cache = (k_nope.clone(), k_pe.clone())
+        prefill_metadata = SimpleMetadata(
+            req_ids=["req-a"],
+            token_req_indices_cpu=torch.tensor([0, 0], dtype=torch.int32),
+            token_positions_cpu=torch.tensor([0, 1], dtype=torch.int64),
+            prefill_lens_cpu=torch.tensor([2], dtype=torch.int32),
+            attn_state="PrefillNoCache",
+            num_actual_tokens=2,
+        )
+        manager.persist_prefill_kv_to_microkv(
+            "model.layers.0.self_attn",
+            kv_cache,
+            torch.tensor([0, 1], dtype=torch.int64),
+            prefill_metadata,
+        )
+        decode_metadata = SimpleMetadata(
+            req_ids=["req-a"],
+            token_req_indices_cpu=torch.tensor([0], dtype=torch.int32),
+            token_positions_cpu=torch.tensor([3], dtype=torch.int64),
+            prefill_lens_cpu=torch.tensor([2], dtype=torch.int32),
+            block_table=torch.tensor([[0, 1]], dtype=torch.int32),
+            num_decode_tokens=1,
+        )
+
+        compact_inputs = manager.prepare_compact_sfa_inputs(
+            "model.layers.0.self_attn",
+            kv_cache,
+            torch.tensor([[[1, 3]]], dtype=torch.int32),
+            decode_metadata,
+            torch.tensor([4], dtype=torch.int32),
+        )
+
+        self.assertTrue(torch.equal(compact_inputs.topk_indices, torch.tensor([[[1, 2]]], dtype=torch.int32)))
+        self.assertTrue(torch.equal(compact_inputs.block_table, torch.tensor([[2, 3]], dtype=torch.int32)))
+        self.assertEqual(len(client.batch_get_keys), 1)
+        self.assertEqual(client.batch_get_keys[0][1], [manager.make_key("req-a", 0, 1)])
+        self.assertTrue(torch.equal(kv_cache[0].view(-1, 1, 1)[6], torch.tensor([[3.0]])))
+        self.assertTrue(torch.equal(kv_cache[1].view(-1, 1, 1)[6], torch.tensor([[103.0]])))
 
     def test_mismatch_raises_with_strict_validation(self):
         client = FakeMicroKVClient()

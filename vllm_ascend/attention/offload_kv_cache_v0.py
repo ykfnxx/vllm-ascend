@@ -343,6 +343,7 @@ class OffloadKVCacheV0Manager:
 
         layer_id = parse_layer_id(layer_name)
         topk_indices_cpu = topk_indices.detach().cpu()
+        block_table_cpu = attn_metadata.block_table.detach().cpu()
         compact_topk_indices_cpu = topk_indices_cpu.clone()
         num_decode_tokens = int(attn_metadata.num_decode_tokens)
         if num_decode_tokens == 0:
@@ -372,7 +373,8 @@ class OffloadKVCacheV0Manager:
             compact_actual_seq_lengths[req_index] = self.compact_blocks_per_req * self.block_size
 
             prefill_len = int(attn_metadata.prefill_lens_cpu[req_index].item())
-            valid_query_tokens = self._collect_compact_query_tokens(topk_indices_cpu, decode_token_indices, prefill_len)
+            key_len = int(actual_seq_lengths_kv[req_index].item())
+            valid_query_tokens = self._collect_compact_query_tokens(topk_indices_cpu, decode_token_indices, key_len)
             if len(valid_query_tokens) > self.query_count:
                 raise ValueError(
                     "KV offload v0.1.1 query count exceeds real op QUERY_COUNT: "
@@ -401,6 +403,9 @@ class OffloadKVCacheV0Manager:
                 slot_out=slot_out,
                 offload_block_row=offload_block_row,
                 kv_cache=kv_cache,
+                prefill_len=prefill_len,
+                block_table_cpu=block_table_cpu,
+                req_index=req_index,
             )
             for decode_token_index in decode_token_indices:
                 flattened_topk = compact_topk_indices_cpu[decode_token_index].reshape(-1)
@@ -584,7 +589,7 @@ class OffloadKVCacheV0Manager:
         self,
         topk_indices_cpu: torch.Tensor,
         decode_token_indices: list[int],
-        prefill_len: int,
+        key_len: int,
     ) -> list[int]:
         valid_query_tokens: list[int] = []
         seen_tokens: set[int] = set()
@@ -592,10 +597,10 @@ class OffloadKVCacheV0Manager:
             flattened_topk = topk_indices_cpu[decode_token_index].reshape(-1)
             for token_pos_tensor in flattened_topk:
                 token_pos = int(token_pos_tensor.item())
-                if token_pos < 0 or token_pos >= prefill_len or token_pos >= self.index_size:
+                if token_pos < 0 or token_pos >= key_len or token_pos >= self.index_size:
                     raise ValueError(
-                        "KV offload v0.1.1 compact SFA topk token is outside supported prefill range: "
-                        f"token_pos={token_pos}, prefill_len={prefill_len}, index_size={self.index_size}"
+                        "KV offload v0.1.1 compact SFA topk token is outside supported key range: "
+                        f"token_pos={token_pos}, key_len={key_len}, index_size={self.index_size}"
                     )
                 if token_pos not in seen_tokens:
                     seen_tokens.add(token_pos)
@@ -757,30 +762,43 @@ class OffloadKVCacheV0Manager:
         slot_out: torch.Tensor,
         offload_block_row: list[int],
         kv_cache: tuple[torch.Tensor, ...],
+        prefill_len: int,
+        block_table_cpu: torch.Tensor,
+        req_index: int,
     ) -> dict[int, int]:
-        keys = [self.make_key(req_id, layer_id, token_pos) for token_pos in valid_query_tokens]
+        prefill_query_offsets = [
+            query_offset for query_offset, token_pos in enumerate(valid_query_tokens) if token_pos < prefill_len
+        ]
+        keys = [self.make_key(req_id, layer_id, valid_query_tokens[query_offset]) for query_offset in prefill_query_offsets]
         records = self.client.batch_get(self.cache_type, keys)
         k_nope_flat = kv_cache[0].view(-1, *kv_cache[0].shape[2:])
         k_pe_flat = kv_cache[1].view(-1, *kv_cache[1].shape[2:])
+        records_by_query_offset = dict(zip(prefill_query_offsets, records, strict=True))
         token_pos_to_slot: dict[int, int] = {}
         for query_offset, token_pos in enumerate(valid_query_tokens):
-            record = records[query_offset]
-            if record is None:
-                raise MicroKVRecordError(
-                    "KV offload v0.1.1 MicroKV miss after compact lookup: "
-                    f"req_id={req_id}, layer_id={layer_id}, token_pos={token_pos}"
-                )
-            loaded_k_nope, loaded_k_pe = unpack_mla_token_record(
-                record,
-                expected_k_nope_shape=tuple(kv_cache[0].shape[2:]),
-                expected_k_pe_shape=tuple(kv_cache[1].shape[2:]),
-                expected_dtype=kv_cache[0].dtype,
-                device=kv_cache[0].device,
-            )
             slot_id = int(slot_out[0, query_offset].item())
             physical_slot = physical_slot_for_compact_slot(slot_id, self.block_size, offload_block_row)
-            k_nope_flat[physical_slot].copy_(loaded_k_nope)
-            k_pe_flat[physical_slot].copy_(loaded_k_pe)
+            if token_pos < prefill_len:
+                record = records_by_query_offset[query_offset]
+                if record is None:
+                    raise MicroKVRecordError(
+                        "KV offload v0.1.1 MicroKV miss after compact lookup: "
+                        f"req_id={req_id}, layer_id={layer_id}, token_pos={token_pos}"
+                    )
+                loaded_k_nope, loaded_k_pe = unpack_mla_token_record(
+                    record,
+                    expected_k_nope_shape=tuple(kv_cache[0].shape[2:]),
+                    expected_k_pe_shape=tuple(kv_cache[1].shape[2:]),
+                    expected_dtype=kv_cache[0].dtype,
+                    device=kv_cache[0].device,
+                )
+                k_nope_flat[physical_slot].copy_(loaded_k_nope)
+                k_pe_flat[physical_slot].copy_(loaded_k_pe)
+            else:
+                source_block = int(block_table_cpu[req_index, token_pos // self.block_size].item())
+                source_slot = source_block * self.block_size + token_pos % self.block_size
+                k_nope_flat[physical_slot].copy_(k_nope_flat[source_slot])
+                k_pe_flat[physical_slot].copy_(k_pe_flat[source_slot])
             token_pos_to_slot[token_pos] = slot_id
         return token_pos_to_slot
 
