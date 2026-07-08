@@ -17,6 +17,7 @@
 # Adapted from vllm-project/vllm/vllm/worker/gpu_model_runner.py
 #
 
+import importlib.util
 import math
 import sys
 from collections import defaultdict
@@ -25,6 +26,7 @@ from copy import copy, deepcopy
 from dataclasses import dataclass
 from functools import partial
 from multiprocessing import Manager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
 import numpy as np
@@ -163,6 +165,24 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
+
+
+def _load_direct_aicpu_maintain_op(library_path: str):
+    repo_root = Path(__file__).resolve().parents[2]
+    module_path = (
+        repo_root
+        / "csrc"
+        / "asu_hbm_index_maintain_aicpu"
+        / "tmp"
+        / "direct_maintain.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "asu_hbm_index_direct_maintain",
+        module_path,
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.load_direct_maintain_op(library_path)
 
 
 @dataclass
@@ -384,6 +404,15 @@ class NPUModelRunner(GPUModelRunner):
                 logger.warning(
                     "KV offload v0 using pure-Python reference HBM index ops "
                     "(VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS=1); not for performance."
+                )
+            elif envs.VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_AICPU_MAINTAIN_LIB:
+                maintain_op = _load_direct_aicpu_maintain_op(
+                    envs.VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_AICPU_MAINTAIN_LIB
+                )
+                logger.warning(
+                    "KV offload v0 using ASU direct AICPU maintain library %s; "
+                    "lookup still uses the real _C_ascend lookup op.",
+                    envs.VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_AICPU_MAINTAIN_LIB,
                 )
 
             self.offload_kv_cache_v0 = OffloadKVCacheV0Manager(
