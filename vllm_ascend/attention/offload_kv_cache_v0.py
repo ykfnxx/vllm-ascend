@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from vllm.logger import logger
 
 from vllm_ascend.attention.offload_kv_cache_v0_ownership import (
     BlockOwnershipRegistry,
@@ -196,6 +197,7 @@ class OffloadKVCacheV0Manager:
         compact_sfa_enabled: bool = False,
         max_pinned_reqs: int = 0,
         block_size: int = 128,
+        trace_index_ops: bool = False,
     ) -> None:
         self.client = client
         self.cache_type = cache_type
@@ -212,6 +214,7 @@ class OffloadKVCacheV0Manager:
         self.compact_sfa_enabled = compact_sfa_enabled
         self.max_pinned_reqs = max_pinned_reqs
         self.block_size = block_size
+        self.trace_index_ops = trace_index_ops
         self.compact_blocks_per_req = compact_blocks_per_req(self.slot_count, block_size)
         self.lookup_op = lookup_op
         self.maintain_op = maintain_op
@@ -379,7 +382,18 @@ class OffloadKVCacheV0Manager:
 
             state = self.get_or_create_hbm_index_state(req_id, layer_id, kv_cache[0].device)
             query_index = self._prepare_query_index(state, valid_query_tokens)
+            free_head_before_lookup = self._free_head_value(state)
             slot_out = self._call_lookup(state, query_index)
+            self._log_hbm_index_lookup(
+                path="compact",
+                layer_id=layer_id,
+                req_id=req_id,
+                query_count=int(query_index.shape[1]),
+                unique_count=len(valid_query_tokens),
+                free_head_before=free_head_before_lookup,
+                state=state,
+                slot_out=slot_out,
+            )
             token_pos_to_slot = self._load_query_tokens_to_compact_cache(
                 req_id=req_id,
                 layer_id=layer_id,
@@ -396,7 +410,15 @@ class OffloadKVCacheV0Manager:
 
             state.last_query_slots.copy_(slot_out)
             if int(state.free_head[0].item()) > 0:
+                free_head_before_maintain = self._free_head_value(state)
                 self._call_maintain(state)
+                self._log_hbm_index_maintain(
+                    path="compact",
+                    layer_id=layer_id,
+                    req_id=req_id,
+                    free_head_before=free_head_before_maintain,
+                    state=state,
+                )
 
         compact_topk_indices = compact_topk_indices_cpu.to(device=topk_indices.device, dtype=topk_indices.dtype)
         compact_block_table = torch.stack(compact_block_table_rows, dim=0)
@@ -463,7 +485,18 @@ class OffloadKVCacheV0Manager:
 
             state = self.get_or_create_bypass_cache(req_id, layer_id, kv_cache[0], kv_cache[1])
             query_index = self._prepare_query_index(state, valid_query_tokens)
+            free_head_before_lookup = self._free_head_value(state)
             slot_out = self._call_lookup(state, query_index)
+            self._log_hbm_index_lookup(
+                path="validate",
+                layer_id=layer_id,
+                req_id=req_id,
+                query_count=int(query_index.shape[1]),
+                unique_count=len(valid_query_tokens),
+                free_head_before=free_head_before_lookup,
+                state=state,
+                slot_out=slot_out,
+            )
             token_pos_to_slot = self._load_query_tokens_to_bypass_cache(
                 req_id=req_id,
                 layer_id=layer_id,
@@ -516,7 +549,15 @@ class OffloadKVCacheV0Manager:
             free_head = int(state.free_head[0].item())
             if free_head > 0:
                 stats.evicted_items += free_head
+                free_head_before_maintain = self._free_head_value(state)
                 self._call_maintain(state)
+                self._log_hbm_index_maintain(
+                    path="validate",
+                    layer_id=layer_id,
+                    req_id=req_id,
+                    free_head_before=free_head_before_maintain,
+                    state=state,
+                )
 
         return stats
 
@@ -589,6 +630,81 @@ class OffloadKVCacheV0Manager:
             state.last_query_slots,
             1,
             self.maintain_seed,
+        )
+
+    def _free_head_value(self, state: HBMIndexLayerState) -> int:
+        if not self.trace_index_ops:
+            return -1
+        return int(state.free_head[0].item())
+
+    def _free_available(self, state: HBMIndexLayerState, free_head: int) -> int:
+        return int(state.free_slots.shape[1]) - free_head
+
+    def _slot_out_range(self, slot_out: torch.Tensor) -> tuple[int, int]:
+        if slot_out.numel() == 0:
+            return -1, -1
+        return int(slot_out.min().item()), int(slot_out.max().item())
+
+    def _log_hbm_index_lookup(
+        self,
+        path: str,
+        layer_id: int,
+        req_id: str,
+        query_count: int,
+        unique_count: int,
+        free_head_before: int,
+        state: HBMIndexLayerState,
+        slot_out: torch.Tensor,
+    ) -> None:
+        if not self.trace_index_ops:
+            return
+
+        free_head_after = int(state.free_head[0].item())
+        slot_out_min, slot_out_max = self._slot_out_range(slot_out)
+        logger.info(
+            "[kv-offload][hbm-index][lookup] path=%s layer=%d req=%s query=%d unique=%d "
+            "free_head_before=%d free_head_after=%d free_available_before=%d "
+            "free_available_after=%d allocated=%d slot_out_min=%d slot_out_max=%d",
+            path,
+            layer_id,
+            req_id,
+            query_count,
+            unique_count,
+            free_head_before,
+            free_head_after,
+            self._free_available(state, free_head_before),
+            self._free_available(state, free_head_after),
+            free_head_after - free_head_before,
+            slot_out_min,
+            slot_out_max,
+        )
+
+    def _log_hbm_index_maintain(
+        self,
+        path: str,
+        layer_id: int,
+        req_id: str,
+        free_head_before: int,
+        state: HBMIndexLayerState,
+    ) -> None:
+        if not self.trace_index_ops:
+            return
+
+        free_head_after = int(state.free_head[0].item())
+        logger.info(
+            "[kv-offload][hbm-index][maintain] path=%s layer=%d req=%s seed=%d protected=%d "
+            "free_head_before=%d free_head_after=%d free_available_before=%d "
+            "free_available_after=%d reclaimed=%d",
+            path,
+            layer_id,
+            req_id,
+            self.maintain_seed,
+            int(state.last_query_slots.numel()),
+            free_head_before,
+            free_head_after,
+            self._free_available(state, free_head_before),
+            self._free_available(state, free_head_after),
+            free_head_before - free_head_after,
         )
 
     def _load_query_tokens_to_bypass_cache(

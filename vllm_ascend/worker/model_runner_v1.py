@@ -393,6 +393,7 @@ class NPUModelRunner(GPUModelRunner):
                 block_size=self.block_size,
                 lookup_op=lookup_op,
                 maintain_op=maintain_op,
+                trace_index_ops=envs.VLLM_ASCEND_KV_OFFLOAD_V0_TRACE_INDEX_OPS,
             )
 
         eplb_config = self.ascend_config.eplb_config

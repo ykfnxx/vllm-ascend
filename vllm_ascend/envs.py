@@ -127,6 +127,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS": lambda: bool(
         int(os.getenv("VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS", "0"))
     ),
+    # Trace HBM index lookup/maintain free-slot counters in the KV offload path.
+    "VLLM_ASCEND_KV_OFFLOAD_V0_TRACE_INDEX_OPS": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KV_OFFLOAD_V0_TRACE_INDEX_OPS", "0"))
+    ),
     # Unix domain socket used by the MicroKV daemon.
     "MICROKV_SOCKET": lambda: os.getenv("MICROKV_SOCKET", "/tmp/microkv.sock"),
     # Deprecated: v0.1 real-op validation uses the fixed ASU HBM index SLOT_COUNT.
