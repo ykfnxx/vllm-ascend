@@ -127,9 +127,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS": lambda: bool(
         int(os.getenv("VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS", "0"))
     ),
+    # Temporary eager-only path for the ASU direct AIV lookup shared library.
+    # When set, lookup is injected as a Python callable with the same signature
+    # as torch.ops._C_ascend.asu_hbm_index_lookup.
+    "VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_LOOKUP_LIB": lambda: os.getenv(
+        "VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_LOOKUP_LIB", ""
+    ),
     # Temporary eager-only path for the ASU direct AICPU maintain shared library.
-    # When set, lookup still uses the real torch.ops._C_ascend lookup op, while
-    # maintain is injected as a ctypes callable loaded from this .so.
+    # When set, maintain is injected as a ctypes callable loaded from this .so.
     "VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_AICPU_MAINTAIN_LIB": lambda: os.getenv(
         "VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_AICPU_MAINTAIN_LIB", ""
     ),

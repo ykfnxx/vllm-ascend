@@ -167,6 +167,18 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 SEQ_LEN_WITH_MAX_PA_WORKSPACE = 6144
 
 
+def _load_direct_lookup_op(library_path: str):
+    repo_root = Path(__file__).resolve().parents[2]
+    module_path = repo_root / "csrc" / "asu_hbm_index_lookup" / "tmp" / "direct_lookup.py"
+    spec = importlib.util.spec_from_file_location(
+        "asu_hbm_index_direct_lookup",
+        module_path,
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.load_direct_lookup_op(library_path)
+
+
 def _load_direct_aicpu_maintain_op(library_path: str):
     repo_root = Path(__file__).resolve().parents[2]
     module_path = (
@@ -405,15 +417,23 @@ class NPUModelRunner(GPUModelRunner):
                     "KV offload v0 using pure-Python reference HBM index ops "
                     "(VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS=1); not for performance."
                 )
-            elif envs.VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_AICPU_MAINTAIN_LIB:
-                maintain_op = _load_direct_aicpu_maintain_op(
-                    envs.VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_AICPU_MAINTAIN_LIB
-                )
-                logger.warning(
-                    "KV offload v0 using ASU direct AICPU maintain library %s; "
-                    "lookup still uses the real _C_ascend lookup op.",
-                    envs.VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_AICPU_MAINTAIN_LIB,
-                )
+            else:
+                if envs.VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_LOOKUP_LIB:
+                    lookup_op = _load_direct_lookup_op(
+                        envs.VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_LOOKUP_LIB
+                    )
+                    logger.warning(
+                        "KV offload v0 using ASU direct lookup library %s.",
+                        envs.VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_LOOKUP_LIB,
+                    )
+                if envs.VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_AICPU_MAINTAIN_LIB:
+                    maintain_op = _load_direct_aicpu_maintain_op(
+                        envs.VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_AICPU_MAINTAIN_LIB
+                    )
+                    logger.warning(
+                        "KV offload v0 using ASU direct AICPU maintain library %s.",
+                        envs.VLLM_ASCEND_KV_OFFLOAD_V0_DIRECT_AICPU_MAINTAIN_LIB,
+                    )
 
             self.offload_kv_cache_v0 = OffloadKVCacheV0Manager(
                 client=KVStoreClient(envs.MICROKV_SOCKET),

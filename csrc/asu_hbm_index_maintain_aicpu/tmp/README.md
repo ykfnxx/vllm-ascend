@@ -6,10 +6,10 @@ vllm-ascend custom op.
 
 In the current framework bring-up:
 
-- lookup is compiled and called as the vllm-ascend custom op
-  `torch.ops._C_ascend.asu_hbm_index_lookup`.
-- maintain is compiled from ASU-Ascend as a direct AICPU `.so` and injected as
-  `OffloadKVCacheV0Manager.maintain_op`.
+- lookup can be compiled from ASU-Ascend as a direct AIV `.so` and injected as
+  `OffloadKVCacheV0Manager.lookup_op`.
+- maintain can be compiled from ASU-Ascend as a direct AICPU `.so` and injected
+  as `OffloadKVCacheV0Manager.maintain_op`.
 
 Build the ASU direct AICPU library from the ASU-Ascend repo:
 
@@ -27,7 +27,6 @@ unset VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS
 
 With this env var set:
 
-- lookup still uses the real `torch.ops._C_ascend.asu_hbm_index_lookup` op.
 - maintain uses `ctypes` to call `asu_hbm_index_maintain_do` from the ASU
   direct AICPU `.so`.
 - `VLLM_ASCEND_KV_OFFLOAD_V0_REF_HBM_OPS=1` overrides this path and switches
