@@ -374,7 +374,14 @@ class OffloadKVCacheV0Manager:
 
             prefill_len = int(attn_metadata.prefill_lens_cpu[req_index].item())
             key_len = int(actual_seq_lengths_kv[req_index].item())
+            current_key_len = max(
+                int(attn_metadata.token_positions_cpu[decode_token_index].item()) + 1
+                for decode_token_index in decode_token_indices
+            )
+            key_len = max(key_len, current_key_len)
             valid_query_tokens = self._collect_compact_query_tokens(topk_indices_cpu, decode_token_indices, key_len)
+            if not valid_query_tokens:
+                continue
             if len(valid_query_tokens) > self.query_count:
                 raise ValueError(
                     "KV offload v0.1.1 query count exceeds real op QUERY_COUNT: "
@@ -411,6 +418,8 @@ class OffloadKVCacheV0Manager:
                 flattened_topk = compact_topk_indices_cpu[decode_token_index].reshape(-1)
                 for topk_offset, token_pos_tensor in enumerate(topk_indices_cpu[decode_token_index].reshape(-1)):
                     token_pos = int(token_pos_tensor.item())
+                    if token_pos < 0:
+                        continue
                     flattened_topk[topk_offset] = token_pos_to_slot[token_pos]
 
             state.last_query_slots.copy_(slot_out)
@@ -597,7 +606,9 @@ class OffloadKVCacheV0Manager:
             flattened_topk = topk_indices_cpu[decode_token_index].reshape(-1)
             for token_pos_tensor in flattened_topk:
                 token_pos = int(token_pos_tensor.item())
-                if token_pos < 0 or token_pos >= key_len or token_pos >= self.index_size:
+                if token_pos < 0:
+                    continue
+                if token_pos >= key_len or token_pos >= self.index_size:
                     raise ValueError(
                         "KV offload v0.1.1 compact SFA topk token is outside supported key range: "
                         f"token_pos={token_pos}, key_len={key_len}, index_size={self.index_size}"

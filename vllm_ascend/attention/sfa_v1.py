@@ -1265,8 +1265,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         sfa_attn_metadata = attn_metadata
         sfa_actual_seq_lengths_key = actual_seq_lengths_key
         if offload_kv_cache_v0 is not None:
-            state_name = getattr(attn_metadata.attn_state, "name", str(attn_metadata.attn_state))
-            if offload_kv_cache_v0.compact_sfa_enabled is True and state_name == "DecodeOnly":
+            is_decode_only = attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+            if offload_kv_cache_v0.compact_sfa_enabled is True and is_decode_only:
                 compact_sfa_inputs = offload_kv_cache_v0.prepare_compact_sfa_inputs(
                     layer_name=layer_name,
                     kv_cache=kv_cache,

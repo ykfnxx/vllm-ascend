@@ -19,6 +19,33 @@ class AscendSFACompactStaticTest(unittest.TestCase):
         self.assertIn("sfa_topk_indices", source)
         self.assertIn("sfa_attn_metadata", source)
 
+    def test_compact_sfa_routes_decode_by_attention_state_enum(self):
+        source = (REPO_ROOT / "vllm_ascend/attention/sfa_v1.py").read_text()
+
+        self.assertIn("attn_metadata.attn_state == AscendAttentionState.DecodeOnly", source)
+        self.assertNotIn('state_name == "DecodeOnly"', source)
+
+    def test_compact_sfa_uses_current_decode_position_for_key_range(self):
+        source = (REPO_ROOT / "vllm_ascend/attention/offload_kv_cache_v0.py").read_text()
+        compact_pos = source.index("def prepare_compact_sfa_inputs")
+        collect_pos = source.index("def _collect_compact_query_tokens")
+        compact_source = source[compact_pos:collect_pos]
+
+        self.assertIn("attn_metadata.token_positions_cpu", compact_source)
+        self.assertIn("max(key_len, current_key_len)", compact_source)
+        self.assertNotIn("supported prefill range", source)
+
+    def test_compact_sfa_preserves_negative_topk_sentinel(self):
+        source = (REPO_ROOT / "vllm_ascend/attention/offload_kv_cache_v0.py").read_text()
+        compact_pos = source.index("def prepare_compact_sfa_inputs")
+        collect_pos = source.index("def _collect_compact_query_tokens")
+        prepare_source = source[compact_pos:collect_pos]
+        collect_source = source[collect_pos:source.index("def _prepare_query_index")]
+
+        self.assertIn("if token_pos < 0:\n                        continue", prepare_source)
+        self.assertIn("if token_pos < 0:\n                    continue", collect_source)
+        self.assertIn("if token_pos >= key_len or token_pos >= self.index_size", collect_source)
+
     def test_compact_sfa_envs_are_declared(self):
         source = (REPO_ROOT / "vllm_ascend/envs.py").read_text()
 
