@@ -59,6 +59,7 @@ from vllm_ascend.utils import (
     enable_sp,
     get_ascend_device_type,
     register_ascend_customop,
+    set_dsa_mgr_worker,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -96,6 +97,18 @@ class NPUWorker(WorkerBase):
         from vllm_ascend.utils import adapt_patch
 
         adapt_patch()
+        from vllm_ascend.dsa_sparse.dsa_config import (
+            attach_dsa_sparse_cache_attrs,
+            is_dsa_sparse_config_enabled,
+        )
+
+        attach_dsa_sparse_cache_attrs(vllm_config)
+        if is_dsa_sparse_config_enabled(vllm_config):
+            from vllm_ascend.patch.dsa_sparse.patch_runtime import (
+                install_dsa_runtime_patches,
+            )
+
+            install_dsa_runtime_patches()
 
         # Register ops when worker init.
         from vllm_ascend import ops
@@ -136,6 +149,7 @@ class NPUWorker(WorkerBase):
 
         self.use_v2_model_runner = envs_vllm.VLLM_USE_V2_MODEL_RUNNER
         self._pp_send_work: list[Handle] = []
+        self.dsa_mgr_worker = None
 
         ascend_compilation_config = get_ascend_config().ascend_compilation_config
         if ascend_compilation_config.enable_npugraph_ex and ascend_compilation_config.enable_static_kernel:
@@ -323,6 +337,28 @@ class NPUWorker(WorkerBase):
         else:
             self.model_runner = NPUModelRunner(self.vllm_config, self.device)
 
+        from vllm_ascend.dsa_sparse.dsa_config import is_dsa_sparse_config_enabled
+
+        if is_dsa_sparse_config_enabled(self.vllm_config):
+            from vllm_ascend.dsa_sparse.dsa_ascend_hot_kv_store import (
+                create_dsa_hot_kv_store,
+            )
+            from vllm_ascend.dsa_sparse.dsa_ascend_ops_backend import (
+                AscendDSAOpsBackend,
+            )
+            from vllm_ascend.dsa_sparse.dsa_sparse import DSASparseV1
+            from vllm_ascend.dsa_sparse.dsa_types import DSASparseRole
+
+            self.dsa_mgr_worker = DSASparseV1(
+                self.vllm_config,
+                DSASparseRole.WORKER,
+                dram_store=create_dsa_hot_kv_store(self.vllm_config),
+                ops_backend=AscendDSAOpsBackend(),
+                resident_device=self.device,
+            )
+            set_dsa_mgr_worker(self.dsa_mgr_worker)
+            self.model_runner.set_dsa_mgr(self.dsa_mgr_worker)
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -496,7 +532,14 @@ class NPUWorker(WorkerBase):
         return {self.rank: metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        return self.model_runner.get_kv_cache_spec()
+        kv_cache_spec = self.model_runner.get_kv_cache_spec()
+        from vllm_ascend.dsa_sparse.dsa_config import is_dsa_sparse_config_enabled
+
+        if is_dsa_sparse_config_enabled(self.vllm_config):
+            from vllm.v1.kv_cache_interface import IndexerKVSpec
+
+            assert any(isinstance(spec, IndexerKVSpec) for spec in kv_cache_spec.values())
+        return kv_cache_spec
 
     def update_max_model_len(self, max_model_len: int) -> None:
         """Update max_model_len after auto-fit to NPU memory.

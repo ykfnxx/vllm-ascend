@@ -1,0 +1,1087 @@
+"""DSA 稀疏卸载的主生命周期管理器。
+
+本文件保留 DSA 稀疏卸载的运行时主流程：scheduler/worker 两侧请求状态、
+slot 估算、model-forward 元数据汇聚、attention_begin/after_indexer/
+attention_finished hook，以及和图模式 capture/replay 的生命周期衔接。
+
+不再把所有辅助逻辑都堆在这里：
+- dsa_attention_layout.py 负责从 attention metadata 中抽取 forward 共享布局。
+- dsa_batch_tensor_utils.py 负责把 request rows 物化成张量/block-table。
+- dsa_forward_batch.py 负责一轮 forward 的 batch 数据结构和构造。
+- dsa_graph_buffers.py 负责当前 V1 图模式下需要稳定地址的持久 buffer。
+
+后续继续拆分时，应优先围绕元数据职责边界做小步整理；DSASparseBase 和
+DSASparseV1 仍作为算法核心，保留 scheduler/worker 侧主要 hook 的入口。
+"""
+
+from __future__ import annotations
+
+from typing import Any, Optional
+import math
+
+import torch
+from vllm_ascend.dsa_sparse.dsa_hot_kv_store_core import (
+    BlockType, DSAHotKVStore)
+from vllm_ascend.dsa_sparse.dsa_forward_batch import (
+    DSAForwardLayerBatch, DSAForwardSparseDecodeBatch, DSALayerRuntimeBatch,
+    DSALayerSparseDecodeBatch, DSAModelForwardMeta,
+    _build_forward_batches_from_dsa_meta)
+from vllm_ascend.dsa_sparse.dsa_graph_buffers import DSAGraphBuffersMixin
+from vllm_ascend.dsa_sparse.dsa_attention_layout import (
+    materialize_query_position_metadata, slice_position_row,
+    resolve_full_block_table_tensor, select_forward_shared_metadata)
+from vllm_ascend.dsa_sparse.dsa_resident_pool import (
+    DSAResidentLayerResourceView, DSAResidentTokenPool)
+
+from vllm.v1.core.sched.output import SchedulerOutput
+
+from vllm.config import VllmConfig
+
+from vllm.logger import init_logger
+from vllm.v1.request import Request
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm_ascend.dsa_sparse.dsa_layer_cache_zones import (
+    DSALayerCacheRegistry, LayerCacheZones, resolve_layer_cache_zones)
+from vllm_ascend.dsa_sparse.dsa_req_meta import ReqType
+from vllm_ascend.dsa_sparse.dsa_types import (
+    DSADecodeRowMode, DSASparseRole, INVALID_SLOT, ReqStage)
+from vllm_ascend.dsa_sparse.dsa_spec_utils import (
+    is_dsa_indexer_spec,
+    is_dsa_mla_resident_spec,
+)
+from vllm.forward_context import ForwardContext
+
+from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+
+logger = init_logger(__name__)
+
+
+def _query_position_row_is_empty(row) -> bool:
+    if row is None:
+        return True
+    if torch.is_tensor(row):
+        return int(row.numel()) == 0
+    return len(row) == 0
+
+
+def _reset_indexer_score_controls(attn_metadata) -> None:
+    attn_metadata.dsa_score_topk_k = None
+    attn_metadata.dsa_indexer_seq_lens = None
+    attn_metadata.dsa_selection_topk_indices = None
+    attn_metadata.dsa_full_batch_selection_topk_indices = None
+
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    if value <= 0:
+        return 0
+    return int(math.ceil(value / multiple) * multiple)
+
+
+class DSASparseBase:
+    """DSA sparse offload algorithm base shared by scheduler and worker.
+
+    DSASparseBase owns the common algorithm configuration and invariants:
+    block size, rounded sparse budget, sparse enable threshold, and the
+    per-forward batch placeholders consumed by eager and graph paths.
+
+    Keep this base class focused on the algorithm contract shared by future
+    DSA sparse variants.  Execution-mode helpers, such as FULL graph stable
+    buffers, should be added by concrete implementations instead of being a
+    hard dependency of every DSA algorithm base.
+    """
+
+    def __init__(self, vllm_config: VllmConfig, role):
+        self._vllm_config = vllm_config
+        self._role = role
+        self._vllm_blk_size = vllm_config.cache_config.block_size
+        configured_sparse_budget = int(
+            vllm_config.cache_config.dsa_hbm_sparse_budget)
+        rounded_sparse_budget = _round_up_to_multiple(
+            configured_sparse_budget, self._vllm_blk_size)
+        if (configured_sparse_budget > 0
+                and rounded_sparse_budget != configured_sparse_budget):
+            logger.warning(
+                "DSA hbm_sparse_budget=%s is not aligned to block_size=%s; "
+                "rounding up to %s",
+                configured_sparse_budget, self._vllm_blk_size,
+                rounded_sparse_budget)
+        self._hbm_sparse_budget_tokens = rounded_sparse_budget
+        # DSA sparse decode is only beneficial when the full sequence exceeds
+        # HBM capacity (budget blocks + one tail block). Shorter sequences fit
+        # entirely in HBM and use standard dense attention.
+        self._enable_dsa_prompt_len = (
+            self._hbm_sparse_budget_tokens + self._vllm_blk_size)
+        self.dsa_meta = None
+        self.forward_sparse_decode_batch = DSAForwardSparseDecodeBatch.empty()
+        self.forward_layer_batch = DSAForwardLayerBatch.empty()
+        self._forward_sparse_decode_attention_indices_tensor = None
+        # FULL graph captures tensor addresses, not Python objects. DSA graph
+        # paths therefore swap the normal per-forward sparse batch with
+        # phase-specific persistent buffers and only refresh their contents
+        # before replay.
+        self._graph_row_mode_decode_batches: dict[
+            tuple[str, int], DSAForwardSparseDecodeBatch] = {}
+        self._graph_layer_id_tensors: dict[str, torch.Tensor] = {}
+
+    def _is_sparse_cache_enabled(self) -> bool:
+        return bool(self._vllm_config.cache_config.enable_dsa_sparse_cache)
+
+    def _get_fixed_sparse_budget_tokens(self, candidate_tokens: int) -> int:
+        configured_budget = int(self._hbm_sparse_budget_tokens)
+        if configured_budget <= 0 or candidate_tokens <= 0:
+            return 0
+        block_size = self._vllm_blk_size
+        budget_tokens = _round_up_to_multiple(configured_budget, block_size)
+        return max(block_size, min(budget_tokens, candidate_tokens))
+
+
+class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
+    """Current gather-selection based DSA sparse offload implementation.
+
+    DSASparseV1 keeps the scheduler/worker hooks in the algorithm class and
+    opts into DSAGraphBuffersMixin because this concrete implementation supports
+    row-mode decode graph replay.  A future DSA variant may choose a
+    different graph strategy without changing DSASparseBase.
+    """
+
+    def __init__(self,
+                 vllm_config,
+                 role,
+                 dram_store: DSAHotKVStore | None = None,
+                 ops_backend: Any | None = None,
+                 resident_device: torch.device | str | None = None):
+        super().__init__(vllm_config, role)
+
+        if self._role == DSASparseRole.SCHEDULER:
+            return
+
+        if dram_store is None:
+            raise RuntimeError("DSA sparse worker requires a hot DRAM store")
+        self.dsa_hot_kv_store = dram_store
+        if ops_backend is None:
+            raise RuntimeError(
+                "DSA sparse worker requires an Ascend gather-selection backend")
+        self.ops_backend = ops_backend
+
+        self.total_num_hidden_layers = (
+            vllm_config.model_config.get_total_num_hidden_layers()
+        )
+        resident_budget_tokens = max(1, int(self._hbm_sparse_budget_tokens or 0))
+        self.resident_token_pool = DSAResidentTokenPool(
+            max_reqs=int(vllm_config.cache_config.dsa_max_active_reqs),
+            num_layers=self.total_num_hidden_layers,
+            max_tokens=resident_budget_tokens,
+            device=resident_device,
+        )
+        self.resident_token_pool.ensure_resident_slot_token_statuses(
+            topk=resident_budget_tokens)
+
+        self.layer_cache_registry = DSALayerCacheRegistry(
+            num_layers=self.total_num_hidden_layers)
+        self.full_dump_done_by_pool = torch.zeros(
+            (
+                int(vllm_config.cache_config.dsa_max_active_reqs),
+                self.total_num_hidden_layers,
+            ),
+            dtype=torch.bool,
+            device="cpu",
+        )
+
+
+    def _get_full_attention_group_id(self, kv_cache_config) -> int:
+        # DSA residency/load applies to the MLA/full cache group, never the
+        # selector-only indexer group.
+        full_group_ids = [
+            i for i, group in enumerate(kv_cache_config.kv_cache_groups)
+            if is_dsa_mla_resident_spec(group.kv_cache_spec)
+        ]
+        if not full_group_ids:
+            raise RuntimeError(
+                "DSA requires an MLA/full resident KVSpec group for "
+                "full-cache residency")
+        return full_group_ids[0]
+
+    def _get_indexer_group_id(self, kv_cache_config) -> int:
+        # The indexer cache is a separate dense KV group so its block table and
+        # budget do not collapse back into MLA/full-cache sparse semantics.
+        indexer_group_ids = [
+            i for i, group in enumerate(kv_cache_config.kv_cache_groups)
+            if is_dsa_indexer_spec(group.kv_cache_spec)
+        ]
+        if not indexer_group_ids:
+            raise RuntimeError("DSA requires an IndexerKVSpec group for indexer residency")
+        return indexer_group_ids[0]
+
+    def _get_group_num_free_blocks(self, block_pool, group_id: int) -> int:
+        return block_pool.block_pools[group_id].get_num_free_blocks()
+
+    def get_full_attention_group_id(self, kv_cache_config) -> int:
+        return self._get_full_attention_group_id(kv_cache_config)
+
+    def should_release_full_cache_after_prefill(self, request) -> bool:
+        if request.num_prompt_tokens <= self._enable_dsa_prompt_len:
+            return False
+        # Once sparse cache is enabled, completed prefill MLA full blocks must
+        # enter the DRAM-resident path before sparse decode can begin.
+        return request.num_computed_tokens >= request.num_prompt_tokens
+
+    def release_prefill_full_cache_except_tail(
+        self,
+        kv_cache_manager: KVCacheManager,
+        request: Request,
+    ) -> bool:
+        """Release dense prefill full-cache blocks while keeping an unfull tail.
+
+        DSA sparse decode reuses the prefill tail block as the final block in
+        the full/MLA block table. Releasing the entire full-cache group at the
+        prefill/decode boundary would also free that tail, forcing the first
+        decode step to allocate an empty replacement block and losing the tail
+        KV data.
+        """
+        full_group_id = self._get_full_attention_group_id(
+            kv_cache_manager.kv_cache_config)
+        full_manager = kv_cache_manager.coordinator.single_type_managers[
+            full_group_id]
+        request_id = request.request_id
+        req_blocks = full_manager.req_to_blocks.get(request_id)
+        if not req_blocks:
+            return False
+
+        preserve_tail_block = request.num_prompt_tokens % self._vllm_blk_size != 0
+        preserved_tail_block = self._release_full_blocks_except_tail(
+            full_manager, request_id, preserve_tail_block)
+        self._append_preserved_tail_block(
+            full_manager, request_id, preserved_tail_block)
+        return True
+
+    @staticmethod
+    def _select_forward_shared_attn_metadata(attn_metadata):
+        """Return layer-invariant attention metadata for this model forward.
+
+        Ascend SFA may pass split metadata for indexer and full/MLA cache
+        groups. DSA's forward-level query layout must come from full/MLA
+        metadata when available because it owns the resident sparse plane.
+        """
+        return select_forward_shared_metadata(attn_metadata)
+
+    def build_dsa_meta(
+        self,
+        scheduler_output: SchedulerOutput,
+        requests: dict[str, CachedRequestState],
+        input_batch: InputBatch,
+        attn_metadata,
+        kv_cache_config,
+        force_decode_row_mode_score_topk: int = 0,
+    ):
+        """Build DSA request metadata once for the current model forward.
+
+        This is the boundary between vLLM's scheduler/input batch view and the
+        DSA sparse-cache runtime. It only performs layer-invariant assembly:
+        - acquire / bind resident-pool rows for requests in this forward;
+        - snapshot each request's full/indexer block tables and query ranges;
+        - build tensorized forward batches consumed by per-layer hooks.
+
+        It intentionally does not compute indexer scores, choose replacement
+        tokens, move KV cache data, or update layer resident mappings. Those
+        actions happen later in the attention hooks and backend DSA ops.
+        """
+        self.dsa_meta = DSAModelForwardMeta()
+        self.dsa_meta.full_block_table_tensor = (
+            resolve_full_block_table_tensor(attn_metadata))
+
+        attn_metadata = self._select_forward_shared_attn_metadata(
+            attn_metadata)
+
+        full_attention_group_id = self._get_full_attention_group_id(kv_cache_config)
+        indexer_group_id = self._get_indexer_group_id(kv_cache_config)
+
+        query_position_metadata = materialize_query_position_metadata(
+            attn_metadata)
+        cum_query_lens = query_position_metadata["cum_query_lens"]
+        indexer_positions = query_position_metadata["indexer_positions"]
+        resident_positions = query_position_metadata["resident_positions"]
+        sparse_budgets = scheduler_output.req_dsa_sparse_budget_tokens
+        req_stages = scheduler_output.req_dsa_stage
+
+        for (req_id, num_scheduled_tokens) in scheduler_output.num_scheduled_tokens.items():
+            req_state = requests[req_id]
+            context_full_blk_hashes = list(
+                req_state.context_full_blk_hashes)
+            expected_full_blocks = req_state.num_tokens // self._vllm_blk_size
+            if len(context_full_blk_hashes) < expected_full_blocks:
+                raise RuntimeError(
+                    "DSA full-block hash metadata is incomplete for request "
+                    f"{req_id}: expected_at_least={expected_full_blocks}, "
+                    f"actual={len(context_full_blk_hashes)}, "
+                    f"num_tokens={req_state.num_tokens}, "
+                    f"block_size={self._vllm_blk_size}. The worker must receive "
+                    "Request.block_hashes from the scheduler at vLLM block "
+                    "granularity.")
+
+            req_index = input_batch.req_id_to_index[req_id]
+            req_block_ids = req_state.block_ids
+            if full_attention_group_id >= len(req_block_ids):
+                raise RuntimeError(
+                    f"DSA build_dsa_meta missing full group block ids for req {req_id}: "
+                    f"group={full_attention_group_id}, total_groups={len(req_block_ids)}")
+            if indexer_group_id >= len(req_block_ids):
+                raise RuntimeError(
+                    f"DSA build_dsa_meta missing indexer group block ids for req {req_id}: "
+                    f"group={indexer_group_id}, total_groups={len(req_block_ids)}")
+            query_end_loc = cum_query_lens[req_index]
+            query_start_loc = 0 if req_index == 0 else cum_query_lens[req_index - 1]
+            query_len = query_end_loc - query_start_loc
+            resident_valid_seq_len = (
+                scheduler_output.req_dsa_resident_valid_seq_len[req_id])
+            num_output_tokens = len(req_state.output_token_ids)
+            sparse_budget_tokens = int(sparse_budgets[req_id])
+            req_stage = ReqStage(req_stages[req_id])
+            sparse_decode_enabled = (
+                req_stage.is_sparse_decode
+                and sparse_budget_tokens > 0
+                and num_output_tokens > 0
+                and int(resident_valid_seq_len) >= 0
+            )
+            query_positions_needed = (num_output_tokens > 0)
+            dense_query_positions = []
+            resident_query_positions = []
+            if query_positions_needed:
+                dense_query_positions = slice_position_row(
+                    indexer_positions, query_start_loc, query_len)
+                resident_query_positions = slice_position_row(
+                    resident_positions, query_start_loc, query_len)
+            if _query_position_row_is_empty(resident_query_positions):
+                resident_query_positions = dense_query_positions
+            resident_pool_idx = self.resident_token_pool.acquire(req_id)
+            self.dsa_hot_kv_store.bind_request_pool_index(
+                req_id, resident_pool_idx)
+
+            # Query positions are recorded in both dense/indexer and resident
+            # spaces because sparse SFA consumes resident positions after the
+            # replacement plan is committed.
+            self.dsa_meta.add_request_meta(request_id=req_id,
+                                       index_in_batch=req_index,
+                                       num_prompt_tokens=req_state.num_prompt_tokens,
+                                       num_output_tokens=num_output_tokens,
+                                       num_scheduled_tokens=num_scheduled_tokens,
+                                       num_computed_tokens=req_state.num_computed_tokens,
+                                       # Prefill/chunked prefill does not have
+                                       # a sparse resident window yet.
+                                       resident_valid_seq_len=resident_valid_seq_len,
+                                       vllm_budget_block_ids=req_block_ids[full_attention_group_id],
+                                       block_size=self._vllm_blk_size,
+                                       query_start_loc=query_start_loc,
+                                       query_len=query_len,
+                                       req_context_full_blk_hashes=context_full_blk_hashes,
+                                       blk_pool_mgr=self.dsa_hot_kv_store,
+                                       dense_query_positions=dense_query_positions,
+                                       resident_query_positions=resident_query_positions,
+                                       stage=req_stage,
+                                       dsa_sparse_enabled=sparse_decode_enabled,
+                                       dsa_sparse_budget_tokens=sparse_budget_tokens,
+                                       resident_pool_idx=resident_pool_idx,
+                                       )
+        (
+            self.forward_sparse_decode_batch,
+            self.forward_layer_batch,
+        ) = _build_forward_batches_from_dsa_meta(
+            self.dsa_meta,
+            tensor_device=self.resident_token_pool.device,
+            force_decode_row_mode_score_topk=(
+                force_decode_row_mode_score_topk),
+        )
+        self._forward_sparse_decode_attention_indices_tensor = None
+
+    """
+    EngineCore Scheduler侧逻辑
+    """
+    def request_begin(self, request_id, prompt_token_ids):
+        token_id_count = (
+            len(prompt_token_ids) if prompt_token_ids is not None else 0)
+        logger.debug(
+            "========== DSA TOKENIZED PROMPT =========="
+            " req_id=%s prompt_token_id_len=%s block_size=%s "
+            "sparse_threshold=%s",
+            request_id,
+            token_id_count,
+            self._vllm_blk_size,
+            self._enable_dsa_prompt_len,
+        )
+
+    def request_finished_in_scheduler(self, request_id):
+        pass
+
+    """
+    Worker侧逻辑
+    """
+    def _mark_full_dump_done(
+        self,
+        resident_pool_indices: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        if int(resident_pool_indices.numel()) == 0:
+            return
+        layer_id = int(layer_id)
+        pool_indices = resident_pool_indices.to(
+            device=self.full_dump_done_by_pool.device, dtype=torch.long)
+        valid_mask = (
+            (pool_indices >= 0)
+            & (pool_indices < int(self.full_dump_done_by_pool.shape[0]))
+        )
+        if bool(valid_mask.any().item()):
+            self.full_dump_done_by_pool[
+                pool_indices[valid_mask], layer_id] = True
+
+    def _clear_full_dump_done(self, request_id: ReqType) -> None:
+        resident_pool_idx = self.resident_token_pool.get_index(request_id)
+        if resident_pool_idx is None:
+            return
+        self.full_dump_done_by_pool[int(resident_pool_idx)].fill_(False)
+
+    def get_layer_resident_resource_view_by_index(
+        self,
+        layer_id: int,
+        *,
+        pool_indices,
+    ) -> DSAResidentLayerResourceView:
+        return self.resident_token_pool.get_layer_resource_view_by_index(
+            pool_indices,
+            int(layer_id),
+        )
+
+    def _build_layer_runtime_batch(
+        self,
+        layer_name: str,
+        cache_zones: LayerCacheZones | None = None,
+    ) -> DSALayerRuntimeBatch:
+        layer_id = int(layer_name.split(".")[2])
+        if cache_zones is None:
+            cache_zones = self.layer_cache_registry.get(layer_id)
+        return self.forward_layer_batch.layer_runtime_batch(
+            layer_id=layer_id,
+            cache_zones=cache_zones,
+        )
+
+    def _ensure_layer_begin_sparse_decode_dump_ready(
+        self,
+        begin_batch: DSALayerRuntimeBatch,
+    ) -> None:
+        """Guard sparse decode against unfinished full-block dump.
+
+        Today's hot DRAM dump path is synchronous from the DSA Python runtime's
+        point of view: attention_finished calls dump_layer_blocks_for_requests()
+        inline, then marks this layer/request ready. This guard is therefore a
+        phase-order assertion, not a real async wait. If the dump path becomes
+        asynchronous, this bool table must be replaced by completion-driven
+        per-block/per-layer readiness, and full-cache block release must wait
+        on that completion before blocks can be recycled.
+        """
+        layer_id = begin_batch.layer_id
+        pool_indices = begin_batch.sparse_decode_guard_pool_indices_tensor.to(
+            device=self.full_dump_done_by_pool.device, dtype=torch.long)
+        valid_pool_mask = (
+            (pool_indices >= 0)
+            & (pool_indices < int(self.full_dump_done_by_pool.shape[0]))
+        )
+        ready_mask = torch.zeros_like(valid_pool_mask, dtype=torch.bool)
+        if bool(valid_pool_mask.any().item()):
+            ready_mask[valid_pool_mask] = self.full_dump_done_by_pool[
+                pool_indices[valid_pool_mask], layer_id]
+        if bool(ready_mask.all().item()):
+            return
+        first_bad = int((~ready_mask).nonzero(as_tuple=False)[0].item())
+        request_id = begin_batch.sparse_decode_guard_request_ids[first_bad]
+        raise RuntimeError(
+            f"DSA sparse decode requires prefill full dump to complete "
+            f"before shrinking full-cache blocks for req "
+            f"{request_id} layer {layer_id}")
+
+    def _build_layer_sparse_decode_batch(
+        self,
+        layer_name: str,
+        attn_metadata,
+    ) -> DSALayerSparseDecodeBatch:
+        forward_batch = self.forward_sparse_decode_batch
+        active_local_rows = getattr(
+            forward_batch, "active_local_row_indices_tensor", None)
+        if not torch.is_tensor(active_local_rows):
+            raise RuntimeError(
+                "DSA sparse decode batch is missing active local row indices")
+        # Row-mode GS always runs over the active decode rows: dense rows keep
+        # native full-cache semantics, sparse rows refresh resident metadata.
+        # The true sparse subset remains in sparse_row_mask_tensor and
+        # sparse_*row_indices_tensor for diagnostics and tests.
+        active_local_rows = active_local_rows.to(
+            device=forward_batch.resident_pool_indices_tensor.device,
+            dtype=torch.long).reshape(-1)
+        num_active_rows = int(active_local_rows.numel())
+
+        layer_id = int(layer_name.split(".")[2])
+        all_rows_active = (
+            num_active_rows
+            == int(forward_batch.resident_pool_indices_tensor.numel()))
+        if all_rows_active:
+            resident_pool_indices = forward_batch.resident_pool_indices_tensor
+            budget_lengths = forward_batch.budget_lengths_tensor
+        else:
+            resident_pool_indices = (
+                forward_batch.resident_pool_indices_tensor.index_select(
+                    0, active_local_rows))
+            budget_lengths = (
+                forward_batch.budget_lengths_tensor.index_select(
+                    0, active_local_rows))
+        resident_view = self.get_layer_resident_resource_view_by_index(
+            layer_id=layer_id,
+            pool_indices=resident_pool_indices,
+        )
+        blk_pool_mgr = forward_batch.blk_pool_mgr
+        cache_zones = self.layer_cache_registry.require(layer_id)
+
+        return DSALayerSparseDecodeBatch(
+            layer_id=layer_id,
+            resident_pool_indices_tensor=resident_pool_indices,
+            budget_lengths_tensor=budget_lengths,
+            resident_view=resident_view,
+            cache_zones=cache_zones,
+            blk_pool_mgr=blk_pool_mgr,
+            attention_indices_width=forward_batch.attention_indices_width,
+        )
+
+    def _apply_layer_sparse_decode_batch(
+        self,
+        layer_batch: DSALayerSparseDecodeBatch,
+        attn_metadata,
+    ):
+        layer_id = layer_batch.layer_id
+        if layer_batch.blk_pool_mgr is None:
+            raise RuntimeError(
+                "DSA gather-selection requires a DRAM block manager")
+        # SFA indices are HBM sparse-KV logical slots, not per-layer
+        # full-sequence topK token ids from lightning_indexer. Row-mode GS
+        # consumes the full active decode batch: dense rows keep the dense
+        # layout, sparse rows gather selected full-block tokens and append the
+        # resident tail.
+        prebuilt_attention_indices = (
+            self._forward_sparse_decode_attention_indices_tensor)
+        full_batch_topk = getattr(
+            attn_metadata, "dsa_full_batch_selection_topk_indices", None)
+        if not torch.is_tensor(full_batch_topk):
+            raise RuntimeError(
+                "DSA row-mode gather-selection requires full-batch "
+                "lightning-indexer topk indices aligned with decode rows; "
+                "the legacy sparse-only GS path is disabled.")
+        forward_batch = self.forward_sparse_decode_batch
+        nopek_dram_arena = layer_batch.blk_pool_mgr.get_arena(
+            layer_id, BlockType.NOPE_K)
+        ropek_dram_arena = layer_batch.blk_pool_mgr.get_arena(
+            layer_id, BlockType.ROPE_K)
+        resident_slot_token_status = (
+            self.resident_token_pool.get_resident_slot_token_status(
+                layer_id=layer_id,
+                topk=int(full_batch_topk.shape[-1]),
+            ))
+        gather_selection = self.ops_backend.gather_selection_update(
+            selection_topk_indices=full_batch_topk,
+            req_pool_entries=forward_batch.resident_pool_indices_tensor,
+            candidate_lens=forward_batch.candidate_lens_tensor,
+            selection_block_table=forward_batch.batch_hbm_block_table,
+            full_block_table=forward_batch.batch_dram_block_table,
+            nopek_cache_zone=layer_batch.cache_zones.nopek_cache_zone,
+            ropek_cache_zone=layer_batch.cache_zones.ropek_cache_zone,
+            nopek_dram_arena=nopek_dram_arena,
+            ropek_dram_arena=ropek_dram_arena,
+            resident_slot_token_status=resident_slot_token_status,
+            query_start_locs=forward_batch.query_start_locs_tensor,
+            query_lens=forward_batch.query_lens_tensor,
+            query_position_rows=forward_batch.query_position_rows_tensor,
+            tail_valid_token_counts=(
+                forward_batch.tail_valid_token_counts_tensor),
+            resident_tail_starts=(
+                forward_batch.resident_tail_starts_tensor),
+            budget_lengths=forward_batch.budget_lengths_tensor,
+            attention_indices_width=layer_batch.attention_indices_width,
+            layer_id=layer_id,
+            existing_attention_indices=getattr(
+                attn_metadata, "dsa_sparse_attention_indices", None),
+            prebuilt_attention_indices=prebuilt_attention_indices,
+            row_modes=forward_batch.row_modes_tensor,
+        )
+        if not gather_selection.resident_update_committed:
+            raise RuntimeError(
+                "DSA gather-selection backend did not commit selection "
+                "metadata")
+        if gather_selection.attention_indices is None:
+            raise RuntimeError(
+                "DSA gather-selection backend did not build attention "
+                "indices")
+
+        sparse_attention_indices = gather_selection.attention_indices
+        self._commit_gather_selection_resident_metadata(layer_batch)
+        attention_indices = sparse_attention_indices
+        if prebuilt_attention_indices is None:
+            self._forward_sparse_decode_attention_indices_tensor = (
+                attention_indices)
+        attn_metadata.dsa_sparse_attention_indices = attention_indices
+        return attention_indices
+
+    def _commit_gather_selection_resident_metadata(
+        self,
+        layer_batch: DSALayerSparseDecodeBatch,
+    ) -> None:
+        """Mirror gather-selection readiness into resident metadata.
+
+        The gather-selection op owns the KV materialization/status state, but
+        the framework still uses resident counts for graph admission and
+        request lifecycle diagnostics. The selected token ids are no longer
+        consumed by this Python path; row-mode GS may pass full-batch active
+        rows while sparse-only topk remains compact, so only the active row
+        metadata is validated here.
+        """
+        pool_indices = layer_batch.resident_pool_indices_tensor.reshape(-1).to(
+            device=layer_batch.resident_view.device,
+            dtype=torch.long,
+        )
+        row_count = int(pool_indices.numel())
+        if row_count <= 0:
+            return
+
+        budget_lengths = layer_batch.budget_lengths_tensor.reshape(-1).to(
+            device=layer_batch.resident_view.device,
+            dtype=torch.long,
+        ).clamp(min=0, max=int(layer_batch.resident_view.max_tokens))
+        if int(budget_lengths.numel()) != row_count:
+            raise RuntimeError(
+                "gather-selection budget row count must match DSA active "
+                f"rows: budget_lengths={tuple(budget_lengths.shape)}, "
+                f"rows={row_count}")
+
+        row_modes = getattr(self.forward_sparse_decode_batch,
+                            "row_modes_tensor", None)
+        counts = layer_batch.resident_view.counts
+        target_counts = budget_lengths.to(dtype=counts.dtype)
+        if torch.is_tensor(row_modes) and int(row_modes.numel()) == row_count:
+            sparse_mask = row_modes.reshape(-1).to(
+                device=layer_batch.resident_view.device,
+                dtype=torch.long,
+            ) == int(DSADecodeRowMode.SPARSE)
+            # This function runs inside FULL graph capture/replay.  Do not use
+            # .item(), boolean Python branches, or dynamic boolean indexing
+            # here: those trigger D2H sync/copy and are illegal while the
+            # stream is captured.  Dense rows preserve their previous resident
+            # counts; sparse rows receive the committed budget length.
+            current_counts = counts.index_select(0, pool_indices)
+            target_counts = torch.where(
+                sparse_mask,
+                target_counts,
+                current_counts,
+            )
+
+        counts.index_copy_(
+            0,
+            pool_indices,
+            target_counts,
+        )
+
+    # Layer-level DSA hook before MLA/SFA.
+    # Current responsibilities:
+    # 1. bind this layer's cache zones for later dump/load;
+    # 2. guard sparse decode until this layer's prefill full-block dump is ready.
+    def attention_begin(self, layer_name, forward_context: ForwardContext):
+        layer_id = int(layer_name.split(".")[2])
+        layer_cache_zones = self.layer_cache_registry.get(layer_id)
+        if layer_cache_zones is None:
+            resolved_cache_zones = resolve_layer_cache_zones(layer_name,
+                                                             forward_context)
+            # Cache zones are worker-lifetime resources. Resolve them only on
+            # first sight; later forwards use the registry fast path to avoid
+            # repeated Python object traversal and tensor identity checks.
+            layer_cache_zones = self.layer_cache_registry.bind_or_validate(
+                layer_id, resolved_cache_zones)
+        begin_batch = self._build_layer_runtime_batch(
+            layer_name,
+            cache_zones=layer_cache_zones,
+        )
+        if int(begin_batch.sparse_decode_guard_pool_indices_tensor.numel()) > 0:
+            self._ensure_layer_begin_sparse_decode_dump_ready(begin_batch)
+
+    def _dump_layer_full_blocks_to_dram_batch(
+        self,
+        layer_batch: DSALayerRuntimeBatch,
+    ) -> None:
+        """Synchronously dump newly completed MLA full blocks for one layer.
+
+        The dump rows are built once per model forward, while the actual cache
+        tensors are layer-specific. This hook supplies the current layer's
+        nopek/ropek cache zones and lets DSAHotKVStore copy those full blocks to
+        hot DRAM. Only after that call returns do we mark prefill dump readiness
+        for sparse decode. Decode full-block dumps also go through this path,
+        but the readiness bit below is only the prefill->decode phase guard.
+        """
+        dump_tables = layer_batch.full_block_dump_tables
+        if dump_tables.request_ids:
+            if dump_tables.blk_pool_mgr is None:
+                raise RuntimeError(
+                    "DSA full-block dump batch has rows but no DRAM store")
+            layer_id = layer_batch.layer_id
+            cache_zones = layer_batch.cache_zones
+            if cache_zones is None:
+                raise RuntimeError(
+                    f"DSA layer cache registry has no zones for layer "
+                    f"{layer_id}")
+            dump_tables.blk_pool_mgr.dump_layer_blocks_for_requests(
+                layer_id=layer_id,
+                request_ids=dump_tables.request_ids,
+                request_pool_indices=dump_tables.request_pool_indices,
+                block_hash_rows=dump_tables.block_hash_rows,
+                block_id_rows=dump_tables.block_id_rows,
+                logical_block_index_rows=dump_tables.logical_block_index_rows,
+                nopek_dev_cache_zone=cache_zones.nopek_cache_zone,
+                ropek_dev_cache_zone=cache_zones.ropek_cache_zone,
+            )
+
+        self._mark_full_dump_done(
+            layer_batch.prefill_done_pool_indices_tensor,
+            layer_batch.layer_id,
+        )
+
+    # Layer-level DSA hook after MLA/SFA.
+    # Current responsibilities:
+    # 1. dump this layer's prefill/decode newly-full MLA blocks to hot DRAM;
+    # 2. mark prefill dump readiness for later sparse decode.
+    # Token-level sparse selection/materialization is handled by after_indexer.
+    def attention_finished(self, layer_name: str):
+        layer_batch = self._build_layer_runtime_batch(layer_name)
+        self._dump_layer_full_blocks_to_dram_batch(layer_batch)
+
+    def prepare_indexer_score_controls(self, layer_name: str, attn_metadata):
+        # This hook prepares the Python-side controls around the document-level
+        # dsa_compute_score_pseudo operator. The dense score tensor itself is
+        # produced by the Ascend attention backend and consumed by
+        # the Ascend gather-selection backend implementation.
+        _reset_indexer_score_controls(attn_metadata)
+
+        if not self.forward_sparse_decode_batch:
+            return
+
+        score_topk_k = self.forward_sparse_decode_batch.score_topk_k
+
+        if score_topk_k > 0:
+            setattr(attn_metadata, "dsa_score_topk_k", score_topk_k)
+
+
+    # Token-level sparse IO runs after the indexer has produced dense scores.
+    def after_indexer(self, layer_name: str, attn_metadata):
+        if hasattr(attn_metadata, "dsa_sparse_attention_indices"):
+            delattr(attn_metadata, "dsa_sparse_attention_indices")
+
+        layer_batch = self._build_layer_sparse_decode_batch(
+            layer_name, attn_metadata)
+        if not layer_batch:
+            return None
+
+        return self._apply_layer_sparse_decode_batch(layer_batch,
+                                                     attn_metadata)
+
+    def request_finished_in_worker(self, request_id):
+        self._clear_full_dump_done(request_id)
+        self.resident_token_pool.release(request_id)
+        self.dsa_hot_kv_store.release_request(request_id)
+
+    def request_preempted_in_worker(self, request_id):
+        self._clear_full_dump_done(request_id)
+        if self.resident_token_pool.get_index(request_id) is not None:
+            self.resident_token_pool.clear_request(request_id)
+
+    def execute_begin(self, scheduler_output: SchedulerOutput):
+        pass
+
+    def execute_finished(self):
+        pass
+
+    def _get_sparse_tail_slots_need(self, request: Request) -> int:
+        total_tokens = int(request.num_tokens)
+        if total_tokens <= 0:
+            return 0
+        full_blocks_before_tail = (total_tokens - 1) // self._vllm_blk_size
+        return total_tokens - full_blocks_before_tail * self._vllm_blk_size
+
+    def _should_preserve_sparse_tail_block(
+        self,
+        request: Request,
+        dense_new_tokens: int,
+    ) -> bool:
+        previous_num_tokens = max(0, int(request.num_tokens) - int(dense_new_tokens))
+        return previous_num_tokens % self._vllm_blk_size != 0
+
+    def _release_full_blocks_except_tail(
+        self,
+        full_manager,
+        request_id: ReqType,
+        preserve_tail_block: bool,
+    ) -> KVCacheBlock | None:
+        req_blocks = full_manager.req_to_blocks.get(request_id)
+        if not req_blocks:
+            return None
+
+        tail_block = req_blocks[-1] if preserve_tail_block else None
+        full_blocks_to_release = req_blocks[:-1]
+        if not preserve_tail_block:
+            full_blocks_to_release = req_blocks
+        full_manager.req_to_blocks[request_id] = []
+        if full_blocks_to_release:
+            full_manager._free_blocks_to_pool(
+                reversed(full_blocks_to_release))
+        full_manager.num_cached_block.pop(request_id, None)
+        return tail_block
+
+    @staticmethod
+    def _append_preserved_tail_block(
+        full_manager,
+        request_id: ReqType,
+        preserved_tail_block: KVCacheBlock | None,
+    ) -> None:
+        if preserved_tail_block is None:
+            return
+        req_blocks = full_manager.req_to_blocks[request_id]
+        req_blocks.append(preserved_tail_block)
+
+    def dsa_alloc_slots_wrap(
+        self,
+        kv_cache_manager: KVCacheManager,
+        request: Request,
+        resident_valid_seq_len: int,
+        num_new_tokens: int,
+        num_new_computed_tokens: int = 0,
+        new_computed_blocks: Optional[KVCacheBlocks] = None,
+        num_lookahead_tokens: int = 0,
+        num_external_computed_tokens: int = 0,
+        delay_cache_blocks: bool = False,
+        num_encoder_tokens: int = 0,
+    ) -> KVCacheBlocks | None:
+        def allocate_dense() -> KVCacheBlocks | None:
+            request.dsa_next_req_stage = (
+                ReqStage.PREFILL if request.num_output_tokens == 0
+                else ReqStage.DENSE_DECODE)
+            request.dsa_resident_valid_seq_len = INVALID_SLOT
+            request.dsa_sparse_budget_tokens = 0
+            dense_blocks = kv_cache_manager.allocate_slots(
+                request,
+                num_new_tokens,
+                num_new_computed_tokens=num_new_computed_tokens,
+                new_computed_blocks=new_computed_blocks,
+                num_lookahead_tokens=num_lookahead_tokens,
+                num_external_computed_tokens=num_external_computed_tokens,
+                delay_cache_blocks=delay_cache_blocks,
+                num_encoder_tokens=num_encoder_tokens,
+            )
+            if dense_blocks is not None:
+                request.dsa_req_stage = request.dsa_next_req_stage
+            return dense_blocks
+
+        if (request.num_computed_tokens < request.num_prompt_tokens
+                or resident_valid_seq_len == INVALID_SLOT):
+            return allocate_dense()
+
+        if (num_new_computed_tokens > 0
+                or num_external_computed_tokens > 0
+                or num_lookahead_tokens > 0
+                or delay_cache_blocks
+                or num_encoder_tokens > 0):
+            return allocate_dense()
+
+        else:
+            coordinator = kv_cache_manager.coordinator
+            block_pool = kv_cache_manager.block_pool
+
+            # ENTER_SPARSE_DECODE shrinks the full/MLA table to sparse-budget
+            # blocks plus an optional unfilled tail block. This covers both the
+            # old long-prompt first decode and the short-prompt long-decode
+            # transition once the sequence crosses the sparse threshold.
+            full_group_id = self._get_full_attention_group_id(
+                kv_cache_manager.kv_cache_config)
+            indexer_group_id = self._get_indexer_group_id(
+                kv_cache_manager.kv_cache_config)
+            full_manager = coordinator.single_type_managers[full_group_id]
+            indexer_manager = coordinator.single_type_managers[indexer_group_id]
+            dense_computed_tokens = (
+                request.num_computed_tokens
+                + max(0, int(num_new_computed_tokens))
+                + max(0, int(num_external_computed_tokens)))
+            dense_num_tokens_need_slot = min(
+                dense_computed_tokens
+                + max(0, int(num_new_tokens))
+                + max(0, int(num_lookahead_tokens)),
+                kv_cache_manager.max_model_len,
+            )
+            indexer_blocks_to_allocate = (
+                indexer_manager.get_num_blocks_to_allocate(
+                    request_id=request.request_id,
+                    num_tokens=dense_num_tokens_need_slot,
+                    new_computed_blocks=[],
+                    total_computed_tokens=dense_computed_tokens,
+                    num_tokens_main_model=dense_num_tokens_need_slot,
+                ))
+            if indexer_blocks_to_allocate > self._get_group_num_free_blocks(
+                    block_pool, indexer_group_id):
+                return None
+
+            req_stage = request.dsa_next_req_stage
+            reset_full_cache = req_stage.is_enter_sparse_decode
+            preserved_tail_block = None
+            sparse_budget_slots = resident_valid_seq_len
+            if reset_full_cache:
+                if request.num_computed_tokens < request.num_prompt_tokens:
+                    return allocate_dense()
+                tail_slots_need = self._get_sparse_tail_slots_need(request)
+                preserve_tail_block = self._should_preserve_sparse_tail_block(
+                    request, num_new_tokens)
+                existing_full_blocks = full_manager.req_to_blocks.get(
+                    request.request_id, [])
+                will_preserve_tail = (
+                    preserve_tail_block and bool(existing_full_blocks))
+                sparse_budget_slots = (
+                    max(0, resident_valid_seq_len - tail_slots_need)
+                    if will_preserve_tail
+                    else resident_valid_seq_len)
+                releasable_full_blocks = max(
+                    0,
+                    len(existing_full_blocks)
+                    - (1 if will_preserve_tail else 0),
+                )
+                sparse_budget_blocks_need = (
+                    (sparse_budget_slots + full_manager.block_size - 1)
+                    // full_manager.block_size
+                    if sparse_budget_slots > 0 else 0)
+                full_blocks_available_after_release = (
+                    self._get_group_num_free_blocks(
+                        block_pool, full_group_id)
+                    + releasable_full_blocks)
+                if (sparse_budget_blocks_need
+                        > full_blocks_available_after_release):
+                    return None
+                preserved_tail_block = self._release_full_blocks_except_tail(
+                    full_manager, request.request_id, preserve_tail_block)
+
+            num_blocks_to_allocate = full_manager.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=sparse_budget_slots,
+                new_computed_blocks=[],
+                total_computed_tokens=sparse_budget_slots,
+                num_tokens_main_model=sparse_budget_slots,
+            )
+            has_enough_blocks = (
+                num_blocks_to_allocate <= self._get_group_num_free_blocks(
+                    block_pool, full_group_id))
+            if not has_enough_blocks:
+                if reset_full_cache:
+                    raise RuntimeError(
+                        "DSA sparse allocation capacity precheck passed but "
+                        "post-release capacity check failed")
+                self._append_preserved_tail_block(
+                    full_manager, request.request_id, preserved_tail_block)
+                return None
+            full_manager.allocate_new_blocks(
+                request.request_id,
+                sparse_budget_slots,
+                sparse_budget_slots,
+            )
+            self._append_preserved_tail_block(
+                full_manager, request.request_id, preserved_tail_block)
+            # Indexer cache is the dense selector plane. It must keep a full
+            # block table for the original sequence in HBM and must not follow
+            # the sparse full/MLA table shrink/replace policy.
+            indexer_manager.allocate_new_blocks(
+                request.request_id,
+                dense_num_tokens_need_slot,
+                dense_num_tokens_need_slot,
+            )
+            request.dsa_req_stage = req_stage
+            request.dsa_next_req_stage = req_stage
+            request.dsa_resident_valid_seq_len = resident_valid_seq_len
+            return KVCacheBlocks(coordinator.get_blocks(request.request_id))
+
+
+    def plan_decode_resident_slots(self, request: Request):
+        # This scheduler-side planner is the single stage-advance point for DSA
+        # cache layout. It both returns the resident MLA/full-cache slot count
+        # for sparse decode and writes the request stage metadata consumed by
+        # worker hooks. Keep this state transition out of layer-wise code.
+        previous_stage = request.dsa_req_stage
+        dense_stage = (
+            ReqStage.PREFILL if request.num_output_tokens == 0
+            else ReqStage.DENSE_DECODE)
+        request.dsa_next_req_stage = dense_stage
+        request.dsa_resident_valid_seq_len = INVALID_SLOT
+        request.dsa_sparse_budget_tokens = 0
+        if not self._is_sparse_cache_enabled():
+            return INVALID_SLOT
+        if request.num_computed_tokens < request.num_prompt_tokens:
+            return INVALID_SLOT
+        if request.num_output_tokens == 0:  # prefill/chunked_prefill
+            return INVALID_SLOT
+        if (request.spec_token_ids or request.num_output_placeholders
+                or request.has_encoder_inputs):
+            return INVALID_SLOT
+        if request.num_tokens <= self._enable_dsa_prompt_len:
+            return INVALID_SLOT
+
+        block_size = self._vllm_blk_size
+        total_tokens = request.num_tokens
+        full_blocks_before_tail = (total_tokens - 1) // block_size
+        tail_slots_need = total_tokens - full_blocks_before_tail * block_size
+        if full_blocks_before_tail <= 0:
+            return INVALID_SLOT
+        return self._plan_sparse_decode_resident_slots(
+            request=request,
+            candidate_full_blocks=full_blocks_before_tail,
+            tail_slots_need=tail_slots_need,
+            previous_stage=previous_stage,
+        )
+
+    def _plan_sparse_decode_resident_slots(
+            self,
+            request: Request,
+            candidate_full_blocks: int,
+            tail_slots_need: int,
+            previous_stage: ReqStage,
+    ) -> int:
+        block_size = self._vllm_blk_size
+        total_tokens = int(request.num_tokens)
+        candidate_tokens = candidate_full_blocks * block_size
+        if candidate_tokens <= 0:
+            return INVALID_SLOT
+
+        sparse_budget_tokens = self._get_fixed_sparse_budget_tokens(
+            candidate_tokens)
+        if sparse_budget_tokens <= 0:
+            return INVALID_SLOT
+
+        resident_valid_seq_len = sparse_budget_tokens + tail_slots_need
+        next_stage = (
+            ReqStage.SPARSE_DECODE
+            if previous_stage.is_sparse_decode
+            else ReqStage.ENTER_SPARSE_DECODE)
+        request.dsa_next_req_stage = next_stage
+        if next_stage.is_enter_sparse_decode:
+            logger.debug(
+                "========== DSA DECODE REACHED SPARSE THRESHOLD =========="
+                " req_id=%s prompt_tokens=%s output_tokens=%s total_tokens=%s "
+                "computed_tokens=%s candidate_full_blocks=%s tail_slots=%s "
+                "sparse_budget=%s resident_valid_seq_len=%s block_size=%s "
+                "sparse_threshold=%s",
+                request.request_id,
+                request.num_prompt_tokens,
+                request.num_output_tokens,
+                total_tokens,
+                request.num_computed_tokens,
+                candidate_full_blocks,
+                tail_slots_need,
+                sparse_budget_tokens,
+                resident_valid_seq_len,
+                block_size,
+                self._enable_dsa_prompt_len,
+            )
+        request.dsa_sparse_budget_tokens = sparse_budget_tokens
+        request.dsa_resident_valid_seq_len = resident_valid_seq_len
+        return request.dsa_resident_valid_seq_len

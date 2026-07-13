@@ -20,6 +20,7 @@
 import math
 import sys
 from collections import defaultdict
+from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
@@ -36,7 +37,14 @@ from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_f
 from vllm.distributed import get_tensor_model_parallel_world_size, tensor_model_parallel_all_gather
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
-from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp_group, get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import (
+    get_dcp_group,
+    get_dp_group,
+    get_ep_group,
+    get_pcp_group,
+    get_pp_group,
+    get_tp_group,
+)
 from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -55,6 +63,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    IndexerKVSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -92,7 +101,22 @@ from vllm.v1.worker.utils import AttentionGroup
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.sfa_v1 import AscendSFABackend
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
+from vllm_ascend.dsa_sparse import dsa_model_runner_state
+from vllm_ascend.dsa_sparse.dsa_config import is_dsa_sparse_config_enabled
+from vllm_ascend.dsa_sparse.dsa_graph_gate import (
+    DSA_GRAPH_PHASE_ROW_MODE_DECODE,
+    DSAGraphGateDecision,
+    evaluate_dsa_row_mode_decode_graph,
+    is_dsa_row_mode_decode_graph_expected_eager,
+    is_dsa_row_mode_decode_graph_enabled,
+)
+from vllm_ascend.dsa_sparse.dsa_trace import (
+    DSA_TRACE_CONFIG_KEY,
+    configure_dsa_trace,
+)
+from vllm_ascend.dsa_sparse.dsa_types import INVALID_SLOT, ReqStage
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -221,6 +245,17 @@ class ExecuteModelState(NamedTuple):
 
 
 class NPUModelRunner(GPUModelRunner):
+    dsa_request_finished_in_worker = (
+        dsa_model_runner_state.dsa_request_finished_in_worker
+    )
+    dsa_request_preempted_in_worker = (
+        dsa_model_runner_state.dsa_request_preempted_in_worker
+    )
+    _normalize_dsa_decode_block_ids = (
+        dsa_model_runner_state.normalize_dsa_decode_block_ids
+    )
+    _update_streaming_request = dsa_model_runner_state.update_streaming_request
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
         # used to expand some buffers, which need to be reverted after
@@ -259,6 +294,12 @@ class NPUModelRunner(GPUModelRunner):
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
+        self.dsa_sparse_enabled = is_dsa_sparse_config_enabled(vllm_config)
+        self.dsa_worker_mgr = None
+        if self.dsa_sparse_enabled:
+            configure_dsa_trace(
+                vllm_config.additional_config.get(DSA_TRACE_CONFIG_KEY)
+            )
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -335,6 +376,14 @@ class NPUModelRunner(GPUModelRunner):
             # TODO(zhenwenqi) after https://github.com/vllm-project/vllm/pull/28988 is merged, we can delete this
             self.input_ids = self._make_buffer(max_buffer_num_tokens, dtype=torch.int32)
             self.positions = self._make_buffer(max_buffer_num_tokens, dtype=torch.int64)
+
+        if self.dsa_sparse_enabled:
+            self.resident_positions = self._make_buffer(
+                max_buffer_num_tokens, dtype=torch.int64
+            )
+            self.resident_valid_seq_lens = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int32
+            )
 
         self.use_eagle = (
             vllm_config.speculative_config.method in ("eagle", "eagle3", "mtp")
@@ -479,6 +528,146 @@ class NPUModelRunner(GPUModelRunner):
             and not self.model_config.enforce_eager
         )
 
+    def _dsa_row_mode_decode_graph_enabled(self) -> bool:
+        return self.dsa_sparse_enabled and is_dsa_row_mode_decode_graph_enabled(
+            self.vllm_config.additional_config
+        )
+
+    @staticmethod
+    def _with_dsa_graph_phase(
+        desc: BatchDescriptor,
+        graph_phase: str,
+    ) -> BatchDescriptor:
+        from vllm_ascend.patch.dsa_sparse.patch_cudagraph_phase import (
+            BatchDescriptor as DSABatchDescriptor,
+        )
+
+        return DSABatchDescriptor(
+            num_tokens=desc.num_tokens,
+            num_reqs=desc.num_reqs,
+            uniform=desc.uniform,
+            has_lora=desc.has_lora,
+            num_active_loras=desc.num_active_loras,
+            dsa_graph_phase=graph_phase,
+        )
+
+    def _register_dsa_row_mode_decode_graph_keys(self) -> None:
+        if (
+            not self._dsa_row_mode_decode_graph_enabled()
+            or not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        ):
+            return
+
+        full_keys = list(self.cudagraph_dispatcher.cudagraph_keys[CUDAGraphMode.FULL])
+        for key in full_keys:
+            if key.dsa_graph_phase is None and key.uniform and key.num_reqs is not None:
+                self.cudagraph_dispatcher.add_cudagraph_key(
+                    CUDAGraphMode.FULL,
+                    self._with_dsa_graph_phase(
+                        key,
+                        DSA_GRAPH_PHASE_ROW_MODE_DECODE,
+                    ),
+                )
+
+    def _raise_if_dsa_row_mode_graph_violation(
+        self,
+        decision: DSAGraphGateDecision,
+        reason: str,
+    ) -> None:
+        if decision.disabled and is_dsa_row_mode_decode_graph_expected_eager(decision.reason):
+            return
+        raise RuntimeError(
+            "DSA row-mode decode graph violation: "
+            f"reason={reason}, rank={dist.get_rank()}, decision={decision}"
+        )
+
+    def _dsa_decode_full_block_dump_req_id(
+        self,
+        *,
+        req_ids: list[str],
+        scheduled_tokens: Mapping[str, int],
+        context_lens: Mapping[str, int],
+        block_size: int,
+    ) -> str | None:
+        for req_id in req_ids:
+            if scheduled_tokens[req_id] <= 0:
+                continue
+            req_state = self.requests[req_id]
+            if not req_state.output_token_ids:
+                continue
+            if context_lens[req_id] % block_size == 0:
+                return req_id
+        return None
+
+    def _evaluate_dsa_row_mode_graph_gate(
+        self,
+        scheduler_output: SchedulerOutput,
+    ) -> DSAGraphGateDecision | None:
+        if not self._dsa_row_mode_decode_graph_enabled():
+            return None
+        assert self.dsa_worker_mgr is not None
+        assert scheduler_output.req_dsa_stage is not None
+        assert scheduler_output.req_dsa_resident_valid_seq_len is not None
+        assert scheduler_output.req_dsa_sparse_budget_tokens is not None
+
+        req_ids = list(self.input_batch.req_ids[: self.input_batch.num_reqs])
+        context_lens = {
+            req_id: (
+                self.requests[req_id].num_prompt_tokens
+                + len(self.requests[req_id].output_token_ids)
+            )
+            for req_id in req_ids
+        }
+        full_block_dump_req_id = self._dsa_decode_full_block_dump_req_id(
+            req_ids=req_ids,
+            scheduled_tokens=scheduler_output.num_scheduled_tokens,
+            context_lens=context_lens,
+            block_size=self.cache_config.block_size,
+        )
+        decision = evaluate_dsa_row_mode_decode_graph(
+            req_ids=req_ids,
+            scheduled_tokens=scheduler_output.num_scheduled_tokens,
+            req_stages=scheduler_output.req_dsa_stage,
+            resident_lens=scheduler_output.req_dsa_resident_valid_seq_len,
+            sparse_budgets=scheduler_output.req_dsa_sparse_budget_tokens,
+            total_tokens=scheduler_output.total_num_scheduled_tokens,
+            capture_sizes=set(self.compilation_config.cudagraph_capture_sizes),
+            configured_budget=self.dsa_worker_mgr._hbm_sparse_budget_tokens,
+            resident_graph_limit=(
+                self.dsa_worker_mgr.get_row_mode_decode_graph_dummy_resident_seq_len()
+            ),
+            context_lens_before_forward=context_lens,
+            block_size=self.cache_config.block_size,
+            resident_sparse_ready=None,
+            has_full_block_dump=full_block_dump_req_id is not None,
+            full_block_dump_req_id=full_block_dump_req_id,
+        )
+        self._last_dsa_row_mode_graph_gate_decision = decision
+        return decision
+
+    @staticmethod
+    def _sync_dsa_row_mode_graph_gate_across_model_parallel(
+        decision: DSAGraphGateDecision,
+    ) -> DSAGraphGateDecision:
+        if not dist.is_initialized():
+            return decision
+
+        disabled = torch.tensor([int(decision.disabled)], dtype=torch.int32)
+        for group in (get_tp_group(), get_ep_group(), get_pp_group()):
+            if dist.get_world_size(group=group.cpu_group) > 1:
+                dist.all_reduce(
+                    disabled,
+                    op=dist.ReduceOp.MAX,
+                    group=group.cpu_group,
+                )
+        if int(disabled.item()) == int(decision.disabled):
+            return decision
+        return DSAGraphGateDecision(
+            disabled=True,
+            reason="model_parallel_peer_disabled",
+            bad_req_id=decision.bad_req_id,
+        )
+
     def _sync_metadata_across_dp(
         self, num_tokens: int, with_prefill: bool = False, is_draft_model: bool = False
     ) -> tuple[int, torch.Tensor | None, bool]:
@@ -523,6 +712,70 @@ class NPUModelRunner(GPUModelRunner):
         if isinstance(self.model, ACLGraphWrapper):
             return self.model.unwrap()
         return self.model
+
+    def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
+        if self.dsa_sparse_enabled:
+            dsa_model_runner_state.update_states(self, scheduler_output)
+            return
+        super()._update_states(scheduler_output)
+
+    def set_dsa_mgr(self, dsa_mgr) -> None:
+        assert self.dsa_sparse_enabled
+        self.dsa_worker_mgr = dsa_mgr
+
+    def prepare_dsa_scheduled_request(
+        self,
+        scheduler_output: "SchedulerOutput",
+        attn_metadata,
+        dsa_graph_row_count: int | None = None,
+        dsa_graph_phase: str | None = None,
+    ) -> None:
+        assert self.dsa_worker_mgr is not None
+        self.dsa_worker_mgr.build_dsa_meta(
+            scheduler_output,
+            self.requests,
+            self.input_batch,
+            attn_metadata,
+            self.kv_cache_config,
+            force_decode_row_mode_score_topk=(
+                0
+                if dsa_graph_row_count is None
+                else self.dsa_worker_mgr._hbm_sparse_budget_tokens
+            ),
+        )
+        if dsa_graph_row_count is not None:
+            graph_phase = dsa_graph_phase or DSA_GRAPH_PHASE_ROW_MODE_DECODE
+            if not self.dsa_worker_mgr.prepare_row_mode_decode_graph_replay_batch(
+                dsa_graph_row_count,
+                graph_phase=graph_phase,
+            ):
+                raise RuntimeError(
+                    "DSA row-mode decode graph replay metadata does not match "
+                    f"the captured buffers: row_count={dsa_graph_row_count}, "
+                    f"graph_phase={graph_phase}"
+                )
+        self.dsa_worker_mgr.execute_begin(scheduler_output)
+
+    def post_process_dsa_after_model_forward(self) -> None:
+        assert self.dsa_worker_mgr is not None
+        self.dsa_worker_mgr.execute_finished()
+
+    @staticmethod
+    def _find_dsa_dummy_full_block_table(attn_metadata) -> torch.Tensor:
+        metadata_items = (
+            attn_metadata.values()
+            if isinstance(attn_metadata, dict)
+            else (
+                metadata
+                for metadata_group in attn_metadata
+                for metadata in metadata_group.values()
+            )
+        )
+        for metadata in metadata_items:
+            table = getattr(metadata, "full_block_tables", None)
+            if torch.is_tensor(table):
+                return table
+        raise RuntimeError("DSA graph capture requires the full block table")
 
     def _pad_query_start_loc_for_fia(
         self,
@@ -610,7 +863,41 @@ class NPUModelRunner(GPUModelRunner):
         cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
         np.add(self.input_batch.num_computed_tokens_cpu[req_indices], arange, out=positions_np)
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
+        if self.dsa_sparse_enabled:
+            resident_positions_np = self.resident_positions.np[
+                :total_num_scheduled_tokens
+            ]
+            np.copyto(resident_positions_np, positions_np)
+            req_dsa_stage = scheduler_output.req_dsa_stage
+            req_dsa_resident_valid_seq_len = (
+                scheduler_output.req_dsa_resident_valid_seq_len
+            )
+            assert req_dsa_stage is not None
+            assert req_dsa_resident_valid_seq_len is not None
+            for req_index, req_id in enumerate(self.input_batch.req_ids):
+                req_stage = ReqStage(req_dsa_stage[req_id])
+                if not req_stage.is_sparse_decode:
+                    continue
+                resident_valid_seq_len = req_dsa_resident_valid_seq_len[req_id]
+                assert resident_valid_seq_len != INVALID_SLOT
+                assert attn_state == AscendAttentionState.DecodeOnly
+                assert num_scheduled_tokens[req_index] == 1
+                query_offset = 0 if req_index == 0 else cu_num_tokens[req_index - 1]
+                resident_positions_np[query_offset] = resident_valid_seq_len - 1
+
+            for kv_cache_gid, kv_cache_group in enumerate(
+                self.kv_cache_config.kv_cache_groups
+            ):
+                group_positions = (
+                    positions_np
+                    if isinstance(kv_cache_group.kv_cache_spec, IndexerKVSpec)
+                    else resident_positions_np
+                )
+                self.input_batch.block_table[kv_cache_gid].compute_slot_mapping(
+                    req_indices, group_positions
+                )
+        else:
+            self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
         self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
 
         if self.use_cp:
@@ -733,6 +1020,19 @@ class NPUModelRunner(GPUModelRunner):
         self.seq_lens.cpu[num_reqs:].fill_(0)
         self.seq_lens.copy_to_gpu()
 
+        if self.dsa_sparse_enabled:
+            self.resident_valid_seq_lens.np[:num_reqs] = self.seq_lens.np[
+                :num_reqs
+            ]
+            for req_index, req_id in enumerate(self.input_batch.req_ids):
+                req_stage = ReqStage(req_dsa_stage[req_id])
+                if req_stage.is_sparse_decode:
+                    self.resident_valid_seq_lens.np[req_index] = (
+                        req_dsa_resident_valid_seq_len[req_id]
+                    )
+            self.resident_valid_seq_lens.cpu[num_reqs:].fill_(0)
+            self.resident_valid_seq_lens.copy_to_gpu()
+
         # Fill unused with -1. Needed for reshape_and_cache in attention_cp
         self.query_start_loc.gpu[num_reqs + 1 :].fill_(-1)
 
@@ -757,6 +1057,8 @@ class NPUModelRunner(GPUModelRunner):
         else:
             # Common case (1D positions)
             self.positions.copy_to_gpu(total_num_scheduled_tokens)
+        if self.dsa_sparse_enabled:
+            self.resident_positions.copy_to_gpu(total_num_scheduled_tokens)
 
         # Record the index of requests that should not be sampled,
         # so that we could clear the sampled tokens before returning
@@ -1194,6 +1496,17 @@ class NPUModelRunner(GPUModelRunner):
                         scheduler_output.num_common_prefix_blocks,
                     )
 
+                dsa_graph_decision = self._evaluate_dsa_row_mode_graph_gate(
+                    scheduler_output
+                )
+                if dsa_graph_decision is not None:
+                    dsa_graph_decision = self._sync_dsa_row_mode_graph_gate_across_model_parallel(
+                        dsa_graph_decision
+                    )
+                force_dsa_row_mode_eager = (
+                    dsa_graph_decision is not None and dsa_graph_decision.disabled
+                )
+
                 (
                     cudagraph_mode,
                     batch_desc,
@@ -1206,9 +1519,43 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     max_num_scheduled_tokens=max_num_scheduled_tokens,
                     use_cascade_attn=cascade_attn_prefix_lens is not None,
-                    force_eager=self.model_config.enforce_eager,
+                    force_eager=(
+                        self.model_config.enforce_eager
+                        or force_dsa_row_mode_eager
+                    ),
                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
                 )
+
+                dsa_graph_row_count: int | None = None
+                dsa_graph_phase: str | None = None
+                if dsa_graph_decision is not None:
+                    if dsa_graph_decision.disabled:
+                        self._raise_if_dsa_row_mode_graph_violation(
+                            dsa_graph_decision,
+                            "gate_disabled",
+                        )
+                    elif cudagraph_mode != CUDAGraphMode.FULL:
+                        self._raise_if_dsa_row_mode_graph_violation(
+                            dsa_graph_decision,
+                            "graph_not_selected",
+                        )
+                    else:
+                        assert dsa_graph_decision.graph_phase is not None
+                        assert dsa_graph_decision.row_count is not None
+                        candidate_desc = self._with_dsa_graph_phase(
+                            batch_desc,
+                            dsa_graph_decision.graph_phase,
+                        )
+                        if candidate_desc not in self.cudagraph_dispatcher.cudagraph_keys[
+                            CUDAGraphMode.FULL
+                        ]:
+                            self._raise_if_dsa_row_mode_graph_violation(
+                                dsa_graph_decision,
+                                "missing_graph_key",
+                            )
+                        batch_desc = candidate_desc
+                        dsa_graph_row_count = dsa_graph_decision.row_count
+                        dsa_graph_phase = dsa_graph_decision.graph_phase
 
                 logger.debug(
                     "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -1356,9 +1703,25 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
+            if self.dsa_sparse_enabled:
+                self.prepare_dsa_scheduled_request(
+                    scheduler_output,
+                    attn_metadata,
+                    dsa_graph_row_count=dsa_graph_row_count,
+                    dsa_graph_phase=dsa_graph_phase,
+                )
+            try:
+                hidden_states = self._model_forward(
+                    num_tokens_padded,
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    **model_kwargs,
+                )
+            finally:
+                if self.dsa_sparse_enabled:
+                    self.post_process_dsa_after_model_forward()
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -1950,6 +2313,7 @@ class NPUModelRunner(GPUModelRunner):
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        dsa_graph_phase: str | None = None,
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
@@ -1977,6 +2341,16 @@ class NPUModelRunner(GPUModelRunner):
             if force_eager:
                 return (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
 
+            if self.dsa_sparse_enabled:
+                return self.cudagraph_dispatcher.dispatch(
+                    num_tokens=num_tokens,
+                    has_lora=has_lora,
+                    uniform_decode=uniform_decode,
+                    valid_modes=valid_modes,
+                    invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                    num_active_loras=num_active_loras,
+                    dsa_graph_phase=dsa_graph_phase,
+                )
             return self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
                 has_lora=has_lora,
@@ -2140,6 +2514,34 @@ class NPUModelRunner(GPUModelRunner):
             seq_lens=self.seq_lens.gpu[:num_reqs_padded],
             # TODO
             seq_lens_cpu=self.seq_lens.cpu[:num_reqs_padded],
+            indexer_seq_lens=(
+                self.seq_lens.gpu[:num_reqs_padded]
+                if self.dsa_sparse_enabled
+                else None
+            ),
+            indexer_seq_lens_cpu=(
+                self.seq_lens.cpu[:num_reqs_padded]
+                if self.dsa_sparse_enabled
+                else None
+            ),
+            resident_valid_seq_lens=(
+                self.resident_valid_seq_lens.gpu[:num_reqs_padded]
+                if self.dsa_sparse_enabled
+                else None
+            ),
+            resident_valid_seq_lens_cpu=(
+                self.resident_valid_seq_lens.cpu[:num_reqs_padded]
+                if self.dsa_sparse_enabled
+                else None
+            ),
+            indexer_positions=(
+                self.positions.gpu if self.dsa_sparse_enabled else None
+            ),
+            resident_positions=(
+                self.resident_positions.gpu
+                if self.dsa_sparse_enabled
+                else None
+            ),
             # TODO
             num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs_padded],
             num_reqs=num_reqs_padded,
@@ -2212,6 +2614,19 @@ class NPUModelRunner(GPUModelRunner):
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
+            if self.dsa_sparse_enabled and not isinstance(
+                kv_cache_group.kv_cache_spec, IndexerKVSpec
+            ):
+                cm.seq_lens = self.resident_valid_seq_lens.gpu[
+                    :num_reqs_padded
+                ]
+                cm.seq_lens_cpu = self.resident_valid_seq_lens.cpu[
+                    :num_reqs_padded
+                ]
+                cm.positions = self.resident_positions.gpu
+                cm.max_seq_len = self.resident_valid_seq_lens.np[
+                    :num_reqs
+                ].max().item()
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
             cm.encoder_seq_lens, cm.encoder_seq_lens_cpu = self._get_encoder_seq_lens(
@@ -2285,6 +2700,43 @@ class NPUModelRunner(GPUModelRunner):
         # it only happens for cudagraph_runtime_mode=FULL.
         return force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL
 
+    def _warmup_and_capture(
+        self,
+        desc: BatchDescriptor,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        profile_seq_lens: int | None = None,
+        allow_microbatching: bool = False,
+        num_warmups: int | None = None,
+    ) -> None:
+        if num_warmups is None:
+            num_warmups = self.compilation_config.cudagraph_num_of_warmups
+        force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
+        for _ in range(num_warmups):
+            self._dummy_run(
+                desc.num_tokens,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                force_attention=force_attention,
+                uniform_decode=desc.uniform,
+                allow_microbatching=allow_microbatching,
+                skip_eplb=True,
+                remove_lora=False,
+                num_active_loras=desc.num_active_loras,
+            )
+        self._dummy_run(
+            desc.num_tokens,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            uniform_decode=desc.uniform,
+            allow_microbatching=allow_microbatching,
+            skip_eplb=True,
+            remove_lora=False,
+            num_active_loras=desc.num_active_loras,
+            is_graph_capturing=True,
+            profile_seq_lens=profile_seq_lens,
+            cudagraph_phase=(
+                desc.dsa_graph_phase if self.dsa_sparse_enabled else None
+            ),
+        )
+
     @torch.inference_mode()
     def _dummy_run(
         self,
@@ -2301,6 +2753,7 @@ class NPUModelRunner(GPUModelRunner):
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        cudagraph_phase: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
@@ -2318,6 +2771,7 @@ class NPUModelRunner(GPUModelRunner):
         # routine of FA2 for pure decode, i.e., Flashdecode + an optimization
         # for GQA/MQA.
         max_query_len = self.uniform_decode_query_len if uniform_decode else num_tokens
+        resident_seq_lens = max_query_len
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
         # has num_tokens in total.
@@ -2364,6 +2818,7 @@ class NPUModelRunner(GPUModelRunner):
             # LoRA state when determining the batch descriptor for capture
             force_has_lora=num_active_loras > 0,
             force_num_active_loras=num_active_loras,
+            dsa_graph_phase=cudagraph_phase,
         )
         if self.use_cp:
             self.pcp_manager.init_batch_info(
@@ -2380,6 +2835,9 @@ class NPUModelRunner(GPUModelRunner):
                 f"Cudagraph runtime mode mismatch in dummy_run. "
                 f"Expected {_cudagraph_mode}, but got {cudagraph_runtime_mode}."
             )
+        if cudagraph_phase is not None:
+            assert cudagraph_runtime_mode == CUDAGraphMode.FULL
+            assert batch_desc.dsa_graph_phase == cudagraph_phase
         num_tokens_padded = batch_desc.num_tokens
         num_reqs_padded = batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
         if num_tokens_across_dp is not None and num_tokens_padded != num_tokens:
@@ -2415,9 +2873,29 @@ class NPUModelRunner(GPUModelRunner):
                     if is_graph_capturing and using_paged_attention(num_tokens, self.vllm_config)
                     else max_query_len
                 )  # type: ignore[assignment]
+            resident_seq_lens = seq_lens
+            if (
+                is_graph_capturing
+                and cudagraph_phase == DSA_GRAPH_PHASE_ROW_MODE_DECODE
+            ):
+                assert self.dsa_worker_mgr is not None
+                seq_lens = max(
+                    seq_lens,
+                    self.dsa_worker_mgr.get_row_mode_decode_graph_dummy_seq_len(),
+                )
+                resident_seq_lens = max(
+                    resident_seq_lens,
+                    self.dsa_worker_mgr.get_row_mode_decode_graph_dummy_resident_seq_len(),
+                )
             self.seq_lens.np[:num_reqs_padded] = seq_lens
             self.seq_lens.np[num_reqs_padded:] = 0
             self.seq_lens.copy_to_gpu()
+            if self.dsa_sparse_enabled:
+                self.resident_valid_seq_lens.np[:num_reqs_padded] = (
+                    resident_seq_lens
+                )
+                self.resident_valid_seq_lens.np[num_reqs_padded:] = 0
+                self.resident_valid_seq_lens.copy_to_gpu()
 
             cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
             self.query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
@@ -2466,6 +2944,14 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 positions = self.positions.gpu[:num_tokens_padded]
 
+            if self.dsa_sparse_enabled:
+                if cudagraph_phase == DSA_GRAPH_PHASE_ROW_MODE_DECODE:
+                    self.resident_positions.gpu[:num_tokens_padded].fill_(
+                        resident_seq_lens - 1
+                    )
+                else:
+                    self.resident_positions.gpu[:num_tokens_padded].copy_(positions)
+
             # update global cos, sin
             update_cos_sin(positions)
 
@@ -2505,20 +2991,46 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
-            with set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                in_profile_run=is_profile,
-                num_actual_tokens=num_tokens_padded,
-                aclgraph_runtime_mode=cudagraph_runtime_mode,
-                batch_descriptor=batch_desc,
-                model_instance=self.model,
+            dsa_graph_saved_state = None
+            if (
+                is_graph_capturing
+                and cudagraph_phase == DSA_GRAPH_PHASE_ROW_MODE_DECODE
             ):
-                outputs = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
+                assert self.dsa_worker_mgr is not None
+                dsa_graph_saved_state = (
+                    self.dsa_worker_mgr.prepare_row_mode_decode_graph_capture_batch(
+                        num_reqs_padded,
+                        tensor_device=self.device,
+                        full_block_table_tensor=(
+                            self._find_dsa_dummy_full_block_table(attn_metadata)
+                        ),
+                        graph_phase=cudagraph_phase,
+                    )
                 )
+            try:
+                with set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    in_profile_run=is_profile,
+                    num_actual_tokens=num_tokens_padded,
+                    aclgraph_runtime_mode=cudagraph_runtime_mode,
+                    batch_descriptor=batch_desc,
+                    model_instance=self.model,
+                ):
+                    outputs = self._model_forward(
+                        num_tokens_padded,
+                        input_ids,
+                        positions,
+                        intermediate_tensors,
+                        inputs_embeds,
+                    )
+            finally:
+                if dsa_graph_saved_state is not None:
+                    self.dsa_worker_mgr.restore_row_mode_decode_graph_capture_batch(
+                        dsa_graph_saved_state
+                    )
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
@@ -2648,6 +3160,12 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        if self.dsa_sparse_enabled:
+            assert self.dsa_worker_mgr is not None
+            self.dsa_worker_mgr.dsa_hot_kv_store.initialize_hot_cache_from_kv_caches(
+                kv_caches,
+                kv_cache_config,
+            )
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
         if self.speculative_config and (
@@ -2782,7 +3300,17 @@ class NPUModelRunner(GPUModelRunner):
                     current_kv_cache_spec = layer_kv_cache_spec[layer_name]
                     assert isinstance(current_kv_cache_spec, AttentionSpec)
 
-                    if self.use_sparse:
+                    if isinstance(current_kv_cache_spec, IndexerKVSpec):
+                        tensor = torch.zeros(
+                            kv_cache_tensor.size,
+                            dtype=torch.int8,
+                            device=self.device,
+                        )
+                        for layer_name_inner in kv_cache_tensor.shared_by:
+                            kv_cache_raw_tensors[layer_name_inner] = tensor
+                        continue
+
+                    if self.use_sparse and not self.dsa_sparse_enabled:
                         # for deepseek v3.2, we split the kv cache according to the corresponding ratio
                         kv_cache_spec = layer_kv_cache_spec[layer_name]
                         sparse_kv_cache_ratio = kv_cache_spec.sparse_kv_cache_ratio
@@ -2809,9 +3337,9 @@ class NPUModelRunner(GPUModelRunner):
                     dsa_k_tensor_size = None
                     dsa_k_scale_tensor_size = None
                     #### for deepseek sparse attention
-                    if self.use_sparse:
+                    if self.use_sparse and not self.dsa_sparse_enabled:
                         dsa_k_tensor_size = int(kv_cache_tensor.size // dsa_k_tensor_split_factor)
-                    if self.use_sparse_c8_indexer:
+                    if self.use_sparse_c8_indexer and not self.dsa_sparse_enabled:
                         dsa_k_scale_tensor_size = int(kv_cache_tensor.size // dsa_k_scale_tensor_split_factor)
 
                     # for other attentions, e.g., self_attn, sliding window attn
@@ -2847,7 +3375,7 @@ class NPUModelRunner(GPUModelRunner):
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the attn kvcache for all shared layers
                         if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
-                            if self.use_sparse:
+                            if self.use_sparse and not self.dsa_sparse_enabled:
                                 if self.use_sparse_c8_indexer:
                                     kv_cache_raw_tensors[layer_name_inner] = (
                                         k_tensor, v_tensor, dsa_k_tensor, dsa_k_scale_tensor
@@ -2895,7 +3423,30 @@ class NPUModelRunner(GPUModelRunner):
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
                 if isinstance(current_kv_cache_spec, AttentionSpec):
-                    if self.use_sparse:
+                    if isinstance(current_kv_cache_spec, IndexerKVSpec):
+                        raw_tensor = kv_cache_raw_tensors[layer_name]
+                        assert raw_tensor is not None
+                        assert (
+                            raw_tensor.numel()
+                            % current_kv_cache_spec.page_size_bytes
+                            == 0
+                        )
+                        num_blocks = (
+                            raw_tensor.numel()
+                            // current_kv_cache_spec.page_size_bytes
+                        )
+                        kv_cache_shape = attn_backend.get_kv_cache_shape(
+                            num_blocks,
+                            current_kv_cache_spec.block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                            current_kv_cache_spec.head_size,
+                        )
+                        kv_caches[layer_name] = raw_tensor.view(
+                            current_kv_cache_spec.dtype
+                        ).view(kv_cache_shape)
+                        continue
+
+                    if self.use_sparse and not self.dsa_sparse_enabled:
                         if self.use_sparse_c8_indexer:
                             raw_k_tensor, raw_v_tensor, raw_dsa_k_tensor, raw_dsa_k_scale_tensor = kv_cache_raw_tensors[  # type: ignore
                                 layer_name]
@@ -2991,7 +3542,7 @@ class NPUModelRunner(GPUModelRunner):
                     k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape)
                     v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape)
 
-                    if self.use_sparse:
+                    if self.use_sparse and not self.dsa_sparse_enabled:
                         dsa_k_cache_shape = (
                             num_blocks,
                             current_kv_cache_spec.block_size,
@@ -3177,11 +3728,14 @@ class NPUModelRunner(GPUModelRunner):
             # they are cached correctly, there will be different objects per
             # layer.
             for layer_name in kv_cache_group_spec.layer_names:
-                attn_backend = layers[layer_name].get_attn_backend()
-                full_cls_name = attn_backend.full_cls_name()
                 layer_kv_cache_spec = kv_cache_group_spec.kv_cache_spec
                 if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                     layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+                if isinstance(layer_kv_cache_spec, IndexerKVSpec):
+                    attn_backend = AscendSFABackend
+                else:
+                    attn_backend = layers[layer_name].get_attn_backend()
+                full_cls_name = attn_backend.full_cls_name()
                 key = (full_cls_name, layer_kv_cache_spec)
                 attn_backends[key] = AttentionGroupKey(attn_backend, layer_kv_cache_spec)
                 attn_backend_layers[key].append(layer_name)
@@ -3269,6 +3823,13 @@ class NPUModelRunner(GPUModelRunner):
         # ordering expected by graph parameter update logic in attention backends.
         mamba_layers: dict[str, MambaBase] = {}
         attn_layer_names = set()
+        deepseek_indexer_cls = None
+        if self.dsa_sparse_enabled:
+            from vllm.model_executor.models.deepseek_v2 import (
+                DeepseekV32IndexerCache,
+            )
+
+            deepseek_indexer_cls = DeepseekV32IndexerCache
         for layer_name, attn_module in attn_layers.items():
             if isinstance(attn_module, Attention):
                 if (kv_tgt_layer := attn_module.kv_sharing_target_layer_name) is not None:
@@ -3294,15 +3855,24 @@ class NPUModelRunner(GPUModelRunner):
                     from vllm.v1.kv_cache_interface import MLAAttentionSpec as AscendMLAAttentionSpec
                     # TODO(rjg-lyh): when kv_cache_spec's refactor is ready,
                     # implement it by creating a new kv_cache_spec class
-                    kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
-                        block_size=self.block_size,
-                        num_kv_heads=1,
-                        head_size=sum(self.sparse_head_dim),
-                        sparse_head_dim=self.sparse_head_dim,
-                        dtype=self.kv_cache_dtype,
-                        cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
-                        cache_sparse_c8=self.use_sparse_c8_indexer,
-                    )
+                    if self.dsa_sparse_enabled:
+                        kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                            block_size=self.block_size,
+                            num_kv_heads=1,
+                            head_size=sum(self.sparse_head_dim[:2]),
+                            dtype=self.kv_cache_dtype,
+                            cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                        )
+                    else:
+                        kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                            block_size=self.block_size,
+                            num_kv_heads=1,
+                            head_size=sum(self.sparse_head_dim),
+                            sparse_head_dim=self.sparse_head_dim,
+                            dtype=self.kv_cache_dtype,
+                            cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
+                            cache_sparse_c8=self.use_sparse_c8_indexer,
+                        )
                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     from vllm.v1.kv_cache_interface import MLAAttentionSpec as AscendMLAAttentionSpec
                     if getattr(attn_module.impl, "fa_quant_layer", False):
@@ -3317,6 +3887,15 @@ class NPUModelRunner(GPUModelRunner):
                         dtype=dtype,
                         cache_dtype_str=cache_dtype_str,
                     )
+
+            elif self.dsa_sparse_enabled and isinstance(
+                attn_module,
+                deepseek_indexer_cls,
+            ):
+                indexer_spec = attn_module.get_kv_cache_spec(self.vllm_config)
+                assert isinstance(indexer_spec, IndexerKVSpec)
+                kv_cache_spec[layer_name] = indexer_spec
+                attn_layer_names.add(layer_name)
 
             elif isinstance(attn_module, MambaBase):
                 mamba_layers[layer_name] = attn_module
@@ -3341,6 +3920,8 @@ class NPUModelRunner(GPUModelRunner):
     ) -> None:
         with update_pass_config(self):
             super()._check_and_update_cudagraph_mode(attention_backends, kv_cache_groups)
+
+        self._register_dsa_row_mode_decode_graph_keys()
 
         capture_descs = self.cudagraph_dispatcher.get_capture_descs()
         capture_sizes = sorted({

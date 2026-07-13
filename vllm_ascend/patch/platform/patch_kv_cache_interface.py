@@ -1,13 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import torch
+import vllm.model_executor.layers.attention.mla_attention
 import vllm.v1.kv_cache_interface
+from vllm.config import VllmConfig
 from typing_extensions import Self
+from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    MLAAttentionSpec,
+)
 
 
 @dataclass(frozen=True)
@@ -135,4 +141,49 @@ class AscendMLAAttentionSpec(MLAAttentionSpec):
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class IndexerKVSpec(AttentionSpec):
+    """Dense HBM cache plane used by the DeepSeek-V3.2 indexer."""
+
+    @property
+    def page_size_bytes(self) -> int:
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * self.head_size
+            * get_dtype_size(self.dtype)
+        )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        max_model_len = vllm_config.model_config.max_model_len
+        cp_world_size = (
+            vllm_config.parallel_config.decode_context_parallel_size
+            * vllm_config.parallel_config.prefill_context_parallel_size
+        )
+        if cp_world_size > 1:
+            max_model_len = cdiv(max_model_len, cp_world_size)
+        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, IndexerKVSpec) for spec in specs)
+        merged_spec = cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            dtype=specs[0].dtype,
+            page_size_padded=specs[0].page_size_padded,
+        )
+        for spec in specs:
+            for field in fields(AttentionSpec):
+                assert getattr(spec, field.name) == getattr(
+                    merged_spec, field.name
+                )
+        return merged_spec
+
+
 vllm.v1.kv_cache_interface.MLAAttentionSpec = AscendMLAAttentionSpec
+vllm.v1.kv_cache_interface.IndexerKVSpec = IndexerKVSpec
+vllm.model_executor.layers.attention.mla_attention.MLAAttentionSpec = (
+    AscendMLAAttentionSpec
+)

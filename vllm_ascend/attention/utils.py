@@ -134,6 +134,14 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # E.g., tensor([128, 256, 64]) for 3 requests with different seq lengths.
     seq_lens_cpu: torch.Tensor = None
 
+    # DSA split cache keeps the full indexer view separate from the resident MLA view.
+    indexer_seq_lens: torch.Tensor = None
+    indexer_seq_lens_cpu: torch.Tensor = None
+    resident_valid_seq_lens: torch.Tensor = None
+    resident_valid_seq_lens_cpu: torch.Tensor = None
+    indexer_positions: torch.Tensor = None
+    resident_positions: torch.Tensor = None
+
     # CPU tensor of already computed tokens count per request.
     # E.g., tensor([100, 200, 50]) means req0 has 100 tokens already computed.
     num_computed_tokens_cpu: torch.Tensor = None
@@ -170,6 +178,20 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
             seq_lens=self.seq_lens[:num_actual_reqs],
             seq_lens_cpu=self.seq_lens_cpu[:num_actual_reqs],
+            indexer_seq_lens=self.indexer_seq_lens[:num_actual_reqs]
+            if self.indexer_seq_lens is not None
+            else None,
+            indexer_seq_lens_cpu=self.indexer_seq_lens_cpu[:num_actual_reqs]
+            if self.indexer_seq_lens_cpu is not None
+            else None,
+            resident_valid_seq_lens=self.resident_valid_seq_lens[:num_actual_reqs]
+            if self.resident_valid_seq_lens is not None
+            else None,
+            resident_valid_seq_lens_cpu=self.resident_valid_seq_lens_cpu[:num_actual_reqs]
+            if self.resident_valid_seq_lens_cpu is not None
+            else None,
+            indexer_positions=self.indexer_positions,
+            resident_positions=self.resident_positions,
             num_computed_tokens_cpu=self.num_computed_tokens_cpu[:num_actual_reqs],
             num_reqs=num_actual_reqs,
             num_actual_tokens=num_actual_tokens,

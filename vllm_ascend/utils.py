@@ -1359,6 +1359,18 @@ def parse_layer_idx(prefix: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+DSA_MGR_WORKER = None
+
+
+def set_dsa_mgr_worker(worker):
+    global DSA_MGR_WORKER
+    DSA_MGR_WORKER = worker
+
+
+def get_dsa_mgr_worker():
+    return DSA_MGR_WORKER
+
+
 @lru_cache(maxsize=1)
 def _libc_getenv():
     import ctypes

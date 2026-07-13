@@ -61,6 +61,21 @@ else:
 _CUSTOM_OP_REGISTERED = False
 
 
+def _configure_dsa_sparse(vllm_config: VllmConfig) -> None:
+    from vllm_ascend.dsa_sparse.dsa_config import (
+        attach_dsa_sparse_cache_attrs,
+        is_dsa_sparse_config_enabled,
+    )
+
+    attach_dsa_sparse_cache_attrs(vllm_config)
+    if is_dsa_sparse_config_enabled(vllm_config):
+        from vllm_ascend.patch.dsa_sparse.patch_runtime import (
+            install_dsa_runtime_patches,
+        )
+
+        install_dsa_runtime_patches()
+
+
 def config_deprecated_logging():
     """Configure deprecated logging format, when used deprecated codes
     in vllm-ascend.
@@ -197,6 +212,7 @@ class NPUPlatform(Platform):
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
         """Apply Ascend-specific defaults. Set sp_min_token_num=1 when enable_sp and not set."""
+        _configure_dsa_sparse(vllm_config)
         pass_config = vllm_config.compilation_config.pass_config
         if pass_config.enable_sp and pass_config.sp_min_token_num is None:
             from vllm_ascend.compilation.passes.sequence_parallelism import get_sp_min_token_num
@@ -251,6 +267,7 @@ class NPUPlatform(Platform):
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         from vllm_ascend.quantization.utils import maybe_auto_detect_quantization
 
+        _configure_dsa_sparse(vllm_config)
         if vllm_config.model_config is not None:
             maybe_auto_detect_quantization(vllm_config)
 
@@ -443,6 +460,33 @@ class NPUPlatform(Platform):
                 parallel_config.worker_cls = "vllm_ascend.worker.worker.NPUWorker"
 
         refresh_block_size(vllm_config)
+
+        from vllm_ascend.dsa_sparse.dsa_config import is_dsa_sparse_config_enabled
+
+        dsa_sparse_enabled = is_dsa_sparse_config_enabled(vllm_config)
+        if dsa_sparse_enabled:
+            if model_config.architecture != "DeepseekV32ForCausalLM":
+                raise ValueError("DSA sparse offload currently supports only DeepseekV32ForCausalLM")
+            if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
+                raise ValueError("DSA sparse offload requires model_runner_v1")
+            if vllm_config.scheduler_config.async_scheduling is not False:
+                raise ValueError("DSA sparse offload requires async_scheduling=False")
+            if vllm_config.scheduler_config.scheduler_cls is not None:
+                raise ValueError("DSA sparse offload requires the default vLLM scheduler")
+            if cache_config.block_size != 128:
+                raise ValueError("DSA sparse offload requires block_size=128")
+            if parallel_config.decode_context_parallel_size != 1 or parallel_config.prefill_context_parallel_size != 1:
+                raise ValueError("DSA sparse offload does not support context parallelism")
+            if vllm_config.speculative_config is not None:
+                raise ValueError("DSA sparse offload does not support speculative decoding")
+            if vllm_config.kv_transfer_config is not None:
+                raise ValueError("DSA sparse offload does not support KV transfer")
+            if ascend_config.enable_sparse_c8:
+                raise ValueError("DSA sparse offload does not support Sparse C8")
+            if envs_ascend.VLLM_ASCEND_BALANCE_SCHEDULING:
+                raise ValueError("DSA sparse offload requires the default vLLM scheduler")
+            if ascend_config.recompute_scheduler_enable or ascend_config.SLO_limits_for_dynamic_batch != -1:
+                raise ValueError("DSA sparse offload requires the default vLLM scheduler")
 
         # Activate custom ops for v1, except on 310P
         if get_ascend_device_type() != AscendDeviceType._310P:

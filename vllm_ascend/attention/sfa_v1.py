@@ -8,6 +8,7 @@ import vllm.envs as envs_vllm
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -17,7 +18,7 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     MLAAttentionImpl,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, IndexerKVSpec
 
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
@@ -25,6 +26,13 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
+from vllm_ascend.dsa_sparse.dsa_batch_tensor_utils import build_dsa_mixed_key_lens
+from vllm_ascend.dsa_sparse.dsa_config import is_dsa_sparse_config_enabled
+from vllm_ascend.dsa_sparse.dsa_trace import (
+    DSA_TRACE_POINT_LIGHTNING_INDEXER,
+    dsa_trace_enabled,
+    dsa_trace_sync_enabled,
+)
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -53,6 +61,7 @@ from vllm_ascend.utils import (
     enable_dsa_cp,
     enable_dsa_cp_with_layer_shard,
     enable_dsa_cp_with_o_proj_tp,
+    get_dsa_mgr_worker,
     get_weight_prefetch_method,
     maybe_trans_nz,
 )
@@ -63,6 +72,98 @@ if TYPE_CHECKING:
 
 # token count limits within bmm_transpose operator
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
+
+
+def _tensor_brief(tensor: torch.Tensor) -> dict:
+    return {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "stride": tuple(tensor.stride()),
+    }
+
+
+def _tensor_sample(tensor: torch.Tensor, limit: int = 8) -> list:
+    flat = tensor.detach().reshape(-1)
+    return flat[: min(limit, int(flat.numel()))].cpu().tolist()
+
+
+def _tensor_minmax(tensor: torch.Tensor) -> dict[str, int | None]:
+    if int(tensor.numel()) == 0:
+        return {"min": None, "max": None}
+    detached = tensor.detach()
+    return {
+        "min": int(detached.min().item()),
+        "max": int(detached.max().item()),
+    }
+
+
+def _topk_row_bounds(
+    topk_indices: torch.Tensor,
+    candidate_lens: torch.Tensor,
+    limit: int = 8,
+) -> list[dict]:
+    topk = topk_indices.detach().reshape(topk_indices.shape[0], -1).cpu()
+    lens = candidate_lens.detach().reshape(-1).cpu()
+    rows = []
+    for row in range(min(limit, int(topk.shape[0]))):
+        row_values = topk[row]
+        candidate_len = int(lens[row])
+        row_min = int(row_values.min().item())
+        row_max = int(row_values.max().item())
+        rows.append(
+            {
+                "row": row,
+                "min": row_min,
+                "max": row_max,
+                "candidate_len": candidate_len,
+                "invalid": row_min < 0 or row_max >= candidate_len,
+            }
+        )
+    return rows
+
+
+def _dsa_lightning_sync() -> None:
+    torch.npu.current_stream().synchronize()
+
+
+def _run_dsa_full_batch_lightning_indexer(
+    *,
+    use_torch_npu_lightning_indexer: bool,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    weights: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    actual_seq_lengths_key: torch.Tensor,
+    block_table: torch.Tensor,
+    sparse_count: int,
+) -> torch.Tensor:
+    if use_torch_npu_lightning_indexer:
+        topk_indices, _ = torch_npu.npu_lightning_indexer(
+            query=query,
+            key=key_cache,
+            weights=weights,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_key=actual_seq_lengths_key,
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=sparse_count,
+            sparse_mode=3,
+        )
+        return topk_indices
+    return torch.ops._C_ascend.npu_lightning_indexer(
+        query=query,
+        key=key_cache,
+        weights=weights,
+        actual_seq_lengths_query=actual_seq_lengths_query,
+        actual_seq_lengths_key=actual_seq_lengths_key,
+        block_table=block_table,
+        layout_query="TND",
+        layout_key="PA_BSND",
+        sparse_count=sparse_count,
+        sparse_mode=3,
+    )
 
 
 class AscendSFABackend(AttentionBackend):
@@ -149,6 +250,19 @@ class AscendSFAMetadata:
     num_decodes: int = 0
     num_decode_tokens: int = 0
     num_prefills: int = 0
+    full_block_tables: torch.Tensor | None = None
+    indexer_block_tables: torch.Tensor | None = None
+    indexer_positions: torch.Tensor | None = None
+    resident_positions: torch.Tensor | None = None
+    resident_valid_seq_lens: torch.Tensor | None = None
+    indexer_seq_lens: torch.Tensor | None = None
+    indexer_min_seq_len: int = 0
+    indexer_max_seq_len: int = 0
+    dsa_score_topk_k: int | None = None
+    dsa_indexer_seq_lens: torch.Tensor | None = None
+    dsa_selection_topk_indices: torch.Tensor | None = None
+    dsa_full_batch_selection_topk_indices: torch.Tensor | None = None
+    dsa_sparse_attention_indices: torch.Tensor | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -195,6 +309,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         self.attn_mask_builder = AttentionMaskBuilder(self.device)
         self.rope_dim = self.model_config.hf_text_config.qk_rope_head_dim
         self.enable_dsa_cp = enable_dsa_cp()
+        self.dsa_sparse_enabled = is_dsa_sparse_config_enabled(vllm_config)
 
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.actual_seq_lengths_query = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
@@ -230,11 +345,59 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
 
         block_table = common_attn_metadata.block_table_tensor[:num_reqs]
         slot_mapping = common_attn_metadata.slot_mapping[:num_input_tokens]
-        input_positions = common_attn_metadata.positions[:num_input_tokens].long()
 
         cum_query_lens = common_attn_metadata.query_start_loc[1 : num_reqs + 1]
-        seq_lens = common_attn_metadata.seq_lens[:num_reqs]
-        seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
+        if self.dsa_sparse_enabled:
+            assert common_attn_metadata.indexer_positions is not None
+            assert common_attn_metadata.resident_positions is not None
+            assert common_attn_metadata.indexer_seq_lens is not None
+            assert common_attn_metadata.indexer_seq_lens_cpu is not None
+            assert common_attn_metadata.resident_valid_seq_lens is not None
+            assert common_attn_metadata.resident_valid_seq_lens_cpu is not None
+
+            indexer_positions = common_attn_metadata.indexer_positions[
+                :num_input_tokens
+            ].long()
+            resident_positions = common_attn_metadata.resident_positions[
+                :num_input_tokens
+            ].long()
+            indexer_seq_lens = common_attn_metadata.indexer_seq_lens[:num_reqs]
+            indexer_seq_lens_cpu = common_attn_metadata.indexer_seq_lens_cpu[
+                :num_reqs
+            ]
+            resident_seq_lens = (
+                common_attn_metadata.resident_valid_seq_lens[:num_reqs]
+            )
+            resident_seq_lens_cpu = (
+                common_attn_metadata.resident_valid_seq_lens_cpu[:num_reqs]
+            )
+            input_positions = indexer_positions
+            if isinstance(self.kv_cache_spec, IndexerKVSpec):
+                seq_lens = indexer_seq_lens
+                seq_lens_cpu = indexer_seq_lens_cpu
+                full_block_tables = None
+                indexer_block_tables = block_table
+            else:
+                seq_lens = resident_seq_lens
+                seq_lens_cpu = resident_seq_lens_cpu
+                full_block_tables = block_table
+                indexer_block_tables = None
+            indexer_min_seq_len = int(indexer_seq_lens_cpu.min().item())
+            indexer_max_seq_len = int(indexer_seq_lens_cpu.max().item())
+        else:
+            input_positions = common_attn_metadata.positions[
+                :num_input_tokens
+            ].long()
+            seq_lens = common_attn_metadata.seq_lens[:num_reqs]
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu[:num_reqs]
+            indexer_positions = None
+            resident_positions = None
+            resident_seq_lens = None
+            indexer_seq_lens = None
+            full_block_tables = None
+            indexer_block_tables = None
+            indexer_min_seq_len = 0
+            indexer_max_seq_len = 0
 
         cos, sin = get_cos_and_sin_mla(input_positions, True)
 
@@ -331,6 +494,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             sin=sin[:num_input_tokens],
             cos=cos[:num_input_tokens],
             dsa_cp_context=dsa_cp_context,
+            full_block_tables=full_block_tables,
+            indexer_block_tables=indexer_block_tables,
+            indexer_positions=indexer_positions,
+            resident_positions=resident_positions,
+            resident_valid_seq_lens=resident_seq_lens,
+            indexer_seq_lens=indexer_seq_lens,
+            indexer_min_seq_len=indexer_min_seq_len,
+            indexer_max_seq_len=indexer_max_seq_len,
         )
 
     def build_for_graph_capture(
@@ -415,6 +586,14 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         self.local_num_heads = self.num_heads
         self.vllm_config = get_current_vllm_config()
+        self.dsa_sparse_enabled = is_dsa_sparse_config_enabled(
+            self.vllm_config
+        )
+        self.indexer_k_cache_layer_name = (
+            self.indexer.k_cache_layer_name
+            if self.dsa_sparse_enabled
+            else None
+        )
         self.is_kv_producer = (
             self.vllm_config.kv_transfer_config is not None and self.vllm_config.kv_transfer_config.is_kv_producer
         )
@@ -922,12 +1101,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         self,
         x: torch.Tensor,
         q_c: torch.Tensor,
-        kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        kv_cache: tuple,
         attn_metadata: M,
         cos: torch.Tensor,
         sin: torch.Tensor,
         actual_seq_lengths_query: torch.Tensor,
         actual_seq_lengths_key: torch.Tensor,
+        indexer_k_cache: torch.Tensor | None = None,
+        indexer_block_table: torch.Tensor | None = None,
+        layer_name: str | None = None,
     ):
         weights, _ = self.weights_proj(x)
 
@@ -960,18 +1142,117 @@ class AscendSFAImpl(MLAAttentionImpl):
         # DSV3.2 currently has graph compilation issues when using torch_npu.npu.lightning_indexer.
         # So two branches are maintained temporarily.
         # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
+        if self.dsa_sparse_enabled:
+            assert indexer_k_cache is not None
+            assert indexer_block_table is not None
+            key_cache = indexer_k_cache
+            block_table = indexer_block_table
+        else:
+            key_cache = kv_cache[2]
+            block_table = attn_metadata.block_table
+
+        if (
+            self.dsa_sparse_enabled
+            and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+        ):
+            assert layer_name is not None
+            dsa_mgr = get_dsa_mgr_worker()
+            assert dsa_mgr is not None
+            dsa_mgr.prepare_indexer_score_controls(layer_name, attn_metadata)
+            if attn_metadata.dsa_score_topk_k is not None:
+                fwd_batch = dsa_mgr.forward_sparse_decode_batch
+                assert fwd_batch
+                assert int(fwd_batch.query_position_rows_tensor.shape[1]) == 1
+                assert not self.use_sparse_c8_indexer
+
+                candidate_lens = fwd_batch.candidate_lens_tensor.to(
+                    device=q_li.device, dtype=torch.int32
+                )
+                mixed_key_lens = build_dsa_mixed_key_lens(
+                    actual_seq_lengths_key=actual_seq_lengths_key,
+                    candidate_lens=candidate_lens,
+                    sparse_row_mask=fwd_batch.sparse_row_mask_tensor,
+                    device=q_li.device,
+                )
+                topk_indices = _run_dsa_full_batch_lightning_indexer(
+                    use_torch_npu_lightning_indexer=(
+                        self.use_torch_npu_lightning_indexer
+                    ),
+                    query=q_li,
+                    key_cache=key_cache,
+                    weights=weights,
+                    actual_seq_lengths_query=actual_seq_lengths_query,
+                    actual_seq_lengths_key=mixed_key_lens,
+                    block_table=block_table,
+                    sparse_count=int(attn_metadata.dsa_score_topk_k),
+                )
+                attn_metadata.dsa_full_batch_selection_topk_indices = (
+                    topk_indices
+                )
+                attn_metadata.dsa_indexer_seq_lens = candidate_lens
+
+                if dsa_trace_enabled(
+                    DSA_TRACE_POINT_LIGHTNING_INDEXER,
+                    layer_name=layer_name,
+                    tp_rank=self.tp_rank,
+                ):
+                    if dsa_trace_sync_enabled(
+                        DSA_TRACE_POINT_LIGHTNING_INDEXER
+                    ):
+                        _dsa_lightning_sync()
+                    logger.info(
+                        "[DSA GS lightning_indexer] %s",
+                        {
+                            "rank": self.tp_rank,
+                            "layer": layer_name,
+                            "query": _tensor_brief(q_li),
+                            "key_cache": _tensor_brief(key_cache),
+                            "weights": _tensor_brief(weights),
+                            "block_table": _tensor_brief(block_table),
+                            "candidate_lens": _tensor_brief(candidate_lens),
+                            "candidate_lens_sample": _tensor_sample(
+                                candidate_lens
+                            ),
+                            "candidate_lens_minmax": _tensor_minmax(
+                                candidate_lens
+                            ),
+                            "topk": _tensor_brief(topk_indices),
+                            "topk_sample": _tensor_sample(
+                                topk_indices, limit=16
+                            ),
+                            "topk_minmax": _tensor_minmax(topk_indices),
+                            "topk_row_bounds": _topk_row_bounds(
+                                topk_indices, candidate_lens
+                            ),
+                        },
+                    )
+
+                sparse_attention_indices = dsa_mgr.after_indexer(
+                    layer_name, attn_metadata
+                )
+                assert sparse_attention_indices is not None
+                if sparse_attention_indices.ndim == 2:
+                    sparse_attention_indices = (
+                        sparse_attention_indices.unsqueeze(1)
+                    )
+                assert sparse_attention_indices.ndim == 3
+                assert int(sparse_attention_indices.shape[0]) == int(
+                    actual_seq_lengths_query.numel()
+                )
+                return sparse_attention_indices
+
         if self.use_sparse_c8_indexer:
             assert len(kv_cache) == 4
             weights = weights.to(torch.float16)
             topk_indices = torch.ops._C_ascend.npu_lightning_indexer_quant(
                 query=q_li.view(q_li_shape_ori),
-                key=kv_cache[2],
+                key=key_cache,
                 weights=weights,
                 query_dequant_scale=q_li_scale.view(q_li_shape_ori[:-1]),
                 key_dequant_scale=kv_cache[3].squeeze(2),  # B S N D -> B S D
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=block_table,
                 query_quant_mode=0,
                 key_quant_mode=0,
                 layout_query="TND",
@@ -982,11 +1263,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         elif self.use_torch_npu_lightning_indexer:
             topk_indices, _ = torch_npu.npu_lightning_indexer(
                 query=q_li,
-                key=kv_cache[2],
+                key=key_cache,
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=2048,
@@ -995,11 +1276,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
                 query=q_li,
-                key=kv_cache[2],
+                key=key_cache,
                 weights=weights,
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
+                block_table=block_table,
                 layout_query="TND",
                 layout_key="PA_BSND",
                 sparse_count=2048,
@@ -1010,7 +1291,14 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _execute_sparse_flash_attention_process(
         self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
     ):
-        block_table = attn_metadata.block_table
+        if self.dsa_sparse_enabled:
+            assert attn_metadata.full_block_tables is not None
+            assert attn_metadata.resident_valid_seq_lens is not None
+            block_table = attn_metadata.full_block_tables
+            seq_lens = attn_metadata.resident_valid_seq_lens
+        else:
+            block_table = attn_metadata.block_table
+            seq_lens = actual_seq_lengths_key
         kv = kv_cache[0]
         key_rope = kv_cache[1]
 
@@ -1023,7 +1311,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             sparse_block_size=1,
             block_table=block_table,
             actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_kv=actual_seq_lengths_key,
+            actual_seq_lengths_kv=seq_lens,
             query_rope=q_pe,
             key_rope=key_rope,
             layout_query="TND",
@@ -1032,11 +1320,33 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         return attn_output
 
+    def _resolve_indexer_metadata(
+        self,
+        forward_context: ForwardContext,
+    ) -> AscendSFAMetadata:
+        assert self.indexer_k_cache_layer_name is not None
+        assert isinstance(forward_context.attn_metadata, dict)
+        return forward_context.attn_metadata[self.indexer_k_cache_layer_name]
+
+    def _resolve_indexer_k_cache(
+        self,
+        forward_context: ForwardContext,
+    ) -> torch.Tensor:
+        assert self.indexer_k_cache_layer_name is not None
+        indexer_layer = forward_context.no_compile_layers[
+            self.indexer_k_cache_layer_name
+        ]
+        indexer_k_cache = indexer_layer.kv_cache[
+            forward_context.virtual_engine
+        ]
+        assert torch.is_tensor(indexer_k_cache)
+        return indexer_k_cache
+
     def forward(
         self,
         layer_name,
         hidden_states: torch.Tensor,  # query in unified attn
-        kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        kv_cache: tuple,
         attn_metadata: M,
         need_gather_q_kv: bool = False,
         output: torch.Tensor | None = None,
@@ -1062,6 +1372,20 @@ class AscendSFAImpl(MLAAttentionImpl):
         else:
             actual_seq_lengths_query = attn_metadata.cum_query_lens
             actual_seq_lengths_key = attn_metadata.seq_lens
+
+        indexer_k_cache = None
+        indexer_block_table = None
+        indexer_slot_mapping = slot_mapping
+        indexer_actual_seq_lengths_key = actual_seq_lengths_key
+        if self.dsa_sparse_enabled:
+            forward_context: ForwardContext = get_forward_context()
+            indexer_metadata = self._resolve_indexer_metadata(forward_context)
+            indexer_k_cache = self._resolve_indexer_k_cache(forward_context)
+            assert indexer_metadata.indexer_block_tables is not None
+            assert indexer_metadata.indexer_seq_lens is not None
+            indexer_slot_mapping = indexer_metadata.slot_mapping
+            indexer_block_table = indexer_metadata.indexer_block_tables
+            indexer_actual_seq_lengths_key = indexer_metadata.indexer_seq_lens
 
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens
@@ -1195,8 +1519,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         if kv_cache is not None:
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event = torch.npu.Event()
+            indexer_cache_for_scatter = (
+                indexer_k_cache
+                if self.dsa_sparse_enabled
+                else kv_cache[2]
+            )
             torch_npu.npu_scatter_nd_update_(
-                kv_cache[2].view(-1, k_li.shape[-1]), slot_mapping.view(-1, 1), k_li.view(-1, k_li.shape[-1])
+                indexer_cache_for_scatter.view(-1, k_li.shape[-1]),
+                indexer_slot_mapping.view(-1, 1),
+                k_li.view(-1, k_li.shape[-1]),
             )  # b, s, n, d
             if self.use_sparse_c8_indexer:
                 assert len(kv_cache) == 4
@@ -1217,7 +1548,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             cos=cos,
             sin=sin,
             actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_key=actual_seq_lengths_key,
+            actual_seq_lengths_key=indexer_actual_seq_lengths_key,
+            indexer_k_cache=indexer_k_cache,
+            indexer_block_table=indexer_block_table,
+            layer_name=layer_name,
         )
 
         attn_output = self._execute_sparse_flash_attention_process(

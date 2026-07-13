@@ -230,6 +230,44 @@ at::Tensor npu_lightning_indexer_meta(
     return lightning_indexer_output;
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+gather_selection_kv_cache_meta(
+    at::Tensor selection_k_rope,
+    at::Tensor selection_kv_cache,
+    const at::Tensor& selection_kv_block_table,
+    at::Tensor selection_kv_block_status,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& selection_topk_indices,
+    const at::Tensor& full_k_rope,
+    const at::Tensor& full_kv_cache,
+    const at::Tensor& full_kv_block_table,
+    const at::Tensor& full_kv_actual_seq,
+    const at::Tensor& row_modes,
+    const at::Tensor& budget_lengths,
+    const at::Tensor& tail_valid_token_counts,
+    const at::Tensor& resident_tail_starts,
+    const at::Tensor& query_position_rows,
+    at::Tensor attention_indices_out)
+{
+    (void)req_pool_entries;
+    (void)row_modes;
+    (void)selection_topk_indices;
+    (void)full_k_rope;
+    (void)full_kv_cache;
+    (void)full_kv_block_table;
+    (void)full_kv_actual_seq;
+    (void)budget_lengths;
+    (void)tail_valid_token_counts;
+    (void)resident_tail_starts;
+    (void)query_position_rows;
+    return std::make_tuple(
+        at::empty_like(selection_k_rope),
+        at::empty_like(selection_kv_cache),
+        at::empty_like(selection_kv_block_table),
+        at::empty_like(selection_kv_block_status),
+        at::empty_like(attention_indices_out));
+}
+
 at::Tensor npu_sparse_flash_attention_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const at::Tensor &sparse_indices, double scale_value, int64_t sparse_block_size,
@@ -596,6 +634,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("batch_matmul_transpose", &vllm_ascend::meta::batch_matmul_transpose);
     // Lightning indexer
     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
+    // DSA gather-selection KV materialization
+    ops.impl("gather_selection_kv_cache", &vllm_ascend::meta::gather_selection_kv_cache_meta);
     // Sparse flash attention
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
     // MoE dispatch-ffn-combine
