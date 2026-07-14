@@ -20,6 +20,7 @@ public:
                                 GM_ADDR slotToIndex,
                                 GM_ADDR freeSlots,
                                 GM_ADDR freeHead,
+                                GM_ADDR reqPoolEntries,
                                 GM_ADDR queryIndex,
                                 GM_ADDR slotOut,
                                 uint32_t reqNum,
@@ -28,10 +29,11 @@ public:
         pipe_ = pipe;
         reqNum_ = reqNum;
 
-        indexGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(index), reqNum_ * INDEX_SIZE);
-        slotToIndexGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(slotToIndex), reqNum_ * SLOT_COUNT);
-        freeSlotsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(freeSlots), reqNum_ * FREE_SLOT_COUNT);
-        freeHeadGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(freeHead), reqNum_);
+        indexGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(index));
+        slotToIndexGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(slotToIndex));
+        freeSlotsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(freeSlots));
+        freeHeadGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(freeHead));
+        reqPoolEntriesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(reqPoolEntries), reqNum_);
         queryIndexGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(queryIndex), reqNum_ * QUERY_COUNT);
         slotOutGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(slotOut), reqNum_ * QUERY_COUNT);
 
@@ -50,10 +52,6 @@ public:
     {
         uint32_t coreId = GetBlockIdx();
         uint32_t blockNum = GetBlockNum();
-        uint32_t reqGroupNum =
-            (reqNum_ + FREE_HEADS_PER_CACHE_LINE - 1U) /
-            FREE_HEADS_PER_CACHE_LINE;
-
         auto queryTile = queryBuf_.Get<int32_t>();
         auto indexTile = indexBuf_.Get<int32_t>();
         auto indexTileFloat = indexBuf_.Get<float>();
@@ -80,76 +78,73 @@ public:
         offsetTileU32.SetSize(QUERY_COUNT);
         maskTile.SetSize(QUERY_COUNT);
 
-        for (uint32_t reqGroupId = coreId;
-             reqGroupId < reqGroupNum;
-             reqGroupId += blockNum) {
-            uint32_t reqStart = reqGroupId * FREE_HEADS_PER_CACHE_LINE;
-            uint32_t reqEnd = reqStart + FREE_HEADS_PER_CACHE_LINE;
-            if (reqEnd > reqNum_) {
-                reqEnd = reqNum_;
+        for (uint32_t reqId = 0; reqId < reqNum_; ++reqId) {
+            uint32_t poolEntry = static_cast<uint32_t>(reqPoolEntriesGm_.GetValue(reqId));
+            // Keep all free_head entries in one cache line on the same core.
+            uint32_t freeHeadCacheLine = poolEntry / FREE_HEADS_PER_CACHE_LINE;
+            if (freeHeadCacheLine % blockNum != coreId) {
+                continue;
             }
 
-            for (uint32_t reqId = reqStart; reqId < reqEnd; ++reqId) {
-                uint32_t indexReqBase = reqId * INDEX_SIZE;
-                uint32_t slotReqBase = reqId * SLOT_COUNT;
-                uint32_t freeReqBase = reqId * FREE_SLOT_COUNT;
-                uint32_t queryReqBase = reqId * QUERY_COUNT;
-                int32_t freeHead = freeHeadGm_.GetValue(reqId);
+            uint32_t indexReqBase = poolEntry * INDEX_SIZE;
+            uint32_t slotReqBase = poolEntry * SLOT_COUNT;
+            uint32_t freeReqBase = poolEntry * FREE_SLOT_COUNT;
+            uint32_t queryReqBase = reqId * QUERY_COUNT;
+            int32_t freeHead = freeHeadGm_.GetValue(poolEntry);
 
-                DataCopy(queryTile, queryIndexGm_[queryReqBase], QUERY_COUNT);
+            DataCopy(queryTile, queryIndexGm_[queryReqBase], QUERY_COUNT);
+            SyncPipelines<HardEvent::MTE2_V>();
+            Duplicate(outTile, NOT_FOUND, QUERY_COUNT);
+            PipeBarrier<PIPE_ALL>();
+
+            for (uint32_t indexBase = 0; indexBase < INDEX_SIZE; indexBase += INDEX_TILE_LEN) {
+                if (indexBase != 0U) {
+                    SyncPipelines<HardEvent::V_MTE2>();
+                }
+                DataCopy(indexTile, indexGm_[indexReqBase + indexBase], INDEX_TILE_LEN);
                 SyncPipelines<HardEvent::MTE2_V>();
-                Duplicate(outTile, NOT_FOUND, QUERY_COUNT);
+
+                Adds(deltaTile, queryTile, -static_cast<int32_t>(indexBase), QUERY_COUNT);
+                Relu(clampTile, deltaTile, QUERY_COUNT);
+                Adds(helperTile, clampTile, -static_cast<int32_t>(INDEX_TILE_LEN - 1U), QUERY_COUNT);
+                Relu(helperTile, helperTile, QUERY_COUNT);
+                Muls(helperTile, helperTile, static_cast<int32_t>(-1), QUERY_COUNT);
+                Add(clampTile, clampTile, helperTile, QUERY_COUNT);
+
+                Muls(offsetTile, clampTile, static_cast<int32_t>(sizeof(int32_t)), QUERY_COUNT);
+                Muls(helperTile, clampTile, static_cast<int32_t>(-1), QUERY_COUNT);
+                Add(helperTile, helperTile, deltaTile, QUERY_COUNT);
+                CompareScalar(maskTile, helperTile, static_cast<int32_t>(0), CMPMODE::EQ, QUERY_COUNT);
+
+                Gather(candidateTileFloat, indexTileFloat, offsetTileU32, 0, QUERY_COUNT);
+                Select(outTileFloat, maskTile, candidateTileFloat, outTileFloat,
+                       SELMODE::VSEL_TENSOR_TENSOR_MODE, QUERY_COUNT);
                 PipeBarrier<PIPE_ALL>();
-
-                for (uint32_t indexBase = 0; indexBase < INDEX_SIZE; indexBase += INDEX_TILE_LEN) {
-                    if (indexBase != 0U) {
-                        SyncPipelines<HardEvent::V_MTE2>();
-                    }
-                    DataCopy(indexTile, indexGm_[indexReqBase + indexBase], INDEX_TILE_LEN);
-                    SyncPipelines<HardEvent::MTE2_V>();
-
-                    Adds(deltaTile, queryTile, -static_cast<int32_t>(indexBase), QUERY_COUNT);
-                    Relu(clampTile, deltaTile, QUERY_COUNT);
-                    Adds(helperTile, clampTile, -static_cast<int32_t>(INDEX_TILE_LEN - 1U), QUERY_COUNT);
-                    Relu(helperTile, helperTile, QUERY_COUNT);
-                    Muls(helperTile, helperTile, static_cast<int32_t>(-1), QUERY_COUNT);
-                    Add(clampTile, clampTile, helperTile, QUERY_COUNT);
-
-                    Muls(offsetTile, clampTile, static_cast<int32_t>(sizeof(int32_t)), QUERY_COUNT);
-                    Muls(helperTile, clampTile, static_cast<int32_t>(-1), QUERY_COUNT);
-                    Add(helperTile, helperTile, deltaTile, QUERY_COUNT);
-                    CompareScalar(maskTile, helperTile, static_cast<int32_t>(0), CMPMODE::EQ, QUERY_COUNT);
-
-                    Gather(candidateTileFloat, indexTileFloat, offsetTileU32, 0, QUERY_COUNT);
-                    Select(outTileFloat, maskTile, candidateTileFloat, outTileFloat,
-                           SELMODE::VSEL_TENSOR_TENSOR_MODE, QUERY_COUNT);
-                    PipeBarrier<PIPE_ALL>();
-                }
-
-                SyncPipelines<HardEvent::V_S>();
-                for (uint32_t i = 0; i < QUERY_COUNT; ++i) {
-                    int32_t slot = outTile.GetValue(i);
-                    if (slot == NOT_FOUND) {
-                        int32_t indexId = queryTile.GetValue(i);
-                        slot = indexGm_.GetValue(indexReqBase + static_cast<uint32_t>(indexId));
-                        if (slot == NOT_FOUND) {
-                            slot = freeSlotsGm_.GetValue(freeReqBase + static_cast<uint32_t>(freeHead));
-                            ++freeHead;
-                            indexGm_.SetValue(indexReqBase + static_cast<uint32_t>(indexId), slot);
-                            slotToIndexGm_.SetValue(slotReqBase + static_cast<uint32_t>(slot), indexId);
-                        }
-                        outTile.SetValue(i, slot);
-                    }
-                }
-
-                // Scalar reads queryTile and may update outTile. Order both
-                // dependencies before the next request reuses these buffers.
-                SyncPipelines<HardEvent::S_MTE2>();
-                SyncPipelines<HardEvent::S_MTE3>();
-                DataCopy(slotOutGm_[queryReqBase], outTile, QUERY_COUNT);
-                SyncPipelines<HardEvent::MTE3_V>();
-                freeHeadGm_.SetValue(reqId, freeHead);
             }
+
+            SyncPipelines<HardEvent::V_S>();
+            for (uint32_t i = 0; i < QUERY_COUNT; ++i) {
+                int32_t slot = outTile.GetValue(i);
+                if (slot == NOT_FOUND) {
+                    int32_t indexId = queryTile.GetValue(i);
+                    slot = indexGm_.GetValue(indexReqBase + static_cast<uint32_t>(indexId));
+                    if (slot == NOT_FOUND) {
+                        slot = freeSlotsGm_.GetValue(freeReqBase + static_cast<uint32_t>(freeHead));
+                        ++freeHead;
+                        indexGm_.SetValue(indexReqBase + static_cast<uint32_t>(indexId), slot);
+                        slotToIndexGm_.SetValue(slotReqBase + static_cast<uint32_t>(slot), indexId);
+                    }
+                    outTile.SetValue(i, slot);
+                }
+            }
+
+            // Scalar reads queryTile and may update outTile. Order both
+            // dependencies before the next request reuses these buffers.
+            SyncPipelines<HardEvent::S_MTE2>();
+            SyncPipelines<HardEvent::S_MTE3>();
+            DataCopy(slotOutGm_[queryReqBase], outTile, QUERY_COUNT);
+            SyncPipelines<HardEvent::MTE3_V>();
+            freeHeadGm_.SetValue(poolEntry, freeHead);
         }
 
         DataCacheCleanAndInvalid<int32_t,
@@ -181,6 +176,7 @@ private:
     GlobalTensor<int32_t> slotToIndexGm_;
     GlobalTensor<int32_t> freeSlotsGm_;
     GlobalTensor<int32_t> freeHeadGm_;
+    GlobalTensor<int32_t> reqPoolEntriesGm_;
     GlobalTensor<int32_t> queryIndexGm_;
     GlobalTensor<int32_t> slotOutGm_;
     uint32_t reqNum_;
@@ -192,6 +188,7 @@ extern "C" __global__ __aicore__ void asu_hbm_index_lookup(GM_ADDR index,
                                                             GM_ADDR slotToIndex,
                                                             GM_ADDR freeSlots,
                                                             GM_ADDR freeHead,
+                                                            GM_ADDR reqPoolEntries,
                                                             GM_ADDR queryIndex,
                                                             GM_ADDR slotOut,
                                                             GM_ADDR workspace,
@@ -201,6 +198,14 @@ extern "C" __global__ __aicore__ void asu_hbm_index_lookup(GM_ADDR index,
     GET_TILING_DATA(tilingData, tiling);
     TPipe pipe;
     KernelAsuHbmIndexLookup op;
-    op.Init(index, slotToIndex, freeSlots, freeHead, queryIndex, slotOut, tilingData.reqNum, &pipe);
+    op.Init(index,
+            slotToIndex,
+            freeSlots,
+            freeHead,
+            reqPoolEntries,
+            queryIndex,
+            slotOut,
+            tilingData.reqNum,
+            &pipe);
     op.Process();
 }

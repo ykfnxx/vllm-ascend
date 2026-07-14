@@ -16,6 +16,7 @@ at::Tensor asu_hbm_index_lookup(at::Tensor& index,
                                 at::Tensor& slot_to_index,
                                 at::Tensor& free_slots,
                                 at::Tensor& free_head,
+                                const at::Tensor& req_pool_entries,
                                 const at::Tensor& query_index,
                                 int64_t req_num)
 {
@@ -23,6 +24,7 @@ at::Tensor asu_hbm_index_lookup(at::Tensor& index,
     TORCH_CHECK(slot_to_index.scalar_type() == at::kInt, "slot_to_index must be int32");
     TORCH_CHECK(free_slots.scalar_type() == at::kInt, "free_slots must be int32");
     TORCH_CHECK(free_head.scalar_type() == at::kInt, "free_head must be int32");
+    TORCH_CHECK(req_pool_entries.scalar_type() == at::kInt, "req_pool_entries must be int32");
     TORCH_CHECK(query_index.scalar_type() == at::kInt, "query_index must be int32");
     TORCH_CHECK(req_num > 0, "req_num must be greater than 0");
 
@@ -32,6 +34,7 @@ at::Tensor asu_hbm_index_lookup(at::Tensor& index,
                  slot_to_index,
                  free_slots,
                  free_head,
+                 req_pool_entries,
                  query_index,
                  req_num,
                  slot_out);

@@ -7,7 +7,7 @@ using namespace ge;
 
 namespace ops {
 namespace {
-constexpr uint32_t QUERY_INDEX_INPUT = 4U;
+constexpr uint32_t QUERY_INDEX_INPUT = 5U;
 constexpr uint32_t SLOT_OUT_OUTPUT = 0U;
 }  // namespace
 

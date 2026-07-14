@@ -9,7 +9,6 @@
 namespace optiling {
 namespace {
 constexpr uint32_t ATTR_REQ_NUM = 0U;
-constexpr uint32_t FREE_HEADS_PER_CACHE_LINE = 16U;
 }  // namespace
 
 static ge::graphStatus AsuHbmIndexLookupTilingFunc(gert::TilingContext* context)
@@ -34,12 +33,7 @@ static ge::graphStatus AsuHbmIndexLookupTilingFunc(gert::TilingContext* context)
     AsuHbmIndexLookupTilingData tiling;
     uint32_t req_num = static_cast<uint32_t>(*req_num_attr);
     tiling.set_reqNum(req_num);
-    // Assign each 64-byte free_head cache line to one core so scalar stores
-    // from different cores cannot overwrite adjacent request entries.
-    uint32_t req_group_num =
-        (req_num + FREE_HEADS_PER_CACHE_LINE - 1U) /
-        FREE_HEADS_PER_CACHE_LINE;
-    context->SetBlockDim(std::min(req_group_num, aiv_num));
+    context->SetBlockDim(std::min(req_num, aiv_num));
 
     tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());

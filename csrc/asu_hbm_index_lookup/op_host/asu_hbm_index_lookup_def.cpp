@@ -29,6 +29,12 @@ public:
             .FormatList({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND})
             .AutoContiguous();
+        this->Input("req_pool_entries")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .FormatList({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND})
+            .AutoContiguous();
         this->Input("query_index")
             .ParamType(REQUIRED)
             .DataType({ge::DT_INT32})

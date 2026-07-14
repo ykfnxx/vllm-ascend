@@ -13,6 +13,7 @@ aclnnAsuHbmIndexMaintainAicpuGetWorkspaceSize(
     const aclTensor* slotToIndex,
     const aclTensor* freeSlots,
     const aclTensor* freeHead,
+    const aclTensor* reqPoolEntries,
     const aclTensor* lastQuerySlots,
     int64_t reqNum,
     int64_t seed,

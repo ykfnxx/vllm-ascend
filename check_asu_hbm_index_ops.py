@@ -20,6 +20,8 @@ RESIDENT_COUNT = SLOT_COUNT - FREE_SLOT_COUNT
 HIT_COUNT = QUERY_COUNT // 2
 MISS_COUNT = QUERY_COUNT - HIT_COUNT
 REQ_NUM = 2
+POOL_NUM = 18
+REQ_POOL_ENTRY_VALUES = (17, 1)
 NOT_FOUND = -1
 UINT32_MASK = (1 << 32) - 1
 
@@ -196,21 +198,25 @@ def _diagnose_aicpu_package(custom_opp: Path) -> None:
 
 def _build_initial_state(torch):
     index = torch.full(
-        (REQ_NUM, INDEX_SIZE), NOT_FOUND, dtype=torch.int32
+        (POOL_NUM, INDEX_SIZE), NOT_FOUND, dtype=torch.int32
     )
     slot_to_index = torch.full(
-        (REQ_NUM, SLOT_COUNT), NOT_FOUND, dtype=torch.int32
+        (POOL_NUM, SLOT_COUNT), NOT_FOUND, dtype=torch.int32
     )
     free_slots = torch.arange(
         RESIDENT_COUNT, SLOT_COUNT, dtype=torch.int32
-    ).repeat(REQ_NUM, 1)
-    free_head = torch.zeros(REQ_NUM, dtype=torch.int32)
+    ).repeat(POOL_NUM, 1)
+    free_head = torch.zeros(POOL_NUM, dtype=torch.int32)
+    req_pool_entries = torch.tensor(
+        REQ_POOL_ENTRY_VALUES, dtype=torch.int32
+    )
     query_index = torch.empty(
         (REQ_NUM, QUERY_COUNT), dtype=torch.int32
     )
     resident_slots = torch.arange(RESIDENT_COUNT, dtype=torch.int32)
 
     for req_id in range(REQ_NUM):
+        pool_entry = int(req_pool_entries[req_id])
         token_base = req_id * 2 * RESIDENT_COUNT
         resident_tokens = torch.arange(
             token_base,
@@ -223,12 +229,19 @@ def _build_initial_state(torch):
             dtype=torch.int32,
         )
 
-        index[req_id, resident_tokens.long()] = resident_slots
-        slot_to_index[req_id, :RESIDENT_COUNT] = resident_tokens
+        index[pool_entry, resident_tokens.long()] = resident_slots
+        slot_to_index[pool_entry, :RESIDENT_COUNT] = resident_tokens
         query_index[req_id, 0::2] = resident_tokens[:HIT_COUNT]
         query_index[req_id, 1::2] = miss_tokens
 
-    return index, slot_to_index, free_slots, free_head, query_index
+    return (
+        index,
+        slot_to_index,
+        free_slots,
+        free_head,
+        query_index,
+        req_pool_entries,
+    )
 
 
 def _lookup_reference(
@@ -237,20 +250,22 @@ def _lookup_reference(
     free_slots,
     free_head,
     query_index,
+    req_pool_entries,
 ):
     slot_out = query_index.new_empty(query_index.shape)
     for req_id in range(REQ_NUM):
-        head = int(free_head[req_id])
+        pool_entry = int(req_pool_entries[req_id])
+        head = int(free_head[pool_entry])
         for query_id in range(QUERY_COUNT):
             index_id = int(query_index[req_id, query_id])
-            slot = int(index[req_id, index_id])
+            slot = int(index[pool_entry, index_id])
             if slot == NOT_FOUND:
-                slot = int(free_slots[req_id, head])
+                slot = int(free_slots[pool_entry, head])
                 head += 1
-                index[req_id, index_id] = slot
-                slot_to_index[req_id, slot] = index_id
+                index[pool_entry, index_id] = slot
+                slot_to_index[pool_entry, slot] = index_id
             slot_out[req_id, query_id] = slot
-        free_head[req_id] = head
+        free_head[pool_entry] = head
     return slot_out
 
 
@@ -260,26 +275,28 @@ def _maintain_reference(
     free_slots,
     free_head,
     last_query_slots,
+    req_pool_entries,
     seed: int,
 ) -> None:
     for req_id in range(REQ_NUM):
-        head = int(free_head[req_id])
+        pool_entry = int(req_pool_entries[req_id])
+        head = int(free_head[pool_entry])
         if head == 0:
             continue
 
         protected = set(int(slot) for slot in last_query_slots[req_id])
-        slot = _hash32((seed & UINT32_MASK) ^ req_id) % SLOT_COUNT
+        slot = _hash32((seed & UINT32_MASK) ^ pool_entry) % SLOT_COUNT
         while head > 0:
-            index_id = int(slot_to_index[req_id, slot])
+            index_id = int(slot_to_index[pool_entry, slot])
             if index_id != NOT_FOUND and slot not in protected:
-                slot_to_index[req_id, slot] = NOT_FOUND
-                index[req_id, index_id] = NOT_FOUND
+                slot_to_index[pool_entry, slot] = NOT_FOUND
+                index[pool_entry, index_id] = NOT_FOUND
                 head -= 1
-                free_slots[req_id, head] = slot
+                free_slots[pool_entry, head] = slot
             slot += 1
             if slot == SLOT_COUNT:
                 slot = 0
-        free_head[req_id] = head
+        free_head[pool_entry] = head
 
 
 def _assert_equal(torch, name: str, actual, expected) -> None:
@@ -329,6 +346,7 @@ def main() -> None:
     expected_free_slots = initial_state[2].clone()
     expected_free_head = initial_state[3].clone()
     query_index = initial_state[4]
+    req_pool_entries = initial_state[5]
 
     expected_slot_out = _lookup_reference(
         expected_index,
@@ -336,6 +354,7 @@ def main() -> None:
         expected_free_slots,
         expected_free_head,
         query_index,
+        req_pool_entries,
     )
 
     index = initial_state[0].to(device)
@@ -343,12 +362,14 @@ def main() -> None:
     free_slots = initial_state[2].to(device)
     free_head = initial_state[3].to(device)
     query_index_npu = query_index.to(device)
+    req_pool_entries_npu = req_pool_entries.to(device)
 
     slot_out = torch.ops._C_ascend.asu_hbm_index_lookup(
         index,
         slot_to_index,
         free_slots,
         free_head,
+        req_pool_entries_npu,
         query_index_npu,
         REQ_NUM,
     )
@@ -380,6 +401,7 @@ def main() -> None:
         slot_to_index,
         free_slots,
         free_head,
+        req_pool_entries_npu,
         slot_out,
         REQ_NUM,
         args.seed,
@@ -392,6 +414,7 @@ def main() -> None:
         expected_free_slots,
         expected_free_head,
         expected_slot_out,
+        req_pool_entries,
         args.seed,
     )
 
@@ -417,7 +440,8 @@ def main() -> None:
 
     print(
         "ASU HBM index custom-op check passed: "
-        f"device={device}, requests={REQ_NUM}, hits/request={HIT_COUNT}, "
+        f"device={device}, requests={REQ_NUM}, pool_entries="
+        f"{REQ_POOL_ENTRY_VALUES}, hits/request={HIT_COUNT}, "
         f"misses/request={MISS_COUNT}, seed={args.seed}, custom_opp={custom_opp}"
     )
 

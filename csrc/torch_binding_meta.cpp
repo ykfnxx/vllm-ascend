@@ -611,6 +611,7 @@ at::Tensor asu_hbm_index_lookup_meta(at::Tensor& index,
                                      at::Tensor& slot_to_index,
                                      at::Tensor& free_slots,
                                      at::Tensor& free_head,
+                                     const at::Tensor& req_pool_entries,
                                      const at::Tensor& query_index,
                                      int64_t req_num)
 {
@@ -618,6 +619,7 @@ at::Tensor asu_hbm_index_lookup_meta(at::Tensor& index,
     (void)slot_to_index;
     (void)free_slots;
     (void)free_head;
+    (void)req_pool_entries;
     (void)req_num;
     return at::empty_like(query_index);
 }
@@ -626,6 +628,7 @@ void asu_hbm_index_maintain_aicpu_meta(at::Tensor& index,
                                        at::Tensor& slot_to_index,
                                        at::Tensor& free_slots,
                                        at::Tensor& free_head,
+                                       const at::Tensor& req_pool_entries,
                                        const at::Tensor& last_query_slots,
                                        int64_t req_num,
                                        int64_t seed)
@@ -634,6 +637,7 @@ void asu_hbm_index_maintain_aicpu_meta(at::Tensor& index,
     (void)slot_to_index;
     (void)free_slots;
     (void)free_head;
+    (void)req_pool_entries;
     (void)last_query_slots;
     (void)req_num;
     (void)seed;

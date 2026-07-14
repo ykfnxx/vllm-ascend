@@ -22,6 +22,11 @@
         },
         "input4": {
             "format": "ND",
+            "name": "req_pool_entries",
+            "type": "DT_INT32"
+        },
+        "input5": {
+            "format": "ND",
             "name": "last_query_slots",
             "type": "DT_INT32"
         },
