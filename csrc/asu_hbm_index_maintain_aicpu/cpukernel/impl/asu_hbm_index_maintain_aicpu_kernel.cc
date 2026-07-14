@@ -157,7 +157,7 @@ uint32_t AsuHbmIndexMaintainAicpuCpuKernel::Compute(CpuKernelContext& ctx)
                      last_query_slots,
                      req_num,
                      seed);
-    return KERNEL_STATUS_OK;
+    return 0U;
 }
 
 REGISTER_CPU_KERNEL(OP_TYPE, AsuHbmIndexMaintainAicpuCpuKernel);
