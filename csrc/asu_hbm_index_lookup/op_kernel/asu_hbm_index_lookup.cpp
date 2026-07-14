@@ -97,12 +97,16 @@ public:
                 int32_t freeHead = freeHeadGm_.GetValue(reqId);
 
                 DataCopy(queryTile, queryIndexGm_[queryReqBase], QUERY_COUNT);
+                SyncPipelines<HardEvent::MTE2_V>();
                 Duplicate(outTile, NOT_FOUND, QUERY_COUNT);
                 PipeBarrier<PIPE_ALL>();
 
                 for (uint32_t indexBase = 0; indexBase < INDEX_SIZE; indexBase += INDEX_TILE_LEN) {
+                    if (indexBase != 0U) {
+                        SyncPipelines<HardEvent::V_MTE2>();
+                    }
                     DataCopy(indexTile, indexGm_[indexReqBase + indexBase], INDEX_TILE_LEN);
-                    PipeBarrier<PIPE_ALL>();
+                    SyncPipelines<HardEvent::MTE2_V>();
 
                     Adds(deltaTile, queryTile, -static_cast<int32_t>(indexBase), QUERY_COUNT);
                     Relu(clampTile, deltaTile, QUERY_COUNT);
@@ -122,6 +126,7 @@ public:
                     PipeBarrier<PIPE_ALL>();
                 }
 
+                SyncPipelines<HardEvent::V_S>();
                 for (uint32_t i = 0; i < QUERY_COUNT; ++i) {
                     int32_t slot = outTile.GetValue(i);
                     if (slot == NOT_FOUND) {
@@ -137,8 +142,12 @@ public:
                     }
                 }
 
-                PipeBarrier<PIPE_ALL>();
+                // Scalar reads queryTile and may update outTile. Order both
+                // dependencies before the next request reuses these buffers.
+                SyncPipelines<HardEvent::S_MTE2>();
+                SyncPipelines<HardEvent::S_MTE3>();
                 DataCopy(slotOutGm_[queryReqBase], outTile, QUERY_COUNT);
+                SyncPipelines<HardEvent::MTE3_V>();
                 freeHeadGm_.SetValue(reqId, freeHead);
             }
         }
@@ -149,6 +158,14 @@ public:
     }
 
 private:
+    template <HardEvent event>
+    __aicore__ inline void SyncPipelines()
+    {
+        event_t eventId = static_cast<event_t>(pipe_->FetchEventID(event));
+        SetFlag<event>(eventId);
+        WaitFlag<event>(eventId);
+    }
+
     TPipe* pipe_;
     TBuf<TPosition::VECIN> queryBuf_;
     TBuf<TPosition::VECIN> indexBuf_;
