@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 from pathlib import Path
+import re
+import subprocess
 
 
 INDEX_SIZE = 128 * 1024
@@ -37,6 +41,14 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=20260714,
         help="Eviction seed passed to the maintain operator",
+    )
+    parser.add_argument(
+        "--diagnose-aicpu",
+        action="store_true",
+        help=(
+            "Inspect the packaged AICPU JSON and shared library without "
+            "running either operator"
+        ),
     )
     return parser.parse_args()
 
@@ -71,6 +83,105 @@ def _hash32(value: int) -> int:
     value = (value * 0x846CA68B) & UINT32_MASK
     value ^= value >> 16
     return value & UINT32_MASK
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _readelf_symbols(shared_library: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["readelf", "--dyn-syms", "--wide", str(shared_library)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        print("[FAIL] readelf is not installed")
+        return ""
+
+    if result.returncode != 0:
+        print(f"[FAIL] readelf failed: {result.stderr.strip()}")
+        return ""
+    return result.stdout
+
+
+def _diagnose_aicpu_package(custom_opp: Path) -> None:
+    op_type = "AsuHbmIndexMaintainAicpu"
+    json_path = custom_opp / "op_impl/cpu/config/cust_aicpu_kernel.json"
+    shared_library = (
+        custom_opp
+        / "op_impl/cpu/aicpu_kernel/impl/libcust_aicpu_kernels.so"
+    )
+    vendor_config = custom_opp.parent / "config.ini"
+    failed = False
+
+    print(f"[INFO] ASCEND_CUSTOM_OPP_PATH={os.environ['ASCEND_CUSTOM_OPP_PATH']}")
+    print(f"[INFO] vendor config={vendor_config} exists={vendor_config.is_file()}")
+    print(f"[INFO] AICPU JSON={json_path} exists={json_path.is_file()}")
+    print(
+        f"[INFO] AICPU library={shared_library} "
+        f"exists={shared_library.is_file()}"
+    )
+
+    if not json_path.is_file():
+        print("[FAIL] packaged AICPU JSON is missing")
+        failed = True
+    else:
+        try:
+            package_info = json.loads(json_path.read_text(encoding="utf-8"))
+            op_info = package_info[op_type]["opInfo"]
+        except (json.JSONDecodeError, KeyError) as error:
+            print(f"[FAIL] invalid AICPU JSON entry: {error}")
+            failed = True
+        else:
+            for field in (
+                "engine",
+                "opKernelLib",
+                "kernelSo",
+                "functionName",
+                "userDefined",
+            ):
+                print(f"[INFO] JSON {field}={op_info.get(field)}")
+            if op_info.get("kernelSo") != shared_library.name:
+                print("[FAIL] JSON kernelSo does not match the packaged library")
+                failed = True
+            if op_info.get("functionName") != "RunCpuKernel":
+                print("[FAIL] JSON functionName is not RunCpuKernel")
+                failed = True
+
+    if not shared_library.is_file():
+        print("[FAIL] packaged AICPU library is missing")
+        failed = True
+    else:
+        print(
+            f"[INFO] AICPU library size={shared_library.stat().st_size} "
+            f"sha256={_sha256(shared_library)}"
+        )
+        symbols = _readelf_symbols(shared_library)
+        run_cpu_kernel = re.search(r"\bRunCpuKernel\b", symbols) is not None
+        direct_kernel = re.search(rf"\b{op_type}\b", symbols) is not None
+        print(f"[INFO] dynamic symbol RunCpuKernel={run_cpu_kernel}")
+        print(f"[INFO] dynamic symbol {op_type}={direct_kernel}")
+        if not run_cpu_kernel:
+            print("[FAIL] AICPU library does not export RunCpuKernel")
+            failed = True
+
+        binary = shared_library.read_bytes()
+        registered_name = op_type.encode("ascii") in binary
+        print(f"[INFO] embedded registered op name {op_type}={registered_name}")
+        if not registered_name:
+            print("[FAIL] AICPU registration name is absent from the library")
+            failed = True
+
+    if failed:
+        raise SystemExit(1)
+    print("[PASS] packaged AICPU metadata and binary entry are consistent")
 
 
 def _build_initial_state(torch):
@@ -191,6 +302,10 @@ def _load_ops(torch) -> None:
 def main() -> None:
     args = _parse_args()
     custom_opp = _configure_custom_opp()
+
+    if args.diagnose_aicpu:
+        _diagnose_aicpu_package(custom_opp)
+        return
 
     import torch
 
