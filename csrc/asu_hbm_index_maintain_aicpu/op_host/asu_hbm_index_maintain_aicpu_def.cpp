@@ -59,6 +59,10 @@ public:
 
         this->Attr("req_num").AttrType(REQUIRED).Int();
         this->Attr("seed").AttrType(REQUIRED).Int();
+
+        this->AICPU().OpKernelLib("CUSTAICPUKernel");
+        this->AICPU().KernelSo("libcust_aicpu_kernels.so");
+        this->AICPU().UserDefined(true);
     }
 };
 
