@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""Check the ASU HBM lookup and AICPU maintain custom operators on NPU."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+
+
+INDEX_SIZE = 128 * 1024
+SLOT_COUNT = 10 * 1024
+FREE_SLOT_COUNT = 2 * 1024
+QUERY_COUNT = 2 * 1024
+RESIDENT_COUNT = SLOT_COUNT - FREE_SLOT_COUNT
+HIT_COUNT = QUERY_COUNT // 2
+MISS_COUNT = QUERY_COUNT - HIT_COUNT
+REQ_NUM = 2
+NOT_FOUND = -1
+UINT32_MASK = (1 << 32) - 1
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run lookup and AICPU maintain, then compare their state with a "
+            "CPU reference implementation."
+        ))
+    parser.add_argument(
+        "--device-id",
+        type=int,
+        default=0,
+        help="NPU device id (default: 0)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=20260714,
+        help="Eviction seed passed to the maintain operator",
+    )
+    return parser.parse_args()
+
+
+def _configure_custom_opp() -> Path:
+    repo_root = Path(__file__).resolve().parent
+    custom_opp = (
+        repo_root
+        / "vllm_ascend"
+        / "_cann_ops_custom"
+        / "vendors"
+        / "vllm-ascend"
+    )
+    if not custom_opp.is_dir():
+        raise RuntimeError(
+            f"custom OPP directory does not exist: {custom_opp}. "
+            "Build vllm-ascend with custom kernels first."
+        )
+
+    current = os.environ.get("ASCEND_CUSTOM_OPP_PATH")
+    os.environ["ASCEND_CUSTOM_OPP_PATH"] = (
+        f"{custom_opp}:{current}" if current else str(custom_opp)
+    )
+    return custom_opp
+
+
+def _hash32(value: int) -> int:
+    value &= UINT32_MASK
+    value ^= value >> 16
+    value = (value * 0x7FEB352D) & UINT32_MASK
+    value ^= value >> 15
+    value = (value * 0x846CA68B) & UINT32_MASK
+    value ^= value >> 16
+    return value & UINT32_MASK
+
+
+def _build_initial_state(torch):
+    index = torch.full(
+        (REQ_NUM, INDEX_SIZE), NOT_FOUND, dtype=torch.int32
+    )
+    slot_to_index = torch.full(
+        (REQ_NUM, SLOT_COUNT), NOT_FOUND, dtype=torch.int32
+    )
+    free_slots = torch.arange(
+        RESIDENT_COUNT, SLOT_COUNT, dtype=torch.int32
+    ).repeat(REQ_NUM, 1)
+    free_head = torch.zeros(REQ_NUM, dtype=torch.int32)
+    query_index = torch.empty(
+        (REQ_NUM, QUERY_COUNT), dtype=torch.int32
+    )
+    resident_slots = torch.arange(RESIDENT_COUNT, dtype=torch.int32)
+
+    for req_id in range(REQ_NUM):
+        token_base = req_id * 2 * RESIDENT_COUNT
+        resident_tokens = torch.arange(
+            token_base,
+            token_base + RESIDENT_COUNT,
+            dtype=torch.int32,
+        )
+        miss_tokens = torch.arange(
+            token_base + RESIDENT_COUNT,
+            token_base + RESIDENT_COUNT + MISS_COUNT,
+            dtype=torch.int32,
+        )
+
+        index[req_id, resident_tokens.long()] = resident_slots
+        slot_to_index[req_id, :RESIDENT_COUNT] = resident_tokens
+        query_index[req_id, 0::2] = resident_tokens[:HIT_COUNT]
+        query_index[req_id, 1::2] = miss_tokens
+
+    return index, slot_to_index, free_slots, free_head, query_index
+
+
+def _lookup_reference(
+    index,
+    slot_to_index,
+    free_slots,
+    free_head,
+    query_index,
+):
+    slot_out = query_index.new_empty(query_index.shape)
+    for req_id in range(REQ_NUM):
+        head = int(free_head[req_id])
+        for query_id in range(QUERY_COUNT):
+            index_id = int(query_index[req_id, query_id])
+            slot = int(index[req_id, index_id])
+            if slot == NOT_FOUND:
+                slot = int(free_slots[req_id, head])
+                head += 1
+                index[req_id, index_id] = slot
+                slot_to_index[req_id, slot] = index_id
+            slot_out[req_id, query_id] = slot
+        free_head[req_id] = head
+    return slot_out
+
+
+def _maintain_reference(
+    index,
+    slot_to_index,
+    free_slots,
+    free_head,
+    last_query_slots,
+    seed: int,
+) -> None:
+    for req_id in range(REQ_NUM):
+        head = int(free_head[req_id])
+        if head == 0:
+            continue
+
+        protected = set(int(slot) for slot in last_query_slots[req_id])
+        slot = _hash32((seed & UINT32_MASK) ^ req_id) % SLOT_COUNT
+        while head > 0:
+            index_id = int(slot_to_index[req_id, slot])
+            if index_id != NOT_FOUND and slot not in protected:
+                slot_to_index[req_id, slot] = NOT_FOUND
+                index[req_id, index_id] = NOT_FOUND
+                head -= 1
+                free_slots[req_id, head] = slot
+            slot += 1
+            if slot == SLOT_COUNT:
+                slot = 0
+        free_head[req_id] = head
+
+
+def _assert_equal(torch, name: str, actual, expected) -> None:
+    if torch.equal(actual, expected):
+        print(f"[PASS] {name}")
+        return
+
+    mismatch = (actual != expected).nonzero()
+    first = tuple(int(value) for value in mismatch[0])
+    raise AssertionError(
+        f"{name} mismatch at {first}: "
+        f"actual={int(actual[first])}, expected={int(expected[first])}; "
+        f"total mismatches={int(mismatch.shape[0])}"
+    )
+
+
+def _load_ops(torch) -> None:
+    import torch_npu  # noqa: F401
+    import vllm_ascend.vllm_ascend_C  # noqa: F401
+
+    for op_name in (
+        "asu_hbm_index_lookup",
+        "asu_hbm_index_maintain_aicpu",
+    ):
+        if not hasattr(torch.ops._C_ascend, op_name):
+            raise RuntimeError(f"torch operator is not registered: {op_name}")
+    print("[PASS] lookup and maintain operators are registered")
+
+
+def main() -> None:
+    args = _parse_args()
+    custom_opp = _configure_custom_opp()
+
+    import torch
+
+    _load_ops(torch)
+    device = torch.device(f"npu:{args.device_id}")
+    torch.npu.set_device(device)
+
+    initial_state = _build_initial_state(torch)
+    expected_index = initial_state[0].clone()
+    expected_slot_to_index = initial_state[1].clone()
+    expected_free_slots = initial_state[2].clone()
+    expected_free_head = initial_state[3].clone()
+    query_index = initial_state[4]
+
+    expected_slot_out = _lookup_reference(
+        expected_index,
+        expected_slot_to_index,
+        expected_free_slots,
+        expected_free_head,
+        query_index,
+    )
+
+    index = initial_state[0].to(device)
+    slot_to_index = initial_state[1].to(device)
+    free_slots = initial_state[2].to(device)
+    free_head = initial_state[3].to(device)
+    query_index_npu = query_index.to(device)
+
+    slot_out = torch.ops._C_ascend.asu_hbm_index_lookup(
+        index,
+        slot_to_index,
+        free_slots,
+        free_head,
+        query_index_npu,
+        REQ_NUM,
+    )
+    torch.npu.synchronize()
+
+    actual_slot_out = slot_out.cpu()
+    _assert_equal(torch, "lookup slot output", actual_slot_out, expected_slot_out)
+    _assert_equal(
+        torch,
+        "lookup free head",
+        free_head.cpu(),
+        expected_free_head,
+    )
+
+    torch.ops._C_ascend.asu_hbm_index_maintain_aicpu(
+        index,
+        slot_to_index,
+        free_slots,
+        free_head,
+        slot_out,
+        REQ_NUM,
+        args.seed,
+    )
+    torch.npu.synchronize()
+
+    _maintain_reference(
+        expected_index,
+        expected_slot_to_index,
+        expected_free_slots,
+        expected_free_head,
+        expected_slot_out,
+        args.seed,
+    )
+
+    _assert_equal(torch, "maintain token-to-slot index", index.cpu(), expected_index)
+    _assert_equal(
+        torch,
+        "maintain slot-to-token index",
+        slot_to_index.cpu(),
+        expected_slot_to_index,
+    )
+    _assert_equal(
+        torch,
+        "maintain free slots",
+        free_slots.cpu(),
+        expected_free_slots,
+    )
+    _assert_equal(
+        torch,
+        "maintain free head",
+        free_head.cpu(),
+        expected_free_head,
+    )
+
+    print(
+        "ASU HBM index custom-op check passed: "
+        f"device={device}, requests={REQ_NUM}, hits/request={HIT_COUNT}, "
+        f"misses/request={MISS_COUNT}, seed={args.seed}, custom_opp={custom_opp}"
+    )
+
+
+if __name__ == "__main__":
+    main()
