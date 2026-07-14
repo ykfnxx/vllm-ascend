@@ -13,6 +13,7 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
 )
 
 
@@ -182,8 +183,26 @@ class IndexerKVSpec(AttentionSpec):
         return merged_spec
 
 
+_original_is_uniform_type = UniformTypeKVCacheSpecs.is_uniform_type.__func__
+
+
+@classmethod
+def _is_uniform_type_with_indexer(
+    cls,
+    kv_cache_specs: dict[str, vllm.v1.kv_cache_interface.KVCacheSpec],
+) -> bool:
+    one_spec = next(iter(kv_cache_specs.values()))
+    if isinstance(one_spec, IndexerKVSpec):
+        return all(
+            isinstance(spec, IndexerKVSpec)
+            for spec in kv_cache_specs.values()
+        )
+    return _original_is_uniform_type(cls, kv_cache_specs)
+
+
 vllm.v1.kv_cache_interface.MLAAttentionSpec = AscendMLAAttentionSpec
 vllm.v1.kv_cache_interface.IndexerKVSpec = IndexerKVSpec
+UniformTypeKVCacheSpecs.is_uniform_type = _is_uniform_type_with_indexer
 vllm.model_executor.layers.attention.mla_attention.MLAAttentionSpec = (
     AscendMLAAttentionSpec
 )
