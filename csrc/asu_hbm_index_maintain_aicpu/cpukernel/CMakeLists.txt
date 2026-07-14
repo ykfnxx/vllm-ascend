@@ -8,7 +8,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(AICPU_BUILTIN_ROOT
     ${ASCEND_CANN_PACKAGE_PATH}/opp/built-in/op_impl/aicpu/aicpu_kernel)
-set(AICPU_BUILTIN_LIB_DIR ${AICPU_BUILTIN_ROOT}/lib/Ascend)
+set(AICPU_BUILTIN_LIB_DIR ${AICPU_BUILTIN_ROOT}/lib)
 
 add_library(cust_aicpu_kernels SHARED
     impl/asu_hbm_index_maintain_aicpu_kernel.cc
@@ -19,7 +19,7 @@ target_compile_definitions(cust_aicpu_kernels PRIVATE
 )
 
 target_include_directories(cust_aicpu_kernels PRIVATE
-    ${AICPU_BUILTIN_ROOT}/inc
+    ${ASCEND_CANN_PACKAGE_PATH}/include/aicpu
 )
 
 target_link_libraries(cust_aicpu_kernels PRIVATE
