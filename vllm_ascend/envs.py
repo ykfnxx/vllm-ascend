@@ -109,6 +109,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
+    "VLLM_ASCEND_ENABLE_DMP": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DMP", "0"))),
 }
 
 # end-env-vars-definition

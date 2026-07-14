@@ -46,6 +46,7 @@ def set_ascend_forward_context(
     skip_compiled: bool = False,
     max_tokens_across_pcp: int = 0,
     draft_attn_metadatas=None,
+    dmp_context=None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -117,6 +118,9 @@ def set_ascend_forward_context(
 
         # set this for rope forward_oot using
         forward_context.is_first_layer = True
+
+        # DMP
+        forward_context.dmp_context = dmp_context
 
         # set layer_idx to enable optimization features that depend on this information.
         # This is only applicable to models that contain these necessary attributes.

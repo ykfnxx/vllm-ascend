@@ -1,10 +1,11 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -83,6 +84,78 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
+
+
+class TestNPUModelRunnerDMP(unittest.TestCase):
+
+    @staticmethod
+    def _metadata(attn_state, num_reqs):
+        return {
+            "layer": SimpleNamespace(
+                attn_state=attn_state,
+                cum_query_lens=torch.arange(1, num_reqs + 1),
+            )
+        }
+
+    @patch("vllm_ascend.worker.model_runner_v1.enable_dsa_cp", return_value=False)
+    def test_dmp_graph_eligibility_requires_uniform_decode(self, _mock_enable_dsa_cp):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+
+        self.assertTrue(
+            runner._is_dmp_eligible(
+                self._metadata(AscendAttentionState.DecodeOnly, 4),
+                4,
+            )
+        )
+        self.assertFalse(
+            runner._is_dmp_eligible(
+                self._metadata(AscendAttentionState.DecodeOnly, 3),
+                3,
+            )
+        )
+        self.assertFalse(
+            runner._is_dmp_eligible(
+                self._metadata(AscendAttentionState.DecodeOnly, 2),
+                4,
+            )
+        )
+        self.assertFalse(
+            runner._is_dmp_eligible(
+                self._metadata(AscendAttentionState.SpecDecoding, 4),
+                4,
+            )
+        )
+
+    def test_dmp_graph_context_is_reused(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner._dmp_graph_contexts = {}
+        runner.model_config = SimpleNamespace(
+            hf_text_config=SimpleNamespace(num_hidden_layers=4)
+        )
+        expected_context = MagicMock()
+        runner._maybe_create_dmp_slices = MagicMock(return_value=expected_context)
+        batch_descriptor = object()
+        attn_metadata = object()
+
+        first = runner._get_or_create_dmp_graph_context(
+            batch_descriptor,
+            attn_metadata,
+            4,
+        )
+        second = runner._get_or_create_dmp_graph_context(
+            batch_descriptor,
+            attn_metadata,
+            4,
+        )
+
+        self.assertIs(first, expected_context)
+        self.assertIs(second, expected_context)
+        runner._maybe_create_dmp_slices.assert_called_once_with(
+            attn_metadata,
+            4,
+            None,
+        )
+        expected_context.prepare_graph_events.assert_called_once_with(4)
 
 
 if __name__ == "__main__":

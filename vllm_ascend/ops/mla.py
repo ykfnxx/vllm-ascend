@@ -19,6 +19,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from typing import Optional
 
 import torch
 from torch import nn
@@ -170,6 +171,54 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         output = output.view(-1, hidden_dim)
         return output
 
+    def forward_indexer_only(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        kv_cache: Optional[torch.Tensor] = None,
+        attn_metadata: Optional[AttentionMetadata] = None,
+    ) -> tuple:
+        """
+        Indexer-only phase for DMP.
+
+        Functional custom op version.
+        torch.ops.vllm.mla_forward_indexer_only returns Tensor tuple.
+        """
+
+        forward_context: ForwardContext = get_forward_context()
+        need_gather_q_kv = forward_context.flash_comm_v1_enabled
+
+        ql_nope, q_pe, topk_indices, output = torch.ops.vllm.mla_forward_indexer_only(
+            hidden_states,
+            need_gather_q_kv,
+            self.prefix,
+        )
+
+        indexer_out = (
+            ql_nope,
+            q_pe,
+            topk_indices,
+            output,
+        )
+
+        return indexer_out
+
+    def forward_sparse_attn_only(
+            self,
+            indexer_result: tuple,
+            kv_cache: Optional[torch.Tensor] = None,
+            attn_metadata: Optional[AttentionMetadata] = None
+    ) -> torch.Tensor:
+        """Sparse-attn-only phase for DMP."""
+        ql_nope, q_pe, topk_indices, output = indexer_result
+        torch.ops.vllm.mla_forward_sparse_attn_only(ql_nope,
+                                                    q_pe,
+                                                    topk_indices,
+                                                    output,
+                                                    self.prefix)
+        assert(len(indexer_result) > 0)
+        return output.view(-1, output.shape[-1])
+
 
 def mla_forward(
     hidden_states: torch.Tensor,
@@ -204,5 +253,126 @@ direct_register_custom_op(
     op_func=mla_forward,
     mutates_args=["output"],
     fake_impl=mla_forward_fake,
+    dispatch_key="PrivateUse1",
+)
+
+def mla_forward_indexer_only(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Functional custom op for indexer-only phase of DMP.
+
+    Returns only tensors.
+    Do not return bool / None / dict / dataclass.
+    """
+
+    forward_context: ForwardContext = get_forward_context()
+    layer = forward_context.no_compile_layers[layer_name]
+
+    if forward_context.attn_metadata is not None:
+        attn_metadata = forward_context.attn_metadata[
+            layer.mla_attn.layer_name
+        ]
+    else:
+        attn_metadata = None
+
+    kv_cache = layer.mla_attn.kv_cache[forward_context.virtual_engine]
+
+    output = torch.empty_like(hidden_states)
+
+    result = layer.mla_attn.impl.forward_indexer_only(
+        layer.mla_attn.layer_name,
+        hidden_states,
+        kv_cache,
+        attn_metadata,
+        need_gather_q_kv,
+        output,
+    )
+    assert(len(result) == 4)
+
+    return result
+
+def mla_forward_indexer_only_fake(
+    hidden_states: torch.Tensor,
+    need_gather_q_kv: bool,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    ql_nope = torch.empty(
+        (...),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+
+    q_pe = torch.empty(
+        (...),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+
+    topk_indices = torch.empty(
+        (...),
+        dtype=torch.int32,
+        device=hidden_states.device,
+    )
+
+    output = torch.empty_like(hidden_states)
+
+    return ql_nope, q_pe, topk_indices, output
+
+
+
+direct_register_custom_op(
+    op_name="mla_forward_indexer_only",
+    op_func=mla_forward_indexer_only,
+    mutates_args=[],
+    fake_impl=mla_forward_indexer_only_fake,
+    dispatch_key="PrivateUse1",
+)
+
+
+def mla_forward_sparse_attn_only(
+    ql_nope: Optional[torch.Tensor],
+    q_pe: Optional[torch.Tensor],
+    topk_indices: Optional[torch.Tensor],
+    output: Optional[torch.Tensor],
+    layer_name: str,
+) -> None:
+    """Custom op for sparse-attn-only phase of DMP."""
+    indexer_result = (
+        ql_nope,
+        q_pe,
+        topk_indices,
+        output
+    )
+    forward_context: ForwardContext = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    if forward_context.attn_metadata:
+        attn_metadata = forward_context.attn_metadata[self.mla_attn.layer_name]
+    else:
+        attn_metadata = forward_context.attn_metadata
+    kv_cache = self.mla_attn.kv_cache[forward_context.virtual_engine]
+    self.mla_attn.impl.forward_sparse_attn_only(
+        indexer_result, self.mla_attn.layer_name, kv_cache, attn_metadata)
+    return
+
+
+def mla_forward_sparse_attn_only_fake(
+    ql_nope: Optional[torch.Tensor],
+    q_pe: Optional[torch.Tensor],
+    topk_indices: Optional[torch.Tensor],
+    output: Optional[torch.Tensor],
+    layer_name: str,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="mla_forward_sparse_attn_only",
+    op_func=mla_forward_sparse_attn_only,
+    mutates_args=[],
+    fake_impl=mla_forward_sparse_attn_only_fake,
     dispatch_key="PrivateUse1",
 )

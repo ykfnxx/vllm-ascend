@@ -265,6 +265,52 @@ class AscendMoERunner(DefaultMoERunner):
         chunked path. Always return False to stay on forward_impl."""
         return False
 
+    def _encode_layer_name(self):
+        try:
+            from vllm.forward_context import (
+                get_forward_context,
+                is_forward_context_available,
+            )
+
+            if is_forward_context_available():
+                forward_context = get_forward_context()
+                dmp_ctx = getattr(forward_context, "dmp_context", None)
+
+                if dmp_ctx is not None:
+                    try:
+                        from vllm.utils.torch_utils import (
+                            _USE_LAYERNAME,
+                            LayerName,
+                        )
+
+                        if _USE_LAYERNAME:
+                            encoded_layer_name = LayerName(self.layer_name)
+                        else:
+                            encoded_layer_name = self.layer_name
+                    except Exception:
+                        encoded_layer_name = self.layer_name
+
+                    print(
+                        "[DMP_MOE_ENCODE]",
+                        "layer_name =", self.layer_name,
+                        "encoded =", encoded_layer_name,
+                    )
+
+                    return encoded_layer_name
+
+        except Exception as e:
+            print("[DMP_MOE_ENCODE] fallback due to exception:", repr(e))
+
+        encoded_layer_name = super()._encode_layer_name()
+
+        print(
+            "[DMP_MOE_ENCODE]",
+            "layer_name =", self.layer_name,
+            "encoded =", encoded_layer_name,
+        )
+
+        return encoded_layer_name
+
     def forward_impl(
         self,
         layer: torch.nn.Module,

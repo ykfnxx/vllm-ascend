@@ -40,6 +40,7 @@ from vllm.distributed.parallel_state import get_dcp_group, get_dp_group, get_pcp
 from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
 from vllm.sequence import IntermediateTensors
@@ -90,6 +91,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup
 
 # yapf: enable
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
@@ -121,6 +123,7 @@ from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
 from vllm_ascend.utils import (
     calc_split_factor,
     check_gdn_layer,
+    enable_dsa_cp,
     enable_sp,
     enable_sp_by_pass,
     get_c_env,
@@ -139,8 +142,8 @@ from vllm_ascend.ascend_forward_context import (  # isort: skip
     set_ascend_forward_context,
     set_mc2_mask,
     set_mc2_tokens_capacity,
+    get_mc2_mask
 )
-from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
@@ -358,6 +361,14 @@ class NPUModelRunner(GPUModelRunner):
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
         set_mc2_mask(vllm_config, self.device)
         self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
+
+        # DMP: pre-allocate NPU stream and block location table to avoid
+        # per-forward resource allocation.
+        self._dmp_load_stream = None
+        self._dmp_block_location = None
+        # Keep graph-only DMP metadata and events alive for the lifetime of
+        # each captured graph. Replay uses the addresses recorded at capture.
+        self._dmp_graph_contexts: dict[BatchDescriptor, Any] = {}
 
         self.use_aclgraph = self._use_aclgraph()
 
@@ -1104,6 +1115,372 @@ class NPUModelRunner(GPUModelRunner):
 
         return draft_token_ids
 
+    def _get_cum_query_lens(self, attn_metadata):
+        """Extract cum_query_lens from attention metadata (dict or single)."""
+        if attn_metadata is None:
+            return None
+        if isinstance(attn_metadata, dict):
+            for meta in attn_metadata.values():
+                if meta is not None and hasattr(meta, 'cum_query_lens'):
+                    return meta.cum_query_lens
+            return None
+        return getattr(attn_metadata, 'cum_query_lens', None)
+
+    def _align_to_request_boundary(self, cum_query_lens, half,
+                                   round_up=True):
+        """Find a request boundary near half.
+
+        cum_query_lens is a monotonically increasing 1D tensor where each
+        element is the cumulative count of query tokens up to that request.
+        The split point must align to a request boundary so no request is
+        split across microbatches.
+
+        When round_up=True (default), always rounds up to the next boundary
+        (preserving original behavior). When round_up=False, picks the
+        boundary closest to half to minimize imbalance.
+        """
+        idx = torch.searchsorted(cum_query_lens, half)
+        if idx >= len(cum_query_lens):
+            return cum_query_lens[-1].item()
+        if round_up:
+            return cum_query_lens[idx].item()
+        # Round to nearest: compare distance to idx-1 and idx boundaries
+        upper = cum_query_lens[idx].item()
+        if idx == 0:
+            return upper
+        lower = cum_query_lens[idx - 1].item()
+        if (half - lower) <= (upper - half):
+            return lower
+        return upper
+
+    def _is_dmp_eligible(self, attn_metadata, num_input_tokens):
+        """Check if DMP is eligible for this batch.
+
+        DMP only applies to decode-only batches with even token count,
+        requires at least 2 requests for microbatch splitting, and is
+        incompatible with DSA-CP.
+        """
+        # return False
+        if attn_metadata is None:
+            print("[DMP dummy] 1")
+            return False
+        # Check attn_state from the first metadata entry
+        attn_state = None
+        if isinstance(attn_metadata, dict):
+            for v in attn_metadata.values():
+                attn_state = getattr(v, 'attn_state', None)
+                break
+        if attn_state is None:
+            print("[DMP dummy] 2")
+            return False
+        if attn_state != AscendAttentionState.DecodeOnly:
+            print("[DMP] _is_dmp_eligible check 3 failed: "
+                  f"attn_state={attn_state}, expected DecodeOnly")
+            return False
+        if num_input_tokens % 2 != 0:
+            print("[DMP dummy] 4")
+            return False
+        # 请求级可拆分性检查：至少 2 个请求才能拆分为两个微批次
+        cum_query_lens = self._get_cum_query_lens(attn_metadata)
+        if cum_query_lens is None:
+            print("[DMP dummy] 5")
+            return False
+        num_reqs = len(cum_query_lens)
+        if num_reqs < 2:
+            print("[DMP dummy] 6")
+            return False
+        # The first graph implementation only supports one decode token per
+        # request. This guarantees a stable 50/50 split for capture/replay.
+        if num_reqs != num_input_tokens:
+            print("[DMP dummy] 8")
+            return False
+        if enable_dsa_cp():
+            print("[DMP dummy] 7")
+            return False
+        return True
+
+    def _maybe_create_dmp_slices(self, attn_metadata, num_input_tokens,
+                                 scheduler_output=None):
+        """Create DMPContext with two microbatch slices if eligible.
+
+        When in SpecDecoding mode, aligns to the nearest request boundary
+        (not always rounding up) and pads the smaller microbatch with
+        dummy tokens to achieve a 50/50 split, which is required for
+        graph mode shape consistency.
+        """
+        if not self._is_dmp_eligible(attn_metadata, num_input_tokens):
+            print("[DMP dummy] _is_dmp_eligible() returns false")
+            return None
+        # print("[DEUBG] _is_dmp_eligible() returns true")
+
+        from vllm_ascend.kv_offload.asu_npu import PlaceholderKVLoadOp
+        from vllm_ascend.kv_offload.block_location import BlockLocationTable
+        from vllm_ascend.kv_offload.kv_loader import KVLoader
+        from vllm_ascend.worker.dmp_context import DMPContext, DMPSlice
+
+        half = num_input_tokens // 2
+
+        # Align half to a request boundary so no request is split across
+        # microbatches.  Use round-to-nearest (not always round-up) to
+        # minimize the padding needed for 50/50 balance.
+        cum_query_lens = self._get_cum_query_lens(attn_metadata)
+        print("[DMP align] num_input_tokens={}, half={}, cum_query_lens={}".format(
+            num_input_tokens, half, cum_query_lens))
+        if cum_query_lens is not None:
+            aligned_half = self._align_to_request_boundary(
+                cum_query_lens, half, round_up=False)
+            print("[DMP align] aligned_half={}, check: aligned_half==0? {}, aligned_half>=num_input_tokens? {}".format(
+                aligned_half, aligned_half == 0, aligned_half >= num_input_tokens))
+            if aligned_half == 0 or aligned_half >= num_input_tokens:
+                print("[DMP dmp_ctx None] 2: aligned_half={}, num_input_tokens={}".format(
+                    aligned_half, num_input_tokens))
+                return None  # Too few requests to split
+            half = int(aligned_half)
+
+        slice_a = DMPSlice(start=0, end=half)
+        slice_b = DMPSlice(start=half, end=num_input_tokens)
+
+        # Pad the smaller microbatch to achieve 50/50 for graph mode
+        pad_size = abs(slice_a.num_real_tokens - slice_b.num_real_tokens)
+        if pad_size > 0:
+            if slice_a.num_real_tokens < slice_b.num_real_tokens:
+                slice_a.num_padded_tokens = pad_size
+            else:
+                slice_b.num_padded_tokens = pad_size
+
+        # Get decode_token_per_req for proper padding of request-level fields
+        decode_token_per_req = 1
+        if isinstance(attn_metadata, dict):
+            for meta in attn_metadata.values():
+                dtr = getattr(meta, 'decode_token_per_req', None)
+                if dtr is not None and dtr > 1:
+                    decode_token_per_req = dtr
+                    break
+        else:
+            dtr = getattr(attn_metadata, 'decode_token_per_req', None)
+            if dtr is not None and dtr > 1:
+                decode_token_per_req = dtr
+
+        # Slice attention metadata for each microbatch (with padding)
+        attn_meta_a = self._slice_attn_metadata(
+            attn_metadata, slice_a, decode_token_per_req)
+        attn_meta_b = self._slice_attn_metadata(
+            attn_metadata, slice_b, decode_token_per_req)
+
+        # Create KV loader with placeholder op.
+        # Reuse the NPU stream and BlockLocationTable across forward passes
+        # to avoid repeated resource allocation.
+        kv_load_op = PlaceholderKVLoadOp()
+        if self._dmp_load_stream is None:
+            self._dmp_load_stream = torch.npu.Stream()
+        load_stream = self._dmp_load_stream
+        kv_loader = KVLoader(kv_load_op, load_stream)
+
+        num_blocks = getattr(self.cache_config, 'num_gpu_blocks', None)
+        # num_blocks = self.cache_config.num_gpu_blocks
+        if num_blocks is None:
+            num_blocks = 1
+        if self._dmp_block_location is None or \
+           self._dmp_block_location.num_blocks != num_blocks:
+            self._dmp_block_location = BlockLocationTable(
+                num_blocks, self.device)
+        block_location = self._dmp_block_location
+
+        # 为每个微批次计算 MC2 通信所需的 padded_num_tokens 和 mc2_mask
+        tp_world_size = get_tensor_model_parallel_world_size()
+        reserved_mc2_mask = get_mc2_mask()
+        padded_num_tokens_list = []
+        mc2_mask_list = []
+        for sl in [slice_a, slice_b]:
+            padded = math.ceil(sl.num_tokens / tp_world_size) \
+                     * tp_world_size
+            padded_num_tokens_list.append(padded)
+            if reserved_mc2_mask is not None:
+                mask = reserved_mc2_mask[:padded].clone()
+                mask[:sl.num_real_tokens] = True
+                mask[sl.num_real_tokens:] = False
+                mc2_mask_list.append(mask)
+            else:
+                mc2_mask_list.append(None)
+
+        return DMPContext(
+            slices=[slice_a, slice_b],
+            kv_loader=kv_loader,
+            block_location=block_location,
+            _attn_metadata_list=[attn_meta_a, attn_meta_b],
+            _num_tokens_list=[slice_a.num_tokens, slice_b.num_tokens],
+            _padded_num_tokens_list=padded_num_tokens_list,
+            _mc2_mask_list=mc2_mask_list,
+        )
+
+    def _get_or_create_dmp_graph_context(
+        self,
+        batch_descriptor: BatchDescriptor,
+        attn_metadata,
+        num_input_tokens: int,
+        scheduler_output=None,
+    ):
+        """Return the persistent DMP context used by one full graph.
+
+        ACL graph replay bypasses Python model forward. Keeping this context
+        alive preserves sliced metadata and Event objects referenced by the
+        captured graph.
+        """
+        dmp_context = self._dmp_graph_contexts.get(batch_descriptor)
+        if dmp_context is None:
+            dmp_context = self._maybe_create_dmp_slices(
+                attn_metadata, num_input_tokens, scheduler_output)
+            if dmp_context is not None:
+                dmp_context.prepare_graph_events(
+                    self.model_config.hf_text_config.num_hidden_layers)
+                self._dmp_graph_contexts[batch_descriptor] = dmp_context
+                logger.info(
+                    "Prepared DMP full-decode graph context for %s",
+                    batch_descriptor,
+                )
+        return dmp_context
+
+    def _slice_attn_metadata(self, attn_metadata, dmp_slice,
+                             decode_token_per_req=1):
+        """Slice attn_metadata tensors for a microbatch.
+
+        For dict-based metadata (v1), slices each layer's metadata.
+        When dmp_slice.num_padded_tokens > 0, extends the sliced metadata
+        with dummy tokens for 50/50 shape balance.
+        """
+        if isinstance(attn_metadata, dict):
+            sliced = {}
+            for layer_name, meta in attn_metadata.items():
+                sliced[layer_name] = self._slice_single_attn_metadata(
+                    meta, dmp_slice, decode_token_per_req)
+            return sliced
+        return self._slice_single_attn_metadata(
+            attn_metadata, dmp_slice, decode_token_per_req)
+
+    def _slice_single_attn_metadata(self, meta, dmp_slice,
+                                    decode_token_per_req=1):
+        """Slice a single AscendSFAMetadata for a microbatch.
+
+        When dmp_slice.num_padded_tokens > 0, extends the sliced metadata
+        with dummy tokens so both microbatches have the same token count
+        (required for graph mode shape consistency).
+        """
+        from copy import copy
+        if meta is None:
+            return None
+        s = dmp_slice
+        sliced = copy(meta)
+        # Token-dimension slicing
+        if hasattr(meta, 'slot_mapping') and meta.slot_mapping is not None:
+            sliced.slot_mapping = meta.slot_mapping[s.start:s.end]
+        if hasattr(meta, 'cos') and meta.cos is not None:
+            sliced.cos = meta.cos[s.start:s.end]
+        if hasattr(meta, 'sin') and meta.sin is not None:
+            sliced.sin = meta.sin[s.start:s.end]
+        if hasattr(meta, 'num_input_tokens'):
+            sliced.num_input_tokens = s.num_tokens
+        if hasattr(meta, 'num_actual_tokens'):
+            # num_actual_tokens marks where real tokens end (for mc2_mask);
+            # padded tokens are dummy and should be masked out.
+            sliced.num_actual_tokens = min(meta.num_actual_tokens,
+                                          s.num_real_tokens)
+        # Request-dimension slicing
+        # Derive request range [req_start, req_end) from the token range
+        # using cum_query_lens (cumulative query token counts per request).
+        if hasattr(meta, 'cum_query_lens') and \
+                meta.cum_query_lens is not None:
+            cum_ql = meta.cum_query_lens
+            # req_start: first request whose cumulative count exceeds s.start
+            req_start = int(
+                torch.searchsorted(cum_ql, s.start, right=True))
+            # req_end: first request whose cumulative count >= s.end
+            req_end = int(torch.searchsorted(cum_ql, s.end - 1,
+                                             right=True)) + 1
+        else:
+            # Fallback: decode-only with 1 token per request
+            req_start = s.start
+            req_end = s.end
+
+        if hasattr(meta, 'block_table') and meta.block_table is not None:
+            sliced.block_table = meta.block_table[req_start:req_end]
+        if hasattr(meta, 'seq_lens') and meta.seq_lens is not None:
+            sliced.seq_lens = meta.seq_lens[req_start:req_end]
+        if hasattr(meta, 'cum_query_lens') and \
+                meta.cum_query_lens is not None:
+            # Recompute cumulative values: microbatch B starts from
+            # token index 0, so subtract the offset.
+            cum_ql_slice = meta.cum_query_lens[req_start:req_end]
+            if s.start > 0:
+                sliced.cum_query_lens = cum_ql_slice - s.start
+            else:
+                sliced.cum_query_lens = cum_ql_slice
+
+        # ── Padding: extend with dummy tokens for 50/50 balance ──
+        if s.num_padded_tokens > 0:
+            device = meta.slot_mapping.device if \
+                hasattr(meta, 'slot_mapping') and \
+                meta.slot_mapping is not None else None
+
+            # slot_mapping: -1 means "no KV write"
+            if hasattr(sliced, 'slot_mapping') and \
+                    sliced.slot_mapping is not None:
+                pad_slots = torch.full((s.num_padded_tokens, ), -1,
+                                       dtype=sliced.slot_mapping.dtype,
+                                       device=device)
+                sliced.slot_mapping = torch.cat(
+                    [sliced.slot_mapping, pad_slots])
+
+            # cos/sin: zeroed (attention will produce zero output)
+            if hasattr(sliced, 'cos') and sliced.cos is not None:
+                pad_cos = torch.zeros(
+                    s.num_padded_tokens, *sliced.cos.shape[1:],
+                    dtype=sliced.cos.dtype, device=device)
+                sliced.cos = torch.cat([sliced.cos, pad_cos])
+            if hasattr(sliced, 'sin') and sliced.sin is not None:
+                pad_sin = torch.zeros(
+                    s.num_padded_tokens, *sliced.sin.shape[1:],
+                    dtype=sliced.sin.dtype, device=device)
+                sliced.sin = torch.cat([sliced.sin, pad_sin])
+
+            # num_input_tokens: total including padding
+            if hasattr(sliced, 'num_input_tokens'):
+                sliced.num_input_tokens = s.num_tokens
+
+            # Request-level padding: add dummy requests
+            num_pad_reqs = s.num_padded_tokens // decode_token_per_req
+            if num_pad_reqs > 0:
+                # seq_lens: 0 for dummy requests (zero-length sequences)
+                if hasattr(sliced, 'seq_lens') and \
+                        sliced.seq_lens is not None:
+                    pad_seq = torch.zeros(
+                        num_pad_reqs, dtype=sliced.seq_lens.dtype,
+                        device=device)
+                    sliced.seq_lens = torch.cat(
+                        [sliced.seq_lens, pad_seq])
+
+                # block_table: zero rows for dummy requests
+                if hasattr(sliced, 'block_table') and \
+                        sliced.block_table is not None:
+                    pad_bt = torch.zeros(
+                        num_pad_reqs, sliced.block_table.shape[1],
+                        dtype=sliced.block_table.dtype, device=device)
+                    sliced.block_table = torch.cat(
+                        [sliced.block_table, pad_bt], dim=0)
+
+                # cum_query_lens: extend with proper increments
+                if hasattr(sliced, 'cum_query_lens') and \
+                        sliced.cum_query_lens is not None:
+                    last_cum = sliced.cum_query_lens[-1].item() \
+                        if len(sliced.cum_query_lens) > 0 else 0
+                    increments = torch.arange(
+                        1, num_pad_reqs + 1, device=device
+                    ) * decode_token_per_req + last_cum
+                    sliced.cum_query_lens = torch.cat(
+                        [sliced.cum_query_lens,
+                         increments.to(sliced.cum_query_lens.dtype)])
+
+        return sliced
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1321,6 +1698,20 @@ class NPUModelRunner(GPUModelRunner):
                 self.debugger.start(model=self.model)
             else:
                 self.debugger.start()
+
+        # DMP: create microbatch slices if eligible
+        dmp_context = None
+        if envs_ascend.VLLM_ASCEND_ENABLE_DMP:
+            if cudagraph_mode == CUDAGraphMode.FULL:
+                # Full graphs are pre-captured. A cached context means this
+                # descriptor was captured through DMP; a miss means its graph
+                # intentionally uses the original model forward.
+                dmp_context = self._dmp_graph_contexts.get(batch_desc)
+            else:
+                dmp_context = self._maybe_create_dmp_slices(
+                    attn_metadata, num_tokens_padded, scheduler_output)
+            print("[DMP exec] dmp_context is None={}".format(dmp_context is None))
+
         if self.ascend_config.enable_async_exponential:
             self.sampler.do_async_exponential(
                 b_s=logits_indices.shape[0],
@@ -1348,6 +1739,7 @@ class NPUModelRunner(GPUModelRunner):
                 model_instance=self.model,
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
+                dmp_context=dmp_context
             ),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
@@ -1533,10 +1925,6 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
-                input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
-                    spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
-                    <= self.effective_drafter_max_model_len
-                )
                 use_padded_batch = (
                     self.speculative_config
                     and (self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model())
@@ -1545,28 +1933,8 @@ class NPUModelRunner(GPUModelRunner):
                 if use_padded_batch:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
-                    sampled_token_ids = sampler_output.sampled_token_ids
-                    if input_fits_in_drafter:
-                        propose_draft_token_ids(sampler_output.sampled_token_ids)
-                    elif self.valid_sampled_token_count_event is not None:
-                        assert spec_decode_common_attn_metadata is not None
-                        if self.drafter is not None: # Fix mypy type check for drafter None check
-                            next_token_ids, valid_sampled_tokens_count = self.drafter.prepare_next_token_ids_padded(
-                                    spec_decode_common_attn_metadata,
-                                    sampled_token_ids,
-                                    self.requests,
-                                    self.input_batch,
-                                    self.discard_request_indices.gpu,
-                                    self.num_discarded_requests,
-                                )
-                            self._copy_valid_sampled_token_count(
-                                next_token_ids, valid_sampled_tokens_count
-                            )
-                            self._draft_token_ids = torch.zeros(
-                                1, device=self.device, dtype=torch.int32
-                            ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
-                            self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
-                if self.speculative_config and not use_padded_batch and input_fits_in_drafter:
+                    propose_draft_token_ids(sampler_output.sampled_token_ids)
+                if self.speculative_config and not use_padded_batch:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
@@ -2505,6 +2873,28 @@ class NPUModelRunner(GPUModelRunner):
                 if hasattr(self.drafter, "model") and hasattr(self.drafter.model, "compute_logits"):
                     return self.drafter.model.compute_logits(hidden_states[dummy_indices])
 
+            dmp_context = None
+            if envs_ascend.VLLM_ASCEND_ENABLE_DMP and uniform_decode:
+                if (
+                    is_graph_capturing
+                    and cudagraph_runtime_mode == CUDAGraphMode.FULL
+                ):
+                    dmp_context = self._get_or_create_dmp_graph_context(
+                        batch_desc,
+                        attn_metadata,
+                        num_tokens_padded,
+                    )
+                elif (
+                    force_attention
+                    and cudagraph_runtime_mode == CUDAGraphMode.NONE
+                ):
+                    # Full-graph warmup runs with graph mode NONE. Exercise
+                    # DMP here so its kernels and buffers are ready to capture.
+                    dmp_context = self._maybe_create_dmp_slices(
+                        attn_metadata,
+                        num_tokens_padded,
+                    )
+
             with set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -2515,6 +2905,7 @@ class NPUModelRunner(GPUModelRunner):
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_desc,
                 model_instance=self.model,
+                dmp_context=dmp_context,
             ):
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
