@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(AICPU_CONTEXT_LIB_DIR
-    ${ASCEND_CANN_PACKAGE_PATH}/opp/built-in/op_impl/aicpu/aicpu_kernel/lib)
+    ${ASCEND_CANN_PACKAGE_PATH}/opp/built-in/op_impl/aicpu/aicpu_kernel/lib/Ascend)
 set(AICPU_RUNTIME_LIB_DIR ${ASCEND_CANN_PACKAGE_PATH}/lib64)
 
 add_library(cust_aicpu_kernels SHARED
