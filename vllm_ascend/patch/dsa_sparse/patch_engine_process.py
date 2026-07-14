@@ -1,7 +1,5 @@
 """Install DSA patches before vLLM v0.18 constructs a child EngineCore."""
 
-from functools import wraps
-
 from vllm.v1.engine.core import EngineCoreProc
 from vllm_ascend.dsa_sparse.dsa_config import (
     attach_dsa_sparse_cache_attrs,
@@ -11,7 +9,7 @@ from vllm_ascend.dsa_sparse.dsa_config import (
 _original_run_engine_core = EngineCoreProc.run_engine_core
 
 
-@wraps(_original_run_engine_core)
+# Keep this function's module identity so spawn imports the DSA patch module.
 def _run_engine_core(
     *args,
     dp_rank: int = 0,
