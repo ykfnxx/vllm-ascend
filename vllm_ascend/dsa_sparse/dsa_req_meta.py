@@ -83,7 +83,11 @@ def _build_req_forward_plan(
         dense_tokens_before_current_query // block_size) * block_size
 
     if is_sparse_decode:
-        resident_tail_start = budget_slot_count
+        # Sparse lookup slots occupy every full resident block before the
+        # independent dense tail block. The current TopK width is deliberately
+        # smaller than this address space and must not define the tail offset.
+        resident_tail_start = max(
+            0, (len(vllm_budget_block_ids) - 1) * block_size)
         dumped_full_token_end = len(req_context_full_blk_hashes) * block_size
         candidate_range_start = 0
         candidate_range_end = min(dumped_full_token_end, dense_tail_start)

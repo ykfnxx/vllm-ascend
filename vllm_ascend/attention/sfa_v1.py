@@ -1201,7 +1201,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     ):
                         _dsa_lightning_sync()
                     logger.info(
-                        "[DSA GS lightning_indexer] %s",
+                        "[DSA lookup lightning_indexer] %s",
                         {
                             "rank": self.tp_rank,
                             "layer": layer_name,

@@ -107,11 +107,25 @@ class DSASparseBase:
                 configured_sparse_budget, self._vllm_blk_size,
                 rounded_sparse_budget)
         self._hbm_sparse_budget_tokens = rounded_sparse_budget
-        # DSA sparse decode is only beneficial when the full sequence exceeds
-        # HBM capacity (budget blocks + one tail block). Shorter sequences fit
-        # entirely in HBM and use standard dense attention.
+        configured_resident_tokens = int(
+            vllm_config.cache_config.dsa_hbm_resident_tokens)
+        self._hbm_resident_tokens = _round_up_to_multiple(
+            configured_resident_tokens, self._vllm_blk_size)
+        if self._hbm_resident_tokens <= self._hbm_sparse_budget_tokens:
+            raise ValueError(
+                "DSA lookup resident capacity must be greater than TopK: "
+                f"resident={self._hbm_resident_tokens}, "
+                f"topk={self._hbm_sparse_budget_tokens}")
+        # One full TopK of free slots guarantees that lookup can allocate an
+        # all-miss query before maintenance reclaims the same number of old
+        # non-protected entries.
+        self._lookup_free_slot_tokens = self._hbm_sparse_budget_tokens
+        self._lookup_total_slot_tokens = (
+            self._hbm_resident_tokens + self._lookup_free_slot_tokens)
+        # Sparse decode starts only after the original sequence exceeds the
+        # physical lookup address space plus its independent dense tail block.
         self._enable_dsa_prompt_len = (
-            self._hbm_sparse_budget_tokens + self._vllm_blk_size)
+            self._lookup_total_slot_tokens + self._vllm_blk_size)
         self.dsa_meta = None
         self.forward_sparse_decode_batch = DSAForwardSparseDecodeBatch.empty()
         self.forward_layer_batch = DSAForwardLayerBatch.empty()
@@ -137,12 +151,12 @@ class DSASparseBase:
 
 
 class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
-    """Current gather-selection based DSA sparse offload implementation.
+    """Current lookup-resident based DSA sparse offload implementation.
 
     DSASparseV1 keeps the scheduler/worker hooks in the algorithm class and
-    opts into DSAGraphBuffersMixin because this concrete implementation supports
-    row-mode decode graph replay.  A future DSA variant may choose a
-    different graph strategy without changing DSASparseBase.
+    retains the existing graph-buffer interface. Lookup configuration rejects
+    graph mode until the dynamic lookup/materialize/maintain path has
+    capture-safe operators.
     """
 
     def __init__(self,
@@ -161,21 +175,21 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         self.dsa_hot_kv_store = dram_store
         if ops_backend is None:
             raise RuntimeError(
-                "DSA sparse worker requires an Ascend gather-selection backend")
+                "DSA sparse worker requires an Ascend lookup backend")
         self.ops_backend = ops_backend
 
         self.total_num_hidden_layers = (
             vllm_config.model_config.get_total_num_hidden_layers()
         )
-        resident_budget_tokens = max(1, int(self._hbm_sparse_budget_tokens or 0))
+        index_capacity = int(vllm_config.model_config.max_model_len)
         self.resident_token_pool = DSAResidentTokenPool(
             max_reqs=int(vllm_config.cache_config.dsa_max_active_reqs),
             num_layers=self.total_num_hidden_layers,
-            max_tokens=resident_budget_tokens,
+            index_capacity=index_capacity,
+            resident_tokens=self._hbm_resident_tokens,
+            free_slot_tokens=self._lookup_free_slot_tokens,
             device=resident_device,
         )
-        self.resident_token_pool.ensure_resident_slot_token_statuses(
-            topk=resident_budget_tokens)
 
         self.layer_cache_registry = DSALayerCacheRegistry(
             num_layers=self.total_num_hidden_layers)
@@ -508,7 +522,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         if not torch.is_tensor(active_local_rows):
             raise RuntimeError(
                 "DSA sparse decode batch is missing active local row indices")
-        # Row-mode GS always runs over the active decode rows: dense rows keep
+        # Row-mode lookup runs over the active decode rows: dense rows keep
         # native full-cache semantics, sparse rows refresh resident metadata.
         # The true sparse subset remains in sparse_row_mask_tensor and
         # sparse_*row_indices_tensor for diagnostics and tests.
@@ -556,33 +570,33 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         layer_id = layer_batch.layer_id
         if layer_batch.blk_pool_mgr is None:
             raise RuntimeError(
-                "DSA gather-selection requires a DRAM block manager")
-        # SFA indices are HBM sparse-KV logical slots, not per-layer
-        # full-sequence topK token ids from lightning_indexer. Row-mode GS
-        # consumes the full active decode batch: dense rows keep the dense
-        # layout, sparse rows gather selected full-block tokens and append the
-        # resident tail.
+                "DSA lookup resident requires a DRAM block manager")
+        # Lightning Indexer returns original sequence token ids. Lookup maps
+        # them to arbitrary slots in the larger resident address space, loads
+        # only misses from DRAM, and returns the mapped slots consumed by SFA.
         prebuilt_attention_indices = (
             self._forward_sparse_decode_attention_indices_tensor)
         full_batch_topk = getattr(
             attn_metadata, "dsa_full_batch_selection_topk_indices", None)
         if not torch.is_tensor(full_batch_topk):
             raise RuntimeError(
-                "DSA row-mode gather-selection requires full-batch "
+                "DSA lookup resident requires full-batch "
                 "lightning-indexer topk indices aligned with decode rows; "
-                "the legacy sparse-only GS path is disabled.")
+                "the legacy sparse-only path is disabled.")
         forward_batch = self.forward_sparse_decode_batch
+        if forward_batch.batch_row_indices == list(
+                range(len(forward_batch.batch_row_indices))):
+            selection_topk = full_batch_topk
+        else:
+            selection_topk = full_batch_topk.index_select(
+                0, forward_batch.batch_row_indices_tensor)
         nopek_dram_arena = layer_batch.blk_pool_mgr.get_arena(
             layer_id, BlockType.NOPE_K)
         ropek_dram_arena = layer_batch.blk_pool_mgr.get_arena(
             layer_id, BlockType.ROPE_K)
-        resident_slot_token_status = (
-            self.resident_token_pool.get_resident_slot_token_status(
-                layer_id=layer_id,
-                topk=int(full_batch_topk.shape[-1]),
-            ))
-        gather_selection = self.ops_backend.gather_selection_update(
-            selection_topk_indices=full_batch_topk,
+        lookup_state = self.resident_token_pool.get_layer_lookup_state(layer_id)
+        lookup_result = self.ops_backend.lookup_resident_update(
+            selection_topk_indices=selection_topk,
             req_pool_entries=forward_batch.resident_pool_indices_tensor,
             candidate_lens=forward_batch.candidate_lens_tensor,
             selection_block_table=forward_batch.batch_hbm_block_table,
@@ -591,33 +605,22 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             ropek_cache_zone=layer_batch.cache_zones.ropek_cache_zone,
             nopek_dram_arena=nopek_dram_arena,
             ropek_dram_arena=ropek_dram_arena,
-            resident_slot_token_status=resident_slot_token_status,
-            query_start_locs=forward_batch.query_start_locs_tensor,
-            query_lens=forward_batch.query_lens_tensor,
-            query_position_rows=forward_batch.query_position_rows_tensor,
+            lookup_state=lookup_state,
+            resident_tokens=self._hbm_resident_tokens,
+            total_slots=self._lookup_total_slot_tokens,
             tail_valid_token_counts=(
                 forward_batch.tail_valid_token_counts_tensor),
             resident_tail_starts=(
                 forward_batch.resident_tail_starts_tensor),
             budget_lengths=forward_batch.budget_lengths_tensor,
             attention_indices_width=layer_batch.attention_indices_width,
-            layer_id=layer_id,
-            existing_attention_indices=getattr(
-                attn_metadata, "dsa_sparse_attention_indices", None),
             prebuilt_attention_indices=prebuilt_attention_indices,
             row_modes=forward_batch.row_modes_tensor,
+            lookup_init_mask=forward_batch.lookup_init_mask_tensor,
+            has_lookup_init_rows=forward_batch.has_lookup_init_rows,
         )
-        if not gather_selection.resident_update_committed:
-            raise RuntimeError(
-                "DSA gather-selection backend did not commit selection "
-                "metadata")
-        if gather_selection.attention_indices is None:
-            raise RuntimeError(
-                "DSA gather-selection backend did not build attention "
-                "indices")
-
-        sparse_attention_indices = gather_selection.attention_indices
-        self._commit_gather_selection_resident_metadata(layer_batch)
+        sparse_attention_indices = lookup_result.attention_indices
+        self._commit_lookup_resident_metadata(layer_batch)
         attention_indices = sparse_attention_indices
         if prebuilt_attention_indices is None:
             self._forward_sparse_decode_attention_indices_tensor = (
@@ -625,19 +628,11 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         attn_metadata.dsa_sparse_attention_indices = attention_indices
         return attention_indices
 
-    def _commit_gather_selection_resident_metadata(
+    def _commit_lookup_resident_metadata(
         self,
         layer_batch: DSALayerSparseDecodeBatch,
     ) -> None:
-        """Mirror gather-selection readiness into resident metadata.
-
-        The gather-selection op owns the KV materialization/status state, but
-        the framework still uses resident counts for graph admission and
-        request lifecycle diagnostics. The selected token ids are no longer
-        consumed by this Python path; row-mode GS may pass full-batch active
-        rows while sparse-only topk remains compact, so only the active row
-        metadata is validated here.
-        """
+        """Mirror stable lookup occupancy into resident metadata."""
         pool_indices = layer_batch.resident_pool_indices_tensor.reshape(-1).to(
             device=layer_batch.resident_view.device,
             dtype=torch.long,
@@ -646,20 +641,15 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         if row_count <= 0:
             return
 
-        budget_lengths = layer_batch.budget_lengths_tensor.reshape(-1).to(
-            device=layer_batch.resident_view.device,
-            dtype=torch.long,
-        ).clamp(min=0, max=int(layer_batch.resident_view.max_tokens))
-        if int(budget_lengths.numel()) != row_count:
-            raise RuntimeError(
-                "gather-selection budget row count must match DSA active "
-                f"rows: budget_lengths={tuple(budget_lengths.shape)}, "
-                f"rows={row_count}")
-
         row_modes = getattr(self.forward_sparse_decode_batch,
                             "row_modes_tensor", None)
         counts = layer_batch.resident_view.counts
-        target_counts = budget_lengths.to(dtype=counts.dtype)
+        target_counts = torch.full(
+            (row_count,),
+            int(self._hbm_resident_tokens),
+            dtype=counts.dtype,
+            device=layer_batch.resident_view.device,
+        )
         if torch.is_tensor(row_modes) and int(row_modes.numel()) == row_count:
             sparse_mask = row_modes.reshape(-1).to(
                 device=layer_batch.resident_view.device,
@@ -669,7 +659,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             # .item(), boolean Python branches, or dynamic boolean indexing
             # here: those trigger D2H sync/copy and are illegal while the
             # stream is captured.  Dense rows preserve their previous resident
-            # counts; sparse rows receive the committed budget length.
+            # counts; sparse rows receive the stable resident count.
             current_counts = counts.index_select(0, pool_indices)
             target_counts = torch.where(
                 sparse_mask,
@@ -758,7 +748,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         # This hook prepares the Python-side controls around the document-level
         # dsa_compute_score_pseudo operator. The dense score tensor itself is
         # produced by the Ascend attention backend and consumed by
-        # the Ascend gather-selection backend implementation.
+        # the Ascend lookup backend implementation.
         _reset_indexer_score_controls(attn_metadata)
 
         if not self.forward_sparse_decode_batch:
@@ -1057,7 +1047,8 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         if sparse_budget_tokens <= 0:
             return INVALID_SLOT
 
-        resident_valid_seq_len = sparse_budget_tokens + tail_slots_need
+        resident_valid_seq_len = (
+            self._lookup_total_slot_tokens + tail_slots_need)
         next_stage = (
             ReqStage.SPARSE_DECODE
             if previous_stage.is_sparse_decode

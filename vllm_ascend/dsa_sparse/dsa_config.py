@@ -30,6 +30,7 @@ _DSA_SPARSE_CONFIG_FIELD_MAPPINGS = (
     ("split_indexer_cache", "enable_dsa_split_indexer_cache"),
     ("indexer_mla_block_ratio", "dsa_indexer_mla_block_ratio"),
     ("hbm_sparse_budget", "dsa_hbm_sparse_budget"),
+    ("hbm_resident_tokens", "dsa_hbm_resident_tokens"),
     ("max_active_reqs", "dsa_max_active_reqs"),
     ("hot_cpu_block_multiple", "dsa_hot_cpu_block_multiple"),
 )
@@ -38,6 +39,9 @@ _DSA_SPARSE_DEFAULT_CACHE_ATTRS: dict[str, Any] = {
     "enable_dsa_split_indexer_cache": False,
     "dsa_indexer_mla_block_ratio": 3,
     "dsa_hbm_sparse_budget": 2048,
+    "dsa_hbm_resident_tokens": 8192,
+    # Direct token->slot tables are per request and per layer. Deployments must
+    # size this existing request-pool limit together with index HBM usage.
     "dsa_max_active_reqs": 256,
     "dsa_hot_cpu_block_multiple": 3,
 }
@@ -98,9 +102,23 @@ def _normalize_dsa_sparse_config(
                 "dsa_sparse_config['enabled']=True requires "
                 "dsa_sparse_config['split_indexer_cache']=True")
         cache_attrs["enable_dsa_split_indexer_cache"] = True
+        sparse_topk = int(cache_attrs["dsa_hbm_sparse_budget"])
+        resident_tokens = int(cache_attrs["dsa_hbm_resident_tokens"])
+        if sparse_topk <= 0:
+            raise ValueError(
+                "dsa_sparse_config['hbm_sparse_budget'] must be positive")
+        if resident_tokens <= sparse_topk:
+            raise ValueError(
+                "dsa_sparse_config['hbm_resident_tokens'] must be greater "
+                "than hbm_sparse_budget")
 
     additional_updates: dict[str, Any] = {}
     if _DSA_GRAPH_PUBLIC_CONFIG_KEY in raw_config:
+        if bool(raw_config[_DSA_GRAPH_PUBLIC_CONFIG_KEY]):
+            raise ValueError(
+                "DSA lookup resident cache does not support row-mode decode "
+                "graph until lookup/miss materialization/maintenance are "
+                "provided as capture-safe NPU operators")
         additional_updates[DSA_ROW_MODE_DECODE_GRAPH_CONFIG_KEY] = (
             raw_config[_DSA_GRAPH_PUBLIC_CONFIG_KEY])
     if "trace_points" in raw_config:
@@ -131,6 +149,13 @@ def attach_dsa_sparse_cache_attrs(vllm_config: Any) -> None:
             f"be a dict, got {type(cache_attrs)!r}")
 
     merged_attrs, additional_updates = _normalize_dsa_sparse_config(cache_attrs)
+    if (merged_attrs["enable_dsa_sparse_cache"]
+            and additional_config.get(
+                DSA_ROW_MODE_DECODE_GRAPH_CONFIG_KEY) is True):
+        raise ValueError(
+            "DSA lookup resident cache does not support row-mode decode "
+            "graph until lookup/miss materialization/maintenance are "
+            "provided as capture-safe NPU operators")
     for key, value in additional_updates.items():
         if key in additional_config and additional_config[key] != value:
             raise ValueError(

@@ -32,8 +32,8 @@ class AscendDSAHotKVStore(DSAHotKVStore):
 
     This store is independent from vLLM-Ascend's CPUOffloadingConnector.  It
     owns per-rank NPU-visible swapped DRAM arenas and logical DRAM block
-    tables used by DSA to stage MLA cache blocks before gather-selection
-    materializes selected tokens back to HBM.
+    tables used by DSA to stage MLA cache blocks before selected tokens are
+    materialized back to HBM.
     """
 
     def __init__(self, vllm_config: VllmConfig):
@@ -48,7 +48,7 @@ class AscendDSAHotKVStore(DSAHotKVStore):
             import torch_npu
         except ImportError as exc:
             raise RuntimeError(
-                "DSA gather-selection requires torch_npu swapped-memory "
+                "DSA lookup materialization requires torch_npu swapped-memory "
                 "DRAM arenas on Ascend") from exc
 
         device_index = torch.npu.current_device()

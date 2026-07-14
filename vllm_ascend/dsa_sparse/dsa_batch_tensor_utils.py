@@ -85,7 +85,7 @@ def build_dsa_mixed_key_lens(
 
     Dense rows must keep their native full sequence length. Sparse rows score
     only over the full-block candidate window; their resident tail is appended
-    later by gather-selection attention-index generation.
+    later by lookup-resident attention-index generation.
     """
     actual_lens = actual_seq_lengths_key.to(
         device=device, dtype=torch.int32).reshape(-1)
@@ -210,35 +210,8 @@ def compute_sparse_attention_indices_width(
     *,
     budget_slot_count: int,
     tail_valid_token_count: int,
-    resident_tail_start: int,
-    query_position_row: IntRow,
 ) -> int:
-    """Return the exact sparse_indices width for one decode row."""
+    """Return TopK mapped slots plus the independent resident tail."""
     budget_slot_count = max(0, int(budget_slot_count))
     tail_valid_token_count = max(0, int(tail_valid_token_count))
-    resident_tail_start = int(resident_tail_start)
-    resident_tail_end = resident_tail_start + tail_valid_token_count
-
-    if torch.is_tensor(query_position_row):
-        # Do not inspect device query-position values on host here: doing
-        # int(tensor_scalar) would synchronize/D2H in the decode hot path.
-        # Reserve one defensive extra column for non-empty tensor rows; GS/SFA
-        # will only consume valid positions and padding remains -1.
-        return (
-            budget_slot_count
-            + tail_valid_token_count
-            + int(int(query_position_row.numel()) > 0)
-        )
-
-    needs_query_extra = False
-    for position in query_position_row:
-        position = int(position)
-        if position < 0:
-            continue
-        in_budget = position < budget_slot_count
-        in_tail = resident_tail_start <= position < resident_tail_end
-        if not in_budget and not in_tail:
-            needs_query_extra = True
-            break
-
-    return budget_slot_count + tail_valid_token_count + int(needs_query_extra)
+    return budget_slot_count + tail_valid_token_count

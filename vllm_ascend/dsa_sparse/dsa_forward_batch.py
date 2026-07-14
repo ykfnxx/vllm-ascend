@@ -1,7 +1,7 @@
 """DSA model forward batch 的数据结构与构造逻辑。
 
 本文件承接 dsa_sparse.py 中“把一轮 model forward 的 ReqMeta 列表整理成
-layer hook / gather-selection / SFA 可消费批量张量”的职责。它持有的是
+layer hook / lookup-resident / SFA 可消费批量张量”的职责。它持有的是
 短生命周期 forward-level batch，而不是请求生命周期状态；请求状态仍由
 dsa_sparse.py 和 dsa_req_meta.py 推进，HBM/DRAM 资源仍由 resident pool / hot
 KV store 管理。
@@ -102,16 +102,16 @@ class DSAForwardSparseDecodeBatch:
 
     Built once per model forward and reused by every layer's after_indexer
     hook. It contains the tensorized, layer-invariant inputs needed by the
-    gather-selection path, such as resident pool rows, query ranges, HBM block
+    lookup-resident path, such as resident pool rows, query ranges, HBM block
     tables, and the DRAM logical block table.
 
     row-mode decode 刻意拆开两组“行”语义：
 
     * active_*row_indices_tensor:
-      本次 model forward 中所有进入统一 lightning-indexer -> GS -> SFA
-      路径的 decode 行。这里既包含 DENSE 行，也包含 SPARSE 行；GS 通过
-      row_modes_tensor 决定每一行具体走 dense 还是 sparse 语义，所以主
-      计算路径必须按 active rows 覆盖整批 decode 行。
+      本次 model forward 中所有进入统一 lightning-indexer -> lookup
+      -> SFA 路径的 decode 行。这里既包含 DENSE 行，也包含
+      SPARSE 行；row_modes_tensor 决定每行使用 dense 还是 sparse
+      语义，所以主计算路径必须按 active rows 覆盖整批 decode 行。
     * sparse_*row_indices_tensor:
       active rows 里真正处于 sparse resident 语义的子集。它适合做诊断、
       测试、图 replay 保真，以及后续 sparse-only 账本统计；但不能再用
@@ -149,9 +149,11 @@ class DSAForwardSparseDecodeBatch:
     query_last_token_indices_are_identity: bool
     batch_row_indices_tensor: torch.Tensor
     row_modes_tensor: torch.Tensor
+    lookup_init_mask_tensor: torch.Tensor
+    has_lookup_init_rows: bool
     # active_* 是 row-mode kernel 路径处理的全部 decode 行；sparse_* 仍是
     # 真 sparse 子集。两者都保留，避免图 replay 或后续重构时把“sparse 行”
-    # 误扩展成“全部行”，也避免把 dense 行从统一 GS/SFA 路径里漏掉。
+    # 误扩展成“全部行”，也避免把 dense 行从统一 lookup/SFA 路径里漏掉。
     active_local_row_indices_tensor: torch.Tensor
     active_batch_row_indices_tensor: torch.Tensor
     sparse_row_mask_tensor: torch.Tensor
@@ -204,6 +206,9 @@ class DSAForwardSparseDecodeBatch:
                 (0,), dtype=torch.long, device=device),
             row_modes_tensor=torch.empty(
                 (0,), dtype=torch.int32, device=device),
+            lookup_init_mask_tensor=torch.empty(
+                (0,), dtype=torch.bool, device=device),
+            has_lookup_init_rows=False,
             active_local_row_indices_tensor=torch.empty(
                 (0,), dtype=torch.long, device=device),
             active_batch_row_indices_tensor=torch.empty(
@@ -360,6 +365,7 @@ def _build_forward_batches_from_dsa_meta(
     batch_row_indices: list[int] = []
     sparse_row_mask: list[bool] = []
     row_modes: list[int] = []
+    lookup_init_mask: list[bool] = []
     tail_valid_token_counts: list[int] = []
     resident_tail_starts: list[int] = []
     range_starts: list[int] = []
@@ -367,6 +373,7 @@ def _build_forward_batches_from_dsa_meta(
     candidate_lens: list[int] = []
     budget_row_indices: list[int] = []
     budget_lengths: list[int] = []
+    hbm_slot_counts: list[int] = []
     attention_indices_width = 0
     max_logical_blocks = 0
     budget_block_size = 0
@@ -450,9 +457,11 @@ def _build_forward_batches_from_dsa_meta(
         if req_meta.num_output_tokens <= 0:
             continue
         topk_plan = ReqSparseDecodeForwardPlan.from_req_meta(req_meta)
-        if resident_pool_idx < 0 or not topk_plan.has_valid_topk_window():
+        if resident_pool_idx < 0 or topk_plan.query_len <= 0:
             continue
         is_sparse_row = bool(req_meta.forward_plan.is_sparse_decode)
+        if is_sparse_row and not topk_plan.has_valid_topk_window():
+            continue
         if is_sparse_row:
             if req_meta.blk_pool_mgr is None:
                 raise RuntimeError(
@@ -496,6 +505,8 @@ def _build_forward_batches_from_dsa_meta(
         sparse_row_mask.append(is_sparse_row)
         row_modes.append(int(DSADecodeRowMode.SPARSE if is_sparse_row
                              else DSADecodeRowMode.DENSE))
+        lookup_init_mask.append(
+            is_sparse_row and req_meta.stage.is_enter_sparse_decode)
         resident_pool_indices.append(resident_pool_idx)
         query_start_locs.append(query_start)
         query_lens.append(query_len)
@@ -510,43 +521,47 @@ def _build_forward_batches_from_dsa_meta(
         candidate_lens.append(max(0, range_end - int(topk_plan.range_start)))
         budget_row_indices.append(batch_row_index)
         budget_lengths.append(budget_slot_count)
-        # SFA sparse_indices width is computed from logical resident positions,
-        # not dense/original sequence positions. In single-token decode the
-        # current query's KV entry should already be inside the resident tail
-        # window, so it normally does not need an extra column. If future
-        # metadata places query outside both budget and tail, the helper keeps
-        # one defensive extra slot and that path should be audited.
-        attention_indices_width = max(
-            attention_indices_width,
-            compute_sparse_attention_indices_width(
-                budget_slot_count=budget_slot_count,
-                tail_valid_token_count=tail_valid_count,
-                resident_tail_start=int(
-                    req_meta.forward_plan.resident_tail_start),
-                query_position_row=query_position_row,
-            ))
-        max_logical_blocks = max(
-            max_logical_blocks,
-            (max(0, range_end) + req_meta.block_size - 1)
-            // req_meta.block_size)
+        hbm_slot_counts.append(
+            int(req_meta.forward_plan.resident_tail_start)
+            if is_sparse_row else 0)
         if is_sparse_row:
+            # Sparse decode only admits single-token rows whose current query
+            # KV is in the independent resident tail. SFA therefore consumes
+            # mapped TopK slots followed by that tail. Dense rows retain their
+            # Indexer TopK and must not expand this width to full sequence size.
+            attention_indices_width = max(
+                attention_indices_width,
+                compute_sparse_attention_indices_width(
+                    budget_slot_count=budget_slot_count,
+                    tail_valid_token_count=tail_valid_count,
+                ))
+        if is_sparse_row:
+            max_logical_blocks = max(
+                max_logical_blocks,
+                (max(0, range_end) + req_meta.block_size - 1)
+                // req_meta.block_size)
             score_topk_k = max(
                 score_topk_k,
                 int(req_meta.dsa_sparse_budget_tokens))
 
-    # DSA decode graph capture records the row-mode GS/lightning branch.
+    # DSA decode graph capture records the row-mode lookup/lightning branch.
     # Pure dense replay therefore still needs a positive topk so the Python
-    # control flow reaches the same operator sequence; row_modes tells GS to
+    # control flow reaches the same operator sequence; row_modes tells lookup to
     # leave dense rows as native full-cache rows.
     if request_ids and int(force_decode_row_mode_score_topk) > 0:
         score_topk_k = max(score_topk_k,
                            int(force_decode_row_mode_score_topk))
+        attention_indices_width = max(
+            attention_indices_width,
+            int(force_decode_row_mode_score_topk),
+        )
 
     (
         batch_row_indices,
         request_ids,
         sparse_row_mask,
         row_modes,
+        lookup_init_mask,
         resident_pool_indices,
         query_start_locs,
         query_lens,
@@ -559,11 +574,13 @@ def _build_forward_batches_from_dsa_meta(
         candidate_lens,
         budget_row_indices,
         budget_lengths,
+        hbm_slot_counts,
     ) = sort_decode_rows_by_batch_index(
         batch_row_indices,
         request_ids,
         sparse_row_mask,
         row_modes,
+        lookup_init_mask,
         resident_pool_indices,
         query_start_locs,
         query_lens,
@@ -576,6 +593,7 @@ def _build_forward_batches_from_dsa_meta(
         candidate_lens,
         budget_row_indices,
         budget_lengths,
+        hbm_slot_counts,
     )
 
     sparse_local_row_indices = [
@@ -617,7 +635,7 @@ def _build_forward_batches_from_dsa_meta(
     batch_hbm_block_table = build_hbm_block_table_tensor(
         dsa_meta.full_block_table_tensor,
         budget_row_indices,
-        budget_lengths,
+        hbm_slot_counts,
         block_size=budget_block_size,
         dtype=torch.int32,
         device=device,
@@ -677,6 +695,9 @@ def _build_forward_batches_from_dsa_meta(
             batch_row_indices, dtype=torch.long, device=device),
         row_modes_tensor=build_int_tensor(
             row_modes, dtype=torch.int32, device=device),
+        lookup_init_mask_tensor=build_int_tensor(
+            lookup_init_mask, dtype=torch.bool, device=device),
+        has_lookup_init_rows=any(lookup_init_mask),
         active_local_row_indices_tensor=build_int_tensor(
             active_local_row_indices, dtype=torch.long, device=device),
         active_batch_row_indices_tensor=build_int_tensor(
@@ -720,7 +741,7 @@ class DSALayerSparseDecodeBatch:
 
     This combines DSAForwardSparseDecodeBatch with layer-specific cache zones
     and resident views. Full-batch query/range/block-table tensors stay on
-    DSAForwardSparseDecodeBatch and are passed to gather-selection from there;
+    DSAForwardSparseDecodeBatch and are passed to lookup-resident from there;
     keeping them out of this layer view avoids repeated layer-wise index_select
     work in the decode hot path.
     """

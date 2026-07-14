@@ -122,7 +122,14 @@ def _max_memory_usage_bytes_from_groups(
             vllm_config, kv_cache_groups
         )
 
-    sparse_budget = int(vllm_config.cache_config.dsa_hbm_sparse_budget)
+    block_size = int(vllm_config.cache_config.block_size)
+    sparse_topk = cdiv(
+        int(vllm_config.cache_config.dsa_hbm_sparse_budget), block_size
+    ) * block_size
+    resident_tokens = cdiv(
+        int(vllm_config.cache_config.dsa_hbm_resident_tokens), block_size
+    ) * block_size
+    lookup_slot_tokens = resident_tokens + sparse_topk
     total_bytes = 0
     for group in kv_cache_groups:
         spec = group.kv_cache_spec
@@ -131,7 +138,7 @@ def _max_memory_usage_bytes_from_groups(
         else:
             assert is_dsa_mla_resident_spec(spec)
             resident_blocks = cdiv(
-                sparse_budget + spec.block_size, spec.block_size
+                lookup_slot_tokens + spec.block_size, spec.block_size
             )
             group_bytes = resident_blocks * spec.page_size_bytes
         total_bytes += len(group.layer_names) * group_bytes

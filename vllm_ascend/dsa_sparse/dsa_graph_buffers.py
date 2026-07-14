@@ -80,8 +80,8 @@ class DSAGraphBuffersMixin:
 
     def get_row_mode_decode_graph_dummy_resident_seq_len(self) -> int:
         """Return the capture-time resident MLA cache length for SFA."""
-        budget_tokens = int(self._hbm_sparse_budget_tokens or 0)
-        return max(1, budget_tokens + int(self._vllm_blk_size))
+        total_slots = int(self._lookup_total_slot_tokens or 0)
+        return max(1, total_slots + int(self._vllm_blk_size))
 
     def _graph_max_logical_blocks(self) -> int:
         max_model_len = int(
@@ -92,10 +92,8 @@ class DSAGraphBuffersMixin:
                    // self._vllm_blk_size)
 
     def _graph_attention_indices_width(self) -> int:
-        # Row-mode DSA graphs can replay mixed dense/sparse decode. Sparse rows
-        # need budget + tail, while dense rows may still have one resident tail
-        # block represented by the dense budget plus its valid tail tokens.
-        return int(self._hbm_sparse_budget_tokens or 0) + 2 * int(
+        # TopK mapped slots plus one full independent resident tail block.
+        return int(self._hbm_sparse_budget_tokens or 0) + int(
             self._vllm_blk_size)
 
     def _ensure_graph_layer_id_tensors(
@@ -305,6 +303,9 @@ class DSAGraphBuffersMixin:
                 (row_count,), dtype=torch.long, device=device),
             row_modes_tensor=torch.empty(
                 (row_count,), dtype=torch.int32, device=device),
+            lookup_init_mask_tensor=torch.empty(
+                (row_count,), dtype=torch.bool, device=device),
+            has_lookup_init_rows=True,
             active_local_row_indices_tensor=torch.empty(
                 (row_count,), dtype=torch.long, device=device),
             active_batch_row_indices_tensor=torch.empty(
@@ -346,12 +347,15 @@ class DSAGraphBuffersMixin:
         graph_batch.range_ends_tensor.fill_(dummy_range_end)
         graph_batch.candidate_lens_tensor.fill_(dummy_range_end)
         graph_batch.budget_lengths_tensor.fill_(budget_tokens)
-        graph_batch.resident_tail_starts_tensor.fill_(budget_tokens)
+        graph_batch.resident_tail_starts_tensor.fill_(
+            int(self._lookup_total_slot_tokens))
         graph_batch.tail_valid_token_counts_tensor.fill_(1)
-        graph_batch.query_position_rows_tensor.fill_(budget_tokens)
+        graph_batch.query_position_rows_tensor.fill_(
+            int(self._lookup_total_slot_tokens))
         graph_batch.batch_row_indices_tensor.copy_(row_ids.to(
             dtype=torch.long))
         graph_batch.row_modes_tensor.fill_(int(DSADecodeRowMode.SPARSE))
+        graph_batch.lookup_init_mask_tensor.fill_(True)
         graph_batch.active_local_row_indices_tensor.copy_(row_ids.to(
             dtype=torch.long))
         graph_batch.active_batch_row_indices_tensor.copy_(row_ids.to(
@@ -383,11 +387,10 @@ class DSAGraphBuffersMixin:
         graph_batch = self._get_or_create_row_mode_decode_graph_batch(
             row_count, tensor_device=tensor_device, graph_phase=graph_phase)
         self._ensure_graph_layer_id_tensors(tensor_device)
-        # DSA 图捕获会用 dummy request/pool row 真正跑一遍 GS kernel。
-        # GS status 是请求生命周期状态，不是普通 graph input buffer；
-        # 如果 dummy status 留下来，后续真实请求复用相同 pool_idx 时会被污染。
-        self.resident_token_pool.clear_resident_slot_token_status_prefix(
-            int(row_count))
+        # DSA 图捕获会用 dummy request/pool row 跑一遍 lookup 路径。
+        # Lookup index 是请求生命周期状态，不是普通 graph input buffer；
+        # 如果 dummy index 留下来，后续真实请求复用相同 pool_idx 时会被污染。
+        self.resident_token_pool.clear_lookup_state_prefix(int(row_count))
         saved_state = (
             self.forward_sparse_decode_batch,
             self.forward_layer_batch,
@@ -399,12 +402,12 @@ class DSAGraphBuffersMixin:
             full_block_table_tensor=full_block_table_tensor,
         )
 
-        budget_tokens = int(self._hbm_sparse_budget_tokens or 0)
+        resident_tokens = int(self._hbm_resident_tokens or 0)
         row_count = int(row_count)
         if graph_phase != DSA_GRAPH_PHASE_ROW_MODE_DECODE:
             raise RuntimeError(f"Unknown DSA graph phase: {graph_phase}")
         self.resident_token_pool.req_hbm_cached_token_counts[
-            :row_count, :].fill_(budget_tokens)
+            :row_count, :].fill_(resident_tokens)
 
         self.forward_sparse_decode_batch = graph_batch
         self.forward_layer_batch = DSAForwardLayerBatch.empty(
@@ -423,11 +426,10 @@ class DSAGraphBuffersMixin:
         row_count = int(saved_counts.shape[0])
         self.resident_token_pool.req_hbm_cached_token_counts[
             :row_count].copy_(saved_counts)
-        # capture restore 只恢复 resident count metadata，resident slot token
-        # status 由 resident pool 持有并按 pool row 清理，避免 capture-only
+        # capture restore 只恢复 resident count metadata，lookup index
+        # 由 resident pool 持有并按 pool row 清理，避免 capture-only
         # 状态泄漏到 replay。
-        self.resident_token_pool.clear_resident_slot_token_status_prefix(
-            row_count)
+        self.resident_token_pool.clear_lookup_state_prefix(row_count)
 
     def prepare_row_mode_decode_graph_replay_batch(
         self,
@@ -459,12 +461,15 @@ class DSAGraphBuffersMixin:
             real_batch, "sparse_local_row_indices_tensor", None)
         real_sparse_mask = getattr(real_batch, "sparse_row_mask_tensor", None)
         real_row_modes = getattr(real_batch, "row_modes_tensor", None)
+        real_lookup_init_mask = getattr(
+            real_batch, "lookup_init_mask_tensor", None)
         if (not torch.is_tensor(real_active_local_rows)
                 or not torch.is_tensor(real_active_batch_rows)
                 or not torch.is_tensor(real_sparse_rows)
                 or not torch.is_tensor(real_sparse_local_rows)
                 or not torch.is_tensor(real_sparse_mask)
-                or not torch.is_tensor(real_row_modes)):
+                or not torch.is_tensor(real_row_modes)
+                or not torch.is_tensor(real_lookup_init_mask)):
             return False
         if (int(real_active_local_rows.numel()) != int(row_count)
                 or int(real_active_batch_rows.numel()) != int(row_count)):
@@ -476,6 +481,8 @@ class DSAGraphBuffersMixin:
         if int(real_sparse_mask.numel()) != int(row_count):
             return False
         if int(real_row_modes.numel()) != int(row_count):
+            return False
+        if int(real_lookup_init_mask.numel()) != int(row_count):
             return False
         tensor_device = real_batch.resident_pool_indices_tensor.device
         graph_batch = self._get_or_create_row_mode_decode_graph_batch(
@@ -527,7 +534,7 @@ class DSAGraphBuffersMixin:
         self._copy_tensor_region(
             graph_batch.resident_tail_starts_tensor,
             real_batch.resident_tail_starts_tensor,
-            fill_value=int(self._hbm_sparse_budget_tokens or 0),
+            fill_value=int(self._lookup_total_slot_tokens or 0),
         )
         self._copy_tensor_region(
             graph_batch.query_start_locs_tensor,
@@ -573,6 +580,11 @@ class DSAGraphBuffersMixin:
             graph_batch.row_modes_tensor,
             real_row_modes,
             fill_value=int(DSADecodeRowMode.PAD),
+        )
+        self._copy_tensor_region(
+            graph_batch.lookup_init_mask_tensor,
+            real_lookup_init_mask,
+            fill_value=False,
         )
         self._copy_tensor_region(
             graph_batch.active_local_row_indices_tensor,

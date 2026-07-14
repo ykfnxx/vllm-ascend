@@ -7,7 +7,7 @@
 INVALID_SLOT 是 scheduler/worker 之间传递 resident 状态时使用的哨兵值；
 DSASparseRole 描述 manager 当前运行在 scheduler 侧还是 worker 侧；
 ReqStage 描述请求生命周期里的 DSA 阶段；DSADecodeRowMode 描述传给
-gather-selection/SFA 的每行执行模式。
+lookup-resident/SFA 的每行执行模式。
 
 不要在这里引入重型运行时依赖，避免基础类型模块反向耦合具体实现。
 """
@@ -27,10 +27,10 @@ class DSADecodeRowMode(enum.IntEnum):
     """Per-row execution mode for DSA decode operator boundaries.
 
     ReqStage is scheduler-owned request state.  This enum is the tensorized row
-    contract consumed by gather-selection/SFA style decode operators:
+    contract consumed by lookup-resident/SFA style decode operators:
     - PAD rows are graph padding and must not touch cache state.
     - DENSE rows keep the native full-cache attention indices.
-    - SPARSE rows materialize selected DRAM tokens into resident sparse budget
+    - SPARSE rows materialize selected DRAM tokens into lookup-managed resident
       slots and use resident-cache logical attention indices.
     """
 

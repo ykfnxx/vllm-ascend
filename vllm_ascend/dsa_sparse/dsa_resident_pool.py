@@ -1,17 +1,4 @@
-"""DSA HBM resident sparse budget 资源池。
-
-本文件维护每个请求在 HBM resident plane 上的固定预算槽位，包括请求到
-resident row 的映射、layer 级 resident count 张量视图、GS resident status
-张量，以及图模式可复用的资源池。它只管理 HBM resident 资源的 Python 侧
-生命周期，不负责 DRAM 热层块分配、scheduler 侧 block admission，也不负责
-SFA attention_indices 的构造。
-
-当前 row-mode gather-selection 路径中，resident slot -> 原始 token/segment
-的权威映射由 resident_slot_token_status 持有并被 GS kernel 原址刷新。底层
-算子接口仍沿用历史入参名 selection_kv_block_status；Python/DSA 层使用更
-贴近语义的 resident_slot_token_status，表示“resident 槽里当前是哪一个
-原始 token/segment”。
-"""
+"""Persistent lookup-index state for DSA HBM resident KV slots."""
 
 from __future__ import annotations
 
@@ -27,20 +14,33 @@ class DSAResidentLayerResourceView(NamedTuple):
     max_tokens: int
 
 
-class DSAResidentTokenPool:
-    """Per-worker resident request metadata.
+class DSAResidentLookupState(NamedTuple):
+    """One layer's persistent lookup state across all request-pool rows."""
 
-    Besides pool ownership and resident counts, this pool owns the fixed 5-D
-    resident_slot_token_status tensor used by gather-selection.  The tensor is
-    the authoritative resident slot -> original token/segment mapping and is
-    cleared together with the resident pool row.
+    token_to_slot: torch.Tensor
+    slot_to_token: torch.Tensor
+    free_slots: torch.Tensor
+    free_head: torch.Tensor
+    evict_cursor: torch.Tensor
+
+
+class DSAResidentTokenPool:
+    """Own request rows and per-layer token-to-slot lookup state.
+
+    ``resident_tokens`` is the number of occupied slots kept after maintenance.
+    ``free_slot_tokens`` is the lookup headroom reserved for one decode step.
+    The physical resident address space is their sum. Lookup allocates misses
+    from the headroom and maintenance evicts the same number of non-protected
+    historical entries, restoring the headroom before the next decode step.
     """
 
     def __init__(
         self,
         max_reqs: int,
         num_layers: int,
-        max_tokens: int,
+        index_capacity: int,
+        resident_tokens: int,
+        free_slot_tokens: int,
         *,
         device: torch.device | str | None = None,
     ):
@@ -48,13 +48,29 @@ class DSAResidentTokenPool:
             raise ValueError(f"max_reqs must be positive, got {max_reqs}")
         if num_layers <= 0:
             raise ValueError(f"num_layers must be positive, got {num_layers}")
-        if max_tokens <= 0:
-            raise ValueError(f"max_tokens must be positive, got {max_tokens}")
+        if index_capacity <= 0:
+            raise ValueError(
+                f"index_capacity must be positive, got {index_capacity}")
+        if resident_tokens <= free_slot_tokens:
+            raise ValueError(
+                "resident_tokens must be greater than free_slot_tokens: "
+                f"resident_tokens={resident_tokens}, "
+                f"free_slot_tokens={free_slot_tokens}")
+        if free_slot_tokens <= 0:
+            raise ValueError(
+                f"free_slot_tokens must be positive, got {free_slot_tokens}")
 
         self.max_reqs = int(max_reqs)
         self.num_layers = int(num_layers)
-        self.max_tokens = int(max_tokens)
-        self.device = torch.device("cpu") if device is None else torch.device(device)
+        self.index_capacity = int(index_capacity)
+        self.resident_tokens = int(resident_tokens)
+        self.free_slot_tokens = int(free_slot_tokens)
+        self.total_slots = self.resident_tokens + self.free_slot_tokens
+        # Kept for the existing graph-admission/resource-view API. It now means
+        # stable occupied lookup entries, not the current TopK width.
+        self.max_tokens = self.resident_tokens
+        self.device = (torch.device("cpu") if device is None else
+                       torch.device(device))
         self._free_indices = list(range(self.max_reqs))
         self._request_to_index: dict[Hashable, int] = {}
         self._cached_counts = torch.zeros(
@@ -62,15 +78,33 @@ class DSAResidentTokenPool:
             dtype=torch.int32,
             device=self.device,
         )
-        # 当前 DSA row-mode GS 路径的 topK 等于固定 resident budget，因此
-        # resident slot 状态可以资源池化成一张稳定 5D tensor：
-        # [layer, pool_idx, 1, 1, resident_slot]。逐层传给底层 GS op 时只
-        # 取 self._resident_slot_token_status[layer_id] 这个 4D view，避免
-        # 运行时按 layer lazy 分配，也让 request release/preempt 能一次
-        # 清掉所有 layer 的同一 pool row。
-        self._resident_slot_token_status = torch.full(
-            (self.num_layers, self.max_reqs, 1, 1, self.max_tokens + 1),
+        self._token_to_slot = torch.full(
+            (self.num_layers, self.max_reqs, self.index_capacity),
             -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._slot_to_token = torch.full(
+            (self.num_layers, self.max_reqs, self.total_slots),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._free_slot_template = torch.arange(
+            self.resident_tokens,
+            self.total_slots,
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._free_slots = self._free_slot_template.view(1, 1, -1).expand(
+            self.num_layers, self.max_reqs, -1).clone()
+        self._free_head = torch.zeros(
+            (self.num_layers, self.max_reqs),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self._evict_cursor = torch.zeros(
+            (self.num_layers, self.max_reqs),
             dtype=torch.int32,
             device=self.device,
         )
@@ -103,8 +137,7 @@ class DSAResidentTokenPool:
         return self._request_to_index.get(request_id)
 
     def clear_request(self, request_id: Hashable) -> None:
-        pool_idx = self._require_index(request_id)
-        self._clear_index(pool_idx)
+        self._clear_index(self._require_index(request_id))
 
     def get_layer_resource_view_by_index(
         self,
@@ -127,69 +160,46 @@ class DSAResidentTokenPool:
             counts=self._cached_counts[:, layer_id],
             pool_indices=pool_indices_tensor,
             device=self._cached_counts.device,
-            max_tokens=self.max_tokens,
+            max_tokens=self.resident_tokens,
         )
 
-    def get_resident_slot_token_status(self, *, layer_id: int,
-                                       topk: int) -> torch.Tensor:
-        """Return the per-layer resident slot mapping used by GS.
-
-        resident_slot_token_status 是当前 row-mode GS 路径的权威映射：
-        status[pool_idx, 0, 0, resident_slot] = original token/segment id。
-        底层算子接口因为历史原因仍叫 selection_kv_block_status，但它的值
-        语义不是 block id，而是 resident sparse budget slot 当前承载的原始
-        token/segment id。它由 GS kernel 原址刷新，下一轮 decode 继续用同
-        一张表判断 hit/miss。因此这份状态必须跟 resident pool 的 request
-        行生命周期绑定，而不是藏在无状态算子 backend 里临时创建。
-        """
+    def get_layer_lookup_state(self, layer_id: int) -> DSAResidentLookupState:
         layer_id = self._normalize_layer_id(layer_id)
-        topk = int(topk)
-        if topk <= 0:
-            raise ValueError(f"topk must be positive, got {topk}")
-        if topk > self.max_tokens:
-            raise ValueError(
-                f"topk {topk} exceeds resident budget {self.max_tokens}")
-        if topk != self.max_tokens:
-            raise ValueError(
-                "resident_slot_token_status uses fixed resident budget "
-                f"topk={self.max_tokens}, got {topk}")
-        return self._resident_slot_token_status[layer_id]
+        return DSAResidentLookupState(
+            token_to_slot=self._token_to_slot[layer_id],
+            slot_to_token=self._slot_to_token[layer_id],
+            free_slots=self._free_slots[layer_id],
+            free_head=self._free_head[layer_id],
+            evict_cursor=self._evict_cursor[layer_id],
+        )
 
-    def ensure_resident_slot_token_statuses(
-            self, *, topk: int | None = None) -> None:
-        """Pre-create resident slot token status tensors for every layer.
-
-        图模式 capture/replay 希望关键张量地址提前稳定下来；eager 模式也不应
-        在每层首次 after_indexer 时夹杂一次隐式分配。当前 status 已在
-        __init__ 中固定创建，这里保留为初始化流程里的语义检查入口。
-        """
-        topk = self.max_tokens if topk is None else int(topk)
-        if topk != self.max_tokens:
-            raise ValueError(
-                "resident_slot_token_status uses fixed resident budget "
-                f"topk={self.max_tokens}, got {topk}")
-
-    def clear_resident_slot_token_status(self, pool_idx: int) -> None:
-        pool_idx = int(pool_idx)
-        if pool_idx < 0 or pool_idx >= self.max_reqs:
-            return
-        self._resident_slot_token_status[:, pool_idx].fill_(-1)
-
-    def clear_resident_slot_token_status_prefix(self, row_count: int) -> None:
-        """Clear status rows ``[0, row_count)`` for every layer at once.
-
-        图 capture dummy batch 使用连续的 pool row 前缀。固定 5D status 池
-        允许把原先逐 row 的 Python 循环合成一次 strided tensor fill，减少
-        capture/restore 阶段的 host 调度和 kernel launch 数量。
-        """
+    def clear_lookup_state_prefix(self, row_count: int) -> None:
         row_count = min(max(int(row_count), 0), self.max_reqs)
         if row_count == 0:
             return
-        self._resident_slot_token_status[:, :row_count].fill_(-1)
+        self._token_to_slot[:, :row_count].fill_(-1)
+        self._slot_to_token[:, :row_count].fill_(-1)
+        self._reset_free_slots(slice(0, row_count))
+        self._free_head[:, :row_count].zero_()
+        self._evict_cursor[:, :row_count].zero_()
+
+    def _reset_free_slots(self, pool_rows) -> None:
+        self._free_slots[:, pool_rows].copy_(
+            self._free_slot_template.view(1, 1, -1).expand(
+                self.num_layers,
+                self._free_slots[:, pool_rows].shape[1],
+                -1,
+            ))
 
     def _clear_index(self, pool_idx: int) -> None:
         self._cached_counts[pool_idx].zero_()
-        self.clear_resident_slot_token_status(pool_idx)
+        self._token_to_slot[:, pool_idx].fill_(-1)
+        self._slot_to_token[:, pool_idx].fill_(-1)
+        self._free_slots[:, pool_idx].copy_(
+            self._free_slot_template.view(1, -1).expand(
+                self.num_layers, -1))
+        self._free_head[:, pool_idx].zero_()
+        self._evict_cursor[:, pool_idx].zero_()
 
     def _require_index(self, request_id: Hashable) -> int:
         pool_idx = self._request_to_index.get(request_id)
