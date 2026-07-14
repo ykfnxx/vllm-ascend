@@ -30,6 +30,8 @@
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
 #include "apply_top_k_top_p_custom/apply_top_k_top_p_custom_torch_adpt.h"
+#include "asu_hbm_index_lookup/asu_hbm_index_lookup_torch_adpt.h"
+#include "asu_hbm_index_maintain_aicpu/asu_hbm_index_maintain_aicpu_torch_adpt.h"
 #include "batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h"
 #include "dispatch_gmm_combine_decode/dispatch_gmm_combine_decode_torch_adpt.h"
@@ -892,6 +894,23 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "-> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     ops.impl("gather_selection_kv_cache", torch::kPrivateUse1,
              &vllm_ascend::gather_selection_kv_cache_torch_op);
+
+    ops.def(
+        "asu_hbm_index_lookup(Tensor(a!) index, Tensor(b!) slot_to_index, "
+        "                     Tensor(c!) free_slots, Tensor(d!) free_head, "
+        "                     Tensor query_index, int req_num) -> Tensor");
+    ops.impl("asu_hbm_index_lookup", torch::kPrivateUse1,
+             &vllm_ascend::asu_hbm_index_lookup);
+
+    ops.def(
+        "asu_hbm_index_maintain_aicpu(Tensor(a!) index, "
+        "                             Tensor(b!) slot_to_index, "
+        "                             Tensor(c!) free_slots, "
+        "                             Tensor(d!) free_head, "
+        "                             Tensor last_query_slots, "
+        "                             int req_num, int seed) -> ()");
+    ops.impl("asu_hbm_index_maintain_aicpu", torch::kPrivateUse1,
+             &vllm_ascend::asu_hbm_index_maintain_aicpu);
 
     ops.def(
         "grouped_matmul_swiglu_quant(Tensor x, Tensor weight, Tensor weight_scale, Tensor x_scale,"

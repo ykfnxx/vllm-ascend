@@ -246,6 +246,55 @@ foreach (OP_DEPEND_DIR ${OP_DEPEND_DIR_LIST})
     add_subdirectory(${OP_DEPEND_DIR}/op_host)
 endforeach ()
 
+# ------------------------------------------------ aicpu kernel ------------------------------------------------
+if ("asu_hbm_index_maintain_aicpu" IN_LIST OP_LIST)
+    set(ASU_MAINTAIN_AICPU_DIR
+            ${CMAKE_CURRENT_SOURCE_DIR}/asu_hbm_index_maintain_aicpu/cpukernel
+    )
+    set(ASU_MAINTAIN_AICPU_BUILD_DIR
+            ${CMAKE_CURRENT_BINARY_DIR}/asu_hbm_index_maintain_aicpu_kernel
+    )
+    set(ASU_MAINTAIN_AICPU_LIBRARY
+            ${ASU_MAINTAIN_AICPU_BUILD_DIR}/libcust_aicpu_kernels.so
+    )
+    set(ASU_MAINTAIN_AICPU_COMPILER
+            ${ASCEND_CANN_PACKAGE_PATH}/toolkit/toolchain/hcc/bin/aarch64-target-linux-gnu-g++
+    )
+
+    add_custom_command(
+            OUTPUT ${ASU_MAINTAIN_AICPU_LIBRARY}
+            COMMAND ${CMAKE_COMMAND}
+                    -S ${ASU_MAINTAIN_AICPU_DIR}
+                    -B ${ASU_MAINTAIN_AICPU_BUILD_DIR}
+                    -DCMAKE_BUILD_TYPE=Release
+                    -DCMAKE_CXX_COMPILER=${ASU_MAINTAIN_AICPU_COMPILER}
+                    -DCMAKE_SYSTEM_NAME=Linux
+                    -DCMAKE_SYSTEM_PROCESSOR=aarch64
+                    -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=${ASU_MAINTAIN_AICPU_BUILD_DIR}
+                    -DASCEND_CANN_PACKAGE_PATH=${ASCEND_CANN_PACKAGE_PATH}
+            COMMAND ${CMAKE_COMMAND}
+                    --build ${ASU_MAINTAIN_AICPU_BUILD_DIR}
+                    --target cust_aicpu_kernels
+            DEPENDS
+                    ${ASU_MAINTAIN_AICPU_DIR}/CMakeLists.txt
+                    ${ASU_MAINTAIN_AICPU_DIR}/impl/asu_hbm_index_maintain_aicpu_kernel.cc
+                    ${ASU_MAINTAIN_AICPU_DIR}/impl/asu_hbm_index_maintain_aicpu_kernel.h
+            VERBATIM
+    )
+
+    add_custom_target(asu_hbm_index_maintain_aicpu_kernel ALL
+            DEPENDS ${ASU_MAINTAIN_AICPU_LIBRARY}
+    )
+
+    install(FILES ${ASU_MAINTAIN_AICPU_LIBRARY}
+            DESTINATION packages/vendors/${VENDOR_NAME}/op_impl/cpu/aicpu_kernel/impl
+    )
+    install(FILES
+            ${ASU_MAINTAIN_AICPU_DIR}/op_info_cfg/aicpu_kernel/cust_aicpu_kernel.json
+            DESTINATION packages/vendors/${VENDOR_NAME}/op_impl/cpu/config
+    )
+endif ()
+
 # ------------------------------------------------ aclnn ------------------------------------------------
 get_target_property(base_aclnn_srcs op_host_aclnn SOURCES)
 get_target_property(base_aclnn_inner_srcs op_host_aclnnInner SOURCES)

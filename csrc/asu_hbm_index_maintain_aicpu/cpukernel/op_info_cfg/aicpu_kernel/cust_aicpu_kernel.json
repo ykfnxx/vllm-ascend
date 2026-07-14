@@ -1,0 +1,59 @@
+{
+    "AsuHbmIndexMaintainAicpu": {
+        "input0": {
+            "format": "ND",
+            "name": "index",
+            "type": "DT_INT32"
+        },
+        "input1": {
+            "format": "ND",
+            "name": "slot_to_index",
+            "type": "DT_INT32"
+        },
+        "input2": {
+            "format": "ND",
+            "name": "free_slots",
+            "type": "DT_INT32"
+        },
+        "input3": {
+            "format": "ND",
+            "name": "free_head",
+            "type": "DT_INT32"
+        },
+        "input4": {
+            "format": "ND",
+            "name": "last_query_slots",
+            "type": "DT_INT32"
+        },
+        "opInfo": {
+            "computeCost": "100",
+            "engine": "DNN_VM_AICPU",
+            "flagAsync": "False",
+            "flagPartial": "False",
+            "functionName": "RunCpuKernel",
+            "kernelSo": "libcust_aicpu_kernels.so",
+            "opKernelLib": "CUSTAICPUKernel",
+            "userDefined": "True"
+        },
+        "output0": {
+            "format": "ND",
+            "name": "index_out",
+            "type": "DT_INT32"
+        },
+        "output1": {
+            "format": "ND",
+            "name": "slot_to_index_out",
+            "type": "DT_INT32"
+        },
+        "output2": {
+            "format": "ND",
+            "name": "free_slots_out",
+            "type": "DT_INT32"
+        },
+        "output3": {
+            "format": "ND",
+            "name": "free_head_out",
+            "type": "DT_INT32"
+        }
+    }
+}

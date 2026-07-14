@@ -607,6 +607,38 @@ at::Tensor npu_lightning_indexer_quant_meta(
     return lightning_indexer_quant_output;
 }
 
+at::Tensor asu_hbm_index_lookup_meta(at::Tensor& index,
+                                     at::Tensor& slot_to_index,
+                                     at::Tensor& free_slots,
+                                     at::Tensor& free_head,
+                                     const at::Tensor& query_index,
+                                     int64_t req_num)
+{
+    (void)index;
+    (void)slot_to_index;
+    (void)free_slots;
+    (void)free_head;
+    (void)req_num;
+    return at::empty_like(query_index);
+}
+
+void asu_hbm_index_maintain_aicpu_meta(at::Tensor& index,
+                                       at::Tensor& slot_to_index,
+                                       at::Tensor& free_slots,
+                                       at::Tensor& free_head,
+                                       const at::Tensor& last_query_slots,
+                                       int64_t req_num,
+                                       int64_t seed)
+{
+    (void)index;
+    (void)slot_to_index;
+    (void)free_slots;
+    (void)free_head;
+    (void)last_query_slots;
+    (void)req_num;
+    (void)seed;
+}
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -636,6 +668,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
     // DSA gather-selection KV materialization
     ops.impl("gather_selection_kv_cache", &vllm_ascend::meta::gather_selection_kv_cache_meta);
+    // DSA resident index lookup and AICPU maintenance
+    ops.impl("asu_hbm_index_lookup", &vllm_ascend::meta::asu_hbm_index_lookup_meta);
+    ops.impl("asu_hbm_index_maintain_aicpu", &vllm_ascend::meta::asu_hbm_index_maintain_aicpu_meta);
     // Sparse flash attention
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
     // MoE dispatch-ffn-combine
