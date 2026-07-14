@@ -5,9 +5,12 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_ascend.dsa_sparse.dsa_resident_pool import DSAResidentLookupState
 from vllm_ascend.dsa_sparse.dsa_types import DSADecodeRowMode
+
+logger = init_logger(__name__)
 
 
 class DSALookupOutput(NamedTuple):
@@ -22,6 +25,10 @@ class AscendDSAOpsBackend:
     only those misses, then the AICPU maintain operator restores the free-slot
     headroom for the next decode step.
     """
+
+    def __init__(self) -> None:
+        self._lookup_call_logged = False
+        self._maintain_call_logged = False
 
     @staticmethod
     def _squeeze_cache_head_dim(cache: torch.Tensor | None,
@@ -269,6 +276,14 @@ class AscendDSAOpsBackend:
                 int(sparse_pool_entries.numel()),
             )
         )
+        if not self._lookup_call_logged:
+            logger.info(
+                "DSA sparse invoked asu_hbm_index_lookup: requests=%d, "
+                "query_shape=%s",
+                int(sparse_pool_entries.numel()),
+                tuple(sparse_topk.shape),
+            )
+            self._lookup_call_logged = True
         sparse_misses = sparse_miss_out.to(dtype=torch.bool)
         sparse_selection_block_table = selection_block_table.index_select(
             0, sparse_local_rows)
@@ -315,4 +330,12 @@ class AscendDSAOpsBackend:
             int(sparse_pool_entries.numel()),
             int(maintain_seed),
         )
+        if not self._maintain_call_logged:
+            logger.info(
+                "DSA sparse invoked asu_hbm_index_maintain_aicpu: "
+                "requests=%d, seed=%d",
+                int(sparse_pool_entries.numel()),
+                int(maintain_seed),
+            )
+            self._maintain_call_logged = True
         return DSALookupOutput(attention_indices=attention_indices)
