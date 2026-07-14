@@ -255,10 +255,14 @@ if ("asu_hbm_index_maintain_aicpu" IN_LIST OP_LIST)
             ${CMAKE_CURRENT_BINARY_DIR}/asu_hbm_index_maintain_aicpu_kernel
     )
     set(ASU_MAINTAIN_AICPU_LIBRARY
-            ${ASU_MAINTAIN_AICPU_BUILD_DIR}/libcust_aicpu_kernels.so
+            ${ASU_MAINTAIN_AICPU_BUILD_DIR}/libtransformer_aicpu_kernels.so
     )
     set(ASU_MAINTAIN_AICPU_COMPILER
             ${ASCEND_CANN_PACKAGE_PATH}/toolkit/toolchain/hcc/bin/aarch64-target-linux-gnu-g++
+    )
+    # CANN 8.5 discovers custom AICPU repositories by a whitelisted suffix.
+    set(ASU_MAINTAIN_AICPU_INSTALL_ROOT
+            packages/vendors/${VENDOR_NAME}/op_impl/aicpu_transformer
     )
 
     add_custom_command(
@@ -287,11 +291,11 @@ if ("asu_hbm_index_maintain_aicpu" IN_LIST OP_LIST)
     )
 
     install(FILES ${ASU_MAINTAIN_AICPU_LIBRARY}
-            DESTINATION packages/vendors/${VENDOR_NAME}/op_impl/cpu/aicpu_kernel/impl
+            DESTINATION ${ASU_MAINTAIN_AICPU_INSTALL_ROOT}/op_impl/cpu/aicpu_kernel/impl
     )
     install(FILES
             ${ASU_MAINTAIN_AICPU_DIR}/op_info_cfg/aicpu_kernel/cust_aicpu_kernel.json
-            DESTINATION packages/vendors/${VENDOR_NAME}/op_impl/cpu/config
+            DESTINATION ${ASU_MAINTAIN_AICPU_INSTALL_ROOT}/op_impl/cpu/config
     )
 endif ()
 

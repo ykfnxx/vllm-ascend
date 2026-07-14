@@ -31,7 +31,7 @@
             "flagAsync": "False",
             "flagPartial": "False",
             "functionName": "RunCpuKernel",
-            "kernelSo": "libcust_aicpu_kernels.so",
+            "kernelSo": "libtransformer_aicpu_kernels.so",
             "opKernelLib": "CUSTAICPUKernel",
             "userDefined": "True"
         },

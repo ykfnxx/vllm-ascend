@@ -622,12 +622,19 @@ class NPUPlatform(Platform):
             return
         CUR_DIR = os.path.dirname(os.path.realpath(__file__))
         CUSTOM_OPP_PATH = os.path.join(CUR_DIR, "_cann_ops_custom", "vendors", "vllm-ascend")
+        # CANN 8.5 recognizes custom AICPU repositories by the suffix.
+        AICPU_CUSTOM_OPP_PATH = os.path.join(
+            CUSTOM_OPP_PATH, "op_impl", "aicpu_transformer"
+        )
         if os.path.exists(CUSTOM_OPP_PATH):
             current_cust_opp_path = os.environ.get("ASCEND_CUSTOM_OPP_PATH", "")
+            custom_opp_path = f"{AICPU_CUSTOM_OPP_PATH}:{CUSTOM_OPP_PATH}"
             if current_cust_opp_path:
-                os.environ["ASCEND_CUSTOM_OPP_PATH"] = f"{CUSTOM_OPP_PATH}:{current_cust_opp_path}"
+                os.environ["ASCEND_CUSTOM_OPP_PATH"] = (
+                    f"{custom_opp_path}:{current_cust_opp_path}"
+                )
             else:
-                os.environ["ASCEND_CUSTOM_OPP_PATH"] = CUSTOM_OPP_PATH
+                os.environ["ASCEND_CUSTOM_OPP_PATH"] = custom_opp_path
         _CUSTOM_OP_REGISTERED = True
 
     @classmethod

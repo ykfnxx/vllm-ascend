@@ -55,22 +55,24 @@ def _parse_args() -> argparse.Namespace:
 
 def _configure_custom_opp() -> Path:
     repo_root = Path(__file__).resolve().parent
-    custom_opp = (
+    vendor_opp = (
         repo_root
         / "vllm_ascend"
         / "_cann_ops_custom"
         / "vendors"
         / "vllm-ascend"
     )
+    custom_opp = vendor_opp / "op_impl" / "aicpu_transformer"
     if not custom_opp.is_dir():
         raise RuntimeError(
-            f"custom OPP directory does not exist: {custom_opp}. "
+            f"AICPU custom OPP directory does not exist: {custom_opp}. "
             "Build vllm-ascend with custom kernels first."
         )
 
     current = os.environ.get("ASCEND_CUSTOM_OPP_PATH")
+    custom_paths = f"{custom_opp}:{vendor_opp}"
     os.environ["ASCEND_CUSTOM_OPP_PATH"] = (
-        f"{custom_opp}:{current}" if current else str(custom_opp)
+        f"{custom_paths}:{current}" if current else custom_paths
     )
     return custom_opp
 
@@ -116,13 +118,21 @@ def _diagnose_aicpu_package(custom_opp: Path) -> None:
     json_path = custom_opp / "op_impl/cpu/config/cust_aicpu_kernel.json"
     shared_library = (
         custom_opp
-        / "op_impl/cpu/aicpu_kernel/impl/libcust_aicpu_kernels.so"
+        / "op_impl/cpu/aicpu_kernel/impl/libtransformer_aicpu_kernels.so"
     )
-    vendor_config = custom_opp.parent / "config.ini"
+    vendor_config = custom_opp.parents[2] / "config.ini"
     failed = False
 
     print(f"[INFO] ASCEND_CUSTOM_OPP_PATH={os.environ['ASCEND_CUSTOM_OPP_PATH']}")
-    print(f"[INFO] vendor config={vendor_config} exists={vendor_config.is_file()}")
+    print(
+        f"[INFO] global vendor config={vendor_config} "
+        f"exists={vendor_config.is_file()} required=False"
+    )
+    repository_suffix = custom_opp.name.rsplit("_", 1)[-1]
+    print(f"[INFO] AICPU repository suffix={repository_suffix}")
+    if repository_suffix != "transformer":
+        print("[FAIL] CANN 8.5 will reject this AICPU repository suffix")
+        failed = True
     print(f"[INFO] AICPU JSON={json_path} exists={json_path.is_file()}")
     print(
         f"[INFO] AICPU library={shared_library} "
