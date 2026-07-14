@@ -19,6 +19,10 @@ from vllm_ascend.dsa_sparse.dsa_graph_gate import (
 from vllm_ascend.dsa_sparse.dsa_trace import DSA_TRACE_CONFIG_KEY
 
 DSA_SPARSE_ADDITIONAL_CONFIG_KEY = "dsa_sparse_config"
+DSA_SPARSE_SUPPORTED_ARCHITECTURES = frozenset({
+    "DeepseekV32ForCausalLM",
+    "GlmMoeDsaForCausalLM",
+})
 _DSA_GRAPH_PUBLIC_CONFIG_KEY = "enable_row_mode_decode_graph"
 
 _DSA_SPARSE_CONFIG_FIELD_MAPPINGS = (

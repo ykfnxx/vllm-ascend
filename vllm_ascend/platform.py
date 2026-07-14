@@ -461,12 +461,19 @@ class NPUPlatform(Platform):
 
         refresh_block_size(vllm_config)
 
-        from vllm_ascend.dsa_sparse.dsa_config import is_dsa_sparse_config_enabled
+        from vllm_ascend.dsa_sparse.dsa_config import (
+            DSA_SPARSE_SUPPORTED_ARCHITECTURES,
+            is_dsa_sparse_config_enabled,
+        )
 
         dsa_sparse_enabled = is_dsa_sparse_config_enabled(vllm_config)
         if dsa_sparse_enabled:
-            if model_config.architecture != "DeepseekV32ForCausalLM":
-                raise ValueError("DSA sparse offload currently supports only DeepseekV32ForCausalLM")
+            if model_config.architecture not in DSA_SPARSE_SUPPORTED_ARCHITECTURES:
+                supported = ", ".join(sorted(DSA_SPARSE_SUPPORTED_ARCHITECTURES))
+                raise ValueError(
+                    "DSA sparse offload currently supports only: "
+                    f"{supported}"
+                )
             if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
                 raise ValueError("DSA sparse offload requires model_runner_v1")
             if vllm_config.scheduler_config.async_scheduling is not False:

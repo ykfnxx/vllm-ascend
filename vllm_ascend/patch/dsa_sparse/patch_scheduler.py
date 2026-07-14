@@ -12,7 +12,10 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
 import vllm_ascend.patch.dsa_sparse.patch_scheduler_output  # noqa: F401
-from vllm_ascend.dsa_sparse.dsa_config import is_dsa_sparse_config_enabled
+from vllm_ascend.dsa_sparse.dsa_config import (
+    DSA_SPARSE_SUPPORTED_ARCHITECTURES,
+    is_dsa_sparse_config_enabled,
+)
 from vllm_ascend.dsa_sparse.dsa_sparse import DSASparseV1
 from vllm_ascend.dsa_sparse.dsa_types import DSASparseRole, INVALID_SLOT, ReqStage
 
@@ -219,8 +222,7 @@ def _scheduler_init(self: Scheduler, *args: Any, **kwargs: Any) -> None:
     _original_init(self, *args, **kwargs)
     self.dsa_scheduler_mgr = None
     if (
-        self.vllm_config.model_config.architecture
-        == "DeepseekV32ForCausalLM"
+        self.vllm_config.model_config.architecture in DSA_SPARSE_SUPPORTED_ARCHITECTURES
         and is_dsa_sparse_config_enabled(self.vllm_config)
     ):
         self.dsa_scheduler_mgr = DSASparseV1(
