@@ -44,9 +44,10 @@ _DSA_SPARSE_DEFAULT_CACHE_ATTRS: dict[str, Any] = {
     "dsa_indexer_mla_block_ratio": 3,
     "dsa_hbm_sparse_budget": DSA_LOOKUP_QUERY_TOKENS,
     "dsa_hbm_resident_tokens": DSA_LOOKUP_RESIDENT_TOKENS,
-    # Direct token->slot tables are per request and per layer. Deployments must
-    # size this existing request-pool limit together with index HBM usage.
-    "dsa_max_active_reqs": 256,
+    # Direct token->slot tables are per request and per layer. By default this
+    # follows SchedulerConfig.max_num_seqs so unused request rows are not
+    # allocated in the resident lookup pool.
+    "dsa_max_active_reqs": None,
     "dsa_hot_cpu_block_multiple": 3,
 }
 _DSA_SPARSE_PUBLIC_KEYS = frozenset(
@@ -154,6 +155,9 @@ def attach_dsa_sparse_cache_attrs(vllm_config: Any) -> None:
             f"be a dict, got {type(cache_attrs)!r}")
 
     merged_attrs, additional_updates = _normalize_dsa_sparse_config(cache_attrs)
+    if merged_attrs["dsa_max_active_reqs"] is None:
+        merged_attrs["dsa_max_active_reqs"] = int(
+            vllm_config.scheduler_config.max_num_seqs)
     if (merged_attrs["enable_dsa_sparse_cache"]
             and additional_config.get(
                 DSA_ROW_MODE_DECODE_GRAPH_CONFIG_KEY) is True):

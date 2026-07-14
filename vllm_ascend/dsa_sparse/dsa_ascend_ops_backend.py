@@ -265,6 +265,13 @@ class AscendDSAOpsBackend:
         sparse_topk = topk.index_select(0, sparse_local_rows).contiguous()
         sparse_pool_entries = pool_entries.index_select(
             0, sparse_local_rows).contiguous()
+        if not self._lookup_call_logged:
+            logger.info(
+                "DSA sparse invoking asu_hbm_index_lookup: requests=%d, "
+                "query_shape=%s",
+                int(sparse_pool_entries.numel()),
+                tuple(sparse_topk.shape),
+            )
         sparse_slot_out, sparse_miss_out = (
             torch.ops._C_ascend.asu_hbm_index_lookup(
                 lookup_state.token_to_slot,
@@ -278,7 +285,7 @@ class AscendDSAOpsBackend:
         )
         if not self._lookup_call_logged:
             logger.info(
-                "DSA sparse invoked asu_hbm_index_lookup: requests=%d, "
+                "DSA sparse completed asu_hbm_index_lookup: requests=%d, "
                 "query_shape=%s",
                 int(sparse_pool_entries.numel()),
                 tuple(sparse_topk.shape),
@@ -320,6 +327,13 @@ class AscendDSAOpsBackend:
             resident_tail_starts=resident_tail_starts,
             attention_indices=attention_indices,
         )
+        if not self._maintain_call_logged:
+            logger.info(
+                "DSA sparse invoking asu_hbm_index_maintain_aicpu: "
+                "requests=%d, seed=%d",
+                int(sparse_pool_entries.numel()),
+                int(maintain_seed),
+            )
         torch.ops._C_ascend.asu_hbm_index_maintain_aicpu(
             lookup_state.token_to_slot,
             lookup_state.slot_to_token,
@@ -332,7 +346,7 @@ class AscendDSAOpsBackend:
         )
         if not self._maintain_call_logged:
             logger.info(
-                "DSA sparse invoked asu_hbm_index_maintain_aicpu: "
+                "DSA sparse completed asu_hbm_index_maintain_aicpu: "
                 "requests=%d, seed=%d",
                 int(sparse_pool_entries.numel()),
                 int(maintain_seed),

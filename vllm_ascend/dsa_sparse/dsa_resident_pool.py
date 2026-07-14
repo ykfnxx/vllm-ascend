@@ -112,6 +112,20 @@ class DSAResidentTokenPool:
     def req_hbm_cached_token_counts(self) -> torch.Tensor:
         return self._cached_counts
 
+    @property
+    def allocated_tensor_bytes(self) -> int:
+        """Return the storage bytes owned by the persistent lookup state."""
+        tensors = (
+            self._cached_counts,
+            self._token_to_slot,
+            self._slot_to_token,
+            self._free_slot_template,
+            self._free_slots,
+            self._free_head,
+        )
+        return sum(tensor.numel() * tensor.element_size()
+                   for tensor in tensors)
+
     def acquire(self, request_id: Hashable) -> int:
         current = self._request_to_index.get(request_id)
         if current is not None:

@@ -388,11 +388,28 @@ class NPUWorker(WorkerBase):
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container."
         )
-        self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
+        dsa_lookup_memory = 0
+        if self.dsa_mgr_worker is not None:
+            resident_pool = self.dsa_mgr_worker.resident_token_pool
+            dsa_lookup_memory = resident_pool.allocated_tensor_bytes
+        self.available_kv_cache_memory_bytes = (
+            self.requested_memory - profile_result.non_kv_cache_memory -
+            dsa_lookup_memory)
         logger.debug(profile_result)
-        logger.info_once(
-            "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
-        )
+        if dsa_lookup_memory:
+            logger.info_once(
+                "Available KV cache memory: %.2f GiB "
+                "(reserved %.2f GiB for DSA lookup state)",
+                GiB(self.available_kv_cache_memory_bytes),
+                GiB(dsa_lookup_memory),
+                scope="local",
+            )
+        else:
+            logger.info_once(
+                "Available KV cache memory: %.2f GiB",
+                GiB(self.available_kv_cache_memory_bytes),
+                scope="local",
+            )
 
         return int(self.available_kv_cache_memory_bytes)
 
