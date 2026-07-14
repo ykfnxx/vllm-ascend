@@ -17,7 +17,6 @@ DSASparseV1 仍作为算法核心，保留 scheduler/worker 侧主要 hook 的�
 from __future__ import annotations
 
 from typing import Any, Optional
-import math
 
 import torch
 from vllm_ascend.dsa_sparse.dsa_hot_kv_store_core import (
@@ -31,6 +30,8 @@ from vllm_ascend.dsa_sparse.dsa_attention_layout import (
     materialize_query_position_metadata, slice_position_row,
     resolve_full_block_table_tensor, select_forward_shared_metadata)
 from vllm_ascend.dsa_sparse.dsa_resident_pool import (
+    DSA_LOOKUP_INDEX_CAPACITY, DSA_LOOKUP_QUERY_TOKENS,
+    DSA_LOOKUP_RESIDENT_TOKENS, DSA_LOOKUP_TOTAL_SLOTS,
     DSAResidentLayerResourceView, DSAResidentTokenPool)
 
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -72,17 +73,11 @@ def _reset_indexer_score_controls(attn_metadata) -> None:
     attn_metadata.dsa_full_batch_selection_topk_indices = None
 
 
-def _round_up_to_multiple(value: int, multiple: int) -> int:
-    if value <= 0:
-        return 0
-    return int(math.ceil(value / multiple) * multiple)
-
-
 class DSASparseBase:
     """DSA sparse offload algorithm base shared by scheduler and worker.
 
     DSASparseBase owns the common algorithm configuration and invariants:
-    block size, rounded sparse budget, sparse enable threshold, and the
+    block size, fixed lookup budget, sparse enable threshold, and the
     per-forward batch placeholders consumed by eager and graph paths.
 
     Keep this base class focused on the algorithm contract shared by future
@@ -95,33 +90,37 @@ class DSASparseBase:
         self._vllm_config = vllm_config
         self._role = role
         self._vllm_blk_size = vllm_config.cache_config.block_size
-        configured_sparse_budget = int(
+        self._hbm_sparse_budget_tokens = int(
             vllm_config.cache_config.dsa_hbm_sparse_budget)
-        rounded_sparse_budget = _round_up_to_multiple(
-            configured_sparse_budget, self._vllm_blk_size)
-        if (configured_sparse_budget > 0
-                and rounded_sparse_budget != configured_sparse_budget):
-            logger.warning(
-                "DSA hbm_sparse_budget=%s is not aligned to block_size=%s; "
-                "rounding up to %s",
-                configured_sparse_budget, self._vllm_blk_size,
-                rounded_sparse_budget)
-        self._hbm_sparse_budget_tokens = rounded_sparse_budget
-        configured_resident_tokens = int(
+        self._hbm_resident_tokens = int(
             vllm_config.cache_config.dsa_hbm_resident_tokens)
-        self._hbm_resident_tokens = _round_up_to_multiple(
-            configured_resident_tokens, self._vllm_blk_size)
-        if self._hbm_resident_tokens <= self._hbm_sparse_budget_tokens:
-            raise ValueError(
-                "DSA lookup resident capacity must be greater than TopK: "
-                f"resident={self._hbm_resident_tokens}, "
-                f"topk={self._hbm_sparse_budget_tokens}")
+        if self._is_sparse_cache_enabled():
+            if self._hbm_sparse_budget_tokens != DSA_LOOKUP_QUERY_TOKENS:
+                raise ValueError(
+                    "DSA lookup operator requires hbm_sparse_budget="
+                    f"{DSA_LOOKUP_QUERY_TOKENS}, got "
+                    f"{self._hbm_sparse_budget_tokens}")
+            if self._hbm_resident_tokens != DSA_LOOKUP_RESIDENT_TOKENS:
+                raise ValueError(
+                    "DSA lookup operator requires hbm_resident_tokens="
+                    f"{DSA_LOOKUP_RESIDENT_TOKENS}, got "
+                    f"{self._hbm_resident_tokens}")
+            if (DSA_LOOKUP_RESIDENT_TOKENS % self._vllm_blk_size != 0
+                    or DSA_LOOKUP_QUERY_TOKENS % self._vllm_blk_size != 0):
+                raise ValueError(
+                    "DSA lookup resident and query counts must be divisible "
+                    "by block_size: "
+                    f"resident={DSA_LOOKUP_RESIDENT_TOKENS}, "
+                    f"query={DSA_LOOKUP_QUERY_TOKENS}, "
+                    f"block_size={self._vllm_blk_size}")
         # One full TopK of free slots guarantees that lookup can allocate an
         # all-miss query before maintenance reclaims the same number of old
         # non-protected entries.
         self._lookup_free_slot_tokens = self._hbm_sparse_budget_tokens
         self._lookup_total_slot_tokens = (
-            self._hbm_resident_tokens + self._lookup_free_slot_tokens)
+            DSA_LOOKUP_TOTAL_SLOTS
+            if self._is_sparse_cache_enabled()
+            else self._hbm_resident_tokens + self._lookup_free_slot_tokens)
         # Sparse decode starts only after the original sequence exceeds the
         # physical lookup address space plus its independent dense tail block.
         self._enable_dsa_prompt_len = (
@@ -143,11 +142,9 @@ class DSASparseBase:
 
     def _get_fixed_sparse_budget_tokens(self, candidate_tokens: int) -> int:
         configured_budget = int(self._hbm_sparse_budget_tokens)
-        if configured_budget <= 0 or candidate_tokens <= 0:
+        if configured_budget <= 0 or candidate_tokens < configured_budget:
             return 0
-        block_size = self._vllm_blk_size
-        budget_tokens = _round_up_to_multiple(configured_budget, block_size)
-        return max(block_size, min(budget_tokens, candidate_tokens))
+        return configured_budget
 
 
 class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
@@ -181,11 +178,15 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         self.total_num_hidden_layers = (
             vllm_config.model_config.get_total_num_hidden_layers()
         )
-        index_capacity = int(vllm_config.model_config.max_model_len)
+        max_model_len = int(vllm_config.model_config.max_model_len)
+        if max_model_len > DSA_LOOKUP_INDEX_CAPACITY:
+            raise ValueError(
+                "DSA lookup operator supports max_model_len up to "
+                f"{DSA_LOOKUP_INDEX_CAPACITY}, got {max_model_len}")
         self.resident_token_pool = DSAResidentTokenPool(
             max_reqs=int(vllm_config.cache_config.dsa_max_active_reqs),
             num_layers=self.total_num_hidden_layers,
-            index_capacity=index_capacity,
+            index_capacity=DSA_LOOKUP_INDEX_CAPACITY,
             resident_tokens=self._hbm_resident_tokens,
             free_slot_tokens=self._lookup_free_slot_tokens,
             device=resident_device,
@@ -201,6 +202,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             dtype=torch.bool,
             device="cpu",
         )
+        self._lookup_maintain_seed = 0
 
 
     def _get_full_attention_group_id(self, kv_cache_config) -> int:
@@ -406,6 +408,8 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
                 force_decode_row_mode_score_topk),
         )
         self._forward_sparse_decode_attention_indices_tensor = None
+        self._lookup_maintain_seed = (
+            self._lookup_maintain_seed + 1) & 0x7FFFFFFF
 
     """
     EngineCore Scheduler侧逻辑
@@ -598,7 +602,8 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         lookup_result = self.ops_backend.lookup_resident_update(
             selection_topk_indices=selection_topk,
             req_pool_entries=forward_batch.resident_pool_indices_tensor,
-            candidate_lens=forward_batch.candidate_lens_tensor,
+            sparse_local_row_indices=(
+                forward_batch.sparse_local_row_indices_tensor),
             selection_block_table=forward_batch.batch_hbm_block_table,
             full_block_table=forward_batch.batch_dram_block_table,
             nopek_cache_zone=layer_batch.cache_zones.nopek_cache_zone,
@@ -607,7 +612,6 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             ropek_dram_arena=ropek_dram_arena,
             lookup_state=lookup_state,
             resident_tokens=self._hbm_resident_tokens,
-            total_slots=self._lookup_total_slot_tokens,
             tail_valid_token_counts=(
                 forward_batch.tail_valid_token_counts_tensor),
             resident_tail_starts=(
@@ -618,6 +622,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             row_modes=forward_batch.row_modes_tensor,
             lookup_init_mask=forward_batch.lookup_init_mask_tensor,
             has_lookup_init_rows=forward_batch.has_lookup_init_rows,
+            maintain_seed=self._lookup_maintain_seed,
         )
         sparse_attention_indices = lookup_result.attention_indices
         self._commit_lookup_resident_metadata(layer_batch)
@@ -780,8 +785,8 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
 
     def request_preempted_in_worker(self, request_id):
         self._clear_full_dump_done(request_id)
-        if self.resident_token_pool.get_index(request_id) is not None:
-            self.resident_token_pool.clear_request(request_id)
+        self.resident_token_pool.release(request_id)
+        self.dsa_hot_kv_store.release_request(request_id)
 
     def execute_begin(self, scheduler_output: SchedulerOutput):
         pass

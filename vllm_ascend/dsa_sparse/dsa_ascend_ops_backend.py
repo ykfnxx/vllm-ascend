@@ -17,10 +17,10 @@ class DSALookupOutput(NamedTuple):
 class AscendDSAOpsBackend:
     """Materialize Indexer TopK through a persistent token-to-slot index.
 
-    This framework implementation expresses the lookup state machine with NPU
-    tensor operations. It defines the contract for later fused
-    lookup/materialize/maintain operators and never invokes the legacy
-    gather-selection operator.
+    The AIV lookup operator maps original token ids to persistent resident
+    slots and reports actual allocations. Framework tensor operations copy
+    only those misses, then the AICPU maintain operator restores the free-slot
+    headroom for the next decode step.
     """
 
     @staticmethod
@@ -144,125 +144,6 @@ class AscendDSAOpsBackend:
             dtype=torch.int32)
 
     @staticmethod
-    def _lookup_allocate(
-        *,
-        state: DSAResidentLookupState,
-        topk: torch.Tensor,
-        pool_entries: torch.Tensor,
-        candidate_lens: torch.Tensor,
-        budget_lengths: torch.Tensor,
-        sparse_rows: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size, topk_width = topk.shape
-        pool_rows = pool_entries.to(dtype=torch.long)
-        query_columns = torch.arange(
-            topk_width, dtype=torch.int32, device=topk.device).view(1, -1)
-        valid = (
-            sparse_rows.view(-1, 1)
-            & (query_columns < budget_lengths.view(-1, 1))
-            & (topk >= 0)
-            & (topk < candidate_lens.view(-1, 1))
-        )
-        safe_tokens = torch.where(valid, topk, torch.zeros_like(topk)).to(
-            dtype=torch.long)
-        expanded_pool_rows = pool_rows.view(-1, 1).expand(
-            batch_size, topk_width)
-        old_slots = state.token_to_slot[expanded_pool_rows, safe_tokens]
-        hits = valid & (old_slots >= 0)
-        misses = valid & ~hits
-
-        miss_ranks = misses.to(dtype=torch.int32).cumsum(dim=1) - 1
-        old_heads = state.free_head.index_select(0, pool_rows).view(-1, 1)
-        free_positions = (old_heads + miss_ranks.clamp_min(0)).to(
-            dtype=torch.long)
-        allocated_slots = state.free_slots[
-            expanded_pool_rows, free_positions]
-        slot_out = torch.where(
-            hits,
-            old_slots,
-            torch.where(misses, allocated_slots,
-                        torch.full_like(old_slots, -1)),
-        )
-
-        miss_batch_rows, miss_columns = misses.nonzero(as_tuple=True)
-        miss_pool_rows = pool_rows.index_select(0, miss_batch_rows)
-        miss_tokens = topk[miss_batch_rows, miss_columns].to(dtype=torch.long)
-        miss_slots = slot_out[miss_batch_rows, miss_columns].to(dtype=torch.long)
-        state.token_to_slot[miss_pool_rows, miss_tokens] = miss_slots.to(
-            dtype=torch.int32)
-        state.slot_to_token[miss_pool_rows, miss_slots] = miss_tokens.to(
-            dtype=torch.int32)
-        miss_counts = misses.sum(dim=1, dtype=torch.int32)
-        state.free_head[pool_rows] = (
-            old_heads.reshape(-1) + miss_counts)
-        return slot_out.to(dtype=torch.int32), misses, miss_counts
-
-    @staticmethod
-    def _maintain_lookup_state(
-        *,
-        state: DSAResidentLookupState,
-        pool_entries: torch.Tensor,
-        sparse_rows: torch.Tensor,
-        slot_out: torch.Tensor,
-        miss_counts: torch.Tensor,
-        total_slots: int,
-    ) -> None:
-        pool_rows = pool_entries.to(dtype=torch.long)
-        batch_size = int(pool_rows.numel())
-        slot_columns = torch.arange(
-            total_slots, dtype=torch.int32,
-            device=slot_out.device).view(1, -1)
-        cursors = state.evict_cursor.index_select(0, pool_rows).view(-1, 1)
-        ordered_slots = torch.remainder(
-            slot_columns + cursors, total_slots).to(dtype=torch.long)
-        reverse_rows = state.slot_to_token.index_select(0, pool_rows)
-        ordered_tokens = reverse_rows.gather(1, ordered_slots)
-
-        protected_counts = torch.zeros(
-            (batch_size, total_slots),
-            dtype=torch.int32,
-            device=slot_out.device,
-        )
-        valid_slots = sparse_rows.view(-1, 1) & (slot_out >= 0)
-        protected_counts.scatter_add_(
-            1,
-            torch.where(valid_slots, slot_out, torch.zeros_like(slot_out)).to(
-                dtype=torch.long),
-            valid_slots.to(dtype=torch.int32),
-        )
-        protected = protected_counts > 0
-        eligible = (
-            sparse_rows.view(-1, 1)
-            & (ordered_tokens >= 0)
-            & ~protected.gather(1, ordered_slots)
-        )
-        victim_ranks = eligible.to(dtype=torch.int32).cumsum(dim=1)
-        victim_mask = eligible & (
-            victim_ranks <= miss_counts.view(-1, 1))
-        victim_batch_rows, victim_order_positions = victim_mask.nonzero(
-            as_tuple=True)
-        victim_pool_rows = pool_rows.index_select(0, victim_batch_rows)
-        victim_slots = ordered_slots[
-            victim_batch_rows, victim_order_positions]
-        victim_tokens = ordered_tokens[
-            victim_batch_rows, victim_order_positions].to(dtype=torch.long)
-        free_positions = (
-            victim_ranks[victim_batch_rows, victim_order_positions] - 1
-        ).to(dtype=torch.long)
-
-        state.token_to_slot[victim_pool_rows, victim_tokens] = -1
-        state.slot_to_token[victim_pool_rows, victim_slots] = -1
-        state.free_slots[victim_pool_rows, free_positions] = victim_slots.to(
-            dtype=torch.int32)
-        sparse_pool_rows = pool_rows[sparse_rows]
-        state.free_head[sparse_pool_rows] = 0
-        state.evict_cursor[sparse_pool_rows] = torch.remainder(
-            state.evict_cursor[sparse_pool_rows]
-            + miss_counts[sparse_rows],
-            total_slots,
-        )
-
-    @staticmethod
     def _compose_attention_indices(
         *,
         topk: torch.Tensor,
@@ -314,7 +195,7 @@ class AscendDSAOpsBackend:
         *,
         selection_topk_indices: torch.Tensor,
         req_pool_entries: torch.Tensor,
-        candidate_lens: torch.Tensor,
+        sparse_local_row_indices: torch.Tensor,
         selection_block_table: torch.Tensor,
         full_block_table: torch.Tensor,
         nopek_cache_zone: torch.Tensor,
@@ -323,7 +204,6 @@ class AscendDSAOpsBackend:
         ropek_dram_arena: torch.Tensor,
         lookup_state: DSAResidentLookupState,
         resident_tokens: int,
-        total_slots: int,
         tail_valid_token_counts: torch.Tensor,
         resident_tail_starts: torch.Tensor,
         budget_lengths: torch.Tensor,
@@ -332,6 +212,7 @@ class AscendDSAOpsBackend:
         row_modes: torch.Tensor,
         lookup_init_mask: torch.Tensor,
         has_lookup_init_rows: bool,
+        maintain_seed: int,
     ) -> DSALookupOutput:
         selection_k_rope = self._squeeze_cache_head_dim(
             ropek_cache_zone, "ropek_cache_zone")
@@ -345,8 +226,6 @@ class AscendDSAOpsBackend:
         topk = self._normalize_topk(selection_topk_indices, device)
         pool_entries = self._as_device_i32(
             req_pool_entries, device).reshape(-1)
-        candidate_lens = self._as_device_i32(
-            candidate_lens, device).reshape(-1)
         budget_lengths = self._as_device_i32(
             budget_lengths, device).reshape(-1)
         row_modes = self._as_device_i32(row_modes, device).reshape(-1)
@@ -360,6 +239,8 @@ class AscendDSAOpsBackend:
         resident_tail_starts = self._as_device_i32(
             resident_tail_starts, device).reshape(-1)
         sparse_rows = row_modes == int(DSADecodeRowMode.SPARSE)
+        sparse_local_rows = sparse_local_row_indices.to(
+            device=device, dtype=torch.long).reshape(-1)
 
         if has_lookup_init_rows:
             self._initialize_resident_rows(
@@ -374,25 +255,38 @@ class AscendDSAOpsBackend:
                 full_kv_cache=full_kv_cache,
                 full_k_rope=full_k_rope,
             )
-        slot_out, misses, miss_counts = self._lookup_allocate(
-            state=lookup_state,
-            topk=topk,
-            pool_entries=pool_entries,
-            candidate_lens=candidate_lens,
-            budget_lengths=budget_lengths,
-            sparse_rows=sparse_rows,
+        sparse_topk = topk.index_select(0, sparse_local_rows).contiguous()
+        sparse_pool_entries = pool_entries.index_select(
+            0, sparse_local_rows).contiguous()
+        sparse_slot_out, sparse_miss_out = (
+            torch.ops._C_ascend.asu_hbm_index_lookup(
+                lookup_state.token_to_slot,
+                lookup_state.slot_to_token,
+                lookup_state.free_slots,
+                lookup_state.free_head,
+                sparse_pool_entries,
+                sparse_topk,
+                int(sparse_pool_entries.numel()),
+            )
         )
+        sparse_misses = sparse_miss_out.to(dtype=torch.bool)
+        sparse_selection_block_table = selection_block_table.index_select(
+            0, sparse_local_rows)
+        sparse_full_block_table = full_block_table.index_select(
+            0, sparse_local_rows)
         self._materialize_pairs(
-            token_ids=topk,
-            slot_ids=slot_out,
-            pair_mask=misses,
-            selection_block_table=selection_block_table,
-            full_block_table=full_block_table,
+            token_ids=sparse_topk,
+            slot_ids=sparse_slot_out,
+            pair_mask=sparse_misses,
+            selection_block_table=sparse_selection_block_table,
+            full_block_table=sparse_full_block_table,
             selection_kv_cache=selection_kv_cache,
             selection_k_rope=selection_k_rope,
             full_kv_cache=full_kv_cache,
             full_k_rope=full_k_rope,
         )
+        slot_out = torch.full_like(topk, -1)
+        slot_out.index_copy_(0, sparse_local_rows, sparse_slot_out)
 
         if torch.is_tensor(prebuilt_attention_indices):
             attention_indices = prebuilt_attention_indices
@@ -411,12 +305,14 @@ class AscendDSAOpsBackend:
             resident_tail_starts=resident_tail_starts,
             attention_indices=attention_indices,
         )
-        self._maintain_lookup_state(
-            state=lookup_state,
-            pool_entries=pool_entries,
-            sparse_rows=sparse_rows,
-            slot_out=slot_out,
-            miss_counts=miss_counts,
-            total_slots=int(total_slots),
+        torch.ops._C_ascend.asu_hbm_index_maintain_aicpu(
+            lookup_state.token_to_slot,
+            lookup_state.slot_to_token,
+            lookup_state.free_slots,
+            lookup_state.free_head,
+            sparse_pool_entries,
+            sparse_slot_out,
+            int(sparse_pool_entries.numel()),
+            int(maintain_seed),
         )
         return DSALookupOutput(attention_indices=attention_indices)

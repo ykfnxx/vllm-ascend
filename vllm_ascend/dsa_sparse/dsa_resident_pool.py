@@ -6,6 +6,11 @@ from typing import Hashable, NamedTuple
 
 import torch
 
+DSA_LOOKUP_INDEX_CAPACITY = 128 * 1024
+DSA_LOOKUP_RESIDENT_TOKENS = 8 * 1024
+DSA_LOOKUP_QUERY_TOKENS = 2 * 1024
+DSA_LOOKUP_TOTAL_SLOTS = 10 * 1024
+
 
 class DSAResidentLayerResourceView(NamedTuple):
     counts: torch.Tensor
@@ -21,7 +26,6 @@ class DSAResidentLookupState(NamedTuple):
     slot_to_token: torch.Tensor
     free_slots: torch.Tensor
     free_head: torch.Tensor
-    evict_cursor: torch.Tensor
 
 
 class DSAResidentTokenPool:
@@ -103,11 +107,6 @@ class DSAResidentTokenPool:
             dtype=torch.int32,
             device=self.device,
         )
-        self._evict_cursor = torch.zeros(
-            (self.num_layers, self.max_reqs),
-            dtype=torch.int32,
-            device=self.device,
-        )
 
     @property
     def req_hbm_cached_token_counts(self) -> torch.Tensor:
@@ -170,7 +169,6 @@ class DSAResidentTokenPool:
             slot_to_token=self._slot_to_token[layer_id],
             free_slots=self._free_slots[layer_id],
             free_head=self._free_head[layer_id],
-            evict_cursor=self._evict_cursor[layer_id],
         )
 
     def clear_lookup_state_prefix(self, row_count: int) -> None:
@@ -181,7 +179,6 @@ class DSAResidentTokenPool:
         self._slot_to_token[:, :row_count].fill_(-1)
         self._reset_free_slots(slice(0, row_count))
         self._free_head[:, :row_count].zero_()
-        self._evict_cursor[:, :row_count].zero_()
 
     def _reset_free_slots(self, pool_rows) -> None:
         self._free_slots[:, pool_rows].copy_(
@@ -199,7 +196,6 @@ class DSAResidentTokenPool:
             self._free_slot_template.view(1, -1).expand(
                 self.num_layers, -1))
         self._free_head[:, pool_idx].zero_()
-        self._evict_cursor[:, pool_idx].zero_()
 
     def _require_index(self, request_id: Hashable) -> int:
         pool_idx = self._request_to_index.get(request_id)

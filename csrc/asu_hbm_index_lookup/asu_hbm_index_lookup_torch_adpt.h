@@ -12,13 +12,14 @@
 
 namespace vllm_ascend {
 
-at::Tensor asu_hbm_index_lookup(at::Tensor& index,
-                                at::Tensor& slot_to_index,
-                                at::Tensor& free_slots,
-                                at::Tensor& free_head,
-                                const at::Tensor& req_pool_entries,
-                                const at::Tensor& query_index,
-                                int64_t req_num)
+std::tuple<at::Tensor, at::Tensor> asu_hbm_index_lookup(
+    at::Tensor& index,
+    at::Tensor& slot_to_index,
+    at::Tensor& free_slots,
+    at::Tensor& free_head,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& query_index,
+    int64_t req_num)
 {
     TORCH_CHECK(index.scalar_type() == at::kInt, "index must be int32");
     TORCH_CHECK(slot_to_index.scalar_type() == at::kInt, "slot_to_index must be int32");
@@ -29,6 +30,7 @@ at::Tensor asu_hbm_index_lookup(at::Tensor& index,
     TORCH_CHECK(req_num > 0, "req_num must be greater than 0");
 
     at::Tensor slot_out = at::empty_like(query_index);
+    at::Tensor miss_out = at::empty_like(query_index);
     EXEC_NPU_CMD(aclnnAsuHbmIndexLookup,
                  index,
                  slot_to_index,
@@ -37,8 +39,9 @@ at::Tensor asu_hbm_index_lookup(at::Tensor& index,
                  req_pool_entries,
                  query_index,
                  req_num,
-                 slot_out);
-    return slot_out;
+                 slot_out,
+                 miss_out);
+    return std::make_tuple(slot_out, miss_out);
 }
 
 }  // namespace vllm_ascend

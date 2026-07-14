@@ -16,6 +16,10 @@ from typing import Any
 from vllm_ascend.dsa_sparse.dsa_graph_gate import (
     DSA_ROW_MODE_DECODE_GRAPH_CONFIG_KEY,
 )
+from vllm_ascend.dsa_sparse.dsa_resident_pool import (
+    DSA_LOOKUP_QUERY_TOKENS,
+    DSA_LOOKUP_RESIDENT_TOKENS,
+)
 from vllm_ascend.dsa_sparse.dsa_trace import DSA_TRACE_CONFIG_KEY
 
 DSA_SPARSE_ADDITIONAL_CONFIG_KEY = "dsa_sparse_config"
@@ -38,8 +42,8 @@ _DSA_SPARSE_DEFAULT_CACHE_ATTRS: dict[str, Any] = {
     "enable_dsa_sparse_cache": False,
     "enable_dsa_split_indexer_cache": False,
     "dsa_indexer_mla_block_ratio": 3,
-    "dsa_hbm_sparse_budget": 2048,
-    "dsa_hbm_resident_tokens": 8192,
+    "dsa_hbm_sparse_budget": DSA_LOOKUP_QUERY_TOKENS,
+    "dsa_hbm_resident_tokens": DSA_LOOKUP_RESIDENT_TOKENS,
     # Direct token->slot tables are per request and per layer. Deployments must
     # size this existing request-pool limit together with index HBM usage.
     "dsa_max_active_reqs": 256,
@@ -104,13 +108,14 @@ def _normalize_dsa_sparse_config(
         cache_attrs["enable_dsa_split_indexer_cache"] = True
         sparse_topk = int(cache_attrs["dsa_hbm_sparse_budget"])
         resident_tokens = int(cache_attrs["dsa_hbm_resident_tokens"])
-        if sparse_topk <= 0:
+        if sparse_topk != DSA_LOOKUP_QUERY_TOKENS:
             raise ValueError(
-                "dsa_sparse_config['hbm_sparse_budget'] must be positive")
-        if resident_tokens <= sparse_topk:
+                "dsa_sparse_config['hbm_sparse_budget'] must be "
+                f"{DSA_LOOKUP_QUERY_TOKENS} for the ASU lookup operator")
+        if resident_tokens != DSA_LOOKUP_RESIDENT_TOKENS:
             raise ValueError(
-                "dsa_sparse_config['hbm_resident_tokens'] must be greater "
-                "than hbm_sparse_budget")
+                "dsa_sparse_config['hbm_resident_tokens'] must be "
+                f"{DSA_LOOKUP_RESIDENT_TOKENS} for the ASU lookup operator")
 
     additional_updates: dict[str, Any] = {}
     if _DSA_GRAPH_PUBLIC_CONFIG_KEY in raw_config:

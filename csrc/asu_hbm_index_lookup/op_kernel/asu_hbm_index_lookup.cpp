@@ -23,6 +23,7 @@ public:
                                 GM_ADDR reqPoolEntries,
                                 GM_ADDR queryIndex,
                                 GM_ADDR slotOut,
+                                GM_ADDR missOut,
                                 uint32_t reqNum,
                                 TPipe* pipe)
     {
@@ -36,10 +37,12 @@ public:
         reqPoolEntriesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(reqPoolEntries), reqNum_);
         queryIndexGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(queryIndex), reqNum_ * QUERY_COUNT);
         slotOutGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(slotOut), reqNum_ * QUERY_COUNT);
+        missOutGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(missOut), reqNum_ * QUERY_COUNT);
 
         pipe_->InitBuffer(queryBuf_, QUERY_COUNT * sizeof(int32_t));
         pipe_->InitBuffer(indexBuf_, INDEX_TILE_LEN * sizeof(int32_t));
         pipe_->InitBuffer(outBuf_, QUERY_COUNT * sizeof(int32_t));
+        pipe_->InitBuffer(missBuf_, QUERY_COUNT * sizeof(int32_t));
         pipe_->InitBuffer(candidateBuf_, QUERY_COUNT * sizeof(int32_t));
         pipe_->InitBuffer(deltaBuf_, QUERY_COUNT * sizeof(int32_t));
         pipe_->InitBuffer(clampBuf_, QUERY_COUNT * sizeof(int32_t));
@@ -57,6 +60,7 @@ public:
         auto indexTileFloat = indexBuf_.Get<float>();
         auto outTile = outBuf_.Get<int32_t>();
         auto outTileFloat = outBuf_.Get<float>();
+        auto missTile = missBuf_.Get<int32_t>();
         auto candidateTileFloat = candidateBuf_.Get<float>();
         auto deltaTile = deltaBuf_.Get<int32_t>();
         auto clampTile = clampBuf_.Get<int32_t>();
@@ -70,6 +74,7 @@ public:
         indexTileFloat.SetSize(INDEX_TILE_LEN);
         outTile.SetSize(QUERY_COUNT);
         outTileFloat.SetSize(QUERY_COUNT);
+        missTile.SetSize(QUERY_COUNT);
         candidateTileFloat.SetSize(QUERY_COUNT);
         deltaTile.SetSize(QUERY_COUNT);
         clampTile.SetSize(QUERY_COUNT);
@@ -95,6 +100,7 @@ public:
             DataCopy(queryTile, queryIndexGm_[queryReqBase], QUERY_COUNT);
             SyncPipelines<HardEvent::MTE2_V>();
             Duplicate(outTile, NOT_FOUND, QUERY_COUNT);
+            Duplicate(missTile, static_cast<int32_t>(0), QUERY_COUNT);
             PipeBarrier<PIPE_ALL>();
 
             for (uint32_t indexBase = 0; indexBase < INDEX_SIZE; indexBase += INDEX_TILE_LEN) {
@@ -133,6 +139,7 @@ public:
                         ++freeHead;
                         indexGm_.SetValue(indexReqBase + static_cast<uint32_t>(indexId), slot);
                         slotToIndexGm_.SetValue(slotReqBase + static_cast<uint32_t>(slot), indexId);
+                        missTile.SetValue(i, static_cast<int32_t>(1));
                     }
                     outTile.SetValue(i, slot);
                 }
@@ -143,6 +150,7 @@ public:
             SyncPipelines<HardEvent::S_MTE2>();
             SyncPipelines<HardEvent::S_MTE3>();
             DataCopy(slotOutGm_[queryReqBase], outTile, QUERY_COUNT);
+            DataCopy(missOutGm_[queryReqBase], missTile, QUERY_COUNT);
             SyncPipelines<HardEvent::MTE3_V>();
             freeHeadGm_.SetValue(poolEntry, freeHead);
         }
@@ -165,6 +173,7 @@ private:
     TBuf<TPosition::VECIN> queryBuf_;
     TBuf<TPosition::VECIN> indexBuf_;
     TBuf<TPosition::VECOUT> outBuf_;
+    TBuf<TPosition::VECOUT> missBuf_;
     TBuf<TPosition::VECCALC> candidateBuf_;
     TBuf<TPosition::VECCALC> deltaBuf_;
     TBuf<TPosition::VECCALC> clampBuf_;
@@ -179,6 +188,7 @@ private:
     GlobalTensor<int32_t> reqPoolEntriesGm_;
     GlobalTensor<int32_t> queryIndexGm_;
     GlobalTensor<int32_t> slotOutGm_;
+    GlobalTensor<int32_t> missOutGm_;
     uint32_t reqNum_;
 };
 
@@ -191,6 +201,7 @@ extern "C" __global__ __aicore__ void asu_hbm_index_lookup(GM_ADDR index,
                                                             GM_ADDR reqPoolEntries,
                                                             GM_ADDR queryIndex,
                                                             GM_ADDR slotOut,
+                                                            GM_ADDR missOut,
                                                             GM_ADDR workspace,
                                                             GM_ADDR tiling)
 {
@@ -205,6 +216,7 @@ extern "C" __global__ __aicore__ void asu_hbm_index_lookup(GM_ADDR index,
             reqPoolEntries,
             queryIndex,
             slotOut,
+            missOut,
             tilingData.reqNum,
             &pipe);
     op.Process();

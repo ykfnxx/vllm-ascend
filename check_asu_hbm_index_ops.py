@@ -253,6 +253,7 @@ def _lookup_reference(
     req_pool_entries,
 ):
     slot_out = query_index.new_empty(query_index.shape)
+    miss_out = query_index.new_zeros(query_index.shape)
     for req_id in range(REQ_NUM):
         pool_entry = int(req_pool_entries[req_id])
         head = int(free_head[pool_entry])
@@ -264,9 +265,10 @@ def _lookup_reference(
                 head += 1
                 index[pool_entry, index_id] = slot
                 slot_to_index[pool_entry, slot] = index_id
+                miss_out[req_id, query_id] = 1
             slot_out[req_id, query_id] = slot
         free_head[pool_entry] = head
-    return slot_out
+    return slot_out, miss_out
 
 
 def _maintain_reference(
@@ -348,7 +350,7 @@ def main() -> None:
     query_index = initial_state[4]
     req_pool_entries = initial_state[5]
 
-    expected_slot_out = _lookup_reference(
+    expected_slot_out, expected_miss_out = _lookup_reference(
         expected_index,
         expected_slot_to_index,
         expected_free_slots,
@@ -364,7 +366,7 @@ def main() -> None:
     query_index_npu = query_index.to(device)
     req_pool_entries_npu = req_pool_entries.to(device)
 
-    slot_out = torch.ops._C_ascend.asu_hbm_index_lookup(
+    slot_out, miss_out = torch.ops._C_ascend.asu_hbm_index_lookup(
         index,
         slot_to_index,
         free_slots,
@@ -377,6 +379,7 @@ def main() -> None:
 
     actual_slot_out = slot_out.cpu()
     _assert_equal(torch, "lookup slot output", actual_slot_out, expected_slot_out)
+    _assert_equal(torch, "lookup miss output", miss_out.cpu(), expected_miss_out)
     _assert_equal(
         torch,
         "lookup free head",

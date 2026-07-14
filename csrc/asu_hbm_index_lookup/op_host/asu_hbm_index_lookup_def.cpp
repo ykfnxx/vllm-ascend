@@ -47,6 +47,11 @@ public:
             .DataType({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
+        this->Output("miss_out")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_INT32})
+            .FormatList({ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND});
 
         this->Attr("req_num").AttrType(REQUIRED).Int();
 

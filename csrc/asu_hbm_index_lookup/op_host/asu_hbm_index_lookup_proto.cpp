@@ -9,6 +9,7 @@ namespace ops {
 namespace {
 constexpr uint32_t QUERY_INDEX_INPUT = 5U;
 constexpr uint32_t SLOT_OUT_OUTPUT = 0U;
+constexpr uint32_t MISS_OUT_OUTPUT = 1U;
 }  // namespace
 
 static ge::graphStatus InferShapeAsuHbmIndexLookup(gert::InferShapeContext* context)
@@ -25,6 +26,12 @@ static ge::graphStatus InferShapeAsuHbmIndexLookup(gert::InferShapeContext* cont
     for (size_t dim = 0; dim < query_shape->GetDimNum(); ++dim) {
         out_shape->SetDim(dim, query_shape->GetDim(dim));
     }
+    gert::Shape* miss_shape = context->GetOutputShape(MISS_OUT_OUTPUT);
+    OPS_LOG_E_IF_NULL(context, miss_shape, return ge::GRAPH_FAILED);
+    miss_shape->SetDimNum(query_shape->GetDimNum());
+    for (size_t dim = 0; dim < query_shape->GetDimNum(); ++dim) {
+        miss_shape->SetDim(dim, query_shape->GetDim(dim));
+    }
     return ge::GRAPH_SUCCESS;
 }
 
@@ -34,6 +41,7 @@ static ge::graphStatus InferDataTypeAsuHbmIndexLookup(gert::InferDataTypeContext
                return ge::GRAPH_FAILED);
 
     context->SetOutputDataType(SLOT_OUT_OUTPUT, ge::DT_INT32);
+    context->SetOutputDataType(MISS_OUT_OUTPUT, ge::DT_INT32);
     return ge::GRAPH_SUCCESS;
 }
 

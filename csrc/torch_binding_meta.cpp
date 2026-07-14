@@ -607,13 +607,14 @@ at::Tensor npu_lightning_indexer_quant_meta(
     return lightning_indexer_quant_output;
 }
 
-at::Tensor asu_hbm_index_lookup_meta(at::Tensor& index,
-                                     at::Tensor& slot_to_index,
-                                     at::Tensor& free_slots,
-                                     at::Tensor& free_head,
-                                     const at::Tensor& req_pool_entries,
-                                     const at::Tensor& query_index,
-                                     int64_t req_num)
+std::tuple<at::Tensor, at::Tensor> asu_hbm_index_lookup_meta(
+    at::Tensor& index,
+    at::Tensor& slot_to_index,
+    at::Tensor& free_slots,
+    at::Tensor& free_head,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& query_index,
+    int64_t req_num)
 {
     (void)index;
     (void)slot_to_index;
@@ -621,7 +622,8 @@ at::Tensor asu_hbm_index_lookup_meta(at::Tensor& index,
     (void)free_head;
     (void)req_pool_entries;
     (void)req_num;
-    return at::empty_like(query_index);
+    return std::make_tuple(at::empty_like(query_index),
+                           at::empty_like(query_index));
 }
 
 void asu_hbm_index_maintain_aicpu_meta(at::Tensor& index,
