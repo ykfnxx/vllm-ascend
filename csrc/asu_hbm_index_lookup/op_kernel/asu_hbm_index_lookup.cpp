@@ -9,6 +9,7 @@ constexpr uint32_t SLOT_COUNT = 10U * 1024U;
 constexpr uint32_t FREE_SLOT_COUNT = 2U * 1024U;
 constexpr uint32_t QUERY_COUNT = 2U * 1024U;
 constexpr uint32_t INDEX_TILE_LEN = 16U * 1024U;
+constexpr uint32_t FREE_HEADS_PER_CACHE_LINE = 16U;
 constexpr int32_t NOT_FOUND = -1;
 
 class KernelAsuHbmIndexLookup {
@@ -49,6 +50,9 @@ public:
     {
         uint32_t coreId = GetBlockIdx();
         uint32_t blockNum = GetBlockNum();
+        uint32_t reqGroupNum =
+            (reqNum_ + FREE_HEADS_PER_CACHE_LINE - 1U) /
+            FREE_HEADS_PER_CACHE_LINE;
 
         auto queryTile = queryBuf_.Get<int32_t>();
         auto indexTile = indexBuf_.Get<int32_t>();
@@ -76,58 +80,72 @@ public:
         offsetTileU32.SetSize(QUERY_COUNT);
         maskTile.SetSize(QUERY_COUNT);
 
-        for (uint32_t reqId = coreId; reqId < reqNum_; reqId += blockNum) {
-            uint32_t indexReqBase = reqId * INDEX_SIZE;
-            uint32_t slotReqBase = reqId * SLOT_COUNT;
-            uint32_t freeReqBase = reqId * FREE_SLOT_COUNT;
-            uint32_t queryReqBase = reqId * QUERY_COUNT;
-            int32_t freeHead = freeHeadGm_.GetValue(reqId);
-
-            DataCopy(queryTile, queryIndexGm_[queryReqBase], QUERY_COUNT);
-            Duplicate(outTile, NOT_FOUND, QUERY_COUNT);
-            PipeBarrier<PIPE_ALL>();
-
-            for (uint32_t indexBase = 0; indexBase < INDEX_SIZE; indexBase += INDEX_TILE_LEN) {
-                DataCopy(indexTile, indexGm_[indexReqBase + indexBase], INDEX_TILE_LEN);
-                PipeBarrier<PIPE_ALL>();
-
-                Adds(deltaTile, queryTile, -static_cast<int32_t>(indexBase), QUERY_COUNT);
-                Relu(clampTile, deltaTile, QUERY_COUNT);
-                Adds(helperTile, clampTile, -static_cast<int32_t>(INDEX_TILE_LEN - 1U), QUERY_COUNT);
-                Relu(helperTile, helperTile, QUERY_COUNT);
-                Muls(helperTile, helperTile, static_cast<int32_t>(-1), QUERY_COUNT);
-                Add(clampTile, clampTile, helperTile, QUERY_COUNT);
-
-                Muls(offsetTile, clampTile, static_cast<int32_t>(sizeof(int32_t)), QUERY_COUNT);
-                Muls(helperTile, clampTile, static_cast<int32_t>(-1), QUERY_COUNT);
-                Add(helperTile, helperTile, deltaTile, QUERY_COUNT);
-                CompareScalar(maskTile, helperTile, static_cast<int32_t>(0), CMPMODE::EQ, QUERY_COUNT);
-
-                Gather(candidateTileFloat, indexTileFloat, offsetTileU32, 0, QUERY_COUNT);
-                Select(outTileFloat, maskTile, candidateTileFloat, outTileFloat,
-                       SELMODE::VSEL_TENSOR_TENSOR_MODE, QUERY_COUNT);
-                PipeBarrier<PIPE_ALL>();
+        for (uint32_t reqGroupId = coreId;
+             reqGroupId < reqGroupNum;
+             reqGroupId += blockNum) {
+            uint32_t reqStart = reqGroupId * FREE_HEADS_PER_CACHE_LINE;
+            uint32_t reqEnd = reqStart + FREE_HEADS_PER_CACHE_LINE;
+            if (reqEnd > reqNum_) {
+                reqEnd = reqNum_;
             }
 
-            for (uint32_t i = 0; i < QUERY_COUNT; ++i) {
-                int32_t slot = outTile.GetValue(i);
-                if (slot == NOT_FOUND) {
-                    int32_t indexId = queryTile.GetValue(i);
-                    slot = indexGm_.GetValue(indexReqBase + static_cast<uint32_t>(indexId));
-                    if (slot == NOT_FOUND) {
-                        slot = freeSlotsGm_.GetValue(freeReqBase + static_cast<uint32_t>(freeHead));
-                        ++freeHead;
-                        indexGm_.SetValue(indexReqBase + static_cast<uint32_t>(indexId), slot);
-                        slotToIndexGm_.SetValue(slotReqBase + static_cast<uint32_t>(slot), indexId);
-                    }
-                    outTile.SetValue(i, slot);
+            for (uint32_t reqId = reqStart; reqId < reqEnd; ++reqId) {
+                uint32_t indexReqBase = reqId * INDEX_SIZE;
+                uint32_t slotReqBase = reqId * SLOT_COUNT;
+                uint32_t freeReqBase = reqId * FREE_SLOT_COUNT;
+                uint32_t queryReqBase = reqId * QUERY_COUNT;
+                int32_t freeHead = freeHeadGm_.GetValue(reqId);
+
+                DataCopy(queryTile, queryIndexGm_[queryReqBase], QUERY_COUNT);
+                Duplicate(outTile, NOT_FOUND, QUERY_COUNT);
+                PipeBarrier<PIPE_ALL>();
+
+                for (uint32_t indexBase = 0; indexBase < INDEX_SIZE; indexBase += INDEX_TILE_LEN) {
+                    DataCopy(indexTile, indexGm_[indexReqBase + indexBase], INDEX_TILE_LEN);
+                    PipeBarrier<PIPE_ALL>();
+
+                    Adds(deltaTile, queryTile, -static_cast<int32_t>(indexBase), QUERY_COUNT);
+                    Relu(clampTile, deltaTile, QUERY_COUNT);
+                    Adds(helperTile, clampTile, -static_cast<int32_t>(INDEX_TILE_LEN - 1U), QUERY_COUNT);
+                    Relu(helperTile, helperTile, QUERY_COUNT);
+                    Muls(helperTile, helperTile, static_cast<int32_t>(-1), QUERY_COUNT);
+                    Add(clampTile, clampTile, helperTile, QUERY_COUNT);
+
+                    Muls(offsetTile, clampTile, static_cast<int32_t>(sizeof(int32_t)), QUERY_COUNT);
+                    Muls(helperTile, clampTile, static_cast<int32_t>(-1), QUERY_COUNT);
+                    Add(helperTile, helperTile, deltaTile, QUERY_COUNT);
+                    CompareScalar(maskTile, helperTile, static_cast<int32_t>(0), CMPMODE::EQ, QUERY_COUNT);
+
+                    Gather(candidateTileFloat, indexTileFloat, offsetTileU32, 0, QUERY_COUNT);
+                    Select(outTileFloat, maskTile, candidateTileFloat, outTileFloat,
+                           SELMODE::VSEL_TENSOR_TENSOR_MODE, QUERY_COUNT);
+                    PipeBarrier<PIPE_ALL>();
                 }
-            }
 
-            PipeBarrier<PIPE_ALL>();
-            DataCopy(slotOutGm_[queryReqBase], outTile, QUERY_COUNT);
-            freeHeadGm_.SetValue(reqId, freeHead);
+                for (uint32_t i = 0; i < QUERY_COUNT; ++i) {
+                    int32_t slot = outTile.GetValue(i);
+                    if (slot == NOT_FOUND) {
+                        int32_t indexId = queryTile.GetValue(i);
+                        slot = indexGm_.GetValue(indexReqBase + static_cast<uint32_t>(indexId));
+                        if (slot == NOT_FOUND) {
+                            slot = freeSlotsGm_.GetValue(freeReqBase + static_cast<uint32_t>(freeHead));
+                            ++freeHead;
+                            indexGm_.SetValue(indexReqBase + static_cast<uint32_t>(indexId), slot);
+                            slotToIndexGm_.SetValue(slotReqBase + static_cast<uint32_t>(slot), indexId);
+                        }
+                        outTile.SetValue(i, slot);
+                    }
+                }
+
+                PipeBarrier<PIPE_ALL>();
+                DataCopy(slotOutGm_[queryReqBase], outTile, QUERY_COUNT);
+                freeHeadGm_.SetValue(reqId, freeHead);
+            }
         }
+
+        DataCacheCleanAndInvalid<int32_t,
+                                 CacheLine::ENTIRE_DATA_CACHE,
+                                 DcciDst::CACHELINE_OUT>(freeHeadGm_);
     }
 
 private:

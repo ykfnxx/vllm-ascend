@@ -237,6 +237,18 @@ def main() -> None:
         free_head.cpu(),
         expected_free_head,
     )
+    _assert_equal(
+        torch,
+        "lookup token-to-slot index",
+        index.cpu(),
+        expected_index,
+    )
+    _assert_equal(
+        torch,
+        "lookup slot-to-token index",
+        slot_to_index.cpu(),
+        expected_slot_to_index,
+    )
 
     torch.ops._C_ascend.asu_hbm_index_maintain_aicpu(
         index,
