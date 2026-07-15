@@ -34,7 +34,9 @@ OPERATOR_LOG_MARKERS = (
     "DSA sparse completed asu_hbm_index_maintain_aicpu",
 )
 FRAMEWORK_LOG_MARKERS = (
+    "DSA sparse general-plugin bootstrap installed",
     "DSA sparse platform patch installed",
+    "DSA sparse EngineCore bootstrap verified",
     "DSA sparse EngineCore entry patch active",
     "DSA sparse runtime patches installed",
     "DSA sparse scheduler manager enabled",
@@ -43,6 +45,10 @@ FRAMEWORK_LOG_MARKERS = (
     "DSA sparse worker forward mode active",
     "DSA sparse SFA path active",
     "DSA sparse indexer completed",
+    "DSA sparse after_indexer entered",
+    "DSA sparse layer batch ready",
+    "DSA sparse invoking resident initialization",
+    "DSA sparse completed resident initialization",
 )
 DENSE_SFA_LOG_MARKER = "DSA sparse SFA dense path active"
 SOURCE_MARKERS = {
@@ -63,7 +69,9 @@ SOURCE_MARKERS = {
         "dsa_alloc_slots_wrap",
     ),
     "patch/dsa_sparse/patch_engine_process.py": (
-        "EngineCoreProc.run_engine_core = staticmethod(_run_engine_core)",
+        "ensure_dsa_engine_core_entrypoint",
+        "CoreEngineProcManager",
+        "verify_dsa_runtime_patches_installed",
     ),
     "platform.py": (
         "ASCEND_CUSTOM_OPP_PATH",
@@ -390,6 +398,12 @@ for module_name, distribution_name in (
     except importlib.metadata.PackageNotFoundError:
         version = None
     result[module_name] = {"origin": origin, "version": version}
+result["vllm_general_plugins"] = {
+    entry_point.name: entry_point.value
+    for entry_point in importlib.metadata.entry_points(
+        group="vllm.general_plugins"
+    )
+}
 print(json.dumps(result))
 """
 
@@ -480,6 +494,17 @@ def _probe_service_python(
         reporter.pass_(f"service vllm-ascend is not an rc build: {ascend_version}")
     else:
         reporter.warn("vllm-ascend distribution version is unavailable")
+
+    general_plugins = package_info.get("vllm_general_plugins", {})
+    dsa_plugin = general_plugins.get("ascend_dsa_sparse")
+    if dsa_plugin == "vllm_ascend:register_dsa_sparse":
+        reporter.pass_("service metadata contains the DSA general plugin")
+    else:
+        reporter.fail(
+            "service metadata does not contain the DSA general plugin; "
+            "reinstall vllm-ascend after rebuilding, got "
+            f"{dsa_plugin!r}"
+        )
     return package_info
 
 

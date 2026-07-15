@@ -784,11 +784,18 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         if hasattr(attn_metadata, "dsa_sparse_attention_indices"):
             delattr(attn_metadata, "dsa_sparse_attention_indices")
 
+        logger.info_once(
+            "DSA sparse after_indexer entered: building the layer resident "
+            "decode batch"
+        )
         layer_batch = self._build_layer_sparse_decode_batch(
             layer_name, attn_metadata)
         if not layer_batch:
             return None
 
+        logger.info_once(
+            "DSA sparse layer batch ready: entering the lookup resident backend"
+        )
         return self._apply_layer_sparse_decode_batch(layer_batch,
                                                      attn_metadata)
 

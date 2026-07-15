@@ -535,6 +535,7 @@ setup(
         "vllm.platform_plugins": ["ascend = vllm_ascend:register"],
         "vllm.general_plugins": [
             "ascend_kv_connector = vllm_ascend:register_connector",
+            "ascend_dsa_sparse = vllm_ascend:register_dsa_sparse",
             "ascend_model_loader = vllm_ascend:register_model_loader",
             "ascend_service_profiling = vllm_ascend:register_service_profiling",
         ],

@@ -29,6 +29,7 @@ class AscendDSAOpsBackend:
     def __init__(self) -> None:
         self._lookup_call_logged = False
         self._maintain_call_logged = False
+        self._resident_init_logged = False
 
     @staticmethod
     def _squeeze_cache_head_dim(cache: torch.Tensor | None,
@@ -250,6 +251,13 @@ class AscendDSAOpsBackend:
             device=device, dtype=torch.long).reshape(-1)
 
         if has_lookup_init_rows:
+            if not self._resident_init_logged:
+                logger.info(
+                    "DSA sparse invoking resident initialization: "
+                    "requests=%d, resident_tokens=%d",
+                    int(pool_entries.numel()),
+                    int(resident_tokens),
+                )
             self._initialize_resident_rows(
                 state=lookup_state,
                 pool_entries=pool_entries,
@@ -262,6 +270,14 @@ class AscendDSAOpsBackend:
                 full_kv_cache=full_kv_cache,
                 full_k_rope=full_k_rope,
             )
+            if not self._resident_init_logged:
+                logger.info(
+                    "DSA sparse completed resident initialization: "
+                    "requests=%d, resident_tokens=%d",
+                    int(pool_entries.numel()),
+                    int(resident_tokens),
+                )
+                self._resident_init_logged = True
         sparse_topk = topk.index_select(0, sparse_local_rows).contiguous()
         sparse_pool_entries = pool_entries.index_select(
             0, sparse_local_rows).contiguous()

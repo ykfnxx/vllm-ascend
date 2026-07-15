@@ -28,6 +28,19 @@ def register_connector():
     register_connector()
 
 
+def register_dsa_sparse():
+    """Install DSA runtime patches in each vLLM process."""
+    from vllm.logger import init_logger
+    from vllm_ascend.patch.dsa_sparse.patch_runtime import (
+        install_dsa_runtime_patches,
+    )
+
+    install_dsa_runtime_patches()
+    init_logger("vllm.dsa_sparse").info_once(
+        "DSA sparse general-plugin bootstrap installed"
+    )
+
+
 def register_model_loader():
     from .model_loader.netloader import register_netloader
     from .model_loader.rfork import register_rforkloader
