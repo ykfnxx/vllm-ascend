@@ -55,7 +55,7 @@ from vllm.forward_context import ForwardContext
 
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.dsa_sparse")
 
 
 def _query_position_row_is_empty(row) -> bool:

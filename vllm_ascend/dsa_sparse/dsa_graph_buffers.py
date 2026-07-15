@@ -26,7 +26,7 @@ from vllm_ascend.dsa_sparse.dsa_graph_gate import (
 from vllm_ascend.dsa_sparse.dsa_req_meta import ReqType
 from vllm_ascend.dsa_sparse.dsa_types import DSADecodeRowMode
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.dsa_sparse")
 
 
 _DSA_GRAPH_DUMMY_REQ_ID_PREFIX = "__dsa_graph_dummy_req_"

@@ -57,6 +57,7 @@ SOURCE_MARKERS = {
         '"dsa_hbm_sparse_budget": DSA_LOOKUP_QUERY_TOKENS',
     ),
     "dsa_sparse/dsa_ascend_ops_backend.py": (
+        'init_logger("vllm.dsa_sparse")',
         "torch.ops._C_ascend.asu_hbm_index_lookup",
         "torch.ops._C_ascend.asu_hbm_index_maintain_aicpu",
     ),
@@ -65,6 +66,7 @@ SOURCE_MARKERS = {
         "attn_metadata.dsa_score_topk_k",
     ),
     "patch/dsa_sparse/patch_scheduler.py": (
+        'init_logger("vllm.dsa_sparse")',
         "plan_decode_resident_slots",
         "dsa_alloc_slots_wrap",
     ),

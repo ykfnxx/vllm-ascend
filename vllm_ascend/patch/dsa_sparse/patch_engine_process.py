@@ -20,7 +20,7 @@ from vllm_ascend.dsa_sparse.dsa_config import (
     is_dsa_sparse_config_enabled,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.dsa_sparse")
 
 _DSA_RUN_ENGINE_CORE_WRAPPER_ATTR = (
     "_vllm_ascend_dsa_run_engine_core_wrapper"

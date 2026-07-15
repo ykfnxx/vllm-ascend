@@ -27,7 +27,7 @@ from vllm_ascend.dsa_sparse.dsa_resident_pool import (
     DSAResidentLayerResourceView)
 from vllm_ascend.dsa_sparse.dsa_types import DSADecodeRowMode, ReqStage
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.dsa_sparse")
 
 
 @dataclass

@@ -10,7 +10,7 @@ from vllm.logger import init_logger
 from vllm_ascend.dsa_sparse.dsa_resident_pool import DSAResidentLookupState
 from vllm_ascend.dsa_sparse.dsa_types import DSADecodeRowMode
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.dsa_sparse")
 
 
 class DSALookupOutput(NamedTuple):

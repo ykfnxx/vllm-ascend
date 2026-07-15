@@ -24,7 +24,7 @@ from vllm_ascend.dsa_sparse.dsa_spec_utils import (
     is_dsa_mla_resident_spec,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.dsa_sparse")
 
 
 class AscendDSAHotKVStore(DSAHotKVStore):

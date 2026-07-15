@@ -20,7 +20,7 @@ from vllm_ascend.dsa_sparse.dsa_config import (
 from vllm_ascend.dsa_sparse.dsa_sparse import DSASparseV1
 from vllm_ascend.dsa_sparse.dsa_types import DSASparseRole, INVALID_SLOT, ReqStage
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.dsa_sparse")
 
 
 def _is_prefill(request: Request) -> bool:
