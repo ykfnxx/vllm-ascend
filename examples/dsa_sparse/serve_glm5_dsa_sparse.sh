@@ -2,8 +2,9 @@
 
 set -euo pipefail
 
-# Usage: ./examples/dsa_sparse/serve_glm5_dsa_sparse.sh /path/to/GLM-5
+# Usage: ./examples/dsa_sparse/serve_glm5_dsa_sparse.sh /path/to/GLM-5 [vllm options]
 MODEL_PATH="$1"
+shift
 
 unset VLLM_ASCEND_BALANCE_SCHEDULING
 # Keep operator verification on the non-context-parallel DSA path even when
@@ -30,4 +31,5 @@ exec vllm serve "${MODEL_PATH}" \
   --enforce-eager \
   --no-async-scheduling \
   --block-size 128 \
-  --additional-config '{"fuse_muls_add":true,"multistream_overlap_shared_expert":true,"dsa_sparse_config":{"enabled":true}}'
+  --additional-config '{"fuse_muls_add":true,"multistream_overlap_shared_expert":true,"dsa_sparse_config":{"enabled":true}}' \
+  "$@"
