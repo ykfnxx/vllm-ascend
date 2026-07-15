@@ -6,6 +6,7 @@ from typing import Any
 
 import vllm.v1.core.sched.output as output_mod
 import vllm.v1.core.sched.scheduler as scheduler_mod
+from vllm.logger import init_logger
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -18,6 +19,8 @@ from vllm_ascend.dsa_sparse.dsa_config import (
 )
 from vllm_ascend.dsa_sparse.dsa_sparse import DSASparseV1
 from vllm_ascend.dsa_sparse.dsa_types import DSASparseRole, INVALID_SLOT, ReqStage
+
+logger = init_logger(__name__)
 
 
 def _is_prefill(request: Request) -> bool:
@@ -229,6 +232,20 @@ def _scheduler_init(self: Scheduler, *args: Any, **kwargs: Any) -> None:
             self.vllm_config, DSASparseRole.SCHEDULER
         )
         _install_allocate_slots_wrapper(self)
+        logger.info(
+            "DSA sparse scheduler manager enabled: architecture=%s, "
+            "block_size=%d, sparse_budget=%d, resident_tokens=%d",
+            self.vllm_config.model_config.architecture,
+            self.vllm_config.cache_config.block_size,
+            self.vllm_config.cache_config.dsa_hbm_sparse_budget,
+            self.vllm_config.cache_config.dsa_hbm_resident_tokens,
+        )
+    elif is_dsa_sparse_config_enabled(self.vllm_config):
+        logger.warning(
+            "DSA sparse scheduler patch is loaded but its manager is not "
+            "enabled: architecture=%s",
+            self.vllm_config.model_config.architecture,
+        )
     self.dsa_prefill_full_released_req_ids = set()
 
 
@@ -344,3 +361,4 @@ Scheduler._free_request = _free_request
 Scheduler._maybe_release_dsa_prefill_full_cache = (
     _maybe_release_prefill_full_cache
 )
+logger.info("DSA sparse scheduler patch installed")

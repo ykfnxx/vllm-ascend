@@ -6,6 +6,10 @@ set -euo pipefail
 MODEL_PATH="$1"
 
 unset VLLM_ASCEND_BALANCE_SCHEDULING
+# Keep operator verification on the non-context-parallel DSA path even when
+# the parent shell was used for a FlashComm-enabled deployment.
+unset VLLM_ASCEND_ENABLE_FLASHCOMM1
+unset VLLM_ASCEND_ENABLE_FLASHCOMM
 
 exec vllm serve "${MODEL_PATH}" \
   --host 0.0.0.0 \

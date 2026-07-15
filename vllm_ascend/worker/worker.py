@@ -358,6 +358,11 @@ class NPUWorker(WorkerBase):
             )
             set_dsa_mgr_worker(self.dsa_mgr_worker)
             self.model_runner.set_dsa_mgr(self.dsa_mgr_worker)
+            logger.info(
+                "DSA sparse worker manager enabled: rank=%d, device=%s",
+                self.rank,
+                self.device,
+            )
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:

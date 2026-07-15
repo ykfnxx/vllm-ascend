@@ -136,6 +136,7 @@ class DSASparseBase:
         self._graph_row_mode_decode_batches: dict[
             tuple[str, int], DSAForwardSparseDecodeBatch] = {}
         self._graph_layer_id_tensors: dict[str, torch.Tensor] = {}
+        self._sparse_forward_logged = False
 
     def _is_sparse_cache_enabled(self) -> bool:
         return bool(self._vllm_config.cache_config.enable_dsa_sparse_cache)
@@ -410,6 +411,19 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         self._forward_sparse_decode_attention_indices_tensor = None
         self._lookup_maintain_seed = (
             self._lookup_maintain_seed + 1) & 0x7FFFFFFF
+        sparse_rows_tensor = (
+            self.forward_sparse_decode_batch.sparse_local_row_indices_tensor
+        )
+        num_sparse_rows = int(sparse_rows_tensor.numel())
+        if not self._sparse_forward_logged and num_sparse_rows > 0:
+            logger.info(
+                "DSA sparse worker forward mode active: requests=%s, "
+                "sparse_rows=%d, score_topk=%d",
+                self.forward_sparse_decode_batch.request_ids,
+                num_sparse_rows,
+                self.forward_sparse_decode_batch.score_topk_k,
+            )
+            self._sparse_forward_logged = True
 
     """
     EngineCore Scheduler侧逻辑
@@ -1060,7 +1074,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             else ReqStage.ENTER_SPARSE_DECODE)
         request.dsa_next_req_stage = next_stage
         if next_stage.is_enter_sparse_decode:
-            logger.debug(
+            logger.info(
                 "========== DSA DECODE REACHED SPARSE THRESHOLD =========="
                 " req_id=%s prompt_tokens=%s output_tokens=%s total_tokens=%s "
                 "computed_tokens=%s candidate_full_blocks=%s tail_slots=%s "

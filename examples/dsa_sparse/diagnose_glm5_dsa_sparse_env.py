@@ -23,6 +23,7 @@ DSA_QUERY_TOKENS = 2 * 1024
 DSA_RESIDENT_TOKENS = 8 * 1024
 DSA_BLOCK_SIZE = 128
 DSA_SPARSE_THRESHOLD = DSA_QUERY_TOKENS + DSA_RESIDENT_TOKENS + DSA_BLOCK_SIZE
+VERIFY_PROMPT_TOKENS = 10_600
 SUPPORTED_ARCHITECTURE = "GlmMoeDsaForCausalLM"
 SUPPORTED_MODEL_TYPE = "glm_moe_dsa"
 
@@ -32,6 +33,18 @@ OPERATOR_LOG_MARKERS = (
     "DSA sparse invoking asu_hbm_index_maintain_aicpu",
     "DSA sparse completed asu_hbm_index_maintain_aicpu",
 )
+FRAMEWORK_LOG_MARKERS = (
+    "DSA sparse platform patch installed",
+    "DSA sparse EngineCore entry patch active",
+    "DSA sparse runtime patches installed",
+    "DSA sparse scheduler manager enabled",
+    "DSA sparse worker manager enabled",
+    "DSA DECODE REACHED SPARSE THRESHOLD",
+    "DSA sparse worker forward mode active",
+    "DSA sparse SFA path active",
+    "DSA sparse indexer completed",
+)
+DENSE_SFA_LOG_MARKER = "DSA sparse SFA dense path active"
 SOURCE_MARKERS = {
     "dsa_sparse/dsa_config.py": (
         SUPPORTED_ARCHITECTURE,
@@ -51,6 +64,10 @@ SOURCE_MARKERS = {
     ),
     "patch/dsa_sparse/patch_engine_process.py": (
         "EngineCoreProc.run_engine_core = staticmethod(_run_engine_core)",
+    ),
+    "platform.py": (
+        "ASCEND_CUSTOM_OPP_PATH",
+        '"aicpu_transformer"',
     ),
 }
 
@@ -233,10 +250,26 @@ def _check_process_args(reporter: Reporter, process: ProcessInfo) -> Path | None
         reporter.fail("speculative decoding disables the current DSA path")
     else:
         reporter.pass_("speculative decoding is disabled")
+    max_batched_tokens = _parse_int_arg(
+        reporter, process.argv, "--max-num-batched-tokens"
+    )
     if _has_arg(process.argv, "--enable-chunked-prefill"):
         reporter.pass_("--enable-chunked-prefill is enabled")
+    elif (
+        max_batched_tokens is not None
+        and max_batched_tokens >= VERIFY_PROMPT_TOKENS
+    ):
+        reporter.pass_(
+            "chunked prefill is disabled, but max batched tokens can hold the "
+            f"{VERIFY_PROMPT_TOKENS}-token verification prompt"
+        )
     else:
-        reporter.fail("--enable-chunked-prefill is missing for the long prompt")
+        reporter.warn(
+            "chunked prefill is not a DSA requirement, but the verification "
+            f"prompt has {VERIFY_PROMPT_TOKENS} tokens while "
+            f"--max-num-batched-tokens={max_batched_tokens!r}; enable chunked "
+            "prefill or raise the batch token limit"
+        )
     quantization = _arg_value(process.argv, "--quantization")
     if quantization == "ascend":
         reporter.pass_("--quantization ascend is enabled")
@@ -283,6 +316,20 @@ def _check_process_args(reporter: Reporter, process: ProcessInfo) -> Path | None
         else:
             reporter.fail(f"{name} must be disabled, got {value!r}")
 
+    for name in (
+        "VLLM_ASCEND_ENABLE_FLASHCOMM1",
+        "VLLM_ASCEND_ENABLE_FLASHCOMM",
+    ):
+        value = process.environ.get(name)
+        if _false_or_unset(value):
+            reporter.pass_(f"{name} is disabled")
+        else:
+            reporter.warn(
+                f"{name}={value!r} enables the DSA context-parallel path; "
+                "lookup/maintain still run, but this is not the minimal "
+                "operator-verification path"
+            )
+
     compile_custom_kernels = process.environ.get("COMPILE_CUSTOM_KERNELS")
     if compile_custom_kernels is not None and _false_or_unset(
         compile_custom_kernels
@@ -299,8 +346,9 @@ def _check_process_args(reporter: Reporter, process: ProcessInfo) -> Path | None
         f"{process.environ.get('VLLM_LOGGING_LEVEL', '<unset: INFO default>')}"
     )
     reporter.info(
-        "ASCEND_CUSTOM_OPP_PATH="
+        "initial ASCEND_CUSTOM_OPP_PATH="
         f"{process.environ.get('ASCEND_CUSTOM_OPP_PATH', '<unset>')}"
+        " (vllm-ascend may set it later in NPUPlatform.import_kernels)"
     )
 
     serve_index = process.argv.index("serve")
@@ -465,6 +513,47 @@ def _check_installed_dsa_source(
             reporter.pass_(f"installed source contains DSA integration: {source_path}")
 
 
+def _check_installed_custom_opp(
+    reporter: Reporter,
+    package_info: dict[str, Any] | None,
+) -> None:
+    if package_info is None:
+        return
+    origin = package_info.get("vllm_ascend", {}).get("origin")
+    if not isinstance(origin, str) or origin.startswith("ERROR:"):
+        return
+
+    package_root = Path(origin).parent
+    vendor_opp = package_root / "_cann_ops_custom/vendors/vllm-ascend"
+    aicpu_opp = vendor_opp / "op_impl" / "aicpu_transformer"
+    required_paths = (
+        vendor_opp,
+        aicpu_opp,
+        aicpu_opp / "op_impl/cpu/config/cust_aicpu_kernel.json",
+        aicpu_opp
+        / "op_impl/cpu/aicpu_kernel/impl/libtransformer_aicpu_kernels.so",
+    )
+    for path in required_paths:
+        if path.exists():
+            reporter.pass_(f"service package contains custom OPP path: {path}")
+        else:
+            reporter.fail(f"service package custom OPP path is missing: {path}")
+
+    extension_paths = sorted(package_root.glob("vllm_ascend_C*.so"))
+    if extension_paths:
+        for path in extension_paths:
+            reporter.pass_(f"service package contains custom-op binding: {path}")
+    else:
+        reporter.fail(
+            f"service package contains no vllm_ascend_C extension: {package_root}"
+        )
+
+    reporter.info(
+        "runtime custom OPP path expected from NPUPlatform.import_kernels: "
+        f"{aicpu_opp}:{vendor_opp}"
+    )
+
+
 def _load_json(reporter: Reporter, path: Path) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -552,19 +641,41 @@ def _check_server_log(reporter: Reporter, server_log: Path | None) -> None:
         "Poller timed out",
     )
     found_operator_markers: set[str] = set()
+    found_framework_markers: set[str] = set()
     found_errors: set[str] = set()
     threshold_reached = False
     tokenized_prompt_seen = False
+    dense_sfa_seen = False
     with log_file:
         for line in log_file:
             found_operator_markers.update(
                 marker for marker in OPERATOR_LOG_MARKERS if marker in line
+            )
+            found_framework_markers.update(
+                marker for marker in FRAMEWORK_LOG_MARKERS if marker in line
             )
             found_errors.update(
                 marker for marker in error_markers if marker in line
             )
             threshold_reached |= threshold_marker in line
             tokenized_prompt_seen |= tokenized_marker in line
+            dense_sfa_seen |= DENSE_SFA_LOG_MARKER in line
+
+    framework_present = [
+        marker for marker in FRAMEWORK_LOG_MARKERS
+        if marker in found_framework_markers
+    ]
+    framework_missing = [
+        marker for marker in FRAMEWORK_LOG_MARKERS
+        if marker not in found_framework_markers
+    ]
+    for marker in framework_present:
+        reporter.pass_(f"server log contains framework marker: {marker}")
+    if framework_missing:
+        reporter.warn(
+            "server log is missing framework markers in the expected call "
+            f"chain: {framework_missing!r}"
+        )
 
     present = [
         marker for marker in OPERATOR_LOG_MARKERS
@@ -584,6 +695,12 @@ def _check_server_log(reporter: Reporter, server_log: Path | None) -> None:
     else:
         reporter.warn("server log contains no lookup/maintain invocation markers")
 
+    if dense_sfa_seen:
+        reporter.warn(
+            "SFA executed a DecodeOnly batch without sparse score control and "
+            "used the original indexer at least once"
+        )
+
     if threshold_reached:
         reporter.pass_("server log confirms ENTER_SPARSE_DECODE was reached")
     elif tokenized_prompt_seen:
@@ -592,8 +709,9 @@ def _check_server_log(reporter: Reporter, server_log: Path | None) -> None:
         )
     else:
         reporter.warn(
-            "no DSA stage markers are visible; they require "
-            "VLLM_LOGGING_LEVEL=DEBUG in the current source"
+            "no DSA stage markers are visible; the sparse-threshold marker "
+            "is logged at INFO, so no request reached ENTER_SPARSE_DECODE or "
+            "the scheduler patch is not active"
         )
 
     if found_errors:
@@ -641,6 +759,7 @@ def main() -> int:
         inferred_model_path = _check_process_args(reporter, process)
         package_info = _probe_service_python(reporter, process)
         _check_installed_dsa_source(reporter, package_info)
+        _check_installed_custom_opp(reporter, package_info)
         model_path = args.model_path or inferred_model_path
         if model_path is None:
             reporter.fail("model path is unavailable; pass --model-path")

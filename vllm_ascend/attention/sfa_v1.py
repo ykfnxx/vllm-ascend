@@ -1160,6 +1160,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             assert dsa_mgr is not None
             dsa_mgr.prepare_indexer_score_controls(layer_name, attn_metadata)
             if attn_metadata.dsa_score_topk_k is not None:
+                logger.info_once(
+                    "DSA sparse SFA path active: DecodeOnly uses the DSA "
+                    "indexer -> lookup -> materialize -> maintain flow"
+                )
                 fwd_batch = dsa_mgr.forward_sparse_decode_batch
                 assert fwd_batch
                 assert int(fwd_batch.query_position_rows_tensor.shape[1]) == 1
@@ -1190,6 +1194,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                     topk_indices
                 )
                 attn_metadata.dsa_indexer_seq_lens = candidate_lens
+                logger.info_once(
+                    "DSA sparse indexer completed: forwarding TopK token ids "
+                    "to lookup/materialize/maintain"
+                )
 
                 if dsa_trace_enabled(
                     DSA_TRACE_POINT_LIGHTNING_INDEXER,
@@ -1240,6 +1248,11 @@ class AscendSFAImpl(MLAAttentionImpl):
                     actual_seq_lengths_query.numel()
                 )
                 return sparse_attention_indices
+
+            logger.info_once(
+                "DSA sparse SFA dense path active: DecodeOnly has no sparse "
+                "score control and continues through the original indexer"
+            )
 
         if self.use_sparse_c8_indexer:
             assert len(kv_cache) == 4
