@@ -7,6 +7,7 @@ from typing import NamedTuple
 import torch
 from vllm.logger import init_logger
 
+from vllm_ascend.dsa_sparse.dsa_kv_backend import DSAKVBackend
 from vllm_ascend.dsa_sparse.dsa_resident_pool import DSAResidentLookupState
 from vllm_ascend.dsa_sparse.dsa_types import DSADecodeRowMode
 
@@ -18,31 +19,18 @@ class DSALookupOutput(NamedTuple):
 
 
 class AscendDSAOpsBackend:
-    """Materialize Indexer TopK through a persistent token-to-slot index.
+    """Resolve Indexer TopK through a persistent token-to-slot index.
 
     The AIV lookup operator maps original token ids to persistent resident
-    slots and reports actual allocations. Framework tensor operations copy
-    only those misses, then the AICPU maintain operator restores the free-slot
-    headroom for the next decode step.
+    slots and reports actual allocations. The KV backend writes only those
+    misses into resident HBM, then the AICPU maintain operator restores the
+    free-slot headroom for the next decode step.
     """
 
     def __init__(self) -> None:
         self._lookup_call_logged = False
         self._maintain_call_logged = False
         self._resident_init_logged = False
-
-    @staticmethod
-    def _squeeze_cache_head_dim(cache: torch.Tensor | None,
-                                name: str) -> torch.Tensor:
-        if not torch.is_tensor(cache):
-            raise ValueError(f"{name} is required for DSA lookup resident")
-        if cache.ndim == 4 and int(cache.shape[2]) == 1:
-            return cache.squeeze(2)
-        if cache.ndim == 3:
-            return cache
-        raise ValueError(
-            f"{name} must have shape [blocks, block, 1, dim] or "
-            f"[blocks, block, dim], got {tuple(cache.shape)}")
 
     @staticmethod
     def _normalize_topk(topk: torch.Tensor,
@@ -60,64 +48,16 @@ class AscendDSAOpsBackend:
             return values.to(device=device, dtype=torch.int32).contiguous()
         return torch.tensor(values, dtype=torch.int32, device=device)
 
-    @staticmethod
-    def _materialize_pairs(
-        *,
-        token_ids: torch.Tensor,
-        slot_ids: torch.Tensor,
-        pair_mask: torch.Tensor,
-        selection_block_table: torch.Tensor,
-        full_block_table: torch.Tensor,
-        selection_kv_cache: torch.Tensor,
-        selection_k_rope: torch.Tensor,
-        full_kv_cache: torch.Tensor,
-        full_k_rope: torch.Tensor,
-    ) -> None:
-        """Copy selected original-token KV records into arbitrary slots."""
-        row_indices, pair_indices = pair_mask.nonzero(as_tuple=True)
-        tokens = token_ids[row_indices, pair_indices].to(dtype=torch.long)
-        slots = slot_ids[row_indices, pair_indices].to(dtype=torch.long)
-        block_size = int(selection_kv_cache.shape[1])
-
-        src_logical_blocks = torch.div(
-            tokens, block_size, rounding_mode="floor")
-        src_offsets = torch.remainder(tokens, block_size)
-        dst_logical_blocks = torch.div(
-            slots, block_size, rounding_mode="floor")
-        dst_offsets = torch.remainder(slots, block_size)
-        src_physical_blocks = full_block_table[
-            row_indices, src_logical_blocks].to(dtype=torch.long)
-        dst_physical_blocks = selection_block_table[
-            row_indices, dst_logical_blocks].to(dtype=torch.long)
-        src_flat_slots = src_physical_blocks * block_size + src_offsets
-        dst_flat_slots = dst_physical_blocks * block_size + dst_offsets
-
-        selection_kv_cache.reshape(-1, selection_kv_cache.shape[-1]).index_copy_(
-            0,
-            dst_flat_slots,
-            full_kv_cache.reshape(-1, full_kv_cache.shape[-1]).index_select(
-                0, src_flat_slots),
-        )
-        selection_k_rope.reshape(-1, selection_k_rope.shape[-1]).index_copy_(
-            0,
-            dst_flat_slots,
-            full_k_rope.reshape(-1, full_k_rope.shape[-1]).index_select(
-                0, src_flat_slots),
-        )
-
     def _initialize_resident_rows(
         self,
         *,
+        layer_id: int,
+        kv_backend: DSAKVBackend,
         state: DSAResidentLookupState,
         pool_entries: torch.Tensor,
         initialize_rows: torch.Tensor,
         resident_tokens: int,
         selection_block_table: torch.Tensor,
-        full_block_table: torch.Tensor,
-        selection_kv_cache: torch.Tensor,
-        selection_k_rope: torch.Tensor,
-        full_kv_cache: torch.Tensor,
-        full_k_rope: torch.Tensor,
     ) -> None:
         pool_rows = pool_entries.to(dtype=torch.long)
         batch_size = int(pool_rows.numel())
@@ -129,16 +69,13 @@ class AscendDSAOpsBackend:
         slots = tokens
         init_mask = initialize_rows.view(-1, 1).expand(-1, resident_tokens)
 
-        self._materialize_pairs(
-            token_ids=tokens,
-            slot_ids=slots,
-            pair_mask=init_mask,
-            selection_block_table=selection_block_table,
-            full_block_table=full_block_table,
-            selection_kv_cache=selection_kv_cache,
-            selection_k_rope=selection_k_rope,
-            full_kv_cache=full_kv_cache,
-            full_k_rope=full_k_rope,
+        kv_backend.load_tokens_into(
+            layer_id=int(layer_id),
+            request_pool_entries=pool_entries,
+            token_positions=tokens,
+            destination_slots=slots,
+            load_mask=init_mask,
+            destination_block_table=selection_block_table,
         )
         init_batch_rows, init_token_positions = init_mask.nonzero(as_tuple=True)
         init_pool_rows = pool_rows.index_select(0, init_batch_rows)
@@ -201,15 +138,12 @@ class AscendDSAOpsBackend:
     def lookup_resident_update(
         self,
         *,
+        layer_id: int,
+        kv_backend: DSAKVBackend,
         selection_topk_indices: torch.Tensor,
         req_pool_entries: torch.Tensor,
         sparse_local_row_indices: torch.Tensor,
         selection_block_table: torch.Tensor,
-        full_block_table: torch.Tensor,
-        nopek_cache_zone: torch.Tensor,
-        ropek_cache_zone: torch.Tensor,
-        nopek_dram_arena: torch.Tensor,
-        ropek_dram_arena: torch.Tensor,
         lookup_state: DSAResidentLookupState,
         resident_tokens: int,
         tail_valid_token_counts: torch.Tensor,
@@ -222,15 +156,7 @@ class AscendDSAOpsBackend:
         has_lookup_init_rows: bool,
         maintain_seed: int,
     ) -> DSALookupOutput:
-        selection_k_rope = self._squeeze_cache_head_dim(
-            ropek_cache_zone, "ropek_cache_zone")
-        selection_kv_cache = self._squeeze_cache_head_dim(
-            nopek_cache_zone, "nopek_cache_zone")
-        full_k_rope = self._squeeze_cache_head_dim(
-            ropek_dram_arena, "ropek_dram_arena")
-        full_kv_cache = self._squeeze_cache_head_dim(
-            nopek_dram_arena, "nopek_dram_arena")
-        device = selection_kv_cache.device
+        device = selection_block_table.device
         topk = self._normalize_topk(selection_topk_indices, device)
         pool_entries = self._as_device_i32(
             req_pool_entries, device).reshape(-1)
@@ -241,7 +167,6 @@ class AscendDSAOpsBackend:
             device=device, dtype=torch.bool).reshape(-1)
         selection_block_table = self._as_device_i32(
             selection_block_table, device)
-        full_block_table = self._as_device_i32(full_block_table, device)
         tail_valid_token_counts = self._as_device_i32(
             tail_valid_token_counts, device).reshape(-1)
         resident_tail_starts = self._as_device_i32(
@@ -259,16 +184,13 @@ class AscendDSAOpsBackend:
                     int(resident_tokens),
                 )
             self._initialize_resident_rows(
+                layer_id=int(layer_id),
+                kv_backend=kv_backend,
                 state=lookup_state,
                 pool_entries=pool_entries,
                 initialize_rows=lookup_init_mask,
                 resident_tokens=int(resident_tokens),
                 selection_block_table=selection_block_table,
-                full_block_table=full_block_table,
-                selection_kv_cache=selection_kv_cache,
-                selection_k_rope=selection_k_rope,
-                full_kv_cache=full_kv_cache,
-                full_k_rope=full_k_rope,
             )
             if not self._resident_init_logged:
                 logger.info(
@@ -310,18 +232,13 @@ class AscendDSAOpsBackend:
         sparse_misses = sparse_miss_out.to(dtype=torch.bool)
         sparse_selection_block_table = selection_block_table.index_select(
             0, sparse_local_rows)
-        sparse_full_block_table = full_block_table.index_select(
-            0, sparse_local_rows)
-        self._materialize_pairs(
-            token_ids=sparse_topk,
-            slot_ids=sparse_slot_out,
-            pair_mask=sparse_misses,
-            selection_block_table=sparse_selection_block_table,
-            full_block_table=sparse_full_block_table,
-            selection_kv_cache=selection_kv_cache,
-            selection_k_rope=selection_k_rope,
-            full_kv_cache=full_kv_cache,
-            full_k_rope=full_k_rope,
+        kv_backend.load_tokens_into(
+            layer_id=int(layer_id),
+            request_pool_entries=sparse_pool_entries,
+            token_positions=sparse_topk,
+            destination_slots=sparse_slot_out,
+            load_mask=sparse_misses,
+            destination_block_table=sparse_selection_block_table,
         )
         slot_out = torch.full_like(topk, -1)
         slot_out.index_copy_(0, sparse_local_rows, sparse_slot_out)

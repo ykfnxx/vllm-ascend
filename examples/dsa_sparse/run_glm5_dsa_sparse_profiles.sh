@@ -18,7 +18,6 @@ ROUNDS=1
 PORT=8077
 SERVER_START_TIMEOUT=1800
 REQUEST_TIMEOUT=1800
-HOT_CPU_BLOCK_MULTIPLE=1
 NUM_GPU_BLOCKS_OVERRIDE=128
 API_KEY=""
 MAX_NUM_SEQS=""
@@ -52,7 +51,6 @@ Server options:
   --port N                      Local service port (default: 8077)
   --server-start-timeout N      Startup timeout in seconds (default: 1800)
   --request-timeout N           Request timeout in seconds (default: 1800)
-  --hot-cpu-block-multiple N    Host hot-cache multiplier (default: 1)
   --num-gpu-blocks-override N   MLA block-pool size (default: 128)
   --api-key KEY                 Bearer token passed to the profile client
   --                            Remaining arguments are passed to vllm serve
@@ -64,8 +62,7 @@ Example:
     --run-name ratio3-hot1 \
     --batch-sizes 1,2,4,8 \
     --num-gpu-blocks-override 768 \
-    --max-num-seqs 8 \
-    --hot-cpu-block-multiple 1
+    --max-num-seqs 8
 EOF
 }
 
@@ -147,11 +144,6 @@ while (($# > 0)); do
       REQUEST_TIMEOUT="$2"
       shift 2
       ;;
-    --hot-cpu-block-multiple)
-      require_value "$1" "${2:-}"
-      HOT_CPU_BLOCK_MULTIPLE="$2"
-      shift 2
-      ;;
     --num-gpu-blocks-override)
       require_value "$1" "${2:-}"
       NUM_GPU_BLOCKS_OVERRIDE="$2"
@@ -205,8 +197,6 @@ fi
   fail "--max-num-seqs must be a positive integer"
 ((MAX_NUM_SEQS >= MAX_BATCH_SIZE)) || \
   fail "--max-num-seqs must be at least the maximum batch size"
-[[ "${HOT_CPU_BLOCK_MULTIPLE}" =~ ^[1-9][0-9]*$ ]] || \
-  fail "--hot-cpu-block-multiple must be a positive integer"
 [[ "${NUM_GPU_BLOCKS_OVERRIDE}" =~ ^[1-9][0-9]*$ ]] || \
   fail "--num-gpu-blocks-override must be a positive integer"
 
@@ -220,8 +210,7 @@ if ((NUM_GPU_BLOCKS_OVERRIDE < MIN_GPU_BLOCKS)); then
 fi
 
 DSA_ADDITIONAL_CONFIG="$(python3 -c \
-  'import json,sys; print(json.dumps({"fuse_muls_add": True, "multistream_overlap_shared_expert": True, "dsa_sparse_config": {"enabled": True, "hot_cpu_block_multiple": int(sys.argv[1])}}))' \
-  "${HOT_CPU_BLOCK_MULTIPLE}")"
+  'import json; print(json.dumps({"fuse_muls_add": True, "multistream_overlap_shared_expert": True, "dsa_sparse_config": {"enabled": True, "kv_backend": "mock"}}))')"
 
 mkdir -p "${OUTPUT_ROOT}"
 OUTPUT_ROOT="$(cd "${OUTPUT_ROOT}" && pwd)"

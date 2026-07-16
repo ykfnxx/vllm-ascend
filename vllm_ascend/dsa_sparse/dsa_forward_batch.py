@@ -3,8 +3,8 @@
 本文件承接 dsa_sparse.py 中“把一轮 model forward 的 ReqMeta 列表整理成
 layer hook / lookup-resident / SFA 可消费批量张量”的职责。它持有的是
 短生命周期 forward-level batch，而不是请求生命周期状态；请求状态仍由
-dsa_sparse.py 和 dsa_req_meta.py 推进，HBM/DRAM 资源仍由 resident pool / hot
-KV store 管理。
+dsa_sparse.py 和 dsa_req_meta.py 推进，HBM resident 资源由 resident pool
+管理，后端 KV I/O 由 worker 级 DSAKVBackend 执行。
 """
 
 from __future__ import annotations
@@ -15,10 +15,8 @@ from typing import List
 import torch
 from vllm.logger import init_logger
 
-from vllm_ascend.dsa_sparse.dsa_hot_kv_store_core import DSAHotKVStore
 from vllm_ascend.dsa_sparse.dsa_batch_tensor_utils import (
-    build_dram_block_table_for_io, build_hbm_block_table_tensor,
-    build_int_tensor, build_padded_int_tensor,
+    build_hbm_block_table_tensor, build_int_tensor, build_padded_int_tensor,
     compute_sparse_attention_indices_width, sort_decode_rows_by_batch_index)
 from vllm_ascend.dsa_sparse.dsa_layer_cache_zones import LayerCacheZones
 from vllm_ascend.dsa_sparse.dsa_req_meta import (
@@ -37,8 +35,8 @@ class DSAModelForwardMeta:
     This object is deliberately short-lived: build_dsa_meta() recreates it for
     every model forward from scheduler/input-batch state. It should not grow
     request-lifetime or layer-lifetime state; persistent resources belong to
-    DSAResidentTokenPool / DSAHotKVStore, and layer-specific views are derived
-    later from DSAForwardSparseDecodeBatch or DSAForwardLayerBatch.
+    DSAResidentTokenPool, and layer-specific views are derived later from
+    DSAForwardSparseDecodeBatch or DSAForwardLayerBatch.
     """
 
     requests: List[ReqMeta]
@@ -62,7 +60,6 @@ class DSAModelForwardMeta:
             query_start_loc: int,
             query_len: int,
             req_context_full_blk_hashes: list = None,
-            blk_pool_mgr: DSAHotKVStore | None = None,
             dense_query_positions: QueryPositionRow | None = None,
             resident_query_positions: QueryPositionRow | None = None,
             stage: ReqStage = ReqStage.PREFILL,
@@ -82,7 +79,6 @@ class DSAModelForwardMeta:
                            query_start_loc=query_start_loc,
                            query_len=query_len,
                            req_context_full_blk_hashes=req_context_full_blk_hashes,
-                           blk_pool_mgr=blk_pool_mgr,
                            stage=stage,
                            dense_query_positions=(
                                [] if dense_query_positions is None
@@ -103,7 +99,7 @@ class DSAForwardSparseDecodeBatch:
     Built once per model forward and reused by every layer's after_indexer
     hook. It contains the tensorized, layer-invariant inputs needed by the
     lookup-resident path, such as resident pool rows, query ranges, HBM block
-    tables, and the DRAM logical block table.
+    tables, and lookup row metadata.
 
     row-mode decode 刻意拆开两组“行”语义：
 
@@ -129,7 +125,6 @@ class DSAForwardSparseDecodeBatch:
     """
 
     max_logical_blocks: int
-    blk_pool_mgr: DSAHotKVStore | None
     score_topk_k: int
     resident_pool_indices_tensor: torch.Tensor
     query_position_rows_tensor: torch.Tensor
@@ -143,8 +138,6 @@ class DSAForwardSparseDecodeBatch:
     candidate_lens_tensor: torch.Tensor
     budget_lengths_tensor: torch.Tensor
     batch_hbm_block_table: torch.Tensor
-    dram_block_table: torch.Tensor
-    batch_dram_block_table: torch.Tensor
     attention_indices_width: int
     query_last_token_indices_are_identity: bool
     batch_row_indices_tensor: torch.Tensor
@@ -173,7 +166,6 @@ class DSAForwardSparseDecodeBatch:
         empty_i32_table = torch.empty((0, 0), dtype=torch.int32, device=device)
         return cls(
             max_logical_blocks=0,
-            blk_pool_mgr=None,
             score_topk_k=0,
             resident_pool_indices_tensor=torch.empty(
                 (0,), dtype=torch.int32, device=device),
@@ -198,8 +190,6 @@ class DSAForwardSparseDecodeBatch:
             budget_lengths_tensor=torch.empty(
                 (0,), dtype=torch.int32, device=device),
             batch_hbm_block_table=empty_i32_table,
-            dram_block_table=empty_i32_table,
-            batch_dram_block_table=empty_i32_table,
             attention_indices_width=0,
             query_last_token_indices_are_identity=False,
             batch_row_indices_tensor=torch.empty(
@@ -311,9 +301,9 @@ class DSAForwardLayerBatch:
 
 @dataclass(frozen=True)
 class DSAFullBlockDumpTables:
-    """Forward-level rows consumed by the hot DRAM full-block dump path.
+    """Forward-level rows consumed by the KV backend block put path.
 
-    This table only carries dump row metadata. Prefill dump readiness is a
+    This table only carries put row metadata. Prefill put readiness is a
     separate tensor in DSAForwardLayerBatch because attention_finished only
     needs resident pool rows to mark readiness; it does not need hashes or
     logical block ids.
@@ -324,7 +314,6 @@ class DSAFullBlockDumpTables:
     block_hash_rows: list[list]
     block_id_rows: list[list[int]]
     logical_block_index_rows: list[list[int]]
-    blk_pool_mgr: DSAHotKVStore | None
 
     def __bool__(self) -> bool:
         return bool(self.request_ids)
@@ -337,7 +326,6 @@ class DSAFullBlockDumpTables:
             block_hash_rows=[],
             block_id_rows=[],
             logical_block_index_rows=[],
-            blk_pool_mgr=None,
         )
 
 
@@ -377,7 +365,6 @@ def _build_forward_batches_from_dsa_meta(
     attention_indices_width = 0
     max_logical_blocks = 0
     budget_block_size = 0
-    sparse_blk_pool_mgr = None
     score_topk_k = 0
 
     sparse_decode_guard_request_ids: list[ReqType] = []
@@ -388,7 +375,6 @@ def _build_forward_batches_from_dsa_meta(
     dump_block_id_rows: list[list[int]] = []
     dump_logical_block_index_rows: list[list[int]] = []
     prefill_done_pool_indices: list[int] = []
-    dump_blk_pool_mgr = None
 
     for req_meta in dsa_meta.requests:
         resident_pool_idx = int(req_meta.resident_pool_idx)
@@ -438,16 +424,6 @@ def _build_forward_batches_from_dsa_meta(
         if mark_prefill_done:
             prefill_done_pool_indices.append(resident_pool_idx)
         if block_ids:
-            if req_meta.blk_pool_mgr is None:
-                raise RuntimeError(
-                    f"DSA full-block dump request {req_meta.request_id} "
-                    f"has no DRAM block manager")
-            if dump_blk_pool_mgr is None:
-                dump_blk_pool_mgr = req_meta.blk_pool_mgr
-            elif dump_blk_pool_mgr is not req_meta.blk_pool_mgr:
-                raise RuntimeError(
-                    "DSA full-block dump batch spans multiple DRAM stores; "
-                    "one worker hot store is expected")
             dump_request_ids.append(req_meta.request_id)
             dump_request_pool_indices.append(resident_pool_idx)
             dump_block_hash_rows.append(block_hashes)
@@ -462,25 +438,6 @@ def _build_forward_batches_from_dsa_meta(
         is_sparse_row = bool(req_meta.forward_plan.is_sparse_decode)
         if is_sparse_row and not topk_plan.has_valid_topk_window():
             continue
-        if is_sparse_row:
-            if req_meta.blk_pool_mgr is None:
-                raise RuntimeError(
-                    f"DSA sparse decode request {req_meta.request_id} "
-                    f"has no DRAM block manager")
-            if sparse_blk_pool_mgr is None:
-                sparse_blk_pool_mgr = req_meta.blk_pool_mgr
-            elif sparse_blk_pool_mgr is not req_meta.blk_pool_mgr:
-                raise RuntimeError(
-                    "DSA sparse decode batch spans multiple DRAM stores; "
-                    "one worker hot store is expected")
-        elif int(force_decode_row_mode_score_topk) > 0:
-            if sparse_blk_pool_mgr is None:
-                sparse_blk_pool_mgr = req_meta.blk_pool_mgr
-            elif (req_meta.blk_pool_mgr is not None
-                  and sparse_blk_pool_mgr is not req_meta.blk_pool_mgr):
-                raise RuntimeError(
-                    "DSA row-mode decode batch spans multiple DRAM stores; "
-                    "one worker hot store is expected")
 
         query_start = int(topk_plan.query_start_loc)
         query_len = int(topk_plan.query_len)
@@ -610,26 +567,6 @@ def _build_forward_batches_from_dsa_meta(
     true_sparse_batch_rows = [
         batch_row_indices[row] for row in sparse_local_row_indices
     ]
-    if sparse_blk_pool_mgr is None:
-        dram_block_table = torch.full(
-            (0, max_logical_blocks),
-            0,
-            dtype=torch.int32,
-            device=device,
-        )
-    else:
-        get_dram_block_table = getattr(
-            sparse_blk_pool_mgr, "get_dram_block_table_tensor", None)
-        if not callable(get_dram_block_table):
-            raise RuntimeError(
-                "DSA DRAM store must expose a resourceized "
-                "get_dram_block_table_tensor()")
-        dram_block_table = get_dram_block_table(
-            num_logical_blocks=max_logical_blocks,
-            device=device,
-            dtype=torch.int32,
-        )
-
     resident_pool_indices_tensor = build_int_tensor(
         resident_pool_indices, dtype=torch.int32, device=device)
     batch_hbm_block_table = build_hbm_block_table_tensor(
@@ -641,24 +578,9 @@ def _build_forward_batches_from_dsa_meta(
         device=device,
         pad_value=0,
     )
-    if sparse_blk_pool_mgr is None:
-        batch_dram_block_table = torch.full(
-            (len(request_ids), max_logical_blocks),
-            0,
-            dtype=torch.int32,
-            device=device,
-        )
-    else:
-        batch_dram_block_table = build_dram_block_table_for_io(
-            dram_block_table,
-            resident_pool_indices_tensor,
-            dtype=torch.int32,
-            device=device,
-        )
 
     sparse_batch = DSAForwardSparseDecodeBatch(
         max_logical_blocks=max_logical_blocks,
-        blk_pool_mgr=sparse_blk_pool_mgr,
         score_topk_k=score_topk_k,
         resident_pool_indices_tensor=resident_pool_indices_tensor,
         query_position_rows_tensor=build_padded_int_tensor(
@@ -686,8 +608,6 @@ def _build_forward_batches_from_dsa_meta(
         budget_lengths_tensor=build_int_tensor(
             budget_lengths, dtype=torch.int32, device=device),
         batch_hbm_block_table=batch_hbm_block_table,
-        dram_block_table=dram_block_table,
-        batch_dram_block_table=batch_dram_block_table,
         attention_indices_width=attention_indices_width,
         query_last_token_indices_are_identity=(
             query_last_token_indices == batch_row_indices),
@@ -724,7 +644,6 @@ def _build_forward_batches_from_dsa_meta(
             block_hash_rows=dump_block_hash_rows,
             block_id_rows=dump_block_id_rows,
             logical_block_index_rows=dump_logical_block_index_rows,
-            blk_pool_mgr=dump_blk_pool_mgr,
         ),
         prefill_done_pool_indices_tensor=build_int_tensor(
             prefill_done_pool_indices,
@@ -739,8 +658,8 @@ def _build_forward_batches_from_dsa_meta(
 class DSALayerSparseDecodeBatch:
     """Layer-level sparse decode view for after_indexer.
 
-    This combines DSAForwardSparseDecodeBatch with layer-specific cache zones
-    and resident views. Full-batch query/range/block-table tensors stay on
+    This combines DSAForwardSparseDecodeBatch with the layer-specific resident
+    view. Full-batch query/range/block-table tensors stay on
     DSAForwardSparseDecodeBatch and are passed to lookup-resident from there;
     keeping them out of this layer view avoids repeated layer-wise index_select
     work in the decode hot path.
@@ -750,8 +669,6 @@ class DSALayerSparseDecodeBatch:
     resident_pool_indices_tensor: torch.Tensor
     budget_lengths_tensor: torch.Tensor
     resident_view: DSAResidentLayerResourceView
-    cache_zones: LayerCacheZones
-    blk_pool_mgr: DSAHotKVStore | None
     attention_indices_width: int
 
     def __bool__(self) -> bool:

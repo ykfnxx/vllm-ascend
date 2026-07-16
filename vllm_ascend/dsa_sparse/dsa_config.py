@@ -36,7 +36,7 @@ _DSA_SPARSE_CONFIG_FIELD_MAPPINGS = (
     ("hbm_sparse_budget", "dsa_hbm_sparse_budget"),
     ("hbm_resident_tokens", "dsa_hbm_resident_tokens"),
     ("max_active_reqs", "dsa_max_active_reqs"),
-    ("hot_cpu_block_multiple", "dsa_hot_cpu_block_multiple"),
+    ("kv_backend", "dsa_kv_backend"),
 )
 _DSA_SPARSE_DEFAULT_CACHE_ATTRS: dict[str, Any] = {
     "enable_dsa_sparse_cache": False,
@@ -48,7 +48,7 @@ _DSA_SPARSE_DEFAULT_CACHE_ATTRS: dict[str, Any] = {
     # follows SchedulerConfig.max_num_seqs so unused request rows are not
     # allocated in the resident lookup pool.
     "dsa_max_active_reqs": None,
-    "dsa_hot_cpu_block_multiple": 3,
+    "dsa_kv_backend": "mock",
 }
 _DSA_SPARSE_PUBLIC_KEYS = frozenset(
     {public for public, _ in _DSA_SPARSE_CONFIG_FIELD_MAPPINGS}
@@ -117,6 +117,10 @@ def _normalize_dsa_sparse_config(
             raise ValueError(
                 "dsa_sparse_config['hbm_resident_tokens'] must be "
                 f"{DSA_LOOKUP_RESIDENT_TOKENS} for the ASU lookup operator")
+        if cache_attrs["dsa_kv_backend"] != "mock":
+            raise ValueError(
+                "dsa_sparse_config['kv_backend'] must be 'mock' until an "
+                "external DSA KV backend is registered")
 
     additional_updates: dict[str, Any] = {}
     if _DSA_GRAPH_PUBLIC_CONFIG_KEY in raw_config:

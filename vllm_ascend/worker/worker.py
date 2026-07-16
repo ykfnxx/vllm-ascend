@@ -340,11 +340,11 @@ class NPUWorker(WorkerBase):
         from vllm_ascend.dsa_sparse.dsa_config import is_dsa_sparse_config_enabled
 
         if is_dsa_sparse_config_enabled(self.vllm_config):
-            from vllm_ascend.dsa_sparse.dsa_ascend_hot_kv_store import (
-                create_dsa_hot_kv_store,
-            )
             from vllm_ascend.dsa_sparse.dsa_ascend_ops_backend import (
                 AscendDSAOpsBackend,
+            )
+            from vllm_ascend.dsa_sparse.dsa_kv_backend import (
+                create_dsa_kv_backend,
             )
             from vllm_ascend.dsa_sparse.dsa_sparse import DSASparseV1
             from vllm_ascend.dsa_sparse.dsa_types import DSASparseRole
@@ -352,7 +352,7 @@ class NPUWorker(WorkerBase):
             self.dsa_mgr_worker = DSASparseV1(
                 self.vllm_config,
                 DSASparseRole.WORKER,
-                dram_store=create_dsa_hot_kv_store(self.vllm_config),
+                kv_backend=create_dsa_kv_backend(self.vllm_config),
                 ops_backend=AscendDSAOpsBackend(),
                 resident_device=self.device,
             )

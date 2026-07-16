@@ -19,13 +19,12 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import torch
-from vllm_ascend.dsa_sparse.dsa_hot_kv_store_core import (
-    BlockType, DSAHotKVStore)
 from vllm_ascend.dsa_sparse.dsa_forward_batch import (
     DSAForwardLayerBatch, DSAForwardSparseDecodeBatch, DSALayerRuntimeBatch,
     DSALayerSparseDecodeBatch, DSAModelForwardMeta,
     _build_forward_batches_from_dsa_meta)
 from vllm_ascend.dsa_sparse.dsa_graph_buffers import DSAGraphBuffersMixin
+from vllm_ascend.dsa_sparse.dsa_kv_backend import DSAKVBackend
 from vllm_ascend.dsa_sparse.dsa_attention_layout import (
     materialize_query_position_metadata, slice_position_row,
     resolve_full_block_table_tensor, select_forward_shared_metadata)
@@ -160,7 +159,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
     def __init__(self,
                  vllm_config,
                  role,
-                 dram_store: DSAHotKVStore | None = None,
+                 kv_backend: DSAKVBackend | None = None,
                  ops_backend: Any | None = None,
                  resident_device: torch.device | str | None = None):
         super().__init__(vllm_config, role)
@@ -168,9 +167,9 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         if self._role == DSASparseRole.SCHEDULER:
             return
 
-        if dram_store is None:
-            raise RuntimeError("DSA sparse worker requires a hot DRAM store")
-        self.dsa_hot_kv_store = dram_store
+        if kv_backend is None:
+            raise RuntimeError("DSA sparse worker requires a KV backend")
+        self.kv_backend = kv_backend
         if ops_backend is None:
             raise RuntimeError(
                 "DSA sparse worker requires an Ascend lookup backend")
@@ -371,8 +370,6 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             if _query_position_row_is_empty(resident_query_positions):
                 resident_query_positions = dense_query_positions
             resident_pool_idx = self.resident_token_pool.acquire(req_id)
-            self.dsa_hot_kv_store.bind_request_pool_index(
-                req_id, resident_pool_idx)
 
             # Query positions are recorded in both dense/indexer and resident
             # spaces because sparse SFA consumes resident positions after the
@@ -391,7 +388,6 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
                                        query_start_loc=query_start_loc,
                                        query_len=query_len,
                                        req_context_full_blk_hashes=context_full_blk_hashes,
-                                       blk_pool_mgr=self.dsa_hot_kv_store,
                                        dense_query_positions=dense_query_positions,
                                        resident_query_positions=resident_query_positions,
                                        stage=req_stage,
@@ -499,15 +495,13 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         self,
         begin_batch: DSALayerRuntimeBatch,
     ) -> None:
-        """Guard sparse decode against unfinished full-block dump.
+        """Guard sparse decode against unfinished full-block backend puts.
 
-        Today's hot DRAM dump path is synchronous from the DSA Python runtime's
-        point of view: attention_finished calls dump_layer_blocks_for_requests()
-        inline, then marks this layer/request ready. This guard is therefore a
-        phase-order assertion, not a real async wait. If the dump path becomes
-        asynchronous, this bool table must be replaced by completion-driven
-        per-block/per-layer readiness, and full-cache block release must wait
-        on that completion before blocks can be recycled.
+        ``attention_finished`` calls ``DSAKVBackend.put_blocks`` inline, then
+        marks this layer/request ready. This guard is therefore a phase-order
+        assertion, not an async wait. An asynchronous backend must complete the
+        put before returning; otherwise this readiness table and full-cache
+        block recycling contract must be replaced with completion-driven state.
         """
         layer_id = begin_batch.layer_id
         pool_indices = begin_batch.sparse_decode_guard_pool_indices_tensor.to(
@@ -525,8 +519,8 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         first_bad = int((~ready_mask).nonzero(as_tuple=False)[0].item())
         request_id = begin_batch.sparse_decode_guard_request_ids[first_bad]
         raise RuntimeError(
-            f"DSA sparse decode requires prefill full dump to complete "
-            f"before shrinking full-cache blocks for req "
+            f"DSA sparse decode requires the prefill full-block backend put "
+            f"to complete before shrinking full-cache blocks for req "
             f"{request_id} layer {layer_id}")
 
     def _build_layer_sparse_decode_batch(
@@ -567,16 +561,12 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             layer_id=layer_id,
             pool_indices=resident_pool_indices,
         )
-        blk_pool_mgr = forward_batch.blk_pool_mgr
-        cache_zones = self.layer_cache_registry.require(layer_id)
 
         return DSALayerSparseDecodeBatch(
             layer_id=layer_id,
             resident_pool_indices_tensor=resident_pool_indices,
             budget_lengths_tensor=budget_lengths,
             resident_view=resident_view,
-            cache_zones=cache_zones,
-            blk_pool_mgr=blk_pool_mgr,
             attention_indices_width=forward_batch.attention_indices_width,
         )
 
@@ -586,12 +576,9 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         attn_metadata,
     ):
         layer_id = layer_batch.layer_id
-        if layer_batch.blk_pool_mgr is None:
-            raise RuntimeError(
-                "DSA lookup resident requires a DRAM block manager")
         # Lightning Indexer returns original sequence token ids. Lookup maps
-        # them to arbitrary slots in the larger resident address space, loads
-        # only misses from DRAM, and returns the mapped slots consumed by SFA.
+        # them to arbitrary slots in the larger resident address space. The KV
+        # backend writes misses directly into those resident HBM slots.
         prebuilt_attention_indices = (
             self._forward_sparse_decode_attention_indices_tensor)
         full_batch_topk = getattr(
@@ -608,22 +595,15 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         else:
             selection_topk = full_batch_topk.index_select(
                 0, forward_batch.batch_row_indices_tensor)
-        nopek_dram_arena = layer_batch.blk_pool_mgr.get_arena(
-            layer_id, BlockType.NOPE_K)
-        ropek_dram_arena = layer_batch.blk_pool_mgr.get_arena(
-            layer_id, BlockType.ROPE_K)
         lookup_state = self.resident_token_pool.get_layer_lookup_state(layer_id)
         lookup_result = self.ops_backend.lookup_resident_update(
+            layer_id=layer_id,
+            kv_backend=self.kv_backend,
             selection_topk_indices=selection_topk,
             req_pool_entries=forward_batch.resident_pool_indices_tensor,
             sparse_local_row_indices=(
                 forward_batch.sparse_local_row_indices_tensor),
             selection_block_table=forward_batch.batch_hbm_block_table,
-            full_block_table=forward_batch.batch_dram_block_table,
-            nopek_cache_zone=layer_batch.cache_zones.nopek_cache_zone,
-            ropek_cache_zone=layer_batch.cache_zones.ropek_cache_zone,
-            nopek_dram_arena=nopek_dram_arena,
-            ropek_dram_arena=ropek_dram_arena,
             lookup_state=lookup_state,
             resident_tokens=self._hbm_resident_tokens,
             tail_valid_token_counts=(
@@ -694,8 +674,8 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
 
     # Layer-level DSA hook before MLA/SFA.
     # Current responsibilities:
-    # 1. bind this layer's cache zones for later dump/load;
-    # 2. guard sparse decode until this layer's prefill full-block dump is ready.
+    # 1. bind this layer's cache zones for later backend put/load;
+    # 2. guard sparse decode until this layer's prefill block put is ready.
     def attention_begin(self, layer_name, forward_context: ForwardContext):
         layer_id = int(layer_name.split(".")[2])
         layer_cache_zones = self.layer_cache_registry.get(layer_id)
@@ -707,6 +687,12 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             # repeated Python object traversal and tensor identity checks.
             layer_cache_zones = self.layer_cache_registry.bind_or_validate(
                 layer_id, resolved_cache_zones)
+            self.kv_backend.register_layer_cache(
+                layer_id=layer_id,
+                block_size=int(self._vllm_blk_size),
+                nopek_cache=layer_cache_zones.nopek_cache_zone,
+                ropek_cache=layer_cache_zones.ropek_cache_zone,
+            )
         begin_batch = self._build_layer_runtime_batch(
             layer_name,
             cache_zones=layer_cache_zones,
@@ -714,39 +700,28 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         if int(begin_batch.sparse_decode_guard_pool_indices_tensor.numel()) > 0:
             self._ensure_layer_begin_sparse_decode_dump_ready(begin_batch)
 
-    def _dump_layer_full_blocks_to_dram_batch(
+    def _put_layer_full_blocks_to_backend_batch(
         self,
         layer_batch: DSALayerRuntimeBatch,
     ) -> None:
-        """Synchronously dump newly completed MLA full blocks for one layer.
+        """Put newly completed MLA full blocks through the KV backend.
 
         The dump rows are built once per model forward, while the actual cache
-        tensors are layer-specific. This hook supplies the current layer's
-        nopek/ropek cache zones and lets DSAHotKVStore copy those full blocks to
-        hot DRAM. Only after that call returns do we mark prefill dump readiness
-        for sparse decode. Decode full-block dumps also go through this path,
-        but the readiness bit below is only the prefill->decode phase guard.
+        tensors are registered once per layer. Only after put_blocks returns do
+        we mark prefill readiness for sparse decode. Decode full-block puts also
+        go through this path, but the readiness bit below is only the
+        prefill-to-decode phase guard.
         """
         dump_tables = layer_batch.full_block_dump_tables
         if dump_tables.request_ids:
-            if dump_tables.blk_pool_mgr is None:
-                raise RuntimeError(
-                    "DSA full-block dump batch has rows but no DRAM store")
             layer_id = layer_batch.layer_id
-            cache_zones = layer_batch.cache_zones
-            if cache_zones is None:
-                raise RuntimeError(
-                    f"DSA layer cache registry has no zones for layer "
-                    f"{layer_id}")
-            dump_tables.blk_pool_mgr.dump_layer_blocks_for_requests(
+            self.kv_backend.put_blocks(
                 layer_id=layer_id,
                 request_ids=dump_tables.request_ids,
                 request_pool_indices=dump_tables.request_pool_indices,
-                block_hash_rows=dump_tables.block_hash_rows,
-                block_id_rows=dump_tables.block_id_rows,
                 logical_block_index_rows=dump_tables.logical_block_index_rows,
-                nopek_dev_cache_zone=cache_zones.nopek_cache_zone,
-                ropek_dev_cache_zone=cache_zones.ropek_cache_zone,
+                block_key_rows=dump_tables.block_hash_rows,
+                source_block_id_rows=dump_tables.block_id_rows,
             )
 
         self._mark_full_dump_done(
@@ -756,12 +731,12 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
 
     # Layer-level DSA hook after MLA/SFA.
     # Current responsibilities:
-    # 1. dump this layer's prefill/decode newly-full MLA blocks to hot DRAM;
-    # 2. mark prefill dump readiness for later sparse decode.
+    # 1. put this layer's prefill/decode newly-full MLA blocks into the backend;
+    # 2. mark prefill put readiness for later sparse decode.
     # Token-level sparse selection/materialization is handled by after_indexer.
     def attention_finished(self, layer_name: str):
         layer_batch = self._build_layer_runtime_batch(layer_name)
-        self._dump_layer_full_blocks_to_dram_batch(layer_batch)
+        self._put_layer_full_blocks_to_backend_batch(layer_batch)
 
     def prepare_indexer_score_controls(self, layer_name: str, attn_metadata):
         # This hook prepares the Python-side controls around the document-level
@@ -801,13 +776,17 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
 
     def request_finished_in_worker(self, request_id):
         self._clear_full_dump_done(request_id)
+        pool_idx = int(self.resident_token_pool.get_index(request_id))
+        self.kv_backend.release_request(
+            request_id=request_id, request_pool_idx=pool_idx)
         self.resident_token_pool.release(request_id)
-        self.dsa_hot_kv_store.release_request(request_id)
 
     def request_preempted_in_worker(self, request_id):
         self._clear_full_dump_done(request_id)
+        pool_idx = int(self.resident_token_pool.get_index(request_id))
+        self.kv_backend.release_request(
+            request_id=request_id, request_pool_idx=pool_idx)
         self.resident_token_pool.release(request_id)
-        self.dsa_hot_kv_store.release_request(request_id)
 
     def execute_begin(self, scheduler_output: SchedulerOutput):
         pass

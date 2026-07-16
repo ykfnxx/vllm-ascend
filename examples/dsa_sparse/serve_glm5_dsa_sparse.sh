@@ -31,5 +31,5 @@ exec vllm serve "${MODEL_PATH}" \
   --enforce-eager \
   --no-async-scheduling \
   --block-size 128 \
-  --additional-config '{"fuse_muls_add":true,"multistream_overlap_shared_expert":true,"dsa_sparse_config":{"enabled":true}}' \
+  --additional-config '{"fuse_muls_add":true,"multistream_overlap_shared_expert":true,"dsa_sparse_config":{"enabled":true,"kv_backend":"mock"}}' \
   "$@"

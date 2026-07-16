@@ -14,7 +14,6 @@ from typing import Union
 
 import torch
 
-from vllm_ascend.dsa_sparse.dsa_hot_kv_store_core import DSAHotKVStore
 from vllm_ascend.dsa_sparse.dsa_types import ReqStage
 
 ReqType = Union[str, int]
@@ -156,7 +155,7 @@ class ReqMeta:
     tensorized forward batches in dsa_sparse.py. Long-lived mutable resources
     live elsewhere:
     - HBM sparse resident token rows: DSAResidentTokenPool.
-    - Hot DRAM block tables/arenas: DSAHotKVStore.
+    - Backend-owned KV storage and I/O: DSAKVBackend.
     - Per-layer cache tensor references: dsa_layer_cache_zones.
 
     The fields below are therefore source metadata for batch construction, not
@@ -178,7 +177,6 @@ class ReqMeta:
     query_start_loc: int
     query_len: int
     req_context_full_blk_hashes: list
-    blk_pool_mgr: DSAHotKVStore | None
     stage: ReqStage
     dense_query_positions: QueryPositionRow = field(default_factory=list)
     resident_query_positions: QueryPositionRow = field(default_factory=list)

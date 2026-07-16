@@ -5,7 +5,7 @@
 
 本文件只提供 DSAGraphBuffersMixin：它不推进请求生命周期，也不做
 scheduler slot 估算，而是负责 FULL graph capture/replay 时需要稳定地址
-的 DSA forward batch、layer id tensor、dummy HBM/DRAM block table，以及
+的 DSA forward batch、layer id tensor、dummy HBM block table，以及
 真实 forward 元数据拷贝到 graph-stable buffer 的过程。
 
 DSASparseBase 仍属于算法核心基类，保留在 dsa_sparse.py 中。后续如果
@@ -18,7 +18,6 @@ from __future__ import annotations
 import torch
 from vllm.logger import init_logger
 
-from vllm_ascend.dsa_sparse.dsa_hot_kv_store_core import BlockType
 from vllm_ascend.dsa_sparse.dsa_forward_batch import (
     DSAForwardLayerBatch, DSAForwardSparseDecodeBatch)
 from vllm_ascend.dsa_sparse.dsa_graph_gate import (
@@ -162,44 +161,6 @@ class DSAGraphBuffersMixin:
         graph_batch.batch_hbm_block_table[:rows, :cols].copy_(
             torch.where(copied > 0, copied, fallback[:rows, :cols]))
 
-    def _graph_dummy_dram_block_capacity(self) -> int:
-        blk_pool_mgr = getattr(self, "dsa_hot_kv_store", None)
-        get_arena = getattr(blk_pool_mgr, "get_arena", None)
-        if not callable(get_arena):
-            return 0
-        for layer_id in range(int(getattr(self, "total_num_hidden_layers",
-                                          0) or 0)):
-            try:
-                arena = get_arena(layer_id, BlockType.NOPE_K)
-            except Exception:
-                continue
-            if torch.is_tensor(arena):
-                return max(0, int(arena.shape[0]) - 1)
-        return 0
-
-    def _fill_graph_dummy_dram_block_tables(
-        self,
-        graph_batch: DSAForwardSparseDecodeBatch,
-    ) -> None:
-        """Fill capture-time DRAM tables with legal non-zero arena block ids."""
-        capacity = self._graph_dummy_dram_block_capacity()
-        if capacity <= 0:
-            raise RuntimeError(
-                "DSA row-mode decode graph capture requires a "
-                "preallocated DRAM "
-                "arena before dummy row-mode decode can run")
-        device = graph_batch.batch_dram_block_table.device
-        width = int(graph_batch.max_logical_blocks)
-        ids = ((torch.arange(width,
-                             dtype=graph_batch.batch_dram_block_table.dtype,
-                             device=device)
-                % int(capacity)) + 1)
-        graph_batch.batch_dram_block_table.copy_(
-            ids.reshape(1, -1).expand_as(
-                graph_batch.batch_dram_block_table))
-        graph_batch.dram_block_table.copy_(
-            ids.reshape(1, -1).expand_as(graph_batch.dram_block_table))
-
     @staticmethod
     def _copy_tensor_region(
         dst: torch.Tensor,
@@ -264,7 +225,6 @@ class DSAGraphBuffersMixin:
             (row_count, budget_blocks), dtype=torch.int32, device=device)
         graph_batch = DSAForwardSparseDecodeBatch(
             max_logical_blocks=max_logical_blocks,
-            blk_pool_mgr=getattr(self, "dsa_hot_kv_store", None),
             score_topk_k=budget_tokens,
             resident_pool_indices_tensor=torch.empty(
                 (row_count,), dtype=torch.int32, device=device),
@@ -289,14 +249,6 @@ class DSAGraphBuffersMixin:
             budget_lengths_tensor=torch.empty(
                 (row_count,), dtype=torch.int32, device=device),
             batch_hbm_block_table=graph_batch_hbm_block_table,
-            dram_block_table=torch.empty(
-                (max_reqs, max_logical_blocks),
-                dtype=torch.int32,
-                device=device),
-            batch_dram_block_table=torch.empty(
-                (row_count, max_logical_blocks),
-                dtype=torch.int32,
-                device=device),
             attention_indices_width=self._graph_attention_indices_width(),
             query_last_token_indices_are_identity=True,
             batch_row_indices_tensor=torch.empty(
@@ -372,7 +324,6 @@ class DSAGraphBuffersMixin:
                 "dummy row-mode batch row maps")
         self._fill_graph_dummy_hbm_block_table(graph_batch,
                                                full_block_table_tensor)
-        self._fill_graph_dummy_dram_block_tables(graph_batch)
 
     def prepare_row_mode_decode_graph_capture_batch(
         self,
@@ -509,12 +460,6 @@ class DSAGraphBuffersMixin:
         if int(real_batch.batch_hbm_block_table.shape[1]) > int(
                 graph_batch.batch_hbm_block_table.shape[1]):
             return False
-        if int(real_batch.dram_block_table.shape[1]) > int(
-                graph_batch.dram_block_table.shape[1]):
-            return False
-        if int(real_batch.batch_dram_block_table.shape[1]) > int(
-                graph_batch.batch_dram_block_table.shape[1]):
-            return False
         self._ensure_graph_layer_id_tensors(tensor_device)
         self._copy_tensor_region(
             graph_batch.resident_pool_indices_tensor,
@@ -620,17 +565,6 @@ class DSAGraphBuffersMixin:
             real_batch.batch_hbm_block_table,
             fill_value=0,
         )
-        self._copy_tensor_region(
-            graph_batch.dram_block_table,
-            real_batch.dram_block_table,
-            fill_value=0,
-        )
-        self._copy_tensor_region(
-            graph_batch.batch_dram_block_table,
-            real_batch.batch_dram_block_table,
-            fill_value=0,
-        )
-
         self.forward_sparse_decode_batch = graph_batch
         self.forward_layer_batch = DSAForwardLayerBatch.empty(
             tensor_device=tensor_device)

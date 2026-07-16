@@ -188,24 +188,6 @@ def build_hbm_block_table_tensor(
     return block_ids[:, :max_blocks].to(dtype=dtype)
 
 
-def build_dram_block_table_for_io(
-        dram_block_table: torch.Tensor,
-        resident_pool_indices: torch.Tensor,
-        *,
-        dtype: torch.dtype,
-        device: torch.device) -> torch.Tensor:
-    """Gather batch DRAM rows for paged DSA IO."""
-    row_count = int(resident_pool_indices.numel())
-    width = 0 if dram_block_table.ndim < 2 else int(dram_block_table.shape[1])
-    if row_count == 0:
-        return torch.zeros((0, width), dtype=dtype, device=device)
-    row_indices = resident_pool_indices.to(device=device, dtype=torch.long)
-    batch_table = dram_block_table.index_select(0, row_indices)
-    if batch_table.dtype != torch.long:
-        batch_table = batch_table.to(torch.long)
-    return batch_table.to(dtype=dtype)
-
-
 def compute_sparse_attention_indices_width(
     *,
     budget_slot_count: int,

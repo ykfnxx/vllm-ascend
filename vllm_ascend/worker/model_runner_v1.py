@@ -3160,12 +3160,6 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
-        if self.dsa_sparse_enabled:
-            assert self.dsa_worker_mgr is not None
-            self.dsa_worker_mgr.dsa_hot_kv_store.initialize_hot_cache_from_kv_caches(
-                kv_caches,
-                kv_cache_config,
-            )
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
         if self.speculative_config and (
