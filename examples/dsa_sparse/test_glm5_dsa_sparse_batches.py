@@ -27,6 +27,7 @@ DSA_RESIDENT_TOKENS = 8 * 1024
 DSA_QUERY_TOKENS = 2 * 1024
 DSA_TOTAL_SLOTS = DSA_RESIDENT_TOKENS + DSA_QUERY_TOKENS
 DSA_SPARSE_THRESHOLD = DSA_TOTAL_SLOTS + DSA_BLOCK_SIZE
+DSA_BLOCKS_PER_REQUEST = math.ceil(DSA_SPARSE_THRESHOLD / DSA_BLOCK_SIZE)
 PROMPT_FRAGMENT = (
     "The DSA sparse batch test contains deterministic token data for cache "
     "lookup and mock backend loading. "
@@ -113,6 +114,18 @@ def _validate_args(args: argparse.Namespace) -> None:
         and args.num_gpu_blocks_override <= 0
     ):
         raise ValueError("--num-gpu-blocks-override must be positive")
+    if args.num_gpu_blocks_override is not None:
+        min_gpu_blocks = max(args.batch_sizes) * DSA_BLOCKS_PER_REQUEST + 1
+        if args.num_gpu_blocks_override < min_gpu_blocks:
+            recommended_gpu_blocks = math.ceil(
+                min_gpu_blocks / DSA_BLOCK_SIZE
+            ) * DSA_BLOCK_SIZE
+            raise ValueError(
+                "--num-gpu-blocks-override="
+                f"{args.num_gpu_blocks_override} is too small for max batch "
+                f"size {max(args.batch_sizes)}; minimum={min_gpu_blocks}, "
+                f"recommended={recommended_gpu_blocks}"
+            )
     if args.server_start_timeout <= 0 or args.request_timeout <= 0:
         raise ValueError("timeouts must be positive")
     if shutil.which("vllm") is None:

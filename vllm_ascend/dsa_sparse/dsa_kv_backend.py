@@ -20,6 +20,11 @@ class DSAKVBackend(ABC):
     tensor.
     """
 
+    @property
+    def requires_prefill_put(self) -> bool:
+        """Whether sparse decode must wait for this request's prefill put."""
+        return True
+
     @abstractmethod
     def register_layer_cache(
         self,
@@ -74,6 +79,11 @@ class MockDSAKVBackend(DSAKVBackend):
         self._random = random.Random(int(seed))
         self._put_logged = False
         self._load_logged = False
+
+    @property
+    def requires_prefill_put(self) -> bool:
+        # Mock loads synthesize values and do not consume prefill block data.
+        return False
 
     @staticmethod
     def _squeeze_cache_head_dim(cache: torch.Tensor) -> torch.Tensor:

@@ -503,6 +503,8 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         put before returning; otherwise this readiness table and full-cache
         block recycling contract must be replaced with completion-driven state.
         """
+        if not self.kv_backend.requires_prefill_put:
+            return
         layer_id = begin_batch.layer_id
         pool_indices = begin_batch.sparse_decode_guard_pool_indices_tensor.to(
             device=self.full_dump_done_by_pool.device, dtype=torch.long)
