@@ -1,10 +1,15 @@
 #include "asu_hbm_index_maintain_aicpu_kernel.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <vector>
 
-#include "cpu_kernel_utils.h"
 #include "cpu_tensor.h"
 #include "cpu_types.h"
 
@@ -30,6 +35,7 @@ constexpr uint32_t FREE_HEAD_STRIDE = 16U;
 constexpr uint32_t PROTECTED_WORD_BITS = 64U;
 constexpr uint32_t PROTECTED_WORD_COUNT =
     (SLOT_COUNT + PROTECTED_WORD_BITS - 1U) / PROTECTED_WORD_BITS;
+constexpr uint32_t MAX_REQUEST_WORKERS = 32U;
 constexpr int32_t NOT_FOUND = -1;
 static_assert(FREE_HEAD_STRIDE * sizeof(int32_t) == 64U,
               "free_head row must occupy one 64-byte cache line");
@@ -70,6 +76,131 @@ void CopyState(const int32_t* source, int32_t* destination, uint64_t element_cou
         std::memcpy(destination, source, element_count * sizeof(int32_t));
     }
 }
+
+using RequestTaskFunction = void (*)(void*, uint32_t);
+
+class ParallelJob {
+public:
+    ParallelJob(RequestTaskFunction function,
+                void* context,
+                uint32_t task_count)
+        : function_(function), context_(context), remaining_(task_count)
+    {
+    }
+
+    void Run(uint32_t req_id)
+    {
+        function_(context_, req_id);
+        if (remaining_.fetch_sub(1U) == 1U) {
+            std::lock_guard<std::mutex> lock(done_mutex_);
+            done_condition_.notify_one();
+        }
+    }
+
+    void Wait()
+    {
+        std::unique_lock<std::mutex> lock(done_mutex_);
+        done_condition_.wait(lock, [this]() { return remaining_.load() == 0U; });
+    }
+
+private:
+    RequestTaskFunction function_;
+    void* context_;
+    std::atomic<uint32_t> remaining_;
+    std::mutex done_mutex_;
+    std::condition_variable done_condition_;
+};
+
+struct RequestTask {
+    ParallelJob* job;
+    uint32_t req_id;
+};
+
+// Reuse workers across the per-layer maintain calls in each decode step.
+class RequestThreadPool {
+public:
+    static RequestThreadPool& Instance()
+    {
+        static RequestThreadPool pool;
+        return pool;
+    }
+
+    void ParallelFor(uint32_t req_num,
+                     RequestTaskFunction function,
+                     void* context)
+    {
+        if (req_num == 1U) {
+            function(context, 0U);
+            return;
+        }
+
+        ParallelJob job(function, context, req_num - 1U);
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            for (uint32_t req_id = 1U; req_id < req_num; ++req_id) {
+                tasks_.push_back({&job, req_id});
+            }
+        }
+        task_condition_.notify_all();
+
+        function(context, 0U);
+        job.Wait();
+    }
+
+private:
+    RequestThreadPool() : stopping_(false)
+    {
+        const uint32_t hardware_threads = std::max(
+            1U, static_cast<uint32_t>(std::thread::hardware_concurrency()));
+        const uint32_t worker_num = std::min(
+            MAX_REQUEST_WORKERS,
+            hardware_threads > 1U ? hardware_threads - 1U : 1U);
+        workers_.reserve(worker_num);
+        for (uint32_t worker_id = 0U; worker_id < worker_num; ++worker_id) {
+            workers_.emplace_back(&RequestThreadPool::WorkerLoop, this);
+        }
+    }
+
+    ~RequestThreadPool()
+    {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            stopping_ = true;
+        }
+        task_condition_.notify_all();
+        for (auto& worker : workers_) {
+            worker.join();
+        }
+    }
+
+    RequestThreadPool(const RequestThreadPool&) = delete;
+    RequestThreadPool& operator=(const RequestThreadPool&) = delete;
+
+    void WorkerLoop()
+    {
+        while (true) {
+            RequestTask task;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                task_condition_.wait(
+                    lock,
+                    [this]() { return stopping_ || !tasks_.empty(); });
+                if (stopping_ && tasks_.empty()) {
+                    return;
+                }
+                task = tasks_.front();
+                tasks_.pop_front();
+            }
+            task.job->Run(task.req_id);
+        }
+    }
+
+    std::mutex queue_mutex_;
+    std::condition_variable task_condition_;
+    std::deque<RequestTask> tasks_;
+    std::vector<std::thread> workers_;
+    bool stopping_;
+};
 
 void MaintainOneRequest(int32_t* index,
                         int32_t* slot_to_index,
@@ -118,64 +249,53 @@ void MaintainOneRequest(int32_t* index,
     free_head[pool_entry * FREE_HEAD_STRIDE] = head;
 }
 
-uint32_t MaintainEviction(aicpu::CpuKernelContext& ctx,
-                          int32_t* index,
-                          int32_t* slot_to_index,
-                          int32_t* free_slots,
-                          int32_t* free_head,
-                          const int32_t* req_pool_entries,
-                          const int32_t* last_query_slots,
-                          uint32_t req_num,
-                          uint32_t seed)
+struct MaintainTaskContext {
+    int32_t* index;
+    int32_t* slot_to_index;
+    int32_t* free_slots;
+    int32_t* free_head;
+    const int32_t* req_pool_entries;
+    const int32_t* last_query_slots;
+    uint32_t seed;
+};
+
+void MaintainRequestTask(void* context, uint32_t req_id)
 {
+    auto* task = static_cast<MaintainTaskContext*>(context);
+    MaintainOneRequest(task->index,
+                       task->slot_to_index,
+                       task->free_slots,
+                       task->free_head,
+                       task->req_pool_entries,
+                       task->last_query_slots,
+                       req_id,
+                       task->seed);
+}
+
+void MaintainEviction(int32_t* index,
+                      int32_t* slot_to_index,
+                      int32_t* free_slots,
+                      int32_t* free_head,
+                      const int32_t* req_pool_entries,
+                      const int32_t* last_query_slots,
+                      uint32_t req_num,
+                      uint32_t seed)
+{
+    MaintainTaskContext context = {
+        index,
+        slot_to_index,
+        free_slots,
+        free_head,
+        req_pool_entries,
+        last_query_slots,
+        seed,
+    };
     if (req_num == 1U) {
-        MaintainOneRequest(index,
-                           slot_to_index,
-                           free_slots,
-                           free_head,
-                           req_pool_entries,
-                           last_query_slots,
-                           0U,
-                           seed);
-        return 0U;
+        MaintainRequestTask(&context, 0U);
+        return;
     }
-
-    const uint32_t worker_num = std::min(
-        req_num, aicpu::CpuKernelUtils::GetCPUNum(ctx));
-    if (worker_num == 1U) {
-        for (uint32_t req_id = 0; req_id < req_num; ++req_id) {
-            MaintainOneRequest(index,
-                               slot_to_index,
-                               free_slots,
-                               free_head,
-                               req_pool_entries,
-                               last_query_slots,
-                               req_id,
-                               seed);
-        }
-        return 0U;
-    }
-
-    // The tensors belong to one layer; only independent request rows are
-    // sharded across AICPU workers within this invocation.
-    const int64_t per_unit_size =
-        static_cast<int64_t>(req_num / worker_num);
-    return aicpu::CpuKernelUtils::ParallelFor(
-        ctx,
-        static_cast<int64_t>(req_num),
-        per_unit_size,
-        [=](int64_t start, int64_t end) {
-            for (int64_t req_id = start; req_id < end; ++req_id) {
-                MaintainOneRequest(index,
-                                   slot_to_index,
-                                   free_slots,
-                                   free_head,
-                                   req_pool_entries,
-                                   last_query_slots,
-                                   static_cast<uint32_t>(req_id),
-                                   seed);
-            }
-        });
+    RequestThreadPool::Instance().ParallelFor(
+        req_num, MaintainRequestTask, &context);
 }
 }  // namespace
 
@@ -220,15 +340,15 @@ uint32_t AsuHbmIndexMaintainAicpuCpuKernel::Compute(CpuKernelContext& ctx)
               free_head,
               static_cast<uint64_t>(req_num) * FREE_HEAD_STRIDE);
 
-    return MaintainEviction(ctx,
-                            index,
-                            slot_to_index,
-                            free_slots,
-                            free_head,
-                            req_pool_entries,
-                            last_query_slots,
-                            req_num,
-                            seed);
+    MaintainEviction(index,
+                     slot_to_index,
+                     free_slots,
+                     free_head,
+                     req_pool_entries,
+                     last_query_slots,
+                     req_num,
+                     seed);
+    return 0U;
 }
 
 REGISTER_CPU_KERNEL(OP_TYPE, AsuHbmIndexMaintainAicpuCpuKernel);
