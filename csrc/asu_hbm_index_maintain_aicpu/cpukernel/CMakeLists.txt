@@ -20,17 +20,15 @@ target_compile_definitions(cust_aicpu_kernels PRIVATE
 )
 
 target_include_directories(cust_aicpu_kernels PRIVATE
+    ${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux/pkg_inc/aicpu/cpu_kernels
     ${ASCEND_CANN_PACKAGE_PATH}/include/aicpu
 )
-
-target_compile_options(cust_aicpu_kernels PRIVATE -pthread)
 
 target_link_libraries(cust_aicpu_kernels PRIVATE
     -Wl,--whole-archive
     ${AICPU_LIB_DIR}/libaicpu_context.a
     ${AICPU_LIB_DIR}/libbase_ascend_protobuf.a
     -Wl,--no-whole-archive
-    pthread
 )
 
 target_link_options(cust_aicpu_kernels PRIVATE
