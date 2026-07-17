@@ -19,9 +19,8 @@ QUERY_COUNT = 2 * 1024
 RESIDENT_COUNT = SLOT_COUNT - FREE_SLOT_COUNT
 HIT_COUNT = QUERY_COUNT // 2
 MISS_COUNT = QUERY_COUNT - HIT_COUNT
-REQ_NUM = 2
-POOL_NUM = 18
-REQ_POOL_ENTRY_VALUES = (17, 1)
+MIN_POOL_NUM = 18
+PREFERRED_POOL_ENTRIES = (17, 1)
 NOT_FOUND = -1
 UINT32_MASK = (1 << 32) - 1
 
@@ -43,6 +42,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=20260714,
         help="Eviction seed passed to the maintain operator",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=2,
+        help="Number of request rows passed to both operators (default: 2)",
     )
     parser.add_argument(
         "--diagnose-aicpu",
@@ -196,36 +201,40 @@ def _diagnose_aicpu_package(custom_opp: Path) -> None:
     print("[PASS] packaged AICPU metadata and binary entry are consistent")
 
 
-def _build_initial_state(torch):
+def _build_req_pool_entries(torch, batch_size: int, pool_num: int):
+    entries = list(PREFERRED_POOL_ENTRIES)
+    entries.extend(
+        entry
+        for entry in range(pool_num)
+        if entry not in PREFERRED_POOL_ENTRIES
+    )
+    return torch.tensor(entries[:batch_size], dtype=torch.int32)
+
+
+def _build_initial_state(torch, batch_size: int):
+    pool_num = max(MIN_POOL_NUM, batch_size)
     index = torch.full(
-        (POOL_NUM, INDEX_SIZE), NOT_FOUND, dtype=torch.int32
+        (pool_num, INDEX_SIZE), NOT_FOUND, dtype=torch.int32
     )
     slot_to_index = torch.full(
-        (POOL_NUM, SLOT_COUNT), NOT_FOUND, dtype=torch.int32
+        (pool_num, SLOT_COUNT), NOT_FOUND, dtype=torch.int32
     )
     free_slots = torch.arange(
         RESIDENT_COUNT, SLOT_COUNT, dtype=torch.int32
-    ).repeat(POOL_NUM, 1)
-    free_head = torch.zeros(POOL_NUM, dtype=torch.int32)
-    req_pool_entries = torch.tensor(
-        REQ_POOL_ENTRY_VALUES, dtype=torch.int32
-    )
+    ).repeat(pool_num, 1)
+    free_head = torch.zeros(pool_num, dtype=torch.int32)
+    req_pool_entries = _build_req_pool_entries(torch, batch_size, pool_num)
     query_index = torch.empty(
-        (REQ_NUM, QUERY_COUNT), dtype=torch.int32
+        (batch_size, QUERY_COUNT), dtype=torch.int32
     )
     resident_slots = torch.arange(RESIDENT_COUNT, dtype=torch.int32)
 
-    for req_id in range(REQ_NUM):
+    for req_id in range(batch_size):
         pool_entry = int(req_pool_entries[req_id])
-        token_base = req_id * 2 * RESIDENT_COUNT
-        resident_tokens = torch.arange(
-            token_base,
-            token_base + RESIDENT_COUNT,
-            dtype=torch.int32,
-        )
+        resident_tokens = torch.arange(RESIDENT_COUNT, dtype=torch.int32)
         miss_tokens = torch.arange(
-            token_base + RESIDENT_COUNT,
-            token_base + RESIDENT_COUNT + MISS_COUNT,
+            RESIDENT_COUNT,
+            RESIDENT_COUNT + MISS_COUNT,
             dtype=torch.int32,
         )
 
@@ -252,9 +261,10 @@ def _lookup_reference(
     query_index,
     req_pool_entries,
 ):
+    req_num = query_index.size(0)
     slot_out = query_index.new_empty(query_index.shape)
     miss_out = query_index.new_zeros(query_index.shape)
-    for req_id in range(REQ_NUM):
+    for req_id in range(req_num):
         pool_entry = int(req_pool_entries[req_id])
         head = int(free_head[pool_entry])
         for query_id in range(QUERY_COUNT):
@@ -280,7 +290,8 @@ def _maintain_reference(
     req_pool_entries,
     seed: int,
 ) -> None:
-    for req_id in range(REQ_NUM):
+    req_num = last_query_slots.size(0)
+    for req_id in range(req_num):
         pool_entry = int(req_pool_entries[req_id])
         head = int(free_head[pool_entry])
         if head == 0:
@@ -330,6 +341,8 @@ def _load_ops(torch) -> None:
 
 def main() -> None:
     args = _parse_args()
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be greater than 0")
     custom_opp = _configure_custom_opp()
 
     if args.diagnose_aicpu:
@@ -342,7 +355,7 @@ def main() -> None:
     device = torch.device(f"npu:{args.device_id}")
     torch.npu.set_device(device)
 
-    initial_state = _build_initial_state(torch)
+    initial_state = _build_initial_state(torch, args.batch_size)
     expected_index = initial_state[0].clone()
     expected_slot_to_index = initial_state[1].clone()
     expected_free_slots = initial_state[2].clone()
@@ -373,7 +386,7 @@ def main() -> None:
         free_head,
         req_pool_entries_npu,
         query_index_npu,
-        REQ_NUM,
+        args.batch_size,
     )
     torch.npu.synchronize()
 
@@ -406,7 +419,7 @@ def main() -> None:
         free_head,
         req_pool_entries_npu,
         slot_out,
-        REQ_NUM,
+        args.batch_size,
         args.seed,
     )
     torch.npu.synchronize()
@@ -443,8 +456,8 @@ def main() -> None:
 
     print(
         "ASU HBM index custom-op check passed: "
-        f"device={device}, requests={REQ_NUM}, pool_entries="
-        f"{REQ_POOL_ENTRY_VALUES}, hits/request={HIT_COUNT}, "
+        f"device={device}, requests={args.batch_size}, "
+        f"pool_entries={req_pool_entries.tolist()}, hits/request={HIT_COUNT}, "
         f"misses/request={MISS_COUNT}, seed={args.seed}, custom_opp={custom_opp}"
     )
 
