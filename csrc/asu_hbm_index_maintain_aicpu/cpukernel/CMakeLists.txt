@@ -21,6 +21,7 @@ target_compile_definitions(cust_aicpu_kernels PRIVATE
 
 target_include_directories(cust_aicpu_kernels PRIVATE
     ${ASCEND_CANN_PACKAGE_PATH}/include/aicpu
+    ${ASCEND_CANN_PACKAGE_PATH}/runtime/pkg_inc/aicpu/cpu_kernels
 )
 
 target_link_libraries(cust_aicpu_kernels PRIVATE
