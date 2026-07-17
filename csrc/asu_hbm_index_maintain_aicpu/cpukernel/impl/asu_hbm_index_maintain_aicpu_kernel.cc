@@ -1,8 +1,10 @@
 #include "asu_hbm_index_maintain_aicpu_kernel.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 
+#include "cpu_kernel_utils.h"
 #include "cpu_tensor.h"
 #include "cpu_types.h"
 
@@ -69,54 +71,111 @@ void CopyState(const int32_t* source, int32_t* destination, uint64_t element_cou
     }
 }
 
-void MaintainEviction(int32_t* index,
-                      int32_t* slot_to_index,
-                      int32_t* free_slots,
-                      int32_t* free_head,
-                      const int32_t* req_pool_entries,
-                      const int32_t* last_query_slots,
-                      uint32_t req_num,
-                      uint32_t seed)
+void MaintainOneRequest(int32_t* index,
+                        int32_t* slot_to_index,
+                        int32_t* free_slots,
+                        int32_t* free_head,
+                        const int32_t* req_pool_entries,
+                        const int32_t* last_query_slots,
+                        uint32_t req_id,
+                        uint32_t seed)
 {
-    uint64_t protected_slots[PROTECTED_WORD_COUNT];
-
-    for (uint32_t req_id = 0; req_id < req_num; ++req_id) {
-        const uint32_t pool_entry =
-            static_cast<uint32_t>(req_pool_entries[req_id]);
-        int32_t* req_index = index + pool_entry * INDEX_SIZE;
-        int32_t* req_slot_to_index = slot_to_index + pool_entry * SLOT_COUNT;
-        int32_t* req_free_slots = free_slots + pool_entry * FREE_SLOT_COUNT;
-        const int32_t* req_last_query_slots =
-            last_query_slots + req_id * QUERY_COUNT;
-        int32_t head = free_head[pool_entry * FREE_HEAD_STRIDE];
-        if (head == 0) {
-            continue;
-        }
-
-        uint32_t slot = Hash32(seed ^ pool_entry) % SLOT_COUNT;
-        ClearProtectedSlots(protected_slots);
-        for (uint32_t i = 0; i < QUERY_COUNT; ++i) {
-            MarkProtectedSlot(protected_slots, req_last_query_slots[i]);
-        }
-
-        while (head > 0) {
-            const int32_t index_id = req_slot_to_index[slot];
-            if (index_id != NOT_FOUND &&
-                !IsProtectedSlot(protected_slots, slot)) {
-                req_slot_to_index[slot] = NOT_FOUND;
-                req_index[static_cast<uint32_t>(index_id)] = NOT_FOUND;
-                --head;
-                req_free_slots[static_cast<uint32_t>(head)] =
-                    static_cast<int32_t>(slot);
-            }
-            ++slot;
-            if (slot == SLOT_COUNT) {
-                slot = 0;
-            }
-        }
-
-        free_head[pool_entry * FREE_HEAD_STRIDE] = head;
+    const uint32_t pool_entry =
+        static_cast<uint32_t>(req_pool_entries[req_id]);
+    int32_t* req_index = index + pool_entry * INDEX_SIZE;
+    int32_t* req_slot_to_index = slot_to_index + pool_entry * SLOT_COUNT;
+    int32_t* req_free_slots = free_slots + pool_entry * FREE_SLOT_COUNT;
+    const int32_t* req_last_query_slots =
+        last_query_slots + req_id * QUERY_COUNT;
+    int32_t head = free_head[pool_entry * FREE_HEAD_STRIDE];
+    if (head == 0) {
+        return;
     }
+
+    uint64_t protected_slots[PROTECTED_WORD_COUNT];
+    uint32_t slot = Hash32(seed ^ pool_entry) % SLOT_COUNT;
+    ClearProtectedSlots(protected_slots);
+    for (uint32_t i = 0; i < QUERY_COUNT; ++i) {
+        MarkProtectedSlot(protected_slots, req_last_query_slots[i]);
+    }
+
+    while (head > 0) {
+        const int32_t index_id = req_slot_to_index[slot];
+        if (index_id != NOT_FOUND &&
+            !IsProtectedSlot(protected_slots, slot)) {
+            req_slot_to_index[slot] = NOT_FOUND;
+            req_index[static_cast<uint32_t>(index_id)] = NOT_FOUND;
+            --head;
+            req_free_slots[static_cast<uint32_t>(head)] =
+                static_cast<int32_t>(slot);
+        }
+        ++slot;
+        if (slot == SLOT_COUNT) {
+            slot = 0;
+        }
+    }
+
+    free_head[pool_entry * FREE_HEAD_STRIDE] = head;
+}
+
+uint32_t MaintainEviction(aicpu::CpuKernelContext& ctx,
+                          int32_t* index,
+                          int32_t* slot_to_index,
+                          int32_t* free_slots,
+                          int32_t* free_head,
+                          const int32_t* req_pool_entries,
+                          const int32_t* last_query_slots,
+                          uint32_t req_num,
+                          uint32_t seed)
+{
+    if (req_num == 1U) {
+        MaintainOneRequest(index,
+                           slot_to_index,
+                           free_slots,
+                           free_head,
+                           req_pool_entries,
+                           last_query_slots,
+                           0U,
+                           seed);
+        return 0U;
+    }
+
+    const uint32_t worker_num = std::min(
+        req_num, aicpu::CpuKernelUtils::GetCPUNum(ctx));
+    if (worker_num == 1U) {
+        for (uint32_t req_id = 0; req_id < req_num; ++req_id) {
+            MaintainOneRequest(index,
+                               slot_to_index,
+                               free_slots,
+                               free_head,
+                               req_pool_entries,
+                               last_query_slots,
+                               req_id,
+                               seed);
+        }
+        return 0U;
+    }
+
+    // The tensors belong to one layer; only independent request rows are
+    // sharded across AICPU workers within this invocation.
+    const int64_t per_unit_size =
+        static_cast<int64_t>(req_num / worker_num);
+    return aicpu::CpuKernelUtils::ParallelFor(
+        ctx,
+        static_cast<int64_t>(req_num),
+        per_unit_size,
+        [=](int64_t start, int64_t end) {
+            for (int64_t req_id = start; req_id < end; ++req_id) {
+                MaintainOneRequest(index,
+                                   slot_to_index,
+                                   free_slots,
+                                   free_head,
+                                   req_pool_entries,
+                                   last_query_slots,
+                                   static_cast<uint32_t>(req_id),
+                                   seed);
+            }
+        });
 }
 }  // namespace
 
@@ -161,15 +220,15 @@ uint32_t AsuHbmIndexMaintainAicpuCpuKernel::Compute(CpuKernelContext& ctx)
               free_head,
               static_cast<uint64_t>(req_num) * FREE_HEAD_STRIDE);
 
-    MaintainEviction(index,
-                     slot_to_index,
-                     free_slots,
-                     free_head,
-                     req_pool_entries,
-                     last_query_slots,
-                     req_num,
-                     seed);
-    return 0U;
+    return MaintainEviction(ctx,
+                            index,
+                            slot_to_index,
+                            free_slots,
+                            free_head,
+                            req_pool_entries,
+                            last_query_slots,
+                            req_num,
+                            seed);
 }
 
 REGISTER_CPU_KERNEL(OP_TYPE, AsuHbmIndexMaintainAicpuCpuKernel);
