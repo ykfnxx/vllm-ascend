@@ -10,6 +10,7 @@ DSA_LOOKUP_INDEX_CAPACITY = 128 * 1024
 DSA_LOOKUP_RESIDENT_TOKENS = 8 * 1024
 DSA_LOOKUP_QUERY_TOKENS = 2 * 1024
 DSA_LOOKUP_TOTAL_SLOTS = 10 * 1024
+DSA_FREE_HEAD_STRIDE = 16
 
 
 class DSAResidentLayerResourceView(NamedTuple):
@@ -102,8 +103,10 @@ class DSAResidentTokenPool:
         )
         self._free_slots = self._free_slot_template.view(1, 1, -1).expand(
             self.num_layers, self.max_reqs, -1).clone()
+        # Isolate each scalar head in its own 64-byte cache line so lookup can
+        # update different requests from different AIV cores.
         self._free_head = torch.zeros(
-            (self.num_layers, self.max_reqs),
+            (self.num_layers, self.max_reqs, DSA_FREE_HEAD_STRIDE),
             dtype=torch.int32,
             device=self.device,
         )

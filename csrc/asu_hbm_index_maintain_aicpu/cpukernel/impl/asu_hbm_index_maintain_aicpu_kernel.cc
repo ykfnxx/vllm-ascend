@@ -24,10 +24,13 @@ constexpr uint32_t INDEX_SIZE = 128U * 1024U;
 constexpr uint32_t SLOT_COUNT = 10U * 1024U;
 constexpr uint32_t FREE_SLOT_COUNT = 2U * 1024U;
 constexpr uint32_t QUERY_COUNT = 2U * 1024U;
+constexpr uint32_t FREE_HEAD_STRIDE = 16U;
 constexpr uint32_t PROTECTED_WORD_BITS = 64U;
 constexpr uint32_t PROTECTED_WORD_COUNT =
     (SLOT_COUNT + PROTECTED_WORD_BITS - 1U) / PROTECTED_WORD_BITS;
 constexpr int32_t NOT_FOUND = -1;
+static_assert(FREE_HEAD_STRIDE * sizeof(int32_t) == 64U,
+              "free_head row must occupy one 64-byte cache line");
 
 uint32_t Hash32(uint32_t value)
 {
@@ -85,7 +88,7 @@ void MaintainEviction(int32_t* index,
         int32_t* req_free_slots = free_slots + pool_entry * FREE_SLOT_COUNT;
         const int32_t* req_last_query_slots =
             last_query_slots + req_id * QUERY_COUNT;
-        int32_t head = free_head[pool_entry];
+        int32_t head = free_head[pool_entry * FREE_HEAD_STRIDE];
         if (head == 0) {
             continue;
         }
@@ -112,7 +115,7 @@ void MaintainEviction(int32_t* index,
             }
         }
 
-        free_head[pool_entry] = head;
+        free_head[pool_entry * FREE_HEAD_STRIDE] = head;
     }
 }
 }  // namespace
@@ -154,7 +157,9 @@ uint32_t AsuHbmIndexMaintainAicpuCpuKernel::Compute(CpuKernelContext& ctx)
     CopyState(free_slots_input,
               free_slots,
               static_cast<uint64_t>(req_num) * FREE_SLOT_COUNT);
-    CopyState(free_head_input, free_head, req_num);
+    CopyState(free_head_input,
+              free_head,
+              static_cast<uint64_t>(req_num) * FREE_HEAD_STRIDE);
 
     MaintainEviction(index,
                      slot_to_index,

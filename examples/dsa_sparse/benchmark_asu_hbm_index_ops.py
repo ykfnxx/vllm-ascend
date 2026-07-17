@@ -22,6 +22,7 @@ INDEX_SIZE = 128 * 1024
 SLOT_COUNT = 10 * 1024
 FREE_SLOT_COUNT = 2 * 1024
 QUERY_COUNT = 2 * 1024
+FREE_HEAD_STRIDE = 16
 RESIDENT_COUNT = SLOT_COUNT - FREE_SLOT_COUNT
 MISS_TOKEN_BASE = INDEX_SIZE // 2
 NOT_FOUND = -1
@@ -208,7 +209,10 @@ def build_host_case(torch, batch_size: int, miss_count: int, op_name: str) -> Ho
     slot_to_index = slot_to_index_row.unsqueeze(0).repeat(batch_size, 1)
     free_slots = free_slots_row.unsqueeze(0).repeat(batch_size, 1)
     initial_head = miss_count if op_name == "maintain" else 0
-    free_head = torch.full((batch_size,), initial_head, dtype=torch.int32)
+    free_head = torch.zeros(
+        (batch_size, FREE_HEAD_STRIDE), dtype=torch.int32
+    )
+    free_head[:, 0].fill_(initial_head)
     req_pool_entries = torch.arange(batch_size, dtype=torch.int32)
     query_index = query_row.unsqueeze(0).repeat(batch_size, 1)
     expected_slots = expected_slots_row.unsqueeze(0).repeat(batch_size, 1)
@@ -295,9 +299,10 @@ def check_case(
         torch.npu.synchronize()
         assert_equal(torch, "lookup slots", slot_out, case.expected_slots)
         assert_equal(torch, "lookup misses", miss_out, case.expected_misses)
-        expected_head = torch.full(
-            (batch_size,), miss_count, dtype=torch.int32
+        expected_head = torch.zeros(
+            (batch_size, FREE_HEAD_STRIDE), dtype=torch.int32
         )
+        expected_head[:, 0].fill_(miss_count)
         assert_equal(
             torch,
             "lookup free head",
@@ -308,7 +313,9 @@ def check_case(
 
     call_maintain(torch, case, batch_size, seed)
     torch.npu.synchronize()
-    expected_head = torch.zeros(batch_size, dtype=torch.int32)
+    expected_head = torch.zeros(
+        (batch_size, FREE_HEAD_STRIDE), dtype=torch.int32
+    )
     assert_equal(
         torch,
         "maintain free head",

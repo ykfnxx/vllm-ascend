@@ -9,8 +9,10 @@ constexpr uint32_t SLOT_COUNT = 10U * 1024U;
 constexpr uint32_t FREE_SLOT_COUNT = 2U * 1024U;
 constexpr uint32_t QUERY_COUNT = 2U * 1024U;
 constexpr uint32_t INDEX_TILE_LEN = 16U * 1024U;
-constexpr uint32_t FREE_HEADS_PER_CACHE_LINE = 16U;
+constexpr uint32_t FREE_HEAD_STRIDE = 16U;
 constexpr int32_t NOT_FOUND = -1;
+static_assert(FREE_HEAD_STRIDE * sizeof(int32_t) == 64U,
+              "free_head row must occupy one 64-byte cache line");
 
 class KernelAsuHbmIndexLookup {
 public:
@@ -83,19 +85,14 @@ public:
         offsetTileU32.SetSize(QUERY_COUNT);
         maskTile.SetSize(QUERY_COUNT);
 
-        for (uint32_t reqId = 0; reqId < reqNum_; ++reqId) {
+        for (uint32_t reqId = coreId; reqId < reqNum_; reqId += blockNum) {
             uint32_t poolEntry = static_cast<uint32_t>(reqPoolEntriesGm_.GetValue(reqId));
-            // Keep all free_head entries in one cache line on the same core.
-            uint32_t freeHeadCacheLine = poolEntry / FREE_HEADS_PER_CACHE_LINE;
-            if (freeHeadCacheLine % blockNum != coreId) {
-                continue;
-            }
-
             uint32_t indexReqBase = poolEntry * INDEX_SIZE;
             uint32_t slotReqBase = poolEntry * SLOT_COUNT;
             uint32_t freeReqBase = poolEntry * FREE_SLOT_COUNT;
+            uint32_t freeHeadOffset = poolEntry * FREE_HEAD_STRIDE;
             uint32_t queryReqBase = reqId * QUERY_COUNT;
-            int32_t freeHead = freeHeadGm_.GetValue(poolEntry);
+            int32_t freeHead = freeHeadGm_.GetValue(freeHeadOffset);
 
             DataCopy(queryTile, queryIndexGm_[queryReqBase], QUERY_COUNT);
             SyncPipelines<HardEvent::MTE2_V>();
@@ -152,12 +149,11 @@ public:
             DataCopy(slotOutGm_[queryReqBase], outTile, QUERY_COUNT);
             DataCopy(missOutGm_[queryReqBase], missTile, QUERY_COUNT);
             SyncPipelines<HardEvent::MTE3_V>();
-            freeHeadGm_.SetValue(poolEntry, freeHead);
+            freeHeadGm_.SetValue(freeHeadOffset, freeHead);
+            DataCacheCleanAndInvalid<int32_t,
+                                     CacheLine::SINGLE_CACHE_LINE,
+                                     DcciDst::CACHELINE_OUT>(freeHeadGm_[freeHeadOffset]);
         }
-
-        DataCacheCleanAndInvalid<int32_t,
-                                 CacheLine::ENTIRE_DATA_CACHE,
-                                 DcciDst::CACHELINE_OUT>(freeHeadGm_);
     }
 
 private:

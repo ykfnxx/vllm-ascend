@@ -13,6 +13,7 @@ INDEX_SIZE = 128 * 1024
 SLOT_COUNT = 10 * 1024
 FREE_SLOT_COUNT = 2 * 1024
 QUERY_COUNT = 2 * 1024
+FREE_HEAD_STRIDE = 16
 RESIDENT_COUNT = SLOT_COUNT - FREE_SLOT_COUNT
 HIT_COUNT = QUERY_COUNT // 2
 NOT_FOUND = -1
@@ -89,7 +90,9 @@ def build_initial_state(torch):
     free_slots = torch.arange(
         RESIDENT_COUNT, SLOT_COUNT, dtype=torch.int32
     ).unsqueeze(0)
-    free_head = torch.zeros(REQ_NUM, dtype=torch.int32)
+    free_head = torch.zeros(
+        (REQ_NUM, FREE_HEAD_STRIDE), dtype=torch.int32
+    )
     req_pool_entries = torch.zeros(REQ_NUM, dtype=torch.int32)
     query_index = torch.empty((REQ_NUM, QUERY_COUNT), dtype=torch.int32)
 
@@ -150,7 +153,7 @@ def validate_result(torch, state, outputs, expected) -> None:
         torch,
         "free head after maintain",
         free_head.cpu(),
-        torch.zeros(REQ_NUM, dtype=torch.int32),
+        torch.zeros((REQ_NUM, FREE_HEAD_STRIDE), dtype=torch.int32),
     )
 
     query_slots = index[0].index_select(0, query_index[0].long()).cpu()

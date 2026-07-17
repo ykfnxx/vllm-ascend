@@ -16,6 +16,7 @@ INDEX_SIZE = 128 * 1024
 SLOT_COUNT = 10 * 1024
 FREE_SLOT_COUNT = 2 * 1024
 QUERY_COUNT = 2 * 1024
+FREE_HEAD_STRIDE = 16
 RESIDENT_COUNT = SLOT_COUNT - FREE_SLOT_COUNT
 HIT_COUNT = QUERY_COUNT // 2
 MISS_COUNT = QUERY_COUNT - HIT_COUNT
@@ -222,7 +223,9 @@ def _build_initial_state(torch, batch_size: int):
     free_slots = torch.arange(
         RESIDENT_COUNT, SLOT_COUNT, dtype=torch.int32
     ).repeat(pool_num, 1)
-    free_head = torch.zeros(pool_num, dtype=torch.int32)
+    free_head = torch.zeros(
+        (pool_num, FREE_HEAD_STRIDE), dtype=torch.int32
+    )
     req_pool_entries = _build_req_pool_entries(torch, batch_size, pool_num)
     query_index = torch.empty(
         (batch_size, QUERY_COUNT), dtype=torch.int32
@@ -266,7 +269,7 @@ def _lookup_reference(
     miss_out = query_index.new_zeros(query_index.shape)
     for req_id in range(req_num):
         pool_entry = int(req_pool_entries[req_id])
-        head = int(free_head[pool_entry])
+        head = int(free_head[pool_entry, 0])
         for query_id in range(QUERY_COUNT):
             index_id = int(query_index[req_id, query_id])
             slot = int(index[pool_entry, index_id])
@@ -277,7 +280,7 @@ def _lookup_reference(
                 slot_to_index[pool_entry, slot] = index_id
                 miss_out[req_id, query_id] = 1
             slot_out[req_id, query_id] = slot
-        free_head[pool_entry] = head
+        free_head[pool_entry, 0] = head
     return slot_out, miss_out
 
 
@@ -293,7 +296,7 @@ def _maintain_reference(
     req_num = last_query_slots.size(0)
     for req_id in range(req_num):
         pool_entry = int(req_pool_entries[req_id])
-        head = int(free_head[pool_entry])
+        head = int(free_head[pool_entry, 0])
         if head == 0:
             continue
 
@@ -309,7 +312,7 @@ def _maintain_reference(
             slot += 1
             if slot == SLOT_COUNT:
                 slot = 0
-        free_head[pool_entry] = head
+        free_head[pool_entry, 0] = head
 
 
 def _assert_equal(torch, name: str, actual, expected) -> None:
