@@ -84,6 +84,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--skip-check",
+        action="store_true",
+        help="skip functional output/state checks before benchmarking",
+    )
+    parser.add_argument(
         "--warmup-iterations",
         type=int,
         default=10,
@@ -442,14 +447,15 @@ def main() -> None:
                 torch, batch_size, args.miss_count, op_name
             )
             case = move_case_to_device(host_case, device)
-            check_case(
-                torch,
-                case,
-                op_name,
-                batch_size,
-                args.miss_count,
-                args.seed,
-            )
+            if not args.skip_check:
+                check_case(
+                    torch,
+                    case,
+                    op_name,
+                    batch_size,
+                    args.miss_count,
+                    args.seed,
+                )
 
             if op_name == "lookup":
                 invoke = partial(call_lookup, torch, case, batch_size)
