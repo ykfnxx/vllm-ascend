@@ -364,6 +364,11 @@ class NPUWorker(WorkerBase):
                 self.device,
             )
 
+    def shutdown(self) -> None:
+        if self.dsa_mgr_worker is not None:
+            self.dsa_mgr_worker.kv_backend.close()
+        super().shutdown()
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much

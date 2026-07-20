@@ -478,6 +478,26 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             int(layer_id),
         )
 
+    def register_kv_cache_tensors(self, kv_cache_config,
+                                  kv_caches: dict[str, object]) -> None:
+        """Register every local MLA cache region before model execution."""
+        full_group_id = self._get_full_attention_group_id(kv_cache_config)
+        full_group = kv_cache_config.kv_cache_groups[full_group_id]
+        for layer_name in full_group.layer_names:
+            layer_cache = kv_caches[layer_name]
+            if not isinstance(layer_cache, (tuple, list)) or len(
+                    layer_cache) < 2:
+                raise RuntimeError(
+                    f"DSA requires MLA nope/rope cache tensors for {layer_name}")
+            layer_id = int(layer_name.split(".")[2])
+            self.kv_backend.register_layer_cache(
+                layer_id=layer_id,
+                block_size=int(self._vllm_blk_size),
+                nopek_cache=layer_cache[0],
+                ropek_cache=layer_cache[1],
+            )
+        self.kv_backend.finalize_cache_registration()
+
     def _build_layer_runtime_batch(
         self,
         layer_name: str,

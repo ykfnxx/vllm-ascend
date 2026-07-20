@@ -36,6 +36,10 @@ class DSAKVBackend(ABC):
     ) -> None:
         """Register stable NPU cache tensors for one MLA layer."""
 
+    def finalize_cache_registration(self) -> None:
+        """Finalize cache-region registration before the first transfer."""
+        return
+
     @abstractmethod
     def put_blocks(
         self,
@@ -171,7 +175,15 @@ class MockDSAKVBackend(DSAKVBackend):
 
 
 def create_dsa_kv_backend(vllm_config) -> DSAKVBackend:
-    if vllm_config.cache_config.dsa_kv_backend != "mock":
-        raise ValueError(
-            "Only the mock DSA KV backend is available on this branch")
-    return MockDSAKVBackend()
+    backend_name = vllm_config.cache_config.dsa_kv_backend
+    if backend_name == "mock":
+        return MockDSAKVBackend()
+    if backend_name == "kvio":
+        from vllm_ascend.dsa_sparse.dsa_kvio_backend import KVIODSAKVBackend
+
+        return KVIODSAKVBackend(
+            model_id=int(vllm_config.cache_config.dsa_kvio_model_id),
+            pd_flag=int(vllm_config.cache_config.dsa_kvio_pd_flag),
+            max_model_len=int(vllm_config.model_config.max_model_len),
+        )
+    raise ValueError(f"Unsupported DSA KV backend: {backend_name}")

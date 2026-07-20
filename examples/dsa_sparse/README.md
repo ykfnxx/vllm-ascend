@@ -197,6 +197,30 @@ set -o pipefail
 模型路径之后的参数会继续传给 `vllm serve`，可用于覆盖端口、TP、最大
 并发数和 block 数等默认值。
 
+### 使用 KVIO backend
+
+KVIO backend 需要 worker 环境能够导入 `rdma_kv_ops`。将 DSA 配置中的
+backend 和 KVIO 标识改为：
+
+```json
+{
+  "dsa_sparse_config": {
+    "enabled": true,
+    "kv_backend": "kvio",
+    "kvio_model_id": 0,
+    "kvio_pd_flag": 0
+  }
+}
+```
+
+KV cache 分配完成后，框架会把每个本地 MLA 层的 nope/rope tensor 地址和
+字节长度一次性传给 `aiv_init`。完整 block 使用同步的
+`aiv_put_batch + aiv_wait` 写入远端；lookup miss 使用同步的
+`aiv_get_batch + aiv_wait` 直接写入 resident physical slot。KVIO Python
+接口只接收整数列表，因此 GET 热路径需要将一次批量地址元数据从 NPU 搬到
+CPU。当前 KVIO 接口没有远端删除 API，请求结束只清理本地 pool entry 到
+整数 request ID 的映射。
+
 ### 静态诊断运行中的服务
 
 在服务启动后执行：

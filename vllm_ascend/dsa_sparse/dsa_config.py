@@ -36,6 +36,8 @@ _DSA_SPARSE_CONFIG_FIELD_MAPPINGS = (
     ("hbm_resident_tokens", "dsa_hbm_resident_tokens"),
     ("max_active_reqs", "dsa_max_active_reqs"),
     ("kv_backend", "dsa_kv_backend"),
+    ("kvio_model_id", "dsa_kvio_model_id"),
+    ("kvio_pd_flag", "dsa_kvio_pd_flag"),
 )
 _DSA_SPARSE_DEFAULT_CACHE_ATTRS: dict[str, Any] = {
     "enable_dsa_sparse_cache": False,
@@ -47,6 +49,8 @@ _DSA_SPARSE_DEFAULT_CACHE_ATTRS: dict[str, Any] = {
     # allocated in the resident lookup pool.
     "dsa_max_active_reqs": None,
     "dsa_kv_backend": "mock",
+    "dsa_kvio_model_id": 0,
+    "dsa_kvio_pd_flag": 0,
 }
 _DSA_SPARSE_PUBLIC_KEYS = frozenset(
     {public for public, _ in _DSA_SPARSE_CONFIG_FIELD_MAPPINGS}
@@ -115,10 +119,9 @@ def _normalize_dsa_sparse_config(
             raise ValueError(
                 "dsa_sparse_config['hbm_resident_tokens'] must be "
                 f"{DSA_LOOKUP_RESIDENT_TOKENS} for the ASU lookup operator")
-        if cache_attrs["dsa_kv_backend"] != "mock":
+        if cache_attrs["dsa_kv_backend"] not in {"mock", "kvio"}:
             raise ValueError(
-                "dsa_sparse_config['kv_backend'] must be 'mock' until an "
-                "external DSA KV backend is registered")
+                "dsa_sparse_config['kv_backend'] must be 'mock' or 'kvio'")
 
     additional_updates: dict[str, Any] = {}
     if _DSA_GRAPH_PUBLIC_CONFIG_KEY in raw_config:
