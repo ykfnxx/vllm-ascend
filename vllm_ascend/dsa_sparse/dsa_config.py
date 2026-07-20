@@ -32,7 +32,6 @@ _DSA_GRAPH_PUBLIC_CONFIG_KEY = "enable_row_mode_decode_graph"
 _DSA_SPARSE_CONFIG_FIELD_MAPPINGS = (
     ("enabled", "enable_dsa_sparse_cache"),
     ("split_indexer_cache", "enable_dsa_split_indexer_cache"),
-    ("indexer_mla_block_ratio", "dsa_indexer_mla_block_ratio"),
     ("hbm_sparse_budget", "dsa_hbm_sparse_budget"),
     ("hbm_resident_tokens", "dsa_hbm_resident_tokens"),
     ("max_active_reqs", "dsa_max_active_reqs"),
@@ -41,7 +40,6 @@ _DSA_SPARSE_CONFIG_FIELD_MAPPINGS = (
 _DSA_SPARSE_DEFAULT_CACHE_ATTRS: dict[str, Any] = {
     "enable_dsa_sparse_cache": False,
     "enable_dsa_split_indexer_cache": False,
-    "dsa_indexer_mla_block_ratio": 3,
     "dsa_hbm_sparse_budget": DSA_LOOKUP_QUERY_TOKENS,
     "dsa_hbm_resident_tokens": DSA_LOOKUP_RESIDENT_TOKENS,
     # Direct token->slot tables are per request and per layer. By default this
