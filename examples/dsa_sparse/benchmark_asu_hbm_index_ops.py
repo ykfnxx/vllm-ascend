@@ -43,6 +43,7 @@ class DeviceCase:
     mutable_state: tuple[Any, Any, Any, Any]
     req_pool_entries: Any
     query_index: Any
+    lookup_mask: Any
     expected_slots: Any
     expected_misses: Any
 
@@ -239,6 +240,8 @@ def move_case_to_device(host_case: HostCase, device: Any) -> DeviceCase:
         mutable_state=tuple(tensor.clone() for tensor in baseline_state),
         req_pool_entries=host_case.req_pool_entries.to(device),
         query_index=host_case.query_index.to(device),
+        lookup_mask=host_case.query_index.new_ones(
+            host_case.query_index.shape).to(device),
         expected_slots=host_case.expected_slots.to(device),
         expected_misses=host_case.expected_misses.to(device),
     )
@@ -253,6 +256,7 @@ def call_lookup(torch, case: DeviceCase, batch_size: int):
         free_head,
         case.req_pool_entries,
         case.query_index,
+        case.lookup_mask,
         batch_size,
     )
 

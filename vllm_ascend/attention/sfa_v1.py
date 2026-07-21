@@ -26,7 +26,6 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
-from vllm_ascend.dsa_sparse.dsa_batch_tensor_utils import build_dsa_mixed_key_lens
 from vllm_ascend.dsa_sparse.dsa_config import is_dsa_sparse_config_enabled
 from vllm_ascend.dsa_sparse.dsa_trace import (
     DSA_TRACE_POINT_LIGHTNING_INDEXER,
@@ -100,15 +99,15 @@ def _tensor_minmax(tensor: torch.Tensor) -> dict[str, int | None]:
 
 def _topk_row_bounds(
     topk_indices: torch.Tensor,
-    candidate_lens: torch.Tensor,
+    key_lens: torch.Tensor,
     limit: int = 8,
 ) -> list[dict]:
     topk = topk_indices.detach().reshape(topk_indices.shape[0], -1).cpu()
-    lens = candidate_lens.detach().reshape(-1).cpu()
+    lens = key_lens.detach().reshape(-1).cpu()
     rows = []
     for row in range(min(limit, int(topk.shape[0]))):
         row_values = topk[row]
-        candidate_len = int(lens[row])
+        key_len = int(lens[row])
         row_min = int(row_values.min().item())
         row_max = int(row_values.max().item())
         rows.append(
@@ -116,8 +115,8 @@ def _topk_row_bounds(
                 "row": row,
                 "min": row_min,
                 "max": row_max,
-                "candidate_len": candidate_len,
-                "invalid": row_min < 0 or row_max >= candidate_len,
+                "key_len": key_len,
+                "invalid": row_min < 0 or row_max >= key_len,
             }
         )
     return rows
@@ -1169,14 +1168,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert int(fwd_batch.query_position_rows_tensor.shape[1]) == 1
                 assert not self.use_sparse_c8_indexer
 
-                candidate_lens = fwd_batch.candidate_lens_tensor.to(
+                indexer_key_lens = actual_seq_lengths_key.to(
                     device=q_li.device, dtype=torch.int32
-                )
-                mixed_key_lens = build_dsa_mixed_key_lens(
-                    actual_seq_lengths_key=actual_seq_lengths_key,
-                    candidate_lens=candidate_lens,
-                    sparse_row_mask=fwd_batch.sparse_row_mask_tensor,
-                    device=q_li.device,
                 )
                 topk_indices = _run_dsa_full_batch_lightning_indexer(
                     use_torch_npu_lightning_indexer=(
@@ -1186,14 +1179,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                     key_cache=key_cache,
                     weights=weights,
                     actual_seq_lengths_query=actual_seq_lengths_query,
-                    actual_seq_lengths_key=mixed_key_lens,
+                    actual_seq_lengths_key=indexer_key_lens,
                     block_table=block_table,
                     sparse_count=int(attn_metadata.dsa_score_topk_k),
                 )
                 attn_metadata.dsa_full_batch_selection_topk_indices = (
                     topk_indices
                 )
-                attn_metadata.dsa_indexer_seq_lens = candidate_lens
+                attn_metadata.dsa_indexer_seq_lens = indexer_key_lens
                 logger.info_once(
                     "DSA sparse indexer completed: forwarding TopK token ids "
                     "to lookup/materialize/maintain"
@@ -1217,12 +1210,12 @@ class AscendSFAImpl(MLAAttentionImpl):
                             "key_cache": _tensor_brief(key_cache),
                             "weights": _tensor_brief(weights),
                             "block_table": _tensor_brief(block_table),
-                            "candidate_lens": _tensor_brief(candidate_lens),
-                            "candidate_lens_sample": _tensor_sample(
-                                candidate_lens
+                            "indexer_key_lens": _tensor_brief(indexer_key_lens),
+                            "indexer_key_lens_sample": _tensor_sample(
+                                indexer_key_lens
                             ),
-                            "candidate_lens_minmax": _tensor_minmax(
-                                candidate_lens
+                            "indexer_key_lens_minmax": _tensor_minmax(
+                                indexer_key_lens
                             ),
                             "topk": _tensor_brief(topk_indices),
                             "topk_sample": _tensor_sample(
@@ -1230,7 +1223,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                             ),
                             "topk_minmax": _tensor_minmax(topk_indices),
                             "topk_row_bounds": _topk_row_bounds(
-                                topk_indices, candidate_lens
+                                topk_indices, indexer_key_lens
                             ),
                         },
                     )

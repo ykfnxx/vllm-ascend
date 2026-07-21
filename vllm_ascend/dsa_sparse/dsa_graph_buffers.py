@@ -91,9 +91,8 @@ class DSAGraphBuffersMixin:
                    // self._vllm_blk_size)
 
     def _graph_attention_indices_width(self) -> int:
-        # TopK mapped slots plus one full independent resident tail block.
-        return int(self._hbm_sparse_budget_tokens or 0) + int(
-            self._vllm_blk_size)
+        # Lossless offload preserves the original Indexer TopK cardinality.
+        return int(self._hbm_sparse_budget_tokens or 0)
 
     def _ensure_graph_layer_id_tensors(
         self,
@@ -232,6 +231,8 @@ class DSAGraphBuffersMixin:
                 (row_count, 1), dtype=torch.int32, device=device),
             tail_valid_token_counts_tensor=torch.empty(
                 (row_count,), dtype=torch.int32, device=device),
+            dense_tail_starts_tensor=torch.empty(
+                (row_count,), dtype=torch.int32, device=device),
             resident_tail_starts_tensor=torch.empty(
                 (row_count,), dtype=torch.int32, device=device),
             query_start_locs_tensor=torch.empty(
@@ -288,6 +289,10 @@ class DSAGraphBuffersMixin:
             dummy_seq_len,
             graph_batch.max_logical_blocks * int(self._vllm_blk_size),
         )
+        dummy_dense_tail_start = (
+            ((dummy_seq_len - 1) // int(self._vllm_blk_size))
+            * int(self._vllm_blk_size))
+        dummy_tail_count = dummy_seq_len - dummy_dense_tail_start
 
         row_ids = torch.arange(row_count, dtype=torch.int32, device=device)
         graph_batch.resident_pool_indices_tensor.copy_(row_ids)
@@ -299,11 +304,12 @@ class DSAGraphBuffersMixin:
         graph_batch.range_ends_tensor.fill_(dummy_range_end)
         graph_batch.candidate_lens_tensor.fill_(dummy_range_end)
         graph_batch.budget_lengths_tensor.fill_(budget_tokens)
+        graph_batch.dense_tail_starts_tensor.fill_(dummy_dense_tail_start)
         graph_batch.resident_tail_starts_tensor.fill_(
             int(self._lookup_total_slot_tokens))
-        graph_batch.tail_valid_token_counts_tensor.fill_(1)
+        graph_batch.tail_valid_token_counts_tensor.fill_(dummy_tail_count)
         graph_batch.query_position_rows_tensor.fill_(
-            int(self._lookup_total_slot_tokens))
+            int(self._lookup_total_slot_tokens) + dummy_tail_count - 1)
         graph_batch.batch_row_indices_tensor.copy_(row_ids.to(
             dtype=torch.long))
         graph_batch.row_modes_tensor.fill_(int(DSADecodeRowMode.SPARSE))
@@ -474,6 +480,11 @@ class DSAGraphBuffersMixin:
         self._copy_tensor_region(
             graph_batch.tail_valid_token_counts_tensor,
             real_batch.tail_valid_token_counts_tensor,
+            fill_value=0,
+        )
+        self._copy_tensor_region(
+            graph_batch.dense_tail_starts_tensor,
+            real_batch.dense_tail_starts_tensor,
             fill_value=0,
         )
         self._copy_tensor_region(

@@ -598,9 +598,9 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         attn_metadata,
     ):
         layer_id = layer_batch.layer_id
-        # Lightning Indexer returns original sequence token ids. Lookup maps
-        # them to arbitrary slots in the larger resident address space. The KV
-        # backend writes misses directly into those resident HBM slots.
+        # Lightning Indexer returns TopK ids over the original full sequence.
+        # Dumped-history ids are resolved through lookup and materialized on a
+        # miss; live-tail ids map directly into the independent resident tail.
         prebuilt_attention_indices = (
             self._forward_sparse_decode_attention_indices_tensor)
         full_batch_topk = getattr(
@@ -628,11 +628,10 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             selection_block_table=forward_batch.batch_hbm_block_table,
             lookup_state=lookup_state,
             resident_tokens=self._hbm_resident_tokens,
-            tail_valid_token_counts=(
-                forward_batch.tail_valid_token_counts_tensor),
+            dense_tail_starts=(
+                forward_batch.dense_tail_starts_tensor),
             resident_tail_starts=(
                 forward_batch.resident_tail_starts_tensor),
-            budget_lengths=forward_batch.budget_lengths_tensor,
             attention_indices_width=layer_batch.attention_indices_width,
             prebuilt_attention_indices=prebuilt_attention_indices,
             row_modes=forward_batch.row_modes_tensor,

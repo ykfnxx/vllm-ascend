@@ -87,6 +87,8 @@ def _build_req_forward_plan(
         # smaller than this address space and must not define the tail offset.
         resident_tail_start = max(
             0, (len(vllm_budget_block_ids) - 1) * block_size)
+        # This boundary describes backend-eligible history. Indexer scoring is
+        # still performed over the complete indexer sequence, including tail.
         dumped_full_token_end = len(req_context_full_blk_hashes) * block_size
         candidate_range_start = 0
         candidate_range_end = min(dumped_full_token_end, dense_tail_start)

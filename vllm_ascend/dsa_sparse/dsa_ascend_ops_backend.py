@@ -19,12 +19,12 @@ class DSALookupOutput(NamedTuple):
 
 
 class AscendDSAOpsBackend:
-    """Resolve Indexer TopK through a persistent token-to-slot index.
+    """Map full-sequence Indexer TopK into resident attention slots.
 
-    The AIV lookup operator maps original token ids to persistent resident
-    slots and reports actual allocations. The KV backend writes only those
-    misses into resident HBM, then the AICPU maintain operator restores the
-    free-slot headroom for the next decode step.
+    Dumped-history token ids use the persistent token-to-slot index; live-tail
+    ids map directly into the independent tail block. The KV backend writes
+    only historical misses into resident HBM, then AICPU maintenance restores
+    the free-slot headroom for the next decode step.
     """
 
     def __init__(self) -> None:
@@ -92,46 +92,26 @@ class AscendDSAOpsBackend:
     def _compose_attention_indices(
         *,
         topk: torch.Tensor,
-        slot_out: torch.Tensor,
+        mapped_slots: torch.Tensor,
         row_modes: torch.Tensor,
-        budget_lengths: torch.Tensor,
-        tail_valid_token_counts: torch.Tensor,
-        resident_tail_starts: torch.Tensor,
         attention_indices: torch.Tensor,
     ) -> None:
         batch_size, topk_width = topk.shape
         width = int(attention_indices.shape[1])
         padded_topk = torch.full(
             (batch_size, width), -1, dtype=torch.int32, device=topk.device)
-        padded_slots = torch.full_like(padded_topk, -1)
+        padded_mapped_slots = torch.full_like(padded_topk, -1)
         copy_width = min(topk_width, width)
         padded_topk[:, :copy_width].copy_(topk[:, :copy_width])
-        padded_slots[:, :copy_width].copy_(slot_out[:, :copy_width])
+        padded_mapped_slots[:, :copy_width].copy_(
+            mapped_slots[:, :copy_width])
 
-        columns = torch.arange(
-            width, dtype=torch.int32, device=topk.device).view(1, -1)
         sparse_rows = row_modes == int(DSADecodeRowMode.SPARSE)
         dense_rows = row_modes == int(DSADecodeRowMode.DENSE)
-        budget_mask = columns < budget_lengths.view(-1, 1)
-        tail_offsets = columns - budget_lengths.view(-1, 1)
-        tail_mask = (
-            sparse_rows.view(-1, 1)
-            & (tail_offsets >= 0)
-            & (tail_offsets < tail_valid_token_counts.view(-1, 1))
-        )
-        sparse_values = torch.where(
-            budget_mask,
-            padded_slots,
-            torch.where(
-                tail_mask,
-                resident_tail_starts.view(-1, 1) + tail_offsets,
-                torch.full_like(padded_slots, -1),
-            ),
-        )
         attention_indices.copy_(torch.where(
             dense_rows.view(-1, 1),
             padded_topk,
-            torch.where(sparse_rows.view(-1, 1), sparse_values,
+            torch.where(sparse_rows.view(-1, 1), padded_mapped_slots,
                         torch.full_like(padded_topk, -1)),
         ))
 
@@ -146,9 +126,8 @@ class AscendDSAOpsBackend:
         selection_block_table: torch.Tensor,
         lookup_state: DSAResidentLookupState,
         resident_tokens: int,
-        tail_valid_token_counts: torch.Tensor,
+        dense_tail_starts: torch.Tensor,
         resident_tail_starts: torch.Tensor,
-        budget_lengths: torch.Tensor,
         attention_indices_width: int,
         prebuilt_attention_indices: torch.Tensor | None = None,
         row_modes: torch.Tensor,
@@ -160,18 +139,15 @@ class AscendDSAOpsBackend:
         topk = self._normalize_topk(selection_topk_indices, device)
         pool_entries = self._as_device_i32(
             req_pool_entries, device).reshape(-1)
-        budget_lengths = self._as_device_i32(
-            budget_lengths, device).reshape(-1)
         row_modes = self._as_device_i32(row_modes, device).reshape(-1)
         lookup_init_mask = lookup_init_mask.to(
             device=device, dtype=torch.bool).reshape(-1)
         selection_block_table = self._as_device_i32(
             selection_block_table, device)
-        tail_valid_token_counts = self._as_device_i32(
-            tail_valid_token_counts, device).reshape(-1)
+        dense_tail_starts = self._as_device_i32(
+            dense_tail_starts, device).reshape(-1)
         resident_tail_starts = self._as_device_i32(
             resident_tail_starts, device).reshape(-1)
-        sparse_rows = row_modes == int(DSADecodeRowMode.SPARSE)
         sparse_local_rows = sparse_local_row_indices.to(
             device=device, dtype=torch.long).reshape(-1)
 
@@ -203,6 +179,14 @@ class AscendDSAOpsBackend:
         sparse_topk = topk.index_select(0, sparse_local_rows).contiguous()
         sparse_pool_entries = pool_entries.index_select(
             0, sparse_local_rows).contiguous()
+        sparse_dense_tail_starts = dense_tail_starts.index_select(
+            0, sparse_local_rows).view(-1, 1)
+        sparse_resident_tail_starts = resident_tail_starts.index_select(
+            0, sparse_local_rows).view(-1, 1)
+        sparse_tail_mask = sparse_topk >= sparse_dense_tail_starts
+        sparse_history_mask = ~sparse_tail_mask
+        sparse_lookup_mask = sparse_history_mask.to(
+            dtype=torch.int32).contiguous()
         if not self._lookup_call_logged:
             logger.info(
                 "DSA sparse invoking asu_hbm_index_lookup: requests=%d, "
@@ -218,6 +202,7 @@ class AscendDSAOpsBackend:
                 lookup_state.free_head,
                 sparse_pool_entries,
                 sparse_topk,
+                sparse_lookup_mask,
                 int(sparse_pool_entries.numel()),
             )
         )
@@ -229,7 +214,10 @@ class AscendDSAOpsBackend:
                 tuple(sparse_topk.shape),
             )
             self._lookup_call_logged = True
-        sparse_misses = sparse_miss_out.to(dtype=torch.bool)
+        sparse_misses = (
+            sparse_miss_out.to(dtype=torch.bool)
+            & sparse_history_mask
+        )
         sparse_selection_block_table = selection_block_table.index_select(
             0, sparse_local_rows)
         kv_backend.load_tokens_into(
@@ -240,8 +228,19 @@ class AscendDSAOpsBackend:
             load_mask=sparse_misses,
             destination_block_table=sparse_selection_block_table,
         )
-        slot_out = torch.full_like(topk, -1)
-        slot_out.index_copy_(0, sparse_local_rows, sparse_slot_out)
+        sparse_tail_slots = (
+            sparse_resident_tail_starts
+            + sparse_topk
+            - sparse_dense_tail_starts
+        )
+        sparse_mapped_slots = torch.where(
+            sparse_tail_mask,
+            sparse_tail_slots,
+            sparse_slot_out,
+        )
+        mapped_slots = torch.full_like(topk, -1)
+        mapped_slots.index_copy_(
+            0, sparse_local_rows, sparse_mapped_slots)
 
         if torch.is_tensor(prebuilt_attention_indices):
             attention_indices = prebuilt_attention_indices
@@ -253,11 +252,8 @@ class AscendDSAOpsBackend:
             )
         self._compose_attention_indices(
             topk=topk,
-            slot_out=slot_out,
+            mapped_slots=mapped_slots,
             row_modes=row_modes,
-            budget_lengths=budget_lengths,
-            tail_valid_token_counts=tail_valid_token_counts,
-            resident_tail_starts=resident_tail_starts,
             attention_indices=attention_indices,
         )
         if not self._maintain_call_logged:

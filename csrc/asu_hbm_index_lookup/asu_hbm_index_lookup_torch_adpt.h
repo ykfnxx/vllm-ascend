@@ -19,6 +19,7 @@ std::tuple<at::Tensor, at::Tensor> asu_hbm_index_lookup(
     at::Tensor& free_head,
     const at::Tensor& req_pool_entries,
     const at::Tensor& query_index,
+    const at::Tensor& lookup_mask,
     int64_t req_num)
 {
     TORCH_CHECK(index.scalar_type() == at::kInt, "index must be int32");
@@ -27,6 +28,7 @@ std::tuple<at::Tensor, at::Tensor> asu_hbm_index_lookup(
     TORCH_CHECK(free_head.scalar_type() == at::kInt, "free_head must be int32");
     TORCH_CHECK(req_pool_entries.scalar_type() == at::kInt, "req_pool_entries must be int32");
     TORCH_CHECK(query_index.scalar_type() == at::kInt, "query_index must be int32");
+    TORCH_CHECK(lookup_mask.scalar_type() == at::kInt, "lookup_mask must be int32");
     TORCH_CHECK(req_num > 0, "req_num must be greater than 0");
 
     at::Tensor slot_out = at::empty_like(query_index);
@@ -38,6 +40,7 @@ std::tuple<at::Tensor, at::Tensor> asu_hbm_index_lookup(
                  free_head,
                  req_pool_entries,
                  query_index,
+                 lookup_mask,
                  req_num,
                  slot_out,
                  miss_out);

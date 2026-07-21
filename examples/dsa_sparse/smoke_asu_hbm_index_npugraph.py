@@ -95,6 +95,7 @@ def build_initial_state(torch):
     )
     req_pool_entries = torch.zeros(REQ_NUM, dtype=torch.int32)
     query_index = torch.empty((REQ_NUM, QUERY_COUNT), dtype=torch.int32)
+    lookup_mask = torch.ones_like(query_index)
 
     resident_tokens = torch.arange(RESIDENT_COUNT, dtype=torch.int32)
     resident_slots = torch.arange(RESIDENT_COUNT, dtype=torch.int32)
@@ -122,6 +123,7 @@ def build_initial_state(torch):
         free_head,
         req_pool_entries,
         query_index,
+        lookup_mask,
     )
     expected = (expected_slots, expected_misses)
     return state, expected
@@ -140,7 +142,7 @@ def assert_equal(torch, name: str, actual, expected) -> None:
 
 
 def validate_result(torch, state, outputs, expected) -> None:
-    index, slot_to_index, _, free_head, _, query_index = state
+    index, slot_to_index, _, free_head, _, query_index, _ = state
     slot_out, miss_out = outputs
     expected_slots, expected_misses = expected
 
@@ -186,6 +188,7 @@ def main() -> None:
             free_head,
             req_pool_entries,
             query_index,
+            lookup_mask,
         ):
             slot_out, miss_out = (
                 torch.ops._C_ascend.asu_hbm_index_lookup(
@@ -195,6 +198,7 @@ def main() -> None:
                     free_head,
                     req_pool_entries,
                     query_index,
+                    lookup_mask,
                     REQ_NUM,
                 )
             )

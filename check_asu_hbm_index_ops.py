@@ -380,6 +380,7 @@ def main() -> None:
     free_slots = initial_state[2].to(device)
     free_head = initial_state[3].to(device)
     query_index_npu = query_index.to(device)
+    lookup_mask_npu = torch.ones_like(query_index_npu)
     req_pool_entries_npu = req_pool_entries.to(device)
 
     slot_out, miss_out = torch.ops._C_ascend.asu_hbm_index_lookup(
@@ -389,6 +390,7 @@ def main() -> None:
         free_head,
         req_pool_entries_npu,
         query_index_npu,
+        lookup_mask_npu,
         args.batch_size,
     )
     torch.npu.synchronize()

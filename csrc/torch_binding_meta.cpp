@@ -614,6 +614,7 @@ std::tuple<at::Tensor, at::Tensor> asu_hbm_index_lookup_meta(
     at::Tensor& free_head,
     const at::Tensor& req_pool_entries,
     const at::Tensor& query_index,
+    const at::Tensor& lookup_mask,
     int64_t req_num)
 {
     (void)index;
@@ -621,6 +622,7 @@ std::tuple<at::Tensor, at::Tensor> asu_hbm_index_lookup_meta(
     (void)free_slots;
     (void)free_head;
     (void)req_pool_entries;
+    (void)lookup_mask;
     (void)req_num;
     return std::make_tuple(at::empty_like(query_index),
                            at::empty_like(query_index));

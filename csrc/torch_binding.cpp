@@ -899,6 +899,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "asu_hbm_index_lookup(Tensor(a!) index, Tensor(b!) slot_to_index, "
         "                     Tensor(c!) free_slots, Tensor(d!) free_head, "
         "                     Tensor req_pool_entries, Tensor query_index, "
+        "                     Tensor lookup_mask, "
         "                     int req_num) -> (Tensor, Tensor)");
     ops.impl("asu_hbm_index_lookup", torch::kPrivateUse1,
              &vllm_ascend::asu_hbm_index_lookup);

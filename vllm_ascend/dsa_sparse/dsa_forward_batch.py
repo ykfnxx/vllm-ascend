@@ -129,6 +129,7 @@ class DSAForwardSparseDecodeBatch:
     resident_pool_indices_tensor: torch.Tensor
     query_position_rows_tensor: torch.Tensor
     tail_valid_token_counts_tensor: torch.Tensor
+    dense_tail_starts_tensor: torch.Tensor
     resident_tail_starts_tensor: torch.Tensor
     query_start_locs_tensor: torch.Tensor
     query_lens_tensor: torch.Tensor
@@ -172,6 +173,8 @@ class DSAForwardSparseDecodeBatch:
             query_position_rows_tensor=torch.empty(
                 (0, 0), dtype=torch.int32, device=device),
             tail_valid_token_counts_tensor=torch.empty(
+                (0,), dtype=torch.int32, device=device),
+            dense_tail_starts_tensor=torch.empty(
                 (0,), dtype=torch.int32, device=device),
             resident_tail_starts_tensor=torch.empty(
                 (0,), dtype=torch.int32, device=device),
@@ -355,6 +358,7 @@ def _build_forward_batches_from_dsa_meta(
     row_modes: list[int] = []
     lookup_init_mask: list[bool] = []
     tail_valid_token_counts: list[int] = []
+    dense_tail_starts: list[int] = []
     resident_tail_starts: list[int] = []
     range_starts: list[int] = []
     range_ends: list[int] = []
@@ -471,6 +475,8 @@ def _build_forward_batches_from_dsa_meta(
             query_start + max(query_len, 1) - 1)
         query_positions.append(query_position_row)
         tail_valid_token_counts.append(tail_valid_count)
+        dense_tail_starts.append(
+            int(req_meta.forward_plan.dense_tail_start))
         resident_tail_starts.append(
             int(req_meta.forward_plan.resident_tail_start))
         range_starts.append(int(topk_plan.range_start))
@@ -483,14 +489,13 @@ def _build_forward_batches_from_dsa_meta(
             if is_sparse_row else 0)
         if is_sparse_row:
             # Sparse decode only admits single-token rows whose current query
-            # KV is in the independent resident tail. SFA therefore consumes
-            # mapped TopK slots followed by that tail. Dense rows retain their
-            # Indexer TopK and must not expand this width to full sequence size.
+            # KV is in the independent resident tail. Indexer still selects its
+            # TopK over the original full sequence; every selected token is then
+            # mapped either through lookup or directly into the live tail.
             attention_indices_width = max(
                 attention_indices_width,
                 compute_sparse_attention_indices_width(
                     budget_slot_count=budget_slot_count,
-                    tail_valid_token_count=tail_valid_count,
                 ))
         if is_sparse_row:
             max_logical_blocks = max(
@@ -525,6 +530,7 @@ def _build_forward_batches_from_dsa_meta(
         query_last_token_indices,
         query_positions,
         tail_valid_token_counts,
+        dense_tail_starts,
         resident_tail_starts,
         range_starts,
         range_ends,
@@ -544,6 +550,7 @@ def _build_forward_batches_from_dsa_meta(
         query_last_token_indices,
         query_positions,
         tail_valid_token_counts,
+        dense_tail_starts,
         resident_tail_starts,
         range_starts,
         range_ends,
@@ -591,6 +598,8 @@ def _build_forward_batches_from_dsa_meta(
         ),
         tail_valid_token_counts_tensor=build_int_tensor(
             tail_valid_token_counts, dtype=torch.int32, device=device),
+        dense_tail_starts_tensor=build_int_tensor(
+            dense_tail_starts, dtype=torch.int32, device=device),
         resident_tail_starts_tensor=build_int_tensor(
             resident_tail_starts, dtype=torch.int32, device=device),
         query_start_locs_tensor=build_int_tensor(

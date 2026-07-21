@@ -53,6 +53,7 @@ class OperatorCase:
     free_head: Any
     req_pool_entries: Any
     query_index: Any
+    lookup_mask: Any
     last_query_slots: Any
 
     def reset(self) -> None:
@@ -265,6 +266,8 @@ def build_case(
         free_head=mutable_state[3],
         req_pool_entries=req_pool_entries.to(device),
         query_index=query_index.to(device),
+        lookup_mask=torch.ones_like(
+            query_index, dtype=torch.int32, device=device),
         last_query_slots=last_query_slots.to(device),
     )
 
@@ -277,6 +280,7 @@ def invoke_lookup(torch: Any, case: OperatorCase, batch_size: int) -> Any:
         case.free_head,
         case.req_pool_entries,
         case.query_index,
+        case.lookup_mask,
         batch_size,
     )
 

@@ -1,8 +1,8 @@
 """DSA batch 级元数据的无状态张量构造工具。
 
 本文件只放“把 Python list / request rows 转成本轮 forward 张量”的纯工具：
-padding、排序、HBM/DRAM block table gather、mixed dense/sparse key length、
-以及 sparse attention indices 宽度计算。它不认识 DSASparseV1，也不修改
+padding、排序、HBM/DRAM block table gather，以及 sparse attention indices
+宽度计算。它不认识 DSASparseV1，也不修改
 请求/资源状态。
 
 这样拆分后，dsa_sparse.py 负责调度 DSA 生命周期和 layer hook，本文件负责
@@ -72,38 +72,6 @@ def build_int_tensor(
     return torch.tensor([int(item) for item in values],
                         dtype=dtype,
                         device=device)
-
-
-def build_dsa_mixed_key_lens(
-    *,
-    actual_seq_lengths_key: torch.Tensor,
-    candidate_lens: torch.Tensor,
-    sparse_row_mask: torch.Tensor,
-    device: torch.device,
-) -> torch.Tensor:
-    """Build per-row key lengths for DSA mixed dense/sparse decode.
-
-    Dense rows must keep their native full sequence length. Sparse rows score
-    only over the full-block candidate window; their resident tail is appended
-    later by lookup-resident attention-index generation.
-    """
-    actual_lens = actual_seq_lengths_key.to(
-        device=device, dtype=torch.int32).reshape(-1)
-    candidate_lens = candidate_lens.to(device=device,
-                                       dtype=torch.int32).reshape(-1)
-    sparse_mask = sparse_row_mask.to(device=device,
-                                     dtype=torch.bool).reshape(-1)
-    if int(candidate_lens.numel()) != int(actual_lens.numel()):
-        raise RuntimeError(
-            "DSA candidate_lens must be full-batch when building mixed "
-            f"key lengths: candidate_lens={int(candidate_lens.numel())}, "
-            f"actual={int(actual_lens.numel())}")
-    if int(sparse_mask.numel()) != int(actual_lens.numel()):
-        raise RuntimeError(
-            "DSA sparse row mask must be full-batch when building mixed "
-            f"key lengths: mask={int(sparse_mask.numel())}, "
-            f"actual={int(actual_lens.numel())}")
-    return torch.where(sparse_mask, candidate_lens, actual_lens)
 
 
 def sort_decode_rows_by_batch_index(
@@ -191,9 +159,6 @@ def build_hbm_block_table_tensor(
 def compute_sparse_attention_indices_width(
     *,
     budget_slot_count: int,
-    tail_valid_token_count: int,
 ) -> int:
-    """Return TopK mapped slots plus the independent resident tail."""
-    budget_slot_count = max(0, int(budget_slot_count))
-    tail_valid_token_count = max(0, int(tail_valid_token_count))
-    return budget_slot_count + tail_valid_token_count
+    """Return the original Indexer TopK width after resident-slot mapping."""
+    return max(0, int(budget_slot_count))
