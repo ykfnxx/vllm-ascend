@@ -193,10 +193,27 @@ python3 examples/dsa_sparse/profile_asu_hbm_index_ops.py \
   --output-dir /data/asu-profiles/maintain-bs8
 ```
 
-脚本默认先执行 10 次未采集 warmup，再连续采集 20 次目标算子调用。采集窗口
-内不恢复状态、不执行逐轮同步，也不执行 CPU/NPU 数据比较。当前算子固定为每
-请求 2048 个 query、300 次 update 或 eviction，profiling 脚本不提供
-`--miss-count`。
+脚本默认先执行 10 次未采集 warmup，再连续采集 20 次目标算子调用。默认使用
+steady-state 模式，采集窗口内不恢复状态、不执行逐轮同步，也不执行 CPU/NPU
+数据比较。
+
+如需复现 benchmark 的 reset-state 方法，增加：
+
+```bash
+python3 examples/dsa_sparse/profile_asu_hbm_index_ops.py \
+  --op maintain \
+  --batch-size 8 \
+  --reset-state \
+  --output-dir /data/asu-profiles/maintain-bs8-reset
+```
+
+`--reset-state` 会保留一份 NPU baseline；每次 warmup 和每次正式采集前，将
+`index`、`slot_to_index`、`free_slots`、`free_head` 恢复到 baseline 并同步，
+目标算子执行后再次同步。状态恢复不纳入目标算子本身，但 `copy_` 和同步事件会
+出现在 profiler trace 中，应按 `asu_*` 或 `RunCpuKernel` 名称筛选目标耗时。
+
+当前算子固定为每请求 2048 个 query、300 次 update 或 eviction，profiling
+脚本不提供 `--miss-count`。
 
 lookup 使用 `ProfilerLevel.Level1` 和 `AiCMetrics.PipeUtilization`；maintain
 使用 `ProfilerLevel.Level2` 以保留 AI CPU 细节。两者都关闭 stack、module、

@@ -46,6 +46,7 @@ NOT_FOUND = -1
 
 @dataclass(frozen=True)
 class OperatorCase:
+    baseline_state: tuple[Any, Any, Any, Any] | None
     index: Any
     slot_to_index: Any
     free_slots: Any
@@ -53,6 +54,21 @@ class OperatorCase:
     req_pool_entries: Any
     query_index: Any
     last_query_slots: Any
+
+    def reset(self) -> None:
+        if self.baseline_state is None:
+            raise RuntimeError("reset requested without an NPU baseline")
+        for tensor, baseline in zip(
+            (
+                self.index,
+                self.slot_to_index,
+                self.free_slots,
+                self.free_head,
+            ),
+            self.baseline_state,
+            strict=True,
+        ):
+            tensor.copy_(baseline)
 
 
 def parse_args() -> argparse.Namespace:
@@ -85,6 +101,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=20,
         help="calls captured by the profiler (default: 20)",
+    )
+    parser.add_argument(
+        "--reset-state",
+        action="store_true",
+        help=(
+            "restore the four mutable state tensors and synchronize before "
+            "every warmup/profile call, matching the benchmark methodology"
+        ),
     )
     parser.add_argument(
         "--device-id",
@@ -177,7 +201,12 @@ def load_custom_ops(torch: Any) -> Path:
     return Path(extension.__file__).resolve()
 
 
-def build_case(torch: Any, device: Any, batch_size: int) -> OperatorCase:
+def build_case(
+    torch: Any,
+    device: Any,
+    batch_size: int,
+    reset_state: bool,
+) -> OperatorCase:
     resident_tokens = torch.arange(RESIDENT_COUNT, dtype=torch.int32)
     index = torch.full(
         (batch_size, INDEX_SIZE), NOT_FOUND, dtype=torch.int32
@@ -218,11 +247,22 @@ def build_case(torch: Any, device: Any, batch_size: int) -> OperatorCase:
         batch_size, 1
     )
 
+    device_state = tuple(
+        tensor.to(device)
+        for tensor in (index, slot_to_index, free_slots, free_head)
+    )
+    baseline_state = device_state if reset_state else None
+    mutable_state = (
+        tuple(tensor.clone() for tensor in device_state)
+        if reset_state
+        else device_state
+    )
     return OperatorCase(
-        index=index.to(device),
-        slot_to_index=slot_to_index.to(device),
-        free_slots=free_slots.to(device),
-        free_head=free_head.to(device),
+        baseline_state=baseline_state,
+        index=mutable_state[0],
+        slot_to_index=mutable_state[1],
+        free_slots=mutable_state[2],
+        free_head=mutable_state[3],
         req_pool_entries=req_pool_entries.to(device),
         query_index=query_index.to(device),
         last_query_slots=last_query_slots.to(device),
@@ -278,13 +318,19 @@ def warmup(
     batch_size: int,
     seed: int,
     iterations: int,
+    reset_state: bool,
 ) -> None:
     last_output = None
     for _ in range(iterations):
+        if reset_state:
+            case.reset()
+            torch.npu.synchronize()
         if op_name == "lookup":
             last_output = invoke_lookup(torch, case, batch_size)
         else:
             invoke_maintain(torch, case, batch_size, seed)
+        if reset_state:
+            torch.npu.synchronize()
     torch.npu.synchronize()
     if op_name == "lookup" and last_output is not None:
         validate_lookup_output(last_output, batch_size)
@@ -323,7 +369,10 @@ def profile_operator(
     args: argparse.Namespace,
     raw_root: Path,
 ) -> None:
-    trace_name = f"asu_hbm_index_{args.op}_bs{args.batch_size}"
+    state_mode = "reset" if args.reset_state else "steady"
+    trace_name = (
+        f"asu_hbm_index_{args.op}_bs{args.batch_size}_{state_mode}"
+    )
     handler = torch_npu.profiler.tensorboard_trace_handler(
         str(raw_root),
         worker_name=trace_name,
@@ -348,6 +397,9 @@ def profile_operator(
         on_trace_ready=handler,
     ):
         for _ in range(args.profile_iterations):
+            if args.reset_state:
+                case.reset()
+                torch.npu.synchronize()
             if args.op == "lookup":
                 retained_outputs.append(
                     invoke_lookup(torch, case, args.batch_size)
@@ -356,6 +408,8 @@ def profile_operator(
                 invoke_maintain(
                     torch, case, args.batch_size, args.seed
                 )
+            if args.reset_state:
+                torch.npu.synchronize()
         torch.npu.synchronize()
 
     if args.op == "lookup":
@@ -477,6 +531,7 @@ def write_manifest(
             "fixed_updates_or_evictions_per_request": FIXED_UPDATE_COUNT,
             "warmup_iterations": args.warmup_iterations,
             "profile_iterations": args.profile_iterations,
+            "state_mode": "reset" if args.reset_state else "steady",
             "seed": args.seed,
             "device_id": args.device_id,
             "profiler_level": profiler_level,
@@ -522,10 +577,12 @@ def main() -> None:
         f"[INFO] warmup={args.warmup_iterations}, "
         f"profile_iterations={args.profile_iterations}"
     )
+    state_mode = "reset" if args.reset_state else "steady"
+    print(f"[INFO] state_mode={state_mode}")
     print(f"[INFO] export_type={args.export_type}")
     print(f"[INFO] output={run_root}")
 
-    case = build_case(torch, device, args.batch_size)
+    case = build_case(torch, device, args.batch_size, args.reset_state)
     warmup(
         torch,
         case,
@@ -533,6 +590,7 @@ def main() -> None:
         args.batch_size,
         args.seed,
         args.warmup_iterations,
+        args.reset_state,
     )
     print("[PASS] warmup completed")
 
