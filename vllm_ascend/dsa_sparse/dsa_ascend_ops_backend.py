@@ -58,30 +58,46 @@ class AscendDSAOpsBackend:
         initialize_rows: torch.Tensor,
         resident_tokens: int,
         selection_block_table: torch.Tensor,
+        prefill_topk_positions: torch.Tensor | None = None,
     ) -> None:
         pool_rows = pool_entries.to(dtype=torch.long)
         batch_size = int(pool_rows.numel())
-        tokens = torch.arange(
-            resident_tokens,
-            dtype=torch.int32,
-            device=pool_entries.device,
-        ).view(1, -1).expand(batch_size, -1)
-        slots = tokens
-        init_mask = initialize_rows.view(-1, 1).expand(-1, resident_tokens)
+
+        if prefill_topk_positions is not None:
+            topk_count = prefill_topk_positions.shape[-1]
+            token_positions = prefill_topk_positions.to(
+                dtype=torch.int32, device=pool_entries.device)
+            destination_slots = torch.arange(
+                topk_count,
+                dtype=torch.int32,
+                device=pool_entries.device,
+            ).view(1, -1).expand(batch_size, -1)
+        else:
+            token_positions = torch.arange(
+                resident_tokens,
+                dtype=torch.int32,
+                device=pool_entries.device,
+            ).view(1, -1).expand(batch_size, -1)
+            destination_slots = token_positions
+
+        init_mask = initialize_rows.view(
+            -1, 1).expand(-1, token_positions.shape[-1])
 
         kv_backend.load_tokens_into(
             layer_id=int(layer_id),
             request_pool_entries=pool_entries,
-            token_positions=tokens,
-            destination_slots=slots,
+            token_positions=token_positions,
+            destination_slots=destination_slots,
             load_mask=init_mask,
             destination_block_table=selection_block_table,
         )
         init_batch_rows, init_token_positions = init_mask.nonzero(as_tuple=True)
         init_pool_rows = pool_rows.index_select(0, init_batch_rows)
-        init_tokens = tokens[init_batch_rows, init_token_positions].to(
+        init_tokens = token_positions[init_batch_rows,
+                                      init_token_positions].to(
             dtype=torch.long)
-        init_slots = slots[init_batch_rows, init_token_positions].to(
+        init_slots = destination_slots[init_batch_rows,
+                                       init_token_positions].to(
             dtype=torch.long)
         state.token_to_slot[init_pool_rows, init_tokens] = init_slots.to(
             dtype=torch.int32)
@@ -155,6 +171,7 @@ class AscendDSAOpsBackend:
         lookup_init_mask: torch.Tensor,
         has_lookup_init_rows: bool,
         maintain_seed: int,
+        prefill_topk_positions: torch.Tensor | None = None,
     ) -> DSALookupOutput:
         device = selection_block_table.device
         topk = self._normalize_topk(selection_topk_indices, device)
@@ -191,6 +208,7 @@ class AscendDSAOpsBackend:
                 initialize_rows=lookup_init_mask,
                 resident_tokens=int(resident_tokens),
                 selection_block_table=selection_block_table,
+                prefill_topk_positions=prefill_topk_positions,
             )
             if not self._resident_init_logged:
                 logger.info(

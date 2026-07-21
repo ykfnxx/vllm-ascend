@@ -146,6 +146,13 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # E.g., tensor([100, 200, 50]) means req0 has 100 tokens already computed.
     num_computed_tokens_cpu: torch.Tensor = None
 
+    # CPU bool tensor: True when the request's current prefill chunk is the
+    # last one (num_computed + scheduled >= num_prompt and num_output == 0).
+    is_last_prefill_chunk_flags: torch.Tensor = None
+
+    # Per-request IDs for KVIO remote_request_id alignment on P-node.
+    request_ids: list[str] | None = None
+
     # Number of decode tokens per request, used for speculative decoding.
     # E.g., 1 for normal decoding, >1 for speculative decoding.
     decode_token_per_req: int = 1
@@ -210,6 +217,14 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             num_input_tokens=self.num_input_tokens,
             prefill_context_parallel_metadata=self.prefill_context_parallel_metadata,
             max_seq_len=self.max_seq_len,
+            is_last_prefill_chunk_flags=(
+                self.is_last_prefill_chunk_flags[:num_actual_reqs]
+                if self.is_last_prefill_chunk_flags is not None
+                else None
+            ),
+            request_ids=self.request_ids[:num_actual_reqs]
+            if self.request_ids is not None
+            else None,
         )
 
 

@@ -74,6 +74,10 @@ class DSAKVBackend(ABC):
     def close(self) -> None:
         """Close backend resources owned by this worker."""
 
+    def has_topk_metadata(self) -> bool:
+        """Whether this backend supports TopK metadata KVIO transfer."""
+        return False
+
 
 class MockDSAKVBackend(DSAKVBackend):
     """Storage-free backend that fills miss destinations with mock values."""

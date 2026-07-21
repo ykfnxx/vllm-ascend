@@ -12,6 +12,8 @@ from vllm.logger import init_logger
 
 from vllm_ascend.dsa_sparse.dsa_kv_backend import DSAKVBackend
 
+TOPK_COUNT_DEFAULT = 2048
+
 logger = init_logger("vllm.dsa_sparse")
 
 
@@ -50,6 +52,8 @@ class KVIODSAKVBackend(DSAKVBackend):
             int, tuple[int, torch.Tensor, torch.Tensor]] = {}
         self._regions: dict[int, tuple[_KVIOCacheRegion,
                                        _KVIOCacheRegion]] = {}
+        self._registered_topk_buffers: dict[int, torch.Tensor] = {}
+        self._topk_regions: dict[int, _KVIOCacheRegion] = {}
         self._next_task_id = 1
         self._initialized = False
         self._request_ids_by_pool: dict[int, int] = {}
@@ -99,6 +103,20 @@ class KVIODSAKVBackend(DSAKVBackend):
         self._registered_caches[layer_id] = (
             int(block_size), nopek_cache, ropek_cache)
 
+    def register_topk_metadata_buffer(
+        self,
+        *,
+        layer_id: int,
+        topk_buffer: torch.Tensor,
+    ) -> None:
+        layer_id = int(layer_id)
+        if layer_id in self._registered_topk_buffers:
+            return
+        if self._initialized:
+            raise RuntimeError(
+                "KVIO cache registration cannot change after aiv_init")
+        self._registered_topk_buffers[layer_id] = topk_buffer
+
     def finalize_cache_registration(self) -> None:
         if self._initialized:
             return
@@ -128,15 +146,33 @@ class KVIODSAKVBackend(DSAKVBackend):
                 storage_base += self._max_model_len * token_bytes
             self._regions[layer_id] = (layer_regions[0], layer_regions[1])
 
+        for layer_id in sorted(self._registered_topk_buffers):
+            topk_buffer = self._registered_topk_buffers[layer_id]
+            topk_cache_id = len(cache_addresses)
+            topk_bytes = self._tensor_bytes(topk_buffer)
+            position_bytes = int(topk_buffer.element_size())
+            self._topk_regions[layer_id] = _KVIOCacheRegion(
+                cache_id=topk_cache_id,
+                cache=topk_buffer,
+                token_bytes=position_bytes,
+                block_bytes=position_bytes * TOPK_COUNT_DEFAULT,
+                storage_base=storage_base,
+            )
+            cache_addresses.append(int(topk_buffer.data_ptr()))
+            cache_lengths.append(topk_bytes)
+            storage_base += self._max_model_len * position_bytes
+
         self._check(
             "aiv_init",
             self._ops.aiv_init(cache_addresses, cache_lengths),
         )
         self._initialized = True
         logger.info(
-            "DSA KVIO backend initialized: cache_regions=%d, model_id=%d, "
-            "pd_flag=%d",
+            "DSA KVIO backend initialized: cache_regions=%d (MLA=%d, "
+            "TopK=%d), model_id=%d, pd_flag=%d",
             len(cache_addresses),
+            len(self._regions) * 2,
+            len(self._topk_regions),
             self._model_id,
             self._pd_flag,
         )
@@ -277,6 +313,106 @@ class KVIODSAKVBackend(DSAKVBackend):
     def release_request(self, *, request_id, request_pool_idx: int) -> None:
         self._request_ids_by_pool.pop(int(request_pool_idx), None)
 
+    def load_topk_positions(
+        self,
+        *,
+        layer_id: int,
+        request_pool_entry: int,
+        request_id=None,
+        topk_count: int = TOPK_COUNT_DEFAULT,
+    ) -> torch.Tensor:
+        if int(layer_id) not in self._topk_regions:
+            raise RuntimeError(
+                f"TopK metadata not registered for layer {layer_id}; "
+                "call register_topk_metadata_buffer first")
+        pool_entry = int(request_pool_entry)
+        if pool_entry not in self._request_ids_by_pool:
+            if request_id is not None:
+                self._request_ids_by_pool[pool_entry] = (
+                    self._encode_request_id(request_id))
+            else:
+                raise RuntimeError(
+                    f"request_pool_entry {pool_entry} not registered in "
+                    "KVIO backend and no request_id provided for "
+                    "auto-registration")
+        topk_region = self._topk_regions[int(layer_id)]
+        local_topk_buffer = topk_region.cache
+        remote_request_id = self._remote_request_id(int(request_pool_entry))
+
+        cache_ids = [topk_region.cache_id]
+        remote_request_ids = [remote_request_id]
+        cache_offsets = [0]
+        storage_offsets = [topk_region.storage_base]
+        request_lengths = [topk_count * topk_region.token_bytes]
+
+        task_id = self._next_task()
+        error_code, kernel_us = self._ops.aiv_get_batch(
+            task_id,
+            self._model_id,
+            self._pd_flag,
+            cache_ids,
+            remote_request_ids,
+            cache_offsets,
+            storage_offsets,
+            request_lengths,
+        )
+        self._check("aiv_get_batch (topk)", error_code)
+        self._wait(task_id)
+        logger.debug(
+            "DSA KVIO topk load completed: layer=%d, pool_entry=%d, "
+            "topk_count=%d, kernel_us=%s",
+            int(layer_id), int(request_pool_entry), topk_count, kernel_us)
+        return local_topk_buffer[:topk_count].clone()
+
+    def put_topk_positions(
+        self,
+        *,
+        layer_id: int,
+        request_id,
+        request_pool_entry: int,
+        topk_positions: torch.Tensor,
+        topk_count: int = TOPK_COUNT_DEFAULT,
+    ) -> None:
+        if int(layer_id) not in self._topk_regions:
+            raise RuntimeError(
+                f"TopK metadata not registered for layer {layer_id}; "
+                "call register_topk_metadata_buffer first")
+        topk_region = self._topk_regions[int(layer_id)]
+        local_topk_buffer = topk_region.cache
+        local_topk_buffer[:topk_count].copy_(topk_positions[:topk_count])
+
+        if int(request_pool_entry) not in self._request_ids_by_pool:
+            self._request_ids_by_pool[int(request_pool_entry)] = (
+                self._encode_request_id(request_id))
+        remote_request_id = self._remote_request_id(int(request_pool_entry))
+
+        cache_ids = [topk_region.cache_id]
+        remote_request_ids = [remote_request_id]
+        cache_offsets = [0]
+        storage_offsets = [topk_region.storage_base]
+        request_lengths = [topk_count * topk_region.token_bytes]
+
+        task_id = self._next_task()
+        error_code, kernel_us = self._ops.aiv_put_batch(
+            task_id,
+            self._model_id,
+            self._pd_flag,
+            cache_ids,
+            remote_request_ids,
+            cache_offsets,
+            storage_offsets,
+            request_lengths,
+        )
+        self._check("aiv_put_batch (topk)", error_code)
+        self._wait(task_id)
+        logger.debug(
+            "DSA KVIO topk put completed: layer=%d, pool_entry=%d, "
+            "topk_count=%d, kernel_us=%s",
+            int(layer_id), int(request_pool_entry), topk_count, kernel_us)
+
+    def has_topk_metadata(self) -> bool:
+        return True
+
     def close(self) -> None:
         if not self._initialized:
             return
@@ -284,4 +420,6 @@ class KVIODSAKVBackend(DSAKVBackend):
         self._initialized = False
         self._regions.clear()
         self._registered_caches.clear()
+        self._topk_regions.clear()
+        self._registered_topk_buffers.clear()
         self._request_ids_by_pool.clear()

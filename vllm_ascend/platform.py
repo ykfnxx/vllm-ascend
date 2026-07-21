@@ -487,7 +487,12 @@ class NPUPlatform(Platform):
             if vllm_config.speculative_config is not None:
                 raise ValueError("DSA sparse offload does not support speculative decoding")
             if vllm_config.kv_transfer_config is not None:
-                raise ValueError("DSA sparse offload does not support KV transfer")
+                kv_role = getattr(vllm_config.kv_transfer_config, "kv_role", None)
+                if kv_role not in ("kv_consumer", "kv_both"):
+                    raise ValueError(
+                        "DSA sparse offload only supports KV transfer in "
+                        "kv_consumer or kv_both mode (PD-disaggregated decode "
+                        "or PD-mixed). kv_producer mode is not supported.")
             if ascend_config.enable_sparse_c8:
                 raise ValueError("DSA sparse offload does not support Sparse C8")
             if envs_ascend.VLLM_ASCEND_BALANCE_SCHEDULING:

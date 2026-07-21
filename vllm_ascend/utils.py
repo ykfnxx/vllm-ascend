@@ -1360,6 +1360,7 @@ def parse_layer_idx(prefix: str) -> int | None:
 
 
 DSA_MGR_WORKER = None
+DSA_TOPK_KVIO_WRITER = None
 
 
 def set_dsa_mgr_worker(worker):
@@ -1369,6 +1370,15 @@ def set_dsa_mgr_worker(worker):
 
 def get_dsa_mgr_worker():
     return DSA_MGR_WORKER
+
+
+def set_dsa_topk_kvio_writer(writer):
+    global DSA_TOPK_KVIO_WRITER
+    DSA_TOPK_KVIO_WRITER = writer
+
+
+def get_dsa_topk_kvio_writer():
+    return DSA_TOPK_KVIO_WRITER
 
 
 @lru_cache(maxsize=1)

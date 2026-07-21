@@ -62,6 +62,7 @@ from vllm_ascend.utils import (
     enable_dsa_cp_with_layer_shard,
     enable_dsa_cp_with_o_proj_tp,
     get_dsa_mgr_worker,
+    get_dsa_topk_kvio_writer,
     get_weight_prefetch_method,
     maybe_trans_nz,
 )
@@ -236,6 +237,10 @@ class AscendSFAMetadata:
     block_table: torch.Tensor
     sin: torch.Tensor
     cos: torch.Tensor
+
+    is_last_prefill_chunk_flags: torch.Tensor | None = None
+
+    request_ids: list[str] | None = None
 
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
@@ -502,6 +507,14 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             indexer_seq_lens=indexer_seq_lens,
             indexer_min_seq_len=indexer_min_seq_len,
             indexer_max_seq_len=indexer_max_seq_len,
+            is_last_prefill_chunk_flags=(
+                common_attn_metadata.is_last_prefill_chunk_flags[:num_reqs]
+                if common_attn_metadata.is_last_prefill_chunk_flags is not None
+                else None
+            ),
+            request_ids=(
+                getattr(common_attn_metadata, "request_ids", None)
+            ),
         )
 
     def build_for_graph_capture(
@@ -1299,6 +1312,47 @@ class AscendSFAImpl(MLAAttentionImpl):
                 sparse_count=2048,
                 sparse_mode=3,
             )
+
+        if (self.dsa_sparse_enabled
+                or self.is_kv_producer) and attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+            if self.dsa_sparse_enabled:
+                dsa_mgr = get_dsa_mgr_worker()
+                if dsa_mgr is not None and dsa_mgr.dsa_meta is not None:
+                    cum_query_lens = attn_metadata.cum_query_lens
+                    for req_meta in dsa_mgr.dsa_meta.requests:
+                        if req_meta.is_last_prefill_chunk:
+                            req_index = req_meta.index_in_batch
+                            last_token_row = int(cum_query_lens[req_index]) - 1
+                            if req_index > 0:
+                                first_token_row = int(cum_query_lens[req_index - 1])
+                            else:
+                                first_token_row = 0
+                            if last_token_row >= first_token_row and last_token_row < topk_indices.shape[0]:
+                                layer_id = int(layer_name.split(".")[2]) if layer_name is not None else -1
+                                if layer_id >= 0:
+                                    dsa_mgr.record_prefill_topk(
+                                        req_meta.request_id, layer_id,
+                                        topk_indices[last_token_row, :].detach().cpu().clone())
+            elif self.is_kv_producer:
+                topk_writer = get_dsa_topk_kvio_writer()
+                if topk_writer is not None and attn_metadata.is_last_prefill_chunk_flags is not None:
+                    cum_query_lens = attn_metadata.cum_query_lens
+                    is_last_flags = attn_metadata.is_last_prefill_chunk_flags
+                    request_ids = attn_metadata.request_ids
+                    layer_id = int(layer_name.split(".")[2]) if layer_name is not None else -1
+                    if layer_id >= 0 and request_ids is not None:
+                        for req_index in range(min(is_last_flags.shape[0], len(request_ids))):
+                            if is_last_flags[req_index]:
+                                last_token_row = int(cum_query_lens[req_index]) - 1
+                                if last_token_row >= 0 and last_token_row < topk_indices.shape[0]:
+                                    topk_positions = topk_indices[last_token_row, :].detach().clone()
+                                    topk_writer.put_topk(
+                                        layer_id=layer_id,
+                                        request_id=request_ids[req_index],
+                                        request_pool_entry=req_index,
+                                        topk_positions=topk_positions,
+                                    )
+
         return topk_indices
 
     def _execute_sparse_flash_attention_process(

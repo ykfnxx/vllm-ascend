@@ -60,6 +60,7 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     register_ascend_customop,
     set_dsa_mgr_worker,
+    set_dsa_topk_kvio_writer,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -259,6 +260,9 @@ class NPUWorker(WorkerBase):
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
+        if self.topk_kvio_writer is not None and not self.topk_kvio_writer._initialized:
+            self.topk_kvio_writer._num_blocks = int(num_gpu_blocks)
+            self.topk_kvio_writer.finalize_registration()
 
     def _init_device(self):
         device = torch.device(f"npu:{self.local_rank}")
@@ -364,9 +368,51 @@ class NPUWorker(WorkerBase):
                 self.device,
             )
 
+        self.topk_kvio_writer = None
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        is_kv_producer = (
+            kv_transfer_config is not None
+            and kv_transfer_config.is_kv_producer
+        )
+        if is_kv_producer and not is_dsa_sparse_config_enabled(self.vllm_config):
+            cache_config = self.vllm_config.cache_config
+            kv_backend_name = getattr(cache_config, "dsa_kv_backend", "mock")
+            if kv_backend_name == "kvio":
+                from vllm_ascend.dsa_sparse.dsa_kvio_topk_writer import (
+                    KVIOTopKMetadataWriter,
+                )
+
+                hf_config = self.vllm_config.model_config.hf_text_config
+                self.topk_kvio_writer = KVIOTopKMetadataWriter(
+                    model_id=int(cache_config.dsa_kvio_model_id),
+                    pd_flag=int(cache_config.dsa_kvio_pd_flag),
+                    max_model_len=int(self.vllm_config.model_config.max_model_len),
+                    num_layers=int(hf_config.num_hidden_layers),
+                    block_size=int(cache_config.block_size),
+                    num_blocks=0,
+                    kv_channels=int(hf_config.kv_lora_rank
+                                    if hasattr(hf_config, "kv_lora_rank")
+                                    else hf_config.hidden_size),
+                    head_dim=int(hf_config.qk_rope_head_dim
+                                 if hasattr(hf_config, "qk_rope_head_dim")
+                                 else hf_config.hidden_size // hf_config.num_attention_heads),
+                    device=self.device,
+                )
+                set_dsa_topk_kvio_writer(self.topk_kvio_writer)
+                logger.info(
+                    "P-node KVIO TopK writer created (pending finalize): "
+                    "rank=%d, device=%s, model_id=%d, pd_flag=%d",
+                    self.rank,
+                    self.device,
+                    int(cache_config.dsa_kvio_model_id),
+                    int(cache_config.dsa_kvio_pd_flag),
+                )
+
     def shutdown(self) -> None:
         if self.dsa_mgr_worker is not None:
             self.dsa_mgr_worker.kv_backend.close()
+        if self.topk_kvio_writer is not None:
+            self.topk_kvio_writer.close()
         super().shutdown()
 
     @torch.inference_mode()

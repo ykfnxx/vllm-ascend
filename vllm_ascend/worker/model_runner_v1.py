@@ -2559,6 +2559,29 @@ class NPUModelRunner(GPUModelRunner):
             prefill_context_parallel_metadata=self.long_seq_metadata,
         )
 
+        if (self.dsa_sparse_enabled
+                or (self.is_kv_producer
+                    and not self.dsa_sparse_enabled)):
+            is_last_prefill_flags = torch.zeros(
+                num_reqs_padded, dtype=torch.bool, device="cpu")
+            for req_idx in range(num_reqs):
+                req_id = self.input_batch.req_ids[req_idx]
+                req_state = self.requests[req_id]
+                num_computed = int(
+                    self.input_batch.num_computed_tokens_cpu[req_idx])
+                num_prompt = int(
+                    self.input_batch.num_prompt_tokens[req_idx])
+                num_output = len(req_state.output_token_ids)
+                num_scheduled = int(
+                    scheduler_output.num_scheduled_tokens.get(req_id, 0))
+                is_last_prefill_flags[req_idx] = (
+                    num_computed + num_scheduled >= num_prompt
+                    and num_output == 0
+                )
+            cm_base.is_last_prefill_chunk_flags = is_last_prefill_flags
+            cm_base.request_ids = list(
+                self.input_batch.req_ids[:num_reqs])
+
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
             cm_base.logits_indices_padded = self._prepare_kv_sharing_fast_prefill(logits_indices)

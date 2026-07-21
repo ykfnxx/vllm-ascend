@@ -179,6 +179,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             vllm_config.model_config.get_total_num_hidden_layers()
         )
         max_model_len = int(vllm_config.model_config.max_model_len)
+        self._max_model_len = max_model_len
         if max_model_len > DSA_LOOKUP_INDEX_CAPACITY:
             raise ValueError(
                 "DSA lookup operator supports max_model_len up to "
@@ -203,6 +204,8 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             device="cpu",
         )
         self._lookup_maintain_seed = 0
+        self._prefill_topk_by_request_layer: dict[tuple[str, int],
+                                                   torch.Tensor] = {}
 
 
     def _get_full_attention_group_id(self, kv_cache_config) -> int:
@@ -496,6 +499,20 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
                 nopek_cache=layer_cache[0],
                 ropek_cache=layer_cache[1],
             )
+            if self.kv_backend.has_topk_metadata():
+                from vllm_ascend.dsa_sparse.dsa_kvio_backend import (
+                    TOPK_COUNT_DEFAULT,
+                )
+                topk_buffer = torch.zeros(
+                    self._max_model_len,
+                    TOPK_COUNT_DEFAULT,
+                    dtype=torch.int32,
+                    device=layer_cache[0].device,
+                )
+                self.kv_backend.register_topk_metadata_buffer(
+                    layer_id=layer_id,
+                    topk_buffer=topk_buffer,
+                )
         self.kv_backend.finalize_cache_registration()
 
     def _build_layer_runtime_batch(
@@ -598,9 +615,6 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         attn_metadata,
     ):
         layer_id = layer_batch.layer_id
-        # Lightning Indexer returns original sequence token ids. Lookup maps
-        # them to arbitrary slots in the larger resident address space. The KV
-        # backend writes misses directly into those resident HBM slots.
         prebuilt_attention_indices = (
             self._forward_sparse_decode_attention_indices_tensor)
         full_batch_topk = getattr(
@@ -618,6 +632,32 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             selection_topk = full_batch_topk.index_select(
                 0, forward_batch.batch_row_indices_tensor)
         lookup_state = self.resident_token_pool.get_layer_lookup_state(layer_id)
+
+        prefill_topk_positions = None
+        if forward_batch.has_lookup_init_rows:
+            topk_rows = []
+            for req_id in forward_batch.request_ids:
+                stored = self.get_prefill_topk(req_id, layer_id)
+                if stored is not None:
+                    topk_rows.append(stored)
+                elif self.kv_backend.has_topk_metadata():
+                    pool_idx = int(
+                        self.resident_token_pool.get_index(req_id))
+                    topk_from_kvio = self.kv_backend.load_topk_positions(
+                        layer_id=layer_id,
+                        request_pool_entry=pool_idx,
+                        request_id=req_id,
+                        topk_count=self._hbm_resident_tokens,
+                    )
+                    topk_rows.append(topk_from_kvio)
+                else:
+                    topk_rows.append(
+                        torch.arange(
+                            self._hbm_resident_tokens, dtype=torch.int32))
+            prefill_topk_positions = torch.stack(topk_rows).to(
+                dtype=torch.int32,
+                device=forward_batch.resident_pool_indices_tensor.device)
+
         lookup_result = self.ops_backend.lookup_resident_update(
             layer_id=layer_id,
             kv_backend=self.kv_backend,
@@ -639,6 +679,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             lookup_init_mask=forward_batch.lookup_init_mask_tensor,
             has_lookup_init_rows=forward_batch.has_lookup_init_rows,
             maintain_seed=self._lookup_maintain_seed,
+            prefill_topk_positions=prefill_topk_positions,
         )
         sparse_attention_indices = lookup_result.attention_indices
         self._commit_lookup_resident_metadata(layer_batch)
@@ -802,6 +843,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         self.kv_backend.release_request(
             request_id=request_id, request_pool_idx=pool_idx)
         self.resident_token_pool.release(request_id)
+        self._clear_prefill_topk(request_id)
 
     def request_preempted_in_worker(self, request_id):
         self._clear_full_dump_done(request_id)
@@ -809,6 +851,21 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         self.kv_backend.release_request(
             request_id=request_id, request_pool_idx=pool_idx)
         self.resident_token_pool.release(request_id)
+        self._clear_prefill_topk(request_id)
+
+    def record_prefill_topk(self, request_id: str, layer_id: int,
+                            topk_positions: torch.Tensor):
+        self._prefill_topk_by_request_layer[(request_id, layer_id)] = (
+            topk_positions.detach().cpu().clone())
+
+    def get_prefill_topk(self, request_id: str,
+                         layer_id: int) -> torch.Tensor | None:
+        return self._prefill_topk_by_request_layer.get((request_id, layer_id))
+
+    def _clear_prefill_topk(self, request_id: str):
+        keys = [k for k in self._prefill_topk_by_request_layer if k[0] == request_id]
+        for k in keys:
+            del self._prefill_topk_by_request_layer[k]
 
     def execute_begin(self, scheduler_output: SchedulerOutput):
         pass
