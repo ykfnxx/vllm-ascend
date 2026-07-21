@@ -11,6 +11,7 @@ mock KV backend、并发请求和 Ascend profiler。除特别说明外，命令�
 | [check_asu_hbm_index_ops.py](../../check_asu_hbm_index_ops.py) | 对照 CPU 参考实现检查 lookup 和 maintain 功能 | 是 | 否 |
 | [smoke_asu_hbm_index_npugraph.py](smoke_asu_hbm_index_npugraph.py) | 检查两个算子能否进入 `npugraph_ex` 并回放 | 是 | 否 |
 | [benchmark_asu_hbm_index_ops.py](benchmark_asu_hbm_index_ops.py) | 测量单算子在不同 batch 下的 NPU 执行时间 | 是 | 否 |
+| [profile_asu_hbm_index_ops.py](profile_asu_hbm_index_ops.py) | 单独采集一个 ASU 算子并直接解析 profiler 数据 | 是 | 否 |
 | [serve_glm5_dsa_sparse.sh](serve_glm5_dsa_sparse.sh) | 以 mock KV backend 启动 DSA Sparse 服务 | 是 | 脚本负责启动 |
 | [diagnose_glm5_dsa_sparse_env.py](diagnose_glm5_dsa_sparse_env.py) | 静态检查运行中服务、安装包、模型和日志 | 否 | 是 |
 | [verify_glm5_dsa_sparse_ops.py](verify_glm5_dsa_sparse_ops.py) | 发送长请求并验证两个算子的调用日志 | 服务端需要 | 是 |
@@ -171,6 +172,57 @@ python3 examples/dsa_sparse/benchmark_asu_hbm_index_ops.py \
 
 当 `--miss-count 0` 时 maintain 会直接处理 `free_head == 0` 的场景，接近
 空操作；测试实际淘汰开销时应使用非零值。
+
+### 单算子 trace 采集及直接解析
+
+每次运行只允许选择一个算子。lookup 示例：
+
+```bash
+python3 examples/dsa_sparse/profile_asu_hbm_index_ops.py \
+  --op lookup \
+  --batch-size 8 \
+  --output-dir /data/asu-profiles/lookup-bs8
+```
+
+maintain 示例：
+
+```bash
+python3 examples/dsa_sparse/profile_asu_hbm_index_ops.py \
+  --op maintain \
+  --batch-size 8 \
+  --output-dir /data/asu-profiles/maintain-bs8
+```
+
+脚本默认先执行 10 次未采集 warmup，再连续采集 20 次目标算子调用。采集窗口
+内不恢复状态、不执行逐轮同步，也不执行 CPU/NPU 数据比较。当前算子固定为每
+请求 2048 个 query、300 次 update 或 eviction，profiling 脚本不提供
+`--miss-count`。
+
+lookup 使用 `ProfilerLevel.Level1` 和 `AiCMetrics.PipeUtilization`；maintain
+使用 `ProfilerLevel.Level2` 以保留 AI CPU 细节。两者都关闭 stack、module、
+memory 和 op-args 采集。
+
+profiler 停止后，脚本通过 `tensorboard_trace_handler` 同步解析原始数据，默认
+导出 MindStudio Insight DB。也可以通过 `--export-type text` 导出文本结果。
+输出目录必须为空，结果结构为：
+
+```text
+<output-dir>/
+  raw/
+    <trace>_ascend_pt/
+      FRAMEWORK/
+      PROF_*/
+      ASCEND_PROFILER_OUTPUT/
+  parsed/
+    profiler_info*.json
+    profiler_metadata.json
+    ASCEND_PROFILER_OUTPUT/
+      *.db
+  manifest.json
+```
+
+解析失败或没有生成预期的 DB/Text 文件时，脚本返回非零状态。原始 profile
+默认保留，可以继续交给 `parse_glm5_dsa_profile.py` 重新解析。
 
 ## 5. 启动服务并验证调用链
 
