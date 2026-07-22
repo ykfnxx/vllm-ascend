@@ -1,4 +1,4 @@
-# DMP A3 single-card migration revision 9
+# DMP A3 single-card migration revision 10
 
 Extract this archive directly into `/root/dmp`. The first validation uses the
 smallest GLM-5.1 W4A8 prefix containing a MoE layer on one A3 card, matching the
@@ -96,6 +96,12 @@ Revision 9 adds the `ops_li_update` request-pool operator from
 `xwLearnsLLM/DSA_offload_ops` commit
 `3f5c292a4f069716b683b147da71b3106e2ae2bc`, plus isolated scheme selection so
 schemes 2 and 4 retain their existing operator paths.
+
+Revision 10 makes the persistent GLM-5 Transformers runtime common to every
+scheme and validates its real import path immediately before inference. It
+also registers vLLM-Ascend variables with vLLM's environment validator. This
+revision changes only Python and launch scripts; existing custom-op builds are
+reused without recompilation.
 
 The first invocation creates a path such as
 `/models-reduced/GLM-5.1-w4a8-4layers-dmp-r2` (the exact layer count comes

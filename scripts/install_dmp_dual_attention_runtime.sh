@@ -67,9 +67,17 @@ installed_model_runtime_stamp=""
 if [[ -f "$MODEL_RUNTIME_STAMP" ]]; then
     installed_model_runtime_stamp="$(<"$MODEL_RUNTIME_STAMP")"
 fi
+model_runtime_is_ready=0
+if PYTHONPATH="$MODEL_RUNTIME_PYTHON${PYTHONPATH:+:$PYTHONPATH}" python3 -c '
+from transformers import AutoConfig
+AutoConfig.for_model("glm_moe_dsa")
+' >/dev/null 2>&1; then
+    model_runtime_is_ready=1
+fi
 
 if [[ "$have_model_wheels" == "1" && \
-      "$installed_model_runtime_stamp" != "$expected_model_runtime_stamp" ]]; then
+      ( "$installed_model_runtime_stamp" != "$expected_model_runtime_stamp" || \
+        "$model_runtime_is_ready" != "1" ) ]]; then
     echo "Deploying Transformers model runtime to persistent storage..."
     pip3 install \
         "$HUGGINGFACE_HUB_WHEEL" \

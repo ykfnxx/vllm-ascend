@@ -48,6 +48,7 @@ case "$DMP_SCHEME" in
     exit 2
     ;;
 esac
+dmp_activate_a3_model_runtime
 
 mkdir -p "$CHUNK_DIR"
 
@@ -68,6 +69,7 @@ mkdir -p "$CHUNK_DIR"
   echo "model_path: ${MODEL_PATH:-/models/GLM-5.1-w4a8}"
   echo "reduced_layers: ${REDUCED_LAYERS:-<not-set>}"
   echo "model_quantization: ${MODEL_QUANTIZATION:-ascend}"
+  echo "transformers_runtime: ${DMP_MODEL_RUNTIME_INFO:-<unknown>}"
   echo "enable_expert_parallel: ${ENABLE_EXPERT_PARALLEL:-0}"
   echo "dmp_scheme: $DMP_SCHEME"
   echo "dmp_lookup_maintain: $VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN"

@@ -10,6 +10,7 @@ from standard_run_config import (
     DEFAULT_PROMPT_TOKENS,
     DEFAULT_TENSOR_PARALLEL_SIZE,
     DEFAULT_VISIBLE_DEVICES,
+    activate_model_runtime,
     build_token_prompts,
     configure_dmp_runtime,
     load_seed_texts,
@@ -24,6 +25,8 @@ from standard_run_config import (
 # Use one physical NPU card by default.
 # This must be set before importing torch_npu / vLLM.
 VISIBLE_DEVICES = os.getenv("VISIBLE_DEVICES", DEFAULT_VISIBLE_DEVICES)
+SCRIPT_DIR = Path(__file__).resolve().parent
+TRANSFORMERS_RUNTIME = activate_model_runtime(SCRIPT_DIR)
 # Defaults to scheme 4. The wrapper can select scheme 3 with DMP_SCHEME=3:
 # S0=fused Indexer+Select update, S1=one local mock KVIO per microbatch,
 # then S0 runs selected-cache SFA. The linked fused branch has no separate
@@ -35,7 +38,6 @@ CUSTOM_OPP_PATH = configure_dmp_runtime(VISIBLE_DEVICES)
 preload_dmp_operator_libraries(CUSTOM_OPP_PATH)
 
 # Profiling output.
-SCRIPT_DIR = Path(__file__).resolve().parent
 PROFILE_DIR = SCRIPT_DIR / "vllm_profile"
 PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ["VLLM_TORCH_PROFILER_DIR"] = str(PROFILE_DIR)

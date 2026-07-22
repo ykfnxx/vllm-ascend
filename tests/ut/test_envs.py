@@ -15,8 +15,11 @@
 import inspect
 import os
 
+import vllm.envs as envs_vllm
+
 import vllm_ascend.envs as envs_ascend
 from tests.ut.base import TestBase
+from vllm_ascend import register_envs
 
 
 class TestEnvVariables(TestBase):
@@ -60,3 +63,14 @@ class TestEnvVariables(TestBase):
         for var_name in self.env_vars:
             with self.subTest(var=var_name):
                 getattr(envs_ascend, var_name)
+
+    def test_registers_plugin_envs_with_vllm_validator(self):
+        register_envs()
+        for var_name in (
+            "VLLM_ASCEND_ENABLE_DMP",
+            "VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT",
+            "VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN",
+            "VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION",
+            "VLLM_TORCH_PROFILER_DIR",
+        ):
+            self.assertIn(var_name, envs_vllm.environment_variables)

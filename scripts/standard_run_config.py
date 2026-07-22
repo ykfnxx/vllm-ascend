@@ -3,6 +3,7 @@ import ctypes
 import json
 import os
 import sys
+from importlib import import_module
 from pathlib import Path
 
 DEFAULT_BATCH_SIZE = 64
@@ -39,6 +40,48 @@ DEFAULT_VLLM_ASCEND_OP_API_PATH = (
     "vendors/vllm-ascend/op_api/lib"
 )
 _PRELOADED_OPERATOR_LIBRARIES: list[ctypes.CDLL] = []
+
+
+def activate_model_runtime(script_dir: Path) -> str:
+    """Load the persistent GLM Transformers build before importing vLLM."""
+    runtime = Path(
+        os.getenv(
+            "DMP_MODEL_RUNTIME_PYTHON_PATH",
+            str(script_dir / "dmp-model-runtime/python"),
+        )
+    ).resolve()
+    runtime_text = str(runtime)
+    sys.path[:] = [
+        entry
+        for entry in sys.path
+        if not entry or os.path.normpath(entry) != os.path.normpath(runtime_text)
+    ]
+    sys.path.insert(0, runtime_text)
+    current_pythonpath = [
+        entry
+        for entry in os.getenv("PYTHONPATH", "").split(os.pathsep)
+        if entry and os.path.normpath(entry) != os.path.normpath(runtime_text)
+    ]
+    os.environ["DMP_MODEL_RUNTIME_PYTHON_PATH"] = runtime_text
+    os.environ["PYTHONPATH"] = os.pathsep.join([runtime_text, *current_pythonpath])
+
+    try:
+        transformers = import_module("transformers")
+        transformers.AutoConfig.for_model("glm_moe_dsa")
+    except (AttributeError, ImportError, ValueError) as exc:
+        raise RuntimeError(
+            "The active Transformers runtime does not support "
+            f"model_type=glm_moe_dsa. Expected persistent runtime: {runtime_text}"
+        ) from exc
+
+    module_path = Path(transformers.__file__).resolve()
+    persistent_package = runtime / "transformers"
+    if persistent_package.is_dir() and runtime not in module_path.parents:
+        raise RuntimeError(
+            "The persistent GLM Transformers package was shadowed by "
+            f"{module_path}; expected a module below {runtime_text}"
+        )
+    return str(module_path)
 
 
 def configure_dmp_runtime(visible_devices: str) -> str:

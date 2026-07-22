@@ -30,6 +30,7 @@ runtime_artifacts_ready() {
     local fused_stamp="$SCRIPT_DIR/dmp-fused-indexer-kv-select/opp/.a3-fused-indexer-pool-r1"
     local dual_vendor="$SCRIPT_DIR/dmp-runtime/opp/vendors/customize"
     local lookup_vendor="$SCRIPT_DIR/dmp-lookup-maintain/opp/vendors/customize"
+    local model_runtime="${DMP_MODEL_RUNTIME_PYTHON_PATH:-$SCRIPT_DIR/dmp-model-runtime/python}"
 
     [[ -f "$dual_stamp" ]] &&
     [[ "$(<"$dual_stamp")" == "A3_DUAL_ATTENTION_RUNTIME_REVISION=4" ]] &&
@@ -46,7 +47,11 @@ runtime_artifacts_ready() {
         >/dev/null &&
     compgen -G \
         "$SCRIPT_DIR/dmp-fused-indexer-kv-select/torch_extension/lightning_indexer_decode_custom_ops/*.so" \
-        >/dev/null
+        >/dev/null &&
+    PYTHONPATH="$model_runtime${PYTHONPATH:+:$PYTHONPATH}" python3 -c '
+from transformers import AutoConfig
+AutoConfig.for_model("glm_moe_dsa")
+' >/dev/null 2>&1
 }
 
 echo "[bootstrap] Checking and preparing the complete A3 DMP runtime."

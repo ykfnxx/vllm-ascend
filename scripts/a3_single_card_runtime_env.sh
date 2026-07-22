@@ -21,3 +21,34 @@ dmp_configure_a3_single_card_rendezvous() {
         return 1
     fi
 }
+
+# Put the persistent GLM-5 Transformers build ahead of the image packages for
+# both the frontend and every child process started by vLLM.
+dmp_activate_a3_model_runtime() {
+    local script_dir
+    local model_runtime
+    local runtime_info
+
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    model_runtime="${DMP_MODEL_RUNTIME_PYTHON_PATH:-$script_dir/dmp-model-runtime/python}"
+    export DMP_MODEL_RUNTIME_PYTHON_PATH="$model_runtime"
+    export PYTHONPATH="$model_runtime${PYTHONPATH:+:$PYTHONPATH}"
+
+    if ! runtime_info="$(python3 - <<'PY'
+from pathlib import Path
+
+import transformers
+from transformers import AutoConfig
+
+AutoConfig.for_model("glm_moe_dsa")
+print(Path(transformers.__file__).resolve())
+PY
+    )"; then
+        echo "The active Python environment does not support model_type=glm_moe_dsa." >&2
+        echo "Expected the persistent runtime at: $model_runtime" >&2
+        echo "Run /workspace/scripts/build_a3_dmp_runtime.sh once." >&2
+        return 1
+    fi
+
+    export DMP_MODEL_RUNTIME_INFO="$runtime_info"
+}

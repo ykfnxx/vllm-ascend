@@ -16,8 +16,20 @@
 #
 
 
+def register_envs():
+    """Expose plugin environment variables to vLLM's validator."""
+    import vllm.envs as envs_vllm
+
+    from vllm_ascend.envs import env_variables
+
+    for name, getter in env_variables.items():
+        envs_vllm.environment_variables.setdefault(name, getter)
+
+
 def register():
     """Register the NPU platform."""
+
+    register_envs()
 
     return "vllm_ascend.platform.NPUPlatform"
 

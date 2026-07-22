@@ -143,6 +143,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DMP_HIXL_CONFIG": lambda: os.getenv(
         "VLLM_ASCEND_DMP_HIXL_CONFIG", "/workspace/scripts/dmp_hixl_config.json"
     ),
+    # Profiling destination propagated to EngineCore worker processes.
+    "VLLM_TORCH_PROFILER_DIR": lambda: os.getenv("VLLM_TORCH_PROFILER_DIR", None),
     "VLLM_ASCEND_ENABLE_DMP": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DMP", "0"))),
 }
 
