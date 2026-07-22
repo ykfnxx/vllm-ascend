@@ -146,7 +146,31 @@ def main() -> None:
         f"actual={actual_copied_count}"
     )
     selection_flat = selection_kv_cache.view(args.batch_size, TOTAL_SLOTS, 16)
-    assert selection_flat[0, RESIDENT_SLOTS, 0].cpu().item() == RESIDENT_SLOTS
+    selection_rope_flat = selection_k_rope.view(args.batch_size, TOTAL_SLOTS, 16)
+    physical_row_stride = blocks_per_full_row * block_size
+    expected_miss_values = (
+        torch.arange(
+            RESIDENT_SLOTS,
+            RESIDENT_SLOTS + FIXED_MISS_COUNT,
+            dtype=torch.float32,
+        )
+        .view(1, -1)
+        .expand(args.batch_size, -1)
+        + torch.arange(args.batch_size, dtype=torch.float32).view(-1, 1)
+        * physical_row_stride
+    ).to(torch.float16)
+    torch.testing.assert_close(
+        selection_flat[
+            :, RESIDENT_SLOTS : RESIDENT_SLOTS + FIXED_MISS_COUNT, 0
+        ].cpu(),
+        expected_miss_values,
+    )
+    torch.testing.assert_close(
+        selection_rope_flat[
+            :, RESIDENT_SLOTS : RESIDENT_SLOTS + FIXED_MISS_COUNT, 0
+        ].cpu(),
+        expected_miss_values + 0.25,
+    )
 
     torch.ops.dmp_lookup_maintain.asu_hbm_index_maintain_aicpu(
         token_to_slot,

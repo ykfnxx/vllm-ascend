@@ -26,7 +26,7 @@ dmp_configure_a3_single_card_rendezvous
 
 runtime_artifacts_ready() {
     local dual_stamp="$SCRIPT_DIR/dmp-runtime/.a3-dual-attention-r4"
-    local lookup_stamp="$SCRIPT_DIR/dmp-lookup-maintain/opp/.a3-lookup-maintain-r6"
+    local lookup_stamp="$SCRIPT_DIR/dmp-lookup-maintain/opp/.a3-lookup-maintain-r7"
     local fused_stamp="$SCRIPT_DIR/dmp-fused-indexer-kv-select/opp/.a3-fused-indexer-pool-r1"
     local dual_vendor="$SCRIPT_DIR/dmp-runtime/opp/vendors/customize"
     local lookup_vendor="$SCRIPT_DIR/dmp-lookup-maintain/opp/vendors/customize"
@@ -35,7 +35,7 @@ runtime_artifacts_ready() {
     [[ -f "$dual_stamp" ]] &&
     [[ "$(<"$dual_stamp")" == "A3_DUAL_ATTENTION_RUNTIME_REVISION=4" ]] &&
     [[ -f "$lookup_stamp" ]] &&
-    [[ "$(<"$lookup_stamp")" == "A3_LOOKUP_MAINTAIN_RUNTIME_REVISION=6" ]] &&
+    [[ "$(<"$lookup_stamp")" == "A3_LOOKUP_MAINTAIN_RUNTIME_REVISION=7" ]] &&
     [[ -f "$fused_stamp" ]] &&
     [[ "$(<"$fused_stamp")" == "A3_FUSED_INDEXER_POOL_RUNTIME_REVISION=1" ]] &&
     [[ -f "$dual_vendor/op_api/lib/libcust_opapi.so" ]] &&

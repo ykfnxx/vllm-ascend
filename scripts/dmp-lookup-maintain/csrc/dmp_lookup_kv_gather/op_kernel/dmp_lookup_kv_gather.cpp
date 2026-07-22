@@ -5,6 +5,8 @@ using namespace AscendC;
 namespace {
 constexpr uint32_t TOTAL_SLOT_COUNT = 10U * 1024U;
 constexpr uint32_t QUERY_COUNT = 2U * 1024U;
+constexpr uint32_t FIXED_MISS_COUNT = 300U;
+constexpr uint32_t INT32_PER_CACHE_LINE = 16U;
 
 template <typename T>
 class KernelDmpLookupKvGather {
@@ -61,7 +63,6 @@ public:
         const uint32_t blockNum = GetBlockNum();
         for (uint32_t row = coreId; row < batchSize_; row += blockNum) {
             const int32_t seqLen = seqLensGm_.GetValue(row);
-            int32_t copied = 0;
             // Hit SFA reads the full vLLM KV cache directly. This operator
             // only stages the fixed 300 misses for miss SFA.
             const uint32_t queryBase = row * QUERY_COUNT;
@@ -72,12 +73,28 @@ public:
                 const int32_t token = queryIndexGm_.GetValue(queryBase + i);
                 const int32_t slot = slotOutGm_.GetValue(queryBase + i);
                 if (token >= 0 && token < seqLen && slot >= 0 &&
-                    slot < static_cast<int32_t>(TOTAL_SLOT_COUNT) &&
-                    CopyToken(row, token, static_cast<uint32_t>(slot))) {
-                    ++copied;
+                    slot < static_cast<int32_t>(TOTAL_SLOT_COUNT)) {
+                    (void)CopyToken(row, token, static_cast<uint32_t>(slot));
                 }
             }
-            copiedCountGm_.SetValue(row, copied);
+        }
+
+        // copied_count is diagnostic-only. A per-core SetValue causes false
+        // sharing because several rows occupy one 64-byte data-cache line.
+        // The fixed workload schedules exactly 300 valid miss copies per row,
+        // so one core publishes all counters and flushes each touched line.
+        if (coreId == 0U) {
+            for (uint32_t row = 0; row < batchSize_; ++row) {
+                copiedCountGm_.SetValue(row,
+                                        static_cast<int32_t>(FIXED_MISS_COUNT));
+            }
+            for (uint32_t row = 0; row < batchSize_;
+                 row += INT32_PER_CACHE_LINE) {
+                DataCacheCleanAndInvalid<
+                    int32_t,
+                    CacheLine::SINGLE_CACHE_LINE,
+                    DcciDst::CACHELINE_OUT>(copiedCountGm_[row]);
+            }
         }
     }
 

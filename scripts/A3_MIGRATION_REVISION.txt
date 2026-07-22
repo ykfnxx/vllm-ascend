@@ -1,3 +1,3 @@
-DMP A3 migration revision 11
+DMP A3 migration revision 12
 Base image: quay.io/ascend/vllm-ascend:v0.18.0-a3-openeuler
-Scheme: r9 plus upstream fixed-300 CANN-managed ParallelFor Maintain
+Scheme: r9 plus parallel Maintain and cache-safe fixed-300 KVGather diagnostics

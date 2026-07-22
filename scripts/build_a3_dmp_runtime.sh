@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VISIBLE_DEVICES="${VISIBLE_DEVICES:-0}"
 LOG_DIR="$SCRIPT_DIR/logs/a3_runtime_build_$(date +%Y%m%d_%H%M%S)"
 DUAL_STAMP="$SCRIPT_DIR/dmp-runtime/.a3-dual-attention-r4"
-LOOKUP_STAMP="$SCRIPT_DIR/dmp-lookup-maintain/opp/.a3-lookup-maintain-r6"
+LOOKUP_STAMP="$SCRIPT_DIR/dmp-lookup-maintain/opp/.a3-lookup-maintain-r7"
 FUSED_STAMP="$SCRIPT_DIR/dmp-fused-indexer-kv-select/opp/.a3-fused-indexer-pool-r1"
 FORCE_REBUILD="${DMP_FORCE_REBUILD:-0}"
 mkdir -p "$LOG_DIR"
@@ -43,7 +43,7 @@ lookup_artifacts_present() {
 
 lookup_ready() {
     [[ -f "$LOOKUP_STAMP" ]] &&
-    [[ "$(<"$LOOKUP_STAMP")" == "A3_LOOKUP_MAINTAIN_RUNTIME_REVISION=6" ]] &&
+    [[ "$(<"$LOOKUP_STAMP")" == "A3_LOOKUP_MAINTAIN_RUNTIME_REVISION=7" ]] &&
     lookup_artifacts_present
 }
 
@@ -85,7 +85,7 @@ if [[ "$FORCE_REBUILD" == "1" ]] || ! lookup_ready; then
     bash "$SCRIPT_DIR/build_dmp_lookup_maintain.sh" 2>&1 \
         | tee "$LOG_DIR/lookup_maintain.log"
     mkdir -p "$(dirname "$LOOKUP_STAMP")"
-    printf '%s\n' 'A3_LOOKUP_MAINTAIN_RUNTIME_REVISION=6' > "$LOOKUP_STAMP"
+    printf '%s\n' 'A3_LOOKUP_MAINTAIN_RUNTIME_REVISION=7' > "$LOOKUP_STAMP"
 else
     echo "[2/4] Lookup/Maintain runtime is already complete; skipping rebuild."
 fi
