@@ -10,7 +10,7 @@ FALLBACK_BATCH_SIZE = 48
 DEFAULT_OUTPUT_TOKENS = 10
 DEFAULT_PROMPT_TOKENS = 128 * 1024
 DEFAULT_MAX_MODEL_LEN = 132000
-DEFAULT_VISIBLE_DEVICES = "6"
+DEFAULT_VISIBLE_DEVICES = "0"
 DEFAULT_TENSOR_PARALLEL_SIZE = 1
 DEFAULT_DMP_STREAM_MODE = "two"
 DEFAULT_DMP_KV_BACKEND = "local"
@@ -208,7 +208,9 @@ def preload_dmp_operator_libraries(vendor_root: str) -> None:
     )
     old_library_path = os.path.join(vllm_op_api_path, "libcust_opapi.so")
     try:
-        old_library = ctypes.CDLL(old_library_path, mode=ctypes.RTLD_LOCAL)
+        # vllm_ascend_C links against this base opapi. Make its symbols global
+        # before loading the isolated DMP libraries with RTLD_DEEPBIND.
+        old_library = ctypes.CDLL(old_library_path, mode=ctypes.RTLD_GLOBAL)
     except OSError as exc:
         raise RuntimeError(
             f"Failed to load the bundled vllm-ascend operator library: {old_library_path}"

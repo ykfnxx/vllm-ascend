@@ -6,14 +6,17 @@ OP_ROOT="${DMP_DUAL_ATTENTION_OP_ROOT:-$SCRIPT_DIR/pip-cache-dual-attention}"
 RUNTIME_ROOT="${DMP_DUAL_ATTENTION_RUNTIME_ROOT:-$SCRIPT_DIR/dmp-runtime}"
 PERSISTENT_OPP="$RUNTIME_ROOT/opp"
 PERSISTENT_PYTHON="$RUNTIME_ROOT/python"
+MODEL_RUNTIME_PYTHON="${DMP_MODEL_RUNTIME_PYTHON_PATH:-$SCRIPT_DIR/dmp-model-runtime/python}"
 INSTALLED_OP_API="$PERSISTENT_OPP/vendors/customize/op_api/lib/libcust_opapi.so"
 OPP_STAMP="$PERSISTENT_OPP/.dmp-opp-package.sha256"
 WHEEL_STAMP="$PERSISTENT_PYTHON/.dmp-custom-ops-wheel.sha256"
-TRANSFORMERS_WHEEL="${DMP_TRANSFORMERS_WHEEL:-/workspace/transformers-5.2.0-py3-none-any.whl}"
-HUGGINGFACE_HUB_WHEEL="${DMP_HUGGINGFACE_HUB_WHEEL:-/workspace/huggingface_hub-1.22.0-py3-none-any.whl}"
-MODEL_RUNTIME_STAMP="$PERSISTENT_PYTHON/.dmp-model-runtime.sha256"
+source "$SCRIPT_DIR/resolve_model_runtime_wheels.sh"
+dmp_resolve_model_runtime_wheels
+TRANSFORMERS_WHEEL="$DMP_RESOLVED_TRANSFORMERS_WHEEL"
+HUGGINGFACE_HUB_WHEEL="$DMP_RESOLVED_HUGGINGFACE_HUB_WHEEL"
+MODEL_RUNTIME_STAMP="$MODEL_RUNTIME_PYTHON/.dmp-model-runtime.sha256"
 
-mkdir -p "$PERSISTENT_OPP" "$PERSISTENT_PYTHON"
+mkdir -p "$PERSISTENT_OPP" "$PERSISTENT_PYTHON" "$MODEL_RUNTIME_PYTHON"
 
 RUN_PKG=""
 if [[ -d "$OP_ROOT/op/ascendc/output" ]]; then
@@ -47,42 +50,46 @@ if [[ -f "$WHEEL_STAMP" ]]; then
     installed_wheel_stamp="$(<"$WHEEL_STAMP")"
 fi
 
+have_model_wheels=1
 for wheel in "$TRANSFORMERS_WHEEL" "$HUGGINGFACE_HUB_WHEEL"; do
-    if [[ ! -f "$wheel" ]]; then
-        echo "Required model runtime wheel not found: $wheel" >&2
-        exit 1
-    fi
+    [[ -n "$wheel" && -f "$wheel" ]] || have_model_wheels=0
 done
-
-expected_model_runtime_stamp="$(
-    sha256sum "$TRANSFORMERS_WHEEL" "$HUGGINGFACE_HUB_WHEEL" \
-        | awk '{print $1}' \
-        | sha256sum \
-        | awk '{print $1}'
-)"
+expected_model_runtime_stamp=""
+if [[ "$have_model_wheels" == "1" ]]; then
+    expected_model_runtime_stamp="$(
+        sha256sum "$TRANSFORMERS_WHEEL" "$HUGGINGFACE_HUB_WHEEL" \
+            | awk '{print $1}' \
+            | sha256sum \
+            | awk '{print $1}'
+    )"
+fi
 installed_model_runtime_stamp=""
 if [[ -f "$MODEL_RUNTIME_STAMP" ]]; then
     installed_model_runtime_stamp="$(<"$MODEL_RUNTIME_STAMP")"
 fi
 
-if [[ "$installed_model_runtime_stamp" != "$expected_model_runtime_stamp" ]]; then
+if [[ "$have_model_wheels" == "1" && \
+      "$installed_model_runtime_stamp" != "$expected_model_runtime_stamp" ]]; then
     echo "Deploying Transformers model runtime to persistent storage..."
     pip3 install \
         "$HUGGINGFACE_HUB_WHEEL" \
         "$TRANSFORMERS_WHEEL" \
-        --target "$PERSISTENT_PYTHON" \
+        --target "$MODEL_RUNTIME_PYTHON" \
         --upgrade \
         --no-deps
     printf '%s\n' "$expected_model_runtime_stamp" > "$MODEL_RUNTIME_STAMP"
 fi
 
-if ! PYTHONPATH="$PERSISTENT_PYTHON${PYTHONPATH:+:$PYTHONPATH}" python3 -c '
+if ! PYTHONPATH="$MODEL_RUNTIME_PYTHON:$PERSISTENT_PYTHON${PYTHONPATH:+:$PYTHONPATH}" python3 -c '
 from transformers import AutoConfig
 AutoConfig.for_model("glm_moe_dsa")
 ' >/dev/null 2>&1; then
-    echo "Persistent Transformers runtime does not support model_type=glm_moe_dsa." >&2
-    echo "Check the mounted wheel: $TRANSFORMERS_WHEEL" >&2
+    echo "The A3 image Transformers runtime does not support model_type=glm_moe_dsa." >&2
+    echo "Provide Transformers 5.2 wheels or use the official v0.18.0 A3 image." >&2
     exit 1
+fi
+if [[ "$have_model_wheels" != "1" ]]; then
+    echo "Using the GLM-5.1 Transformers runtime bundled in the A3 image."
 fi
 
 if [[ -n "$RUN_PKG" && ( ! -f "$INSTALLED_OP_API" || "$installed_opp_stamp" != "$expected_opp_stamp" ) ]]; then

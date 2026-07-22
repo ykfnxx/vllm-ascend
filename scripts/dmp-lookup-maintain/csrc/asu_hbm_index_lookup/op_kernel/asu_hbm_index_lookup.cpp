@@ -259,6 +259,7 @@ extern "C" __global__ __aicore__ void asu_hbm_index_lookup(GM_ADDR index,
                                                             GM_ADDR tiling)
 {
     (void)workspace;
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     GET_TILING_DATA(tilingData, tiling);
     TPipe pipe;
     KernelAsuHbmIndexLookup op;

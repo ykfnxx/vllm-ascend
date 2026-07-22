@@ -11,6 +11,7 @@ if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
 fi
 
 _dmp_lookup_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$_dmp_lookup_script_dir/resolve_model_runtime_wheels.sh"
 export VISIBLE_DEVICES="${VISIBLE_DEVICES:-6}"
 export ASCEND_RT_VISIBLE_DEVICES="$VISIBLE_DEVICES"
 export VLLM_ASCEND_ENABLE_DMP=1
@@ -46,11 +47,14 @@ if ! PYTHONPATH="$_dmp_model_runtime${PYTHONPATH:+:$PYTHONPATH}" python3 -c '
 from transformers import AutoConfig
 AutoConfig.for_model("glm_moe_dsa")
 ' >/dev/null 2>&1; then
-    _dmp_transformers_wheel="${DMP_TRANSFORMERS_WHEEL:-/workspace/transformers-5.2.0-py3-none-any.whl}"
-    _dmp_huggingface_wheel="${DMP_HUGGINGFACE_HUB_WHEEL:-/workspace/huggingface_hub-1.22.0-py3-none-any.whl}"
+    dmp_resolve_model_runtime_wheels
+    _dmp_transformers_wheel="$DMP_RESOLVED_TRANSFORMERS_WHEEL"
+    _dmp_huggingface_wheel="$DMP_RESOLVED_HUGGINGFACE_HUB_WHEEL"
     for _dmp_model_wheel in "$_dmp_huggingface_wheel" "$_dmp_transformers_wheel"; do
-        if [[ ! -f "$_dmp_model_wheel" ]]; then
-            echo "Required GLM-5 model runtime wheel is missing: $_dmp_model_wheel" >&2
+        if [[ -z "$_dmp_model_wheel" || ! -f "$_dmp_model_wheel" ]]; then
+            echo "Required GLM-5 model runtime wheel was not found." >&2
+            echo "Expected huggingface_hub-1.22.0*.whl and transformers-5.2.0*.whl under /root/dmp on the host." >&2
+            echo "The new container exposes them under /dmp-host." >&2
             return 1 2>/dev/null || exit 1
         fi
     done
@@ -116,4 +120,6 @@ unset _dmp_lookup_nounset_was_on _dmp_lookup_script_dir \
     _dmp_lookup_python _dmp_lookup_dual_python \
     _dmp_model_runtime _dmp_transformers_wheel _dmp_huggingface_wheel \
     _dmp_model_wheel _dmp_lookup_filtered_opp _dmp_lookup_opp_entries \
-    _dmp_lookup_entry
+    _dmp_lookup_entry DMP_RESOLVED_TRANSFORMERS_WHEEL \
+    DMP_RESOLVED_HUGGINGFACE_HUB_WHEEL
+unset -f dmp_resolve_model_runtime_wheels

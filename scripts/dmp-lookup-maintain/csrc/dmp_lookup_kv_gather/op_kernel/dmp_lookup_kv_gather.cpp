@@ -178,6 +178,10 @@ extern "C" __global__ __aicore__ void dmp_lookup_kv_gather(
     (void)selectionKRopeOut;
     (void)selectionKvCacheOut;
     (void)workspace;
+    // This kernel only uses AIV data movement and scalar bookkeeping. On A3,
+    // task-type inference may otherwise select AIC, which immediately returns
+    // below and leaves copiedCount unwritten.
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     if (g_coreType == AIC) {
         return;
     }

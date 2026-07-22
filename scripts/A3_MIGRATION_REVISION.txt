@@ -1,0 +1,3 @@
+DMP A3 migration revision 7
+Base image: quay.io/ascend/vllm-ascend:v0.18.0-a3-openeuler
+Scheme: DMP Lookup/Maintain r9, A3 native-extension preservation, MoE-aware reduced checkpoint

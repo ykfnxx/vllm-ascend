@@ -139,7 +139,12 @@ def main() -> None:
         seq_lens,
     )
     torch_npu.npu.synchronize()
-    assert copied_count.cpu().tolist() == [FIXED_MISS_COUNT] * args.batch_size
+    actual_copied_count = copied_count.cpu().tolist()
+    expected_copied_count = [FIXED_MISS_COUNT] * args.batch_size
+    assert actual_copied_count == expected_copied_count, (
+        f"KVGather copied_count mismatch: expected={expected_copied_count}, "
+        f"actual={actual_copied_count}"
+    )
     selection_flat = selection_kv_cache.view(args.batch_size, TOTAL_SLOTS, 16)
     assert selection_flat[0, RESIDENT_SLOTS, 0].cpu().item() == RESIDENT_SLOTS
 

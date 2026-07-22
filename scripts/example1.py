@@ -69,6 +69,11 @@ MAX_MODEL_LEN = int(os.getenv("MAX_MODEL_LEN", str(DEFAULT_MAX_MODEL_LEN)))
 TENSOR_PARALLEL_SIZE = int(
     os.getenv("TENSOR_PARALLEL_SIZE", str(DEFAULT_TENSOR_PARALLEL_SIZE))
 )
+MODEL_PATH = os.getenv("MODEL_PATH", "/models/GLM-5.1-w4a8")
+MODEL_QUANTIZATION = os.getenv("MODEL_QUANTIZATION", "ascend").strip().lower()
+MODEL_DTYPE = os.getenv("MODEL_DTYPE", "auto")
+ENABLE_EXPERT_PARALLEL = os.getenv("ENABLE_EXPERT_PARALLEL", "0") == "1"
+quantization = None if MODEL_QUANTIZATION in ("", "none") else MODEL_QUANTIZATION
 _, measured_seed = load_seed_texts(PROMPT_FILE)
 validate_context_length(PROMPT_TOKENS, OUTPUT_TOKENS, MAX_MODEL_LEN)
 
@@ -93,15 +98,16 @@ compilation_config = CompilationConfig(
 )
 
 llm = LLM(
-    model="/models/GLM-5.1",
+    model=MODEL_PATH,
     served_model_name="glm-5",
-    quantization=None,
-    dtype="bfloat16",
+    quantization=quantization,
+    dtype=MODEL_DTYPE,
     disable_log_stats=True,
     load_format="safetensors",
     skip_tokenizer_init=False,
     tensor_parallel_size=TENSOR_PARALLEL_SIZE,
     pipeline_parallel_size=1,
+    enable_expert_parallel=ENABLE_EXPERT_PARALLEL,
     enforce_eager=False,
     enable_chunked_prefill=True,
     enable_prefix_caching=True,
