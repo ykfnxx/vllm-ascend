@@ -6,12 +6,13 @@ namespace {
 
 constexpr uint32_t INDEX_SIZE = 128U * 1024U;
 constexpr uint32_t SLOT_COUNT = 10U * 1024U;
+constexpr uint32_t FREE_SLOT_COUNT = 2U * 1024U;
 constexpr uint32_t QUERY_COUNT = 2U * 1024U;
-constexpr uint32_t RESIDENT_SLOT_COUNT = 8U * 1024U;
-constexpr uint32_t FIXED_UPDATE_COUNT = 300U;
-constexpr uint32_t FIXED_HIT_COUNT = QUERY_COUNT - FIXED_UPDATE_COUNT;
 constexpr uint32_t INDEX_TILE_LEN = 16U * 1024U;
+constexpr uint32_t FREE_HEAD_STRIDE = 16U;
 constexpr int32_t NOT_FOUND = -1;
+static_assert(FREE_HEAD_STRIDE * sizeof(int32_t) == 64U,
+              "free_head row must occupy one 64-byte cache line");
 
 class KernelAsuHbmIndexLookup {
 public:
@@ -34,8 +35,8 @@ public:
 
         indexGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(index));
         slotToIndexGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(slotToIndex));
-        (void)freeSlots;
-        (void)freeHead;
+        freeSlotsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(freeSlots));
+        freeHeadGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(freeHead));
         reqPoolEntriesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(reqPoolEntries), reqNum_);
         queryIndexGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(queryIndex), reqNum_ * QUERY_COUNT);
         lookupMaskGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(lookupMask), reqNum_ * QUERY_COUNT);
@@ -93,7 +94,10 @@ public:
             uint32_t poolEntry = static_cast<uint32_t>(reqPoolEntriesGm_.GetValue(reqId));
             uint32_t indexReqBase = poolEntry * INDEX_SIZE;
             uint32_t slotReqBase = poolEntry * SLOT_COUNT;
+            uint32_t freeReqBase = poolEntry * FREE_SLOT_COUNT;
+            uint32_t freeHeadOffset = poolEntry * FREE_HEAD_STRIDE;
             uint32_t queryReqBase = reqId * QUERY_COUNT;
+            int32_t freeHead = freeHeadGm_.GetValue(freeHeadOffset);
 
             DataCopy(queryTile, queryIndexGm_[queryReqBase], QUERY_COUNT);
             DataCopy(lookupMaskInputTile, lookupMaskGm_[queryReqBase], QUERY_COUNT);
@@ -135,25 +139,18 @@ public:
                     continue;
                 }
                 int32_t slot = outTile.GetValue(i);
-                if (i < FIXED_HIT_COUNT) {
-                    // Keep the full lookup read path, but always return a legal
-                    // resident slot when the synthetic state has no mapping.
+                if (slot == NOT_FOUND) {
+                    int32_t indexId = queryTile.GetValue(i);
+                    slot = indexGm_.GetValue(indexReqBase + static_cast<uint32_t>(indexId));
                     if (slot == NOT_FOUND) {
-                        slot = static_cast<int32_t>(i);
+                        slot = freeSlotsGm_.GetValue(freeReqBase + static_cast<uint32_t>(freeHead));
+                        ++freeHead;
+                        indexGm_.SetValue(indexReqBase + static_cast<uint32_t>(indexId), slot);
+                        slotToIndexGm_.SetValue(slotReqBase + static_cast<uint32_t>(slot), indexId);
+                        missTile.SetValue(i, static_cast<int32_t>(1));
                     }
-                } else {
-                    // Fixed-workload mode: model exactly 300 index updates per
-                    // request without consuming free_slots/free_head.
-                    const int32_t indexId = queryTile.GetValue(i);
-                    slot = static_cast<int32_t>(
-                        RESIDENT_SLOT_COUNT + i - FIXED_HIT_COUNT);
-                    indexGm_.SetValue(
-                        indexReqBase + static_cast<uint32_t>(indexId), slot);
-                    slotToIndexGm_.SetValue(
-                        slotReqBase + static_cast<uint32_t>(slot), indexId);
-                    missTile.SetValue(i, static_cast<int32_t>(1));
+                    outTile.SetValue(i, slot);
                 }
-                outTile.SetValue(i, slot);
             }
 
             // Scalar reads queryTile and may update outTile. Order both
@@ -163,6 +160,10 @@ public:
             DataCopy(slotOutGm_[queryReqBase], outTile, QUERY_COUNT);
             DataCopy(missOutGm_[queryReqBase], missTile, QUERY_COUNT);
             SyncPipelines<HardEvent::MTE3_V>();
+            freeHeadGm_.SetValue(freeHeadOffset, freeHead);
+            DataCacheCleanAndInvalid<int32_t,
+                                     CacheLine::SINGLE_CACHE_LINE,
+                                     DcciDst::CACHELINE_OUT>(freeHeadGm_[freeHeadOffset]);
         }
     }
 
@@ -190,6 +191,8 @@ private:
 
     GlobalTensor<int32_t> indexGm_;
     GlobalTensor<int32_t> slotToIndexGm_;
+    GlobalTensor<int32_t> freeSlotsGm_;
+    GlobalTensor<int32_t> freeHeadGm_;
     GlobalTensor<int32_t> reqPoolEntriesGm_;
     GlobalTensor<int32_t> queryIndexGm_;
     GlobalTensor<int32_t> lookupMaskGm_;

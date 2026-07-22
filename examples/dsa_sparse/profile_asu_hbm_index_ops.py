@@ -10,10 +10,12 @@ Examples:
 
     python3 examples/dsa_sparse/profile_asu_hbm_index_ops.py \
         --op lookup --batch-size 8 \
+        --reset-state \
         --output-dir /data/asu-profiles/lookup-bs8
 
     python3 examples/dsa_sparse/profile_asu_hbm_index_ops.py \
         --op maintain --batch-size 8 \
+        --reset-state \
         --output-dir /data/asu-profiles/maintain-bs8
 """
 
@@ -207,6 +209,7 @@ def build_case(
     device: Any,
     batch_size: int,
     reset_state: bool,
+    op_name: str,
 ) -> OperatorCase:
     resident_tokens = torch.arange(RESIDENT_COUNT, dtype=torch.int32)
     index = torch.full(
@@ -247,6 +250,11 @@ def build_case(
     last_query_slots = last_query_slots_row.unsqueeze(0).repeat(
         batch_size, 1
     )
+
+    if op_name == "maintain":
+        index[:, update_queries.long()] = update_slots
+        slot_to_index[:, update_slots.long()] = update_queries
+        free_head[:, 0].fill_(FIXED_UPDATE_COUNT)
 
     device_state = tuple(
         tensor.to(device)
@@ -586,7 +594,13 @@ def main() -> None:
     print(f"[INFO] export_type={args.export_type}")
     print(f"[INFO] output={run_root}")
 
-    case = build_case(torch, device, args.batch_size, args.reset_state)
+    case = build_case(
+        torch,
+        device,
+        args.batch_size,
+        args.reset_state,
+        args.op,
+    )
     warmup(
         torch,
         case,

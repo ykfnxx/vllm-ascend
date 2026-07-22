@@ -20,6 +20,10 @@ FREE_HEAD_STRIDE = 16
 RESIDENT_COUNT = SLOT_COUNT - FREE_SLOT_COUNT
 HIT_COUNT = QUERY_COUNT // 2
 MISS_COUNT = QUERY_COUNT - HIT_COUNT
+MASKED_COUNT = 128
+ACTIVE_HIT_COUNT = HIT_COUNT - MASKED_COUNT // 2
+ACTIVE_MISS_COUNT = MISS_COUNT - MASKED_COUNT // 2
+TAIL_TOKEN_BASE = INDEX_SIZE - MASKED_COUNT
 MIN_POOL_NUM = 18
 PREFERRED_POOL_ENTRIES = (17, 1)
 NOT_FOUND = -1
@@ -245,6 +249,11 @@ def _build_initial_state(torch, batch_size: int):
         slot_to_index[pool_entry, :RESIDENT_COUNT] = resident_tokens
         query_index[req_id, 0::2] = resident_tokens[:HIT_COUNT]
         query_index[req_id, 1::2] = miss_tokens
+        query_index[req_id, -MASKED_COUNT:] = torch.arange(
+            TAIL_TOKEN_BASE,
+            INDEX_SIZE,
+            dtype=torch.int32,
+        )
 
     return (
         index,
@@ -262,15 +271,18 @@ def _lookup_reference(
     free_slots,
     free_head,
     query_index,
+    lookup_mask,
     req_pool_entries,
 ):
     req_num = query_index.size(0)
-    slot_out = query_index.new_empty(query_index.shape)
+    slot_out = query_index.new_full(query_index.shape, NOT_FOUND)
     miss_out = query_index.new_zeros(query_index.shape)
     for req_id in range(req_num):
         pool_entry = int(req_pool_entries[req_id])
         head = int(free_head[pool_entry, 0])
         for query_id in range(QUERY_COUNT):
+            if int(lookup_mask[req_id, query_id]) == 0:
+                continue
             index_id = int(query_index[req_id, query_id])
             slot = int(index[pool_entry, index_id])
             if slot == NOT_FOUND:
@@ -303,10 +315,10 @@ def _maintain_reference(
         protected = set(int(slot) for slot in last_query_slots[req_id])
         slot = _hash32((seed & UINT32_MASK) ^ pool_entry) % SLOT_COUNT
         while head > 0:
-            index_id = int(slot_to_index[pool_entry, slot])
-            if index_id != NOT_FOUND and slot not in protected:
+            token_id = int(slot_to_index[pool_entry, slot])
+            if token_id != NOT_FOUND and slot not in protected:
                 slot_to_index[pool_entry, slot] = NOT_FOUND
-                index[pool_entry, index_id] = NOT_FOUND
+                index[pool_entry, token_id] = NOT_FOUND
                 head -= 1
                 free_slots[pool_entry, head] = slot
             slot += 1
@@ -365,6 +377,8 @@ def main() -> None:
     expected_free_head = initial_state[3].clone()
     query_index = initial_state[4]
     req_pool_entries = initial_state[5]
+    lookup_mask = torch.ones_like(query_index)
+    lookup_mask[:, -MASKED_COUNT:] = 0
 
     expected_slot_out, expected_miss_out = _lookup_reference(
         expected_index,
@@ -372,6 +386,7 @@ def main() -> None:
         expected_free_slots,
         expected_free_head,
         query_index,
+        lookup_mask,
         req_pool_entries,
     )
 
@@ -380,7 +395,7 @@ def main() -> None:
     free_slots = initial_state[2].to(device)
     free_head = initial_state[3].to(device)
     query_index_npu = query_index.to(device)
-    lookup_mask_npu = torch.ones_like(query_index_npu)
+    lookup_mask_npu = lookup_mask.to(device)
     req_pool_entries_npu = req_pool_entries.to(device)
 
     slot_out, miss_out = torch.ops._C_ascend.asu_hbm_index_lookup(
@@ -462,8 +477,11 @@ def main() -> None:
     print(
         "ASU HBM index custom-op check passed: "
         f"device={device}, requests={args.batch_size}, "
-        f"pool_entries={req_pool_entries.tolist()}, hits/request={HIT_COUNT}, "
-        f"misses/request={MISS_COUNT}, seed={args.seed}, custom_opp={custom_opp}"
+        f"pool_entries={req_pool_entries.tolist()}, "
+        f"hits/request={ACTIVE_HIT_COUNT}, "
+        f"misses/request={ACTIVE_MISS_COUNT}, "
+        f"masked/request={MASKED_COUNT}, "
+        f"seed={args.seed}, custom_opp={custom_opp}"
     )
 
 
