@@ -1,4 +1,7 @@
 Source repository: git@github-stortec:StorTecDev/vllm-ascend.git
 Source branch: dev_lookup_maintain_integration
-Source commit: 1ba7fa8579a547a96dad6245fedc5f765e1a5a76
+Integrated source commit: 1ba7fa8579a547a96dad6245fedc5f765e1a5a76
+Maintain fixed-300 source commit: a55654c79a3f6460ea09501010a29ce45b93f7ba
+Latest source checked: b271ee67d11c372641eb3147b8d9df6a7a8ff5da
 Local changes: standalone binding, 144K index, fused int32 masks, single 10K gather, paired-microbatch SFA, explicit A3 AIV launch
+Upstream behavior retained: CANN-managed request ParallelFor in AICPU Maintain

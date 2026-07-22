@@ -20,6 +20,7 @@ target_compile_definitions(cust_aicpu_kernels PRIVATE
 )
 
 target_include_directories(cust_aicpu_kernels PRIVATE
+    ${ASCEND_CANN_PACKAGE_PATH}/${CMAKE_HOST_SYSTEM_PROCESSOR}-linux/pkg_inc/aicpu/cpu_kernels
     ${ASCEND_CANN_PACKAGE_PATH}/include/aicpu
 )
 
