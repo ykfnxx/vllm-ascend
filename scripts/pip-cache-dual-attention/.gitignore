@@ -1,0 +1,16 @@
+.cursor/
+.tmp/
+cann-recipes-infer/
+configs/
+**/extra-info/
+**/kernel_meta/
+**/__pycache__/
+*.pyc
+*.so
+log/
+op/ascendc/cmake/
+src/__pycache__/
+experiments/gather_select_kvcache/profiler_trace/
+progress.md
+task_plan.md
+findings.md

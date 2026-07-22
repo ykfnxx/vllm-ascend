@@ -8,6 +8,7 @@ import vllm.envs as envs_vllm
 from torch import nn
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadataBuilder
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -916,6 +917,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
     def indexer_select_post_process(
         self,
+        layer_name: str,
         x: torch.Tensor,
         q_c: torch.Tensor,
         kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -948,6 +950,24 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li = q_li @ AscendSFAImpl.q_hadamard
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)
+
+        forward_context = get_forward_context()
+        dmp_context = getattr(forward_context, "dmp_context", None)
+        fused_indexer_kv_select = (
+            getattr(dmp_context, "fused_indexer_kv_select", None) if dmp_context is not None else None
+        )
+        if fused_indexer_kv_select is not None:
+            if self.use_sparse_c8_indexer:
+                raise RuntimeError("DMP fused Indexer+KVSelect does not support sparse C8")
+            return fused_indexer_kv_select.select(
+                layer_name=layer_name,
+                microbatch_idx=dmp_context.active_microbatch_idx,
+                query=q_li,
+                key=kv_cache[2],
+                weights=weights,
+                actual_seq_lengths_key=actual_seq_lengths_key,
+                block_table=attn_metadata.block_table,
+            )
 
         # DSV3.2 currently has graph compilation issues when using torch_npu.npu.lightning_indexer.
         # So two branches are maintained temporarily.
@@ -1202,6 +1222,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata.reshape_cache_event.record()
 
         topk_indices = self.indexer_select_post_process(
+            layer_name=layer_name,
             x=hidden_states,
             q_c=q_c,
             kv_cache=kv_cache,
@@ -1422,6 +1443,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 attn_metadata.reshape_cache_event.record()
 
         topk_indices = self.indexer_select_post_process(
+            layer_name=layer_name,
             x=hidden_states,
             q_c=q_c,
             kv_cache=kv_cache,
@@ -1447,7 +1469,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         Must be called after forward_indexer_only() and after KV load
         completion (wait_load_complete).
         """
-        assert(len(indexer_result) > 0)
+        assert len(indexer_result) > 0
 
         ql_nope, q_pe, topk_indices, output = indexer_result
         output_padded = output
@@ -1460,9 +1482,40 @@ class AscendSFAImpl(MLAAttentionImpl):
             actual_seq_lengths_query = attn_metadata.cum_query_lens
             actual_seq_lengths_key = attn_metadata.seq_lens
 
-        attn_output = self._execute_sparse_flash_attention_process(
-            ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
-        )
+        forward_context = get_forward_context()
+        dmp_context = getattr(forward_context, "dmp_context", None)
+        segmented_runtime = None
+        if dmp_context is not None:
+            segmented_runtime = (
+                dmp_context.dual_attention or dmp_context.lookup_maintain
+            )
+        if segmented_runtime is not None:
+            if dmp_context.lookup_maintain is not None:
+                attn_output = segmented_runtime.run_miss_attention_and_merge(
+                    layer_idx=forward_context.layer_idx,
+                    microbatch_idx=dmp_context.active_microbatch_idx,
+                    indexer_result=indexer_result,
+                    scale=self.scale,
+                    attn_metadata=attn_metadata,
+                )
+            else:
+                attn_output = segmented_runtime.run_miss_attention_and_merge(
+                    layer_name,
+                    dmp_context.active_microbatch_idx,
+                    indexer_result,
+                    self.scale,
+                    attn_metadata,
+                )
+        else:
+            attn_output = self._execute_sparse_flash_attention_process(
+                ql_nope,
+                q_pe,
+                kv_cache,
+                topk_indices,
+                attn_metadata,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
+            )
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
@@ -1475,8 +1528,7 @@ class AscendSFAImpl(MLAAttentionImpl):
 
         if self.enable_dsa_cp_with_o_proj_tp:
             raise NotImplementedError(
-                "DMP sparse-attention split does not support DSA-CP "
-                "with o_proj tensor parallelism"
+                "DMP sparse-attention split does not support DSA-CP with o_proj tensor parallelism"
             )
 
         output[...] = self.o_proj(attn_output)[0]
@@ -1484,3 +1536,83 @@ class AscendSFAImpl(MLAAttentionImpl):
         maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         return output_padded
+
+    def forward_combined_lookup_sparse_attn_only(
+        self,
+        indexer_results: tuple[tuple[torch.Tensor, ...], ...],
+        layer_name: str,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: tuple[M, M],
+        prepared_inputs: tuple[torch.Tensor, ...] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project one combined mb0+mb1 segmented-SFA result for scheme 4."""
+        forward_context = get_forward_context()
+        dmp_context = getattr(forward_context, "dmp_context", None)
+        if dmp_context is None or dmp_context.lookup_maintain is None:
+            raise RuntimeError(
+                "Combined Lookup/Maintain attention requires scheme 4"
+            )
+        if self.enable_dsa_cp_with_o_proj_tp:
+            raise NotImplementedError(
+                "DMP combined attention does not support DSA-CP with o_proj TP"
+            )
+
+        attn_output = (
+            dmp_context.lookup_maintain.run_combined_miss_attention_and_merge(
+                layer_idx=forward_context.layer_idx,
+                indexer_results=indexer_results,
+                scale=self.scale,
+                attn_metadata=attn_metadata,
+                prepared_inputs=prepared_inputs,
+            )
+        )
+        attn_output = self._v_up_proj(attn_output)
+        weight_prefetch_method = get_weight_prefetch_method()
+        weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
+            inputs=self.o_proj.weight,
+            dependency=attn_output,
+            max_size=MAX_O_PROJ_PREFETCH_SIZE,
+            linear_layer=self.o_proj,
+        )
+        projected = self.o_proj(attn_output)[0]
+
+        output_a = indexer_results[0][3]
+        output_b = indexer_results[1][3]
+        num_a = indexer_results[0][0].shape[0]
+        num_b = indexer_results[1][0].shape[0]
+        output_a[...] = projected[:num_a].view_as(output_a)
+        output_b[...] = projected[num_a : num_a + num_b].view_as(output_b)
+
+        maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
+        return (
+            output_a.view(-1, output_a.shape[-1]),
+            output_b.view(-1, output_b.shape[-1]),
+        )
+
+    def forward_combined_lookup_hit_attn_only(
+        self,
+        indexer_results: tuple[tuple[torch.Tensor, ...], ...],
+        layer_name: str,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: tuple[M, M],
+        prepared_inputs: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Run scheme-4 hit SFA from the full resident vLLM KV cache."""
+        del layer_name, kv_cache
+        forward_context = get_forward_context()
+        dmp_context = getattr(forward_context, "dmp_context", None)
+        if dmp_context is None or dmp_context.lookup_maintain is None:
+            raise RuntimeError(
+                "Combined Lookup/Maintain hit attention requires scheme 4"
+            )
+        if self.enable_dsa_cp_with_o_proj_tp:
+            raise NotImplementedError(
+                "DMP combined attention does not support DSA-CP with o_proj TP"
+            )
+        dmp_context.lookup_maintain.run_combined_hit_attention(
+            layer_idx=forward_context.layer_idx,
+            indexer_results=indexer_results,
+            scale=self.scale,
+            attn_metadata=attn_metadata,
+            prepared_inputs=prepared_inputs,
+        )

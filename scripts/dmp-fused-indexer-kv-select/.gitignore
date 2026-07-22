@@ -1,0 +1,6 @@
+csrc/build/
+csrc/output/
+opp/
+.tmp/
+
+runlog/

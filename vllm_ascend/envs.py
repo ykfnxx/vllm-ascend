@@ -109,6 +109,40 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
+    # Fuse Lightning Indexer and KVSelect during DMP decode. This mode keeps
+    # the existing full-cache SFA path and does not enable KVGather, HIXL, or
+    # the segmented Dual-Attention path. It is mutually exclusive with
+    # VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION.
+    "VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT", "0"))
+    ),
+    # Scheme 4: original Lightning Indexer, Lookup/Maintain, miss-only
+    # KVGather, and combined mb0+mb1 segmented SFA. Hit SFA reads the existing
+    # full vLLM KV cache before S0 waits for S1; miss SFA reads the 10K staging
+    # pool after Gather. S2 runs Maintain. Default 0;
+    # mutually exclusive with the other DMP fusion modes below.
+    "VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN", "0"))
+    ),
+    # Enable the experimental Dual-Attention data path inside DMP. This path
+    # requires the KVSelect, KVGather, custom SparseFlashAttention, and
+    # DaAttentionMerge operators from the pip-cache dual-attention branch.
+    # Default is disabled so existing DMP deployments keep using their current
+    # server-provided operators.
+    "VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION", "0"))),
+    # Dual-Attention stream topology: "four" preserves the original S0, S1,
+    # KVSelect, KVGather streams; "two" uses S0 for both indexers/attention/MLP
+    # and one shared S1 for KVSelect/KVGather.
+    "VLLM_ASCEND_DMP_STREAM_MODE": lambda: os.getenv("VLLM_ASCEND_DMP_STREAM_MODE", "four").lower(),
+    # DMP KV selection/load backend. "local" preserves the existing pip-cache
+    # KVSelect/KVGather path. "hixl" enables the experimental two-NPU
+    # IndexerUpdate/HIXL remote-load path configured by the JSON file below.
+    "VLLM_ASCEND_DMP_KV_BACKEND": lambda: os.getenv("VLLM_ASCEND_DMP_KV_BACKEND", "local").lower(),
+    # HIXL endpoint and remote-load resource configuration. This is not
+    # sensitive, but it contains machine-specific device ids and endpoint IPs.
+    "VLLM_ASCEND_DMP_HIXL_CONFIG": lambda: os.getenv(
+        "VLLM_ASCEND_DMP_HIXL_CONFIG", "/workspace/scripts/dmp_hixl_config.json"
+    ),
     "VLLM_ASCEND_ENABLE_DMP": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_DMP", "0"))),
 }
 

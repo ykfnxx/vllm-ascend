@@ -1,0 +1,87 @@
+{
+    "MockKVSelect": {
+        "opInfo": {
+            "computeCost": "100",
+            "engine": "DNN_VM_AICPU",
+            "flagAsync": "False",
+            "flagPartial": "False",
+            "functionName": "RunCpuKernel",
+            "kernelSo": "libasn_aicpu_kernels.so",
+            "opKernelLib": "CUSTAICPUKernel",
+            "userDefined": "True",
+            "workspaceSize": "1024"
+        },
+        "input0": {
+            "name": "selection_k_rope",
+            "type": "DT_FLOAT16"
+        },
+        "input1": {
+            "name": "selection_kv_cache",
+            "type": "DT_FLOAT16"
+        },
+        "input2": {
+            "name": "selection_kv_block_table",
+            "type": "DT_INT32"
+        },
+        "input3": {
+            "name": "selection_kv_block_status",
+            "type": "DT_INT32"
+        },
+        "input4": {
+            "name": "selection_topk_indices",
+            "type": "DT_INT32"
+        },
+        "input5": {
+            "name": "full_k_rope",
+            "type": "DT_FLOAT16"
+        },
+        "input6": {
+            "name": "full_kv_cache",
+            "type": "DT_FLOAT16"
+        },
+        "input7": {
+            "name": "full_kv_block_table",
+            "type": "DT_INT32"
+        },
+        "input8": {
+            "name": "full_kv_actual_seq",
+            "type": "DT_INT32"
+        },
+        "input9": {
+            "name": "full_q_actual_seq",
+            "type": "DT_INT32"
+        },
+        "output0": {
+            "name": "hit_sparse_indices",
+            "type": "DT_INT32"
+        },
+        "output1": {
+            "name": "miss_topk_indices",
+            "type": "DT_INT32"
+        },
+        "output2": {
+            "name": "miss_insert_indices",
+            "type": "DT_INT32"
+        },
+        "output3": {
+            "name": "hit_actual_seq",
+            "type": "DT_INT32"
+        },
+        "output4": {
+            "name": "miss_actual_seq",
+            "type": "DT_INT32"
+        },
+        "output5": {
+            "name": "miss_count",
+            "type": "DT_INT32"
+        },
+        "output6": {
+            "name": "hit_count",
+            "type": "DT_INT32"
+        },
+        "output7": {
+            "name": "selection_status_empty",
+            "type": "DT_INT32"
+        }
+    }
+}

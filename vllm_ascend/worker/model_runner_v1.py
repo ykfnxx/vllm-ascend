@@ -366,6 +366,10 @@ class NPUModelRunner(GPUModelRunner):
         # per-forward resource allocation.
         self._dmp_load_stream = None
         self._dmp_block_location = None
+        self._dmp_dual_attention = None
+        self._dmp_hixl_backend = None
+        self._dmp_fused_indexer_kv_select = None
+        self._dmp_lookup_maintain = None
         # Keep graph-only DMP metadata and events alive for the lifetime of
         # each captured graph. Replay uses the addresses recorded at capture.
         self._dmp_graph_contexts: dict[BatchDescriptor, Any] = {}
@@ -1286,6 +1290,120 @@ class NPUModelRunner(GPUModelRunner):
                 num_blocks, self.device)
         block_location = self._dmp_block_location
 
+        dual_attention = None
+        fused_indexer_kv_select = None
+        lookup_maintain = None
+        enabled_dmp_optimizations = sum((
+            envs_ascend.VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT,
+            envs_ascend.VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN,
+            envs_ascend.VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION,
+        ))
+        if enabled_dmp_optimizations > 1:
+            raise RuntimeError(
+                "DMP Fused Indexer+KVSelect, Lookup/Maintain, and "
+                "Dual-Attention modes are mutually exclusive"
+            )
+        if envs_ascend.VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT:
+            if self._dmp_fused_indexer_kv_select is None:
+                from vllm_ascend.kv_offload.fused_indexer_kv_select import (
+                    CACHE_SLOTS_CAPACITY,
+                    DMPFusedIndexerKVSelect,
+                )
+
+                max_microbatch_tokens = math.ceil(
+                    self.scheduler_config.max_num_seqs / 2
+                )
+                self._dmp_fused_indexer_kv_select = DMPFusedIndexerKVSelect(
+                    self.device,
+                    max_microbatch_tokens=max_microbatch_tokens,
+                )
+                num_layers = self.model_config.hf_text_config.num_hidden_layers
+                state_gib = (
+                    num_layers
+                    * max_microbatch_tokens
+                    * 2
+                    * CACHE_SLOTS_CAPACITY
+                    * (torch.iinfo(torch.int32).bits // 8)
+                    / (1024**3)
+                )
+                logger.info(
+                    "DMP fused Indexer+KVSelect enabled without KVGather; "
+                    "maximum cache-index state is %.2f GiB",
+                    state_gib,
+                )
+            fused_indexer_kv_select = self._dmp_fused_indexer_kv_select
+        if envs_ascend.VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN:
+            if self._dmp_lookup_maintain is None:
+                from vllm_ascend.kv_offload.lookup_maintain import (
+                    DMPLookupMaintain,
+                )
+
+                num_layers = self.model_config.hf_text_config.num_hidden_layers
+                max_microbatch_tokens = math.ceil(
+                    self.scheduler_config.max_num_seqs / 2
+                )
+                self._dmp_lookup_maintain = DMPLookupMaintain(
+                    self.device,
+                    num_layers=num_layers,
+                    max_microbatch_tokens=max_microbatch_tokens,
+                    max_model_len=self.model_config.max_model_len,
+                    block_size=self.cache_config.block_size,
+                )
+                logger.info(
+                    "DMP Lookup/Maintain allocated %.2f GiB before lazy 10K "
+                    "resident KV-pool allocation",
+                    self._dmp_lookup_maintain.allocated_tensor_bytes / (1024**3),
+                )
+            lookup_maintain = self._dmp_lookup_maintain
+        if envs_ascend.VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION:
+            if self._dmp_dual_attention is None:
+                from vllm_ascend.kv_offload.dual_attention import (
+                    DMPDualAttention,
+                )
+
+                stream_mode = envs_ascend.VLLM_ASCEND_DMP_STREAM_MODE
+                kv_backend = envs_ascend.VLLM_ASCEND_DMP_KV_BACKEND
+                shared_aux_stream = (
+                    load_stream if stream_mode in ("2", "two") else None
+                )
+                max_microbatch_tokens = math.ceil(
+                    self.scheduler_config.max_num_seqs / 2
+                )
+                if kv_backend == "hixl" and self._dmp_hixl_backend is None:
+                    from vllm_ascend.kv_offload.hixl_dual_attention import (
+                        HixlDualAttentionBackend,
+                    )
+
+                    hf_config = self.model_config.hf_text_config
+                    self._dmp_hixl_backend = HixlDualAttentionBackend.from_json(
+                        envs_ascend.VLLM_ASCEND_DMP_HIXL_CONFIG,
+                        device=self.device,
+                        dtype=self.dtype,
+                        block_size=self.cache_config.block_size,
+                        max_microbatch_tokens=max_microbatch_tokens,
+                        max_seq_len=self.model_config.max_model_len,
+                        topk=hf_config.index_topk,
+                        kv_lora_rank=hf_config.kv_lora_rank,
+                        rope_dim=hf_config.qk_rope_head_dim,
+                        num_layers=hf_config.num_hidden_layers,
+                    )
+                self._dmp_dual_attention = DMPDualAttention(
+                    self.device,
+                    self.cache_config.block_size,
+                    select_stream=shared_aux_stream,
+                    gather_stream=shared_aux_stream,
+                    stream_mode=stream_mode,
+                    max_microbatch_tokens=max_microbatch_tokens,
+                    kv_backend=kv_backend,
+                    hixl_backend=self._dmp_hixl_backend,
+                )
+                logger.info(
+                    "DMP Dual-Attention stream topology: %s, KV backend: %s",
+                    self._dmp_dual_attention.stream_mode,
+                    self._dmp_dual_attention.kv_backend,
+                )
+            dual_attention = self._dmp_dual_attention
+
         # 为每个微批次计算 MC2 通信所需的 padded_num_tokens 和 mc2_mask
         tp_world_size = get_tensor_model_parallel_world_size()
         reserved_mc2_mask = get_mc2_mask()
@@ -1311,6 +1429,9 @@ class NPUModelRunner(GPUModelRunner):
             _num_tokens_list=[slice_a.num_tokens, slice_b.num_tokens],
             _padded_num_tokens_list=padded_num_tokens_list,
             _mc2_mask_list=mc2_mask_list,
+            dual_attention=dual_attention,
+            fused_indexer_kv_select=fused_indexer_kv_select,
+            lookup_maintain=lookup_maintain,
         )
 
     def _get_or_create_dmp_graph_context(

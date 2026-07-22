@@ -218,6 +218,42 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
 
         return hs_a, res_a, hs_b, res_b
 
+    def forward_sparse_attn_two_mb_once(
+        layer,
+        hs_a,
+        res_a,
+        hs_b,
+        res_b,
+        indexer_out_a,
+        indexer_out_b,
+        prepared_inputs,
+    ):
+        """Run one combined mb0+mb1 segmented SFA and attention update."""
+        attn_a, attn_b = (
+            layer.self_attn.mla_attn.forward_combined_lookup_attention(
+                indexer_out_a, indexer_out_b, prepared_inputs
+            )
+        )
+        num_a = hs_a.shape[0]
+        num_b = hs_b.shape[0]
+        attn_output = torch.cat([attn_a, attn_b], dim=0)
+        if (
+            attn_output.dtype == torch.float16
+            and layer.routed_scaling_factor is not None
+            and layer.shared_expert_scaling_factor is not None
+        ):
+            attn_output = attn_output * (1.0 / layer.routed_scaling_factor)
+
+        assert res_a is not None and res_b is not None
+        residual = torch.cat([res_a, res_b], dim=0)
+        hidden_states = residual + attn_output
+        hidden_states, residual = layer.post_attention_layernorm(
+            hidden_states, residual
+        )
+        hs_a, hs_b = torch.split(hidden_states, [num_a, num_b], dim=0)
+        res_a, res_b = torch.split(residual, [num_a, num_b], dim=0)
+        return hs_a, res_a, hs_b, res_b
+
     # NOTE: DeepseekV2Model compilation is disabled via _ignore_compile_vllm
     # (see above) because dmp_forward's cross-stream logic is incompatible
     # with TorchDynamo.  The @torch.compiler.disable decorator below is kept
@@ -227,20 +263,12 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
     @torch.compiler.disable
     def dmp_forward(self, input_ids, positions, intermediate_tensors,
                     inputs_embeds=None):
-        """Cross-layer DMP interleaved forward.
+        """Dual-microbatch forward with selectable stream topology.
 
-        Per-layer, two microbatches (A/B) execute with cross-layer
-        overlapping: mbB MoE(L) on S0 || mbA Indexer+Load(L+1) on S1.
-
-        Timeline for layer L (L > 0, not last):
-          Step 1: S0 waits for S1's mbA indexer+load(L) to complete
-          Step 2: S0 runs mbA SparseAttn + MoE, records moe_done_A
-          Step 3: S0 runs mbB Indexer + Classify + async_load B
-          Step 4: S0 runs mbB SparseAttn (no MoE yet)
-          Step 5: S1 launches mbA Indexer+Classify+Load(L+1) overlapping
-                  with S0's mbB MoE
-
-        Replaces DeepseekV2Model.forward when DMP is enabled.
+        ``four`` preserves S0 main compute, S1 A-indexer, KVSelect, and
+        KVGather streams. ``two`` runs both indexers and attention/MLP on S0,
+        while KVSelect and KVGather share S1. Cross-layer overlap remains
+        disabled in both modes.
         """
 
         forward_context = get_forward_context()
@@ -347,16 +375,38 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
                                     dtype=pos_b.dtype, device=pos_b.device)
             pos_b = torch.cat([pos_b, pad_pos_b])
 
-        # Cross-layer DMP state
+        # Scheme 4 uses three streams. S0 runs both LI/Lookup calls, combined
+        # hit SFA, then waits for S1 before miss SFA/merge/update/MLP. S1 runs
+        # miss-only KVGather0/1; S2 runs Maintain0/1.
         s0 = torch.npu.current_stream()
-        s1 = dmp_ctx.kv_loader.load_stream   # S1: load stream (reused for indexer)
+        s1 = dmp_ctx.kv_loader.load_stream
+        dual_attention = dmp_ctx.dual_attention
+        lookup_maintain = dmp_ctx.lookup_maintain
+        segmented_attention = (
+            dual_attention is not None or lookup_maintain is not None
+        )
+        two_stream = (
+            dual_attention is not None
+            and dual_attention.stream_mode == "two"
+        )
+        if lookup_maintain is not None:
+            indexer_a_stream = s0
+        elif dual_attention is not None:
+            indexer_a_stream = dual_attention.get_indexer_a_stream(s0, s1)
+        else:
+            indexer_a_stream = s1
 
-        # Make S1 a child of the graph's capture stream. Every layer rejoins
-        # S0 through indexer_done before its output is consumed.
+        # Make every auxiliary stream a child of the graph capture stream.
         fork_event = dmp_ctx.get_event("dmp_fork")
         fork_event.record(s0)
         s1.wait_event(fork_event)
+        if dual_attention is not None and not two_stream:
+            dual_attention.select_stream.wait_event(fork_event)
+            dual_attention.gather_stream.wait_event(fork_event)
+        if lookup_maintain is not None:
+            lookup_maintain.maintain_stream.wait_event(fork_event)
         previous_layer_done = None
+        last_maintain_done = None
 
         layers = list(islice(self.layers, self.start_layer, self.end_layer))
         num_layers = len(layers)
@@ -379,67 +429,209 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
             #     pending_indexer_load_a = None
             #     pending_res_a_next = None
 
-            # if layer_idx == 0:
-                # First layer: mbA indexer on S1 (no cross-layer overlap)
-            with dmp_ctx.enter_microbatch(0), torch.npu.stream(s1):
+            # In two-stream mode A/B indexers are serialized on S0. Enqueuing
+            # A's Select/Gather before B's indexer allows those phases to
+            # overlap without introducing more streams.
+            with (
+                dmp_ctx.enter_microbatch(0),
+                torch.npu.stream(indexer_a_stream),
+            ):
                 if previous_layer_done is not None:
-                    s1.wait_event(previous_layer_done)
-                indexer_out_a, res_a = layer.forward_indexer_only(
-                    pos_a, hs_a, res_a, llama_4_scaling)
-                if not is_capturing:
-                    topk_a = indexer_out_a[2]
-                    if topk_a is not None:
-                        _, asu_a = \
-                            dmp_ctx.block_location.classify_topk_indices(
-                                topk_a, block_size,
-                                num_real_tokens=dmp_ctx.slices[
-                                    0].num_real_tokens)
-                        dmp_ctx.kv_loader.async_load_blocks(
-                            asu_a,
-                            tag=f"L{layer_idx}_A",
-                            kv_cache=layer.self_attn.mla_attn.mla_attn.kv_cache,
-                            block_size=block_size)
-                indexer_a_done = dmp_ctx.get_event(
-                    f"L{layer_idx}_indexer_A_done")
-                indexer_a_done.record(s1)
+                    indexer_a_stream.wait_event(previous_layer_done)
+                indexer_out_a, res_a = layer.forward_indexer_only(pos_a, hs_a, res_a, llama_4_scaling)
+                topk_a = indexer_out_a[2]
+                if (
+                    topk_a is not None
+                    and not segmented_attention
+                    and not is_capturing
+                ):
+                    _, asu_a = dmp_ctx.block_location.classify_topk_indices(
+                        topk_a,
+                        block_size,
+                        num_real_tokens=dmp_ctx.slices[0].num_real_tokens,
+                    )
+                    dmp_ctx.kv_loader.async_load_blocks(
+                        asu_a,
+                        tag=f"L{layer_idx}_A",
+                        kv_cache=layer.self_attn.mla_attn.mla_attn.kv_cache,
+                        block_size=block_size,
+                    )
+                indexer_a_done = dmp_ctx.get_event(f"L{layer_idx}_indexer_A_done")
+                indexer_a_done.record(indexer_a_stream)
+                if lookup_maintain is not None:
+                    layer.self_attn.mla_attn.prepare_dual_attention(indexer_out_a)
+                    select_a_done = dmp_ctx.get_event(
+                        f"L{layer_idx}_select_A_done"
+                    )
+                    select_a_done.record(s0)
+
+            if dual_attention is not None:
+                with (
+                    dmp_ctx.enter_microbatch(0),
+                    torch.npu.stream(dual_attention.select_stream),
+                ):
+                    dual_attention.select_stream.wait_event(indexer_a_done)
+                    layer.self_attn.mla_attn.prepare_dual_attention(indexer_out_a)
+                    select_a_done = dmp_ctx.get_event(f"L{layer_idx}_select_A_done")
+                    select_a_done.record(dual_attention.select_stream)
+
+                with (
+                    dmp_ctx.enter_microbatch(0),
+                    torch.npu.stream(dual_attention.gather_stream),
+                ):
+                    dual_attention.gather_stream.wait_event(select_a_done)
+                    layer.self_attn.mla_attn.gather_dual_attention()
+                    gather_a_done = dmp_ctx.get_event(f"L{layer_idx}_gather_A_done")
+                    gather_a_done.record(dual_attention.gather_stream)
+
+            elif lookup_maintain is not None:
+                with torch.npu.stream(lookup_maintain.maintain_stream):
+                    lookup_maintain.maintain_stream.wait_event(select_a_done)
+                    lookup_maintain.maintain(
+                        layer_idx=self.start_layer + layer_idx,
+                        microbatch_idx=0,
+                    )
+                    maintain_a_done = dmp_ctx.get_event(
+                        f"L{layer_idx}_maintain_A_done"
+                    )
+                    maintain_a_done.record(lookup_maintain.maintain_stream)
+                    last_maintain_done = maintain_a_done
+
+                with dmp_ctx.enter_microbatch(0), torch.npu.stream(s1):
+                    s1.wait_event(select_a_done)
+                    layer.self_attn.mla_attn.gather_dual_attention()
+                    gather_a_done = dmp_ctx.get_event(
+                        f"L{layer_idx}_gather_A_done"
+                    )
+                    gather_a_done.record(s1)
 
             # mbB indexer on S0
             with torch.npu.stream(s0), dmp_ctx.enter_microbatch(1):
-                indexer_out_b, res_b = layer.forward_indexer_only(
-                    pos_b, hs_b, res_b, llama_4_scaling)
-                if not is_capturing:
-                    topk_b = indexer_out_b[2]
-                    if topk_b is not None:
-                        _, asu_b = \
-                            dmp_ctx.block_location.classify_topk_indices(
-                                topk_b, block_size,
-                                num_real_tokens=dmp_ctx.slices[
-                                    1].num_real_tokens)
-                        dmp_ctx.kv_loader.async_load_blocks(
-                            asu_b,
-                            tag=f"L{layer_idx}_B",
-                            kv_cache=layer.self_attn.mla_attn.mla_attn.kv_cache,
-                            block_size=block_size)
+                indexer_out_b, res_b = layer.forward_indexer_only(pos_b, hs_b, res_b, llama_4_scaling)
+                topk_b = indexer_out_b[2]
+                if (
+                    topk_b is not None
+                    and not segmented_attention
+                    and not is_capturing
+                ):
+                    _, asu_b = dmp_ctx.block_location.classify_topk_indices(
+                        topk_b,
+                        block_size,
+                        num_real_tokens=dmp_ctx.slices[1].num_real_tokens,
+                    )
+                    dmp_ctx.kv_loader.async_load_blocks(
+                        asu_b,
+                        tag=f"L{layer_idx}_B",
+                        kv_cache=layer.self_attn.mla_attn.mla_attn.kv_cache,
+                        block_size=block_size,
+                    )
+                if segmented_attention:
+                    indexer_b_done = dmp_ctx.get_event(f"L{layer_idx}_indexer_B_done")
+                    indexer_b_done.record(s0)
+                if lookup_maintain is not None:
+                    layer.self_attn.mla_attn.prepare_dual_attention(indexer_out_b)
+                    select_b_done = dmp_ctx.get_event(
+                        f"L{layer_idx}_select_B_done"
+                    )
+                    select_b_done.record(s0)
 
-            # mbA SFA on S0
-            s0.wait_event(indexer_a_done)
-            if not is_capturing:
-                dmp_ctx.kv_loader.wait_load_complete(f"L{layer_idx}_A")
+            if dual_attention is not None:
+                with (
+                    dmp_ctx.enter_microbatch(1),
+                    torch.npu.stream(dual_attention.select_stream),
+                ):
+                    dual_attention.select_stream.wait_event(indexer_b_done)
+                    layer.self_attn.mla_attn.prepare_dual_attention(indexer_out_b)
+                    select_b_done = dmp_ctx.get_event(f"L{layer_idx}_select_B_done")
+                    select_b_done.record(dual_attention.select_stream)
 
-            with torch.npu.stream(s0), dmp_ctx.enter_microbatch(0):
-                # s0.wait_event(li0_event)
-                hs_a, res_a = layer.forward_sparse_attn_only(
-                        hs_a, res_a, indexer_out_a, llama_4_scaling)
-                # sfa0_event.record(s0)
+                with (
+                    dmp_ctx.enter_microbatch(1),
+                    torch.npu.stream(dual_attention.gather_stream),
+                ):
+                    dual_attention.gather_stream.wait_event(select_b_done)
+                    layer.self_attn.mla_attn.gather_dual_attention()
+                    gather_b_done = dmp_ctx.get_event(f"L{layer_idx}_gather_B_done")
+                    gather_b_done.record(dual_attention.gather_stream)
 
-            # mbB SFA on S0
-            if not is_capturing:
-                dmp_ctx.kv_loader.wait_load_complete(f"L{layer_idx}_B")
-            with torch.npu.stream(s0), dmp_ctx.enter_microbatch(1):
-                # s0.wait_event(li1_event)
-                hs_b, res_b = layer.forward_sparse_attn_only(
-                        hs_b, res_b, indexer_out_b, llama_4_scaling)
-                # sfa1_event.record(s0)
+            elif lookup_maintain is not None:
+                with torch.npu.stream(lookup_maintain.maintain_stream):
+                    lookup_maintain.maintain_stream.wait_event(select_b_done)
+                    lookup_maintain.maintain(
+                        layer_idx=self.start_layer + layer_idx,
+                        microbatch_idx=1,
+                    )
+                    maintain_b_done = dmp_ctx.get_event(
+                        f"L{layer_idx}_maintain_B_done"
+                    )
+                    maintain_b_done.record(lookup_maintain.maintain_stream)
+                    last_maintain_done = maintain_b_done
+
+                with dmp_ctx.enter_microbatch(1), torch.npu.stream(s1):
+                    s1.wait_event(select_b_done)
+                    layer.self_attn.mla_attn.gather_dual_attention()
+                    gather_b_done = dmp_ctx.get_event(
+                        f"L{layer_idx}_gather_B_done"
+                    )
+                    gather_b_done.record(s1)
+
+            if dual_attention is not None:
+                s0.wait_event(select_a_done)
+                with torch.npu.stream(s0), dmp_ctx.enter_microbatch(0):
+                    layer.self_attn.mla_attn.forward_hit_attn_only(indexer_out_a)
+
+                s0.wait_event(select_b_done)
+                with torch.npu.stream(s0), dmp_ctx.enter_microbatch(1):
+                    layer.self_attn.mla_attn.forward_hit_attn_only(indexer_out_b)
+
+            if lookup_maintain is not None:
+                with torch.npu.stream(s0):
+                    # Hit SFA reads the full resident vLLM KV cache and can run
+                    # as soon as both Lookups finish. Only miss SFA depends on
+                    # the 300-token KVGather staging writes on S1.
+                    combined_attention_inputs = (
+                        layer.self_attn.mla_attn.prepare_combined_lookup_attention(
+                            indexer_out_a, indexer_out_b
+                        )
+                    )
+                    layer.self_attn.mla_attn.forward_combined_lookup_hit_attention(
+                        indexer_out_a,
+                        indexer_out_b,
+                        combined_attention_inputs,
+                    )
+                    s0.wait_event(gather_a_done)
+                    s0.wait_event(gather_b_done)
+                    hs_a, res_a, hs_b, res_b = forward_sparse_attn_two_mb_once(
+                        layer,
+                        hs_a,
+                        res_a,
+                        hs_b,
+                        res_b,
+                        indexer_out_a,
+                        indexer_out_b,
+                        combined_attention_inputs,
+                    )
+            else:
+                # Scheme 0/1 and scheme 2 retain their existing per-microbatch
+                # attention behavior.
+                s0.wait_event(indexer_a_done)
+                if segmented_attention:
+                    s0.wait_event(gather_a_done)
+                elif not is_capturing:
+                    dmp_ctx.kv_loader.wait_load_complete(f"L{layer_idx}_A")
+                with torch.npu.stream(s0), dmp_ctx.enter_microbatch(0):
+                    hs_a, res_a = layer.forward_sparse_attn_only(
+                        hs_a, res_a, indexer_out_a, llama_4_scaling
+                    )
+
+                if segmented_attention:
+                    s0.wait_event(gather_b_done)
+                elif not is_capturing:
+                    dmp_ctx.kv_loader.wait_load_complete(f"L{layer_idx}_B")
+                with torch.npu.stream(s0), dmp_ctx.enter_microbatch(1):
+                    hs_b, res_b = layer.forward_sparse_attn_only(
+                        hs_b, res_b, indexer_out_b, llama_4_scaling
+                    )
 
             # mbA MLP on S0
             # with torch.npu.stream(s0):
@@ -497,6 +689,11 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
             previous_layer_done = dmp_ctx.get_event(
                 f"L{layer_idx}_mlp_done")
             previous_layer_done.record(s0)
+
+        # Maintain is state for the next decode replay. Joining only the final
+        # S2 event is sufficient because all Maintain calls share one stream.
+        if last_maintain_done is not None:
+            s0.wait_event(last_maintain_done)
 
         # S1 join S0, then merge microbatches
         # join_event = torch.npu.Event()

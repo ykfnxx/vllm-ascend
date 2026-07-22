@@ -1,0 +1,6 @@
+ascendc/build/
+ascendc/output/
+torch_ops_extension/build/
+torch_ops_extension/dist/
+**/*.egg-info/
+**/__pycache__/

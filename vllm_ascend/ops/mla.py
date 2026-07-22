@@ -203,6 +203,170 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
 
         return indexer_out
 
+    def _get_dmp_attention_runtime(self):
+        forward_context: ForwardContext = get_forward_context()
+        if forward_context.attn_metadata:
+            attn_metadata = forward_context.attn_metadata[self.mla_attn.layer_name]
+        else:
+            attn_metadata = forward_context.attn_metadata
+        kv_cache = self.mla_attn.kv_cache[forward_context.virtual_engine]
+        dmp_context = getattr(forward_context, "dmp_context", None)
+        if dmp_context is None:
+            raise RuntimeError("DMP segmented-attention context is not active")
+        attention_runtime = (
+            dmp_context.dual_attention or dmp_context.lookup_maintain
+        )
+        if attention_runtime is None:
+            raise RuntimeError("DMP segmented-attention runtime is not active")
+        return (
+            dmp_context,
+            attention_runtime,
+            forward_context.layer_idx,
+            kv_cache,
+            attn_metadata,
+        )
+
+    def prepare_dual_attention(self, indexer_result: tuple) -> None:
+        dmp_context, runtime, layer_idx, kv_cache, attn_metadata = (
+            self._get_dmp_attention_runtime()
+        )
+        if dmp_context.lookup_maintain is not None:
+            runtime.lookup(
+                layer_idx=layer_idx,
+                microbatch_idx=dmp_context.active_microbatch_idx,
+                indexer_result=indexer_result,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+            )
+        else:
+            runtime.select(
+                self.mla_attn.layer_name,
+                dmp_context.active_microbatch_idx,
+                indexer_result,
+                kv_cache,
+                attn_metadata,
+            )
+
+    def gather_dual_attention(self) -> None:
+        dmp_context, runtime, layer_idx, kv_cache, attn_metadata = (
+            self._get_dmp_attention_runtime()
+        )
+        if dmp_context.lookup_maintain is not None:
+            runtime.gather(
+                layer_idx=layer_idx,
+                microbatch_idx=dmp_context.active_microbatch_idx,
+                kv_cache=kv_cache,
+                attn_metadata=attn_metadata,
+            )
+        else:
+            runtime.gather(
+                self.mla_attn.layer_name,
+                dmp_context.active_microbatch_idx,
+                kv_cache,
+                attn_metadata,
+            )
+
+    def forward_hit_attn_only(self, indexer_result: tuple) -> None:
+        dmp_context, runtime, layer_idx, _, attn_metadata = (
+            self._get_dmp_attention_runtime()
+        )
+        if dmp_context.lookup_maintain is not None:
+            runtime.run_hit_attention(
+                layer_idx=layer_idx,
+                microbatch_idx=dmp_context.active_microbatch_idx,
+                indexer_result=indexer_result,
+                scale=self.mla_attn.impl.scale,
+                attn_metadata=attn_metadata,
+            )
+        else:
+            runtime.run_hit_attention(
+                self.mla_attn.layer_name,
+                dmp_context.active_microbatch_idx,
+                indexer_result,
+                self.mla_attn.impl.scale,
+                attn_metadata,
+            )
+
+    def forward_combined_lookup_attention(
+        self,
+        indexer_result_a: tuple,
+        indexer_result_b: tuple,
+        prepared_inputs: tuple[torch.Tensor, ...] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run scheme 4 attention once for the merged mb0+mb1 indexer result."""
+        forward_context: ForwardContext = get_forward_context()
+        dmp_context = getattr(forward_context, "dmp_context", None)
+        if dmp_context is None or dmp_context.lookup_maintain is None:
+            raise RuntimeError("Combined Lookup attention requires scheme 4")
+
+        layer_name = self.mla_attn.layer_name
+        metadata = []
+        for microbatch_metadata in dmp_context._attn_metadata_list:
+            if isinstance(microbatch_metadata, dict):
+                metadata.append(microbatch_metadata[layer_name])
+            else:
+                metadata.append(microbatch_metadata)
+        kv_cache = self.mla_attn.kv_cache[forward_context.virtual_engine]
+        return self.mla_attn.impl.forward_combined_lookup_sparse_attn_only(
+            (indexer_result_a, indexer_result_b),
+            layer_name,
+            kv_cache,
+            (metadata[0], metadata[1]),
+            prepared_inputs,
+        )
+
+    def forward_combined_lookup_hit_attention(
+        self,
+        indexer_result_a: tuple,
+        indexer_result_b: tuple,
+        prepared_inputs: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Run scheme-4 hit SFA before waiting for miss KVGather."""
+        forward_context: ForwardContext = get_forward_context()
+        dmp_context = getattr(forward_context, "dmp_context", None)
+        if dmp_context is None or dmp_context.lookup_maintain is None:
+            raise RuntimeError("Combined Lookup hit attention requires scheme 4")
+
+        layer_name = self.mla_attn.layer_name
+        metadata = []
+        for microbatch_metadata in dmp_context._attn_metadata_list:
+            if isinstance(microbatch_metadata, dict):
+                metadata.append(microbatch_metadata[layer_name])
+            else:
+                metadata.append(microbatch_metadata)
+        kv_cache = self.mla_attn.kv_cache[forward_context.virtual_engine]
+        self.mla_attn.impl.forward_combined_lookup_hit_attn_only(
+            (indexer_result_a, indexer_result_b),
+            layer_name,
+            kv_cache,
+            (metadata[0], metadata[1]),
+            prepared_inputs,
+        )
+
+    def prepare_combined_lookup_attention(
+        self,
+        indexer_result_a: tuple,
+        indexer_result_b: tuple,
+    ) -> tuple[torch.Tensor, ...]:
+        """Prepare scheme-4 query inputs while KV Gather runs on S1."""
+        forward_context: ForwardContext = get_forward_context()
+        dmp_context = getattr(forward_context, "dmp_context", None)
+        if dmp_context is None or dmp_context.lookup_maintain is None:
+            raise RuntimeError("Combined Lookup attention requires scheme 4")
+
+        layer_name = self.mla_attn.layer_name
+        metadata = []
+        for microbatch_metadata in dmp_context._attn_metadata_list:
+            if isinstance(microbatch_metadata, dict):
+                metadata.append(microbatch_metadata[layer_name])
+            else:
+                metadata.append(microbatch_metadata)
+        return dmp_context.lookup_maintain.prepare_combined_attention(
+            layer_idx=forward_context.layer_idx,
+            indexer_results=(indexer_result_a, indexer_result_b),
+            attn_metadata=(metadata[0], metadata[1]),
+        )
+
     def forward_sparse_attn_only(
             self,
             indexer_result: tuple,

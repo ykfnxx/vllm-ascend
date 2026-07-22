@@ -1,0 +1,4 @@
+Source repository: git@github-stortec:StorTecDev/vllm-ascend.git
+Source branch: dev_lookup_maintain_integration
+Source commit: 1ba7fa8579a547a96dad6245fedc5f765e1a5a76
+Local changes: standalone binding, 144K index, fused int32 masks, single 10K gather, paired-microbatch SFA

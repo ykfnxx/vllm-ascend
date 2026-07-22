@@ -1,0 +1,50 @@
+测试数据的构造标准：
+  1. 每个 batch row 的 seqlen 在 MIN_SEQLEN 和 MAX_SEQLEN 闭区间内可复现地无放回随机采样；各 row 的 seqlen 保持不同。MIN_SEQLEN == MAX_SEQLEN 时保留等长测试模式。
+  2. 随机构造 query 和 key 和 weight ，因此理论上 top 2048 index 理论上应该是均匀分布在整个序列里面。
+  3. 构造 miss_count 数值，在 MIN_MISS_COUNT 和 MAX_MISS_COUNT 之间随机取值 。不同 batch 的 miss_count 值不同。
+  4. cache_slots 中应该有 CACHE_SIZE 个 有效值（有效值是指非-1值），且有效值保持 unique ，且有效值的取值范围刚好是 0~CACHE_SIZE-1 。
+  5. 对每个 batch row 按该 row 的实际 seqlen 构造 cache_slots：
+        5.1 从 top 2048 index 中随机挑选 (2048-miss_count) 个 index （称为 hit_index）。
+        5.2 从 top 2048 index 之外的 index （一共 seqlen-2048 个 index）中随机挑选 CACHE_SIZE-(2048-miss_count) 个（称为 other_index）。
+        5.3 把 hit_index 和 other_index 拼起来，称为 cached_index。
+        5.4 初始化 shuffled_slots = shuffle(arange(0,CACHE_SIZE))。
+        5.5 把 cache_slots 整行初始化为 -1，再设置 cache_slots[cached_index] = shuffled_slots。
+
+
+lightning_indexer_decode_update 的验收标准：对于每一个 batch 独立检验：
+  1. 算子输出的 topk_index 结果和 lightning_indexer_decode 匹配 （集合相同，顺序不一样）
+  2. 算子输出的 topk_slots 的值全部 >= 0 且 < CACHE_SIZE
+  3. 算子输出的 topk_index 作为索引去 new cache_slots 里面查找出来的 slots 应该和 topk_slots 逐项相等 。
+  4. 算子输出的 topk_index[:miss_count] 作为索引去 old cache_slots 里面查找出来的 slots 值应该都是无效值（-1）
+  5. 算子输出的 topk_index[miss_count:] 作为索引去 old cache_slots 里面查找出来的 slots 值应该和 topk_slots[miss_count:] 逐项相等
+  6. 算子输出的 new cache_slots 中应该有 CACHE_SIZE 个 有效值（有效值是指非-1值），且有效值保持 unique ，且有效值的取值范围刚好是 0~N_CACHED_TOKENS-1 。
+  7. 算子输出的 miss_count 应该刚好等于样例构造时的 miss_count ，也要等于 count(old_cache_slots[b, topk_index] == -1)
+
+
+
+不需要作为验收条件的：
+  1. topk 分布均匀不要作为验收条件： 随机 query/key/weight 下，top2048 理论上大致会散在全序列，但这个只能作为数据构造直觉，不应该写成 hard check。真正验收还是和 LightningIndexerDecode 的输出做 multiset 对比。
+  2. 每个 batch 独立检查： cache_slots 的 unique / count / range 建议都按 batch row 检查。每行独立检查。
+
+
+一些参数约束：
+- 0 <= MIN_MISS_COUNT <= MAX_MISS_COUNT <= 2048
+- 2048 <= MIN_SEQLEN <= MAX_SEQLEN <= 262144
+- N_CACHED_TOKENS >= 2048
+- N_CACHED_TOKENS + MAX_MISS_COUNT <= MIN_SEQLEN
+
+
+一些概念澄清：
+  1. old cache_slots 是指被算子更新之前的 cache_slots
+  2. new cache_slots 是指被算子更新之后的 cache_slots
+  3. 测试脚本可调参数：
+      3.1 CACHE_SIZE 默认设为 8192
+      3.2 MIN_MISS_COUNT 默认设为 0 ,  MAX_MISS_COUNT 默认设为 200
+      3.3 MIN_SEQLEN 默认设为 32768，MAX_SEQLEN 默认设为 65536
+  4. 不要叫 key_seq ，测试和文档里统一叫 seqlen （key的序列长度）
+
+
+注意：
+1. update 正确性由 test.py 验收，性能由 perf.py 测试。
+2. 另外要注意，每次调用算子前要复制 cache_slots ，避免原地修改 cache_slots 导致影响后面的算子的命中率
+3. test_*.py 只验收正确性，perf_*.py 只测试时延
