@@ -46,8 +46,8 @@ library = ctypes.CDLL(
     mode=ctypes.RTLD_LOCAL | getattr(os, "RTLD_DEEPBIND", 0),
 )
 required_symbols = (
-    "aclnnLightningIndexerDecodeUpdate",
-    "aclnnLightningIndexerDecodeUpdateGetWorkspaceSize",
+    "aclnnLightningIndexerDecodeUpdatePool",
+    "aclnnLightningIndexerDecodeUpdatePoolGetWorkspaceSize",
 )
 missing = [name for name in required_symbols if not hasattr(library, name)]
 if missing:
@@ -56,9 +56,9 @@ if missing:
 import lightning_indexer_decode_custom_ops  # noqa: F401,E402
 import torch  # noqa: E402
 
-if not hasattr(torch.ops.custom, "npu_lightning_indexer_decode_update"):
-    raise RuntimeError("npu_lightning_indexer_decode_update was not registered")
-print("Fused Indexer+KVSelect registration OK")
+if not hasattr(torch.ops.custom, "npu_lightning_indexer_decode_update_pool"):
+    raise RuntimeError("npu_lightning_indexer_decode_update_pool was not registered")
+print("Fused Indexer+Select request-pool registration OK")
 PY
 
 (
@@ -68,11 +68,11 @@ PY
         --bs 2 \
         --min-seqlen 4096 \
         --max-seqlen 4096 \
-        --cache-size 2048 \
+        --cache-size 10240 \
         --min-miss-count 0 \
         --max-miss-count 64 \
         --warmup 1 \
         --iters 1
 )
 
-echo "Standalone Indexer+KVSelect fusion is persistent and smoke-tested."
+echo "Fused Indexer+Select request-pool operators are persistent and smoke-tested."

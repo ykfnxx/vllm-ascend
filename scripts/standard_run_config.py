@@ -89,6 +89,18 @@ def configure_dmp_runtime(visible_devices: str) -> str:
             "DMP_FUSED_INDEXER_PYTHON_PATH",
             DEFAULT_FUSED_INDEXER_PYTHON_PATH,
         )
+        for dependency_python_path in (
+            os.getenv(
+                "DMP_LOOKUP_MAINTAIN_PYTHON_PATH",
+                DEFAULT_LOOKUP_MAINTAIN_PYTHON_PATH,
+            ),
+            os.getenv(
+                "DMP_DUAL_ATTENTION_PYTHON_PATH",
+                DEFAULT_DUAL_ATTENTION_PYTHON_PATH,
+            ),
+        ):
+            if dependency_python_path not in sys.path:
+                sys.path.insert(0, dependency_python_path)
     elif lookup_maintain_enabled:
         vendor_root = os.getenv(
             "DMP_LOOKUP_MAINTAIN_OPP_PATH",
@@ -136,7 +148,20 @@ def configure_dmp_runtime(visible_devices: str) -> str:
     selected_opp_paths = []
     if vendor_root:
         selected_opp_paths.append(vendor_root)
-        if lookup_maintain_enabled:
+        if fused_indexer_enabled:
+            selected_opp_paths.extend(
+                (
+                    os.getenv(
+                        "DMP_LOOKUP_MAINTAIN_OPP_PATH",
+                        DEFAULT_LOOKUP_MAINTAIN_OPP_PATH,
+                    ),
+                    os.getenv(
+                        "DMP_DUAL_ATTENTION_OPP_PATH",
+                        DEFAULT_DUAL_ATTENTION_OPP_PATH,
+                    ),
+                )
+            )
+        elif lookup_maintain_enabled:
             # CANN 8.5 requires the suffixed AICPU repository before the
             # surrounding vendor OPP in ASCEND_CUSTOM_OPP_PATH.
             selected_opp_paths.insert(
@@ -235,14 +260,17 @@ def preload_dmp_operator_libraries(vendor_root: str) -> None:
     lookup_maintain_enabled = (
         os.getenv("VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN", "0") == "1"
     )
+    fused_indexer_enabled = (
+        os.getenv("VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT", "0") == "1"
+    )
     if lookup_maintain_enabled:
         required_symbols = [
             "aclnnAsuHbmIndexLookup",
             "aclnnAsuHbmIndexMaintainAicpu",
             "aclnnDmpLookupKvGather",
         ]
-    elif os.getenv("VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT", "0") == "1":
-        required_symbols = ["aclnnLightningIndexerDecodeUpdate"]
+    elif fused_indexer_enabled:
+        required_symbols = ["aclnnLightningIndexerDecodeUpdatePool"]
     else:
         required_symbols = ["aclnnDmpSparseFlashAttention"]
         if os.getenv("VLLM_ASCEND_DMP_KV_BACKEND", "local").lower() == "local":
@@ -287,6 +315,51 @@ def preload_dmp_operator_libraries(vendor_root: str) -> None:
                 f"missing {', '.join(missing_dual_symbols)}: {dual_library_path}"
             )
         loaded_libraries.append(dual_library)
+    elif fused_indexer_enabled:
+        dependency_libraries = (
+            (
+                "KVIO",
+                os.getenv(
+                    "DMP_LOOKUP_MAINTAIN_OPP_PATH",
+                    DEFAULT_LOOKUP_MAINTAIN_OPP_PATH,
+                ),
+                ("aclnnDmpLookupKvGather",),
+            ),
+            (
+                "Dual-Attention SFA",
+                os.getenv(
+                    "DMP_DUAL_ATTENTION_OPP_PATH",
+                    DEFAULT_DUAL_ATTENTION_OPP_PATH,
+                ),
+                ("aclnnDmpSparseFlashAttention",),
+            ),
+        )
+        for label, dependency_root, symbols in dependency_libraries:
+            dependency_library_path = os.path.join(
+                dependency_root, "op_api", "lib", "libcust_opapi.so"
+            )
+            try:
+                dependency_library = ctypes.CDLL(
+                    dependency_library_path,
+                    mode=ctypes.RTLD_LOCAL | getattr(os, "RTLD_DEEPBIND", 0),
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Fused scheme 3 requires the {label} operator library: "
+                    f"{dependency_library_path}"
+                ) from exc
+            missing_dependency_symbols = [
+                symbol
+                for symbol in symbols
+                if not hasattr(dependency_library, symbol)
+            ]
+            if missing_dependency_symbols:
+                raise RuntimeError(
+                    f"{label} library required by fused scheme 3 is stale; "
+                    f"missing {', '.join(missing_dependency_symbols)}: "
+                    f"{dependency_library_path}"
+                )
+            loaded_libraries.append(dependency_library)
     _PRELOADED_OPERATOR_LIBRARIES.extend(loaded_libraries)
 
 

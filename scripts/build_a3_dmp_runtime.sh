@@ -6,6 +6,7 @@ VISIBLE_DEVICES="${VISIBLE_DEVICES:-0}"
 LOG_DIR="$SCRIPT_DIR/logs/a3_runtime_build_$(date +%Y%m%d_%H%M%S)"
 DUAL_STAMP="$SCRIPT_DIR/dmp-runtime/.a3-dual-attention-r4"
 LOOKUP_STAMP="$SCRIPT_DIR/dmp-lookup-maintain/opp/.a3-lookup-maintain-r5"
+FUSED_STAMP="$SCRIPT_DIR/dmp-fused-indexer-kv-select/opp/.a3-fused-indexer-pool-r1"
 FORCE_REBUILD="${DMP_FORCE_REBUILD:-0}"
 mkdir -p "$LOG_DIR"
 echo "A3 runtime preparation log: $LOG_DIR"
@@ -46,38 +47,69 @@ lookup_ready() {
     lookup_artifacts_present
 }
 
+fused_artifacts_present() {
+    local vendor="$SCRIPT_DIR/dmp-fused-indexer-kv-select/opp/vendors/customize"
+    [[ -f "$vendor/op_api/lib/libcust_opapi.so" ]] &&
+    compgen -G \
+        "$SCRIPT_DIR/dmp-fused-indexer-kv-select/torch_extension/lightning_indexer_decode_custom_ops/*.so" \
+        >/dev/null
+}
+
+fused_ready() {
+    [[ -f "$FUSED_STAMP" ]] &&
+    [[ "$(<"$FUSED_STAMP")" == "A3_FUSED_INDEXER_POOL_RUNTIME_REVISION=1" ]] &&
+    fused_artifacts_present
+}
+
 if [[ "$FORCE_REBUILD" == "1" ]] || ! dual_ready; then
     if [[ "$FORCE_REBUILD" != "1" ]] && dual_artifacts_present; then
-        echo "[1/3] Adopting and smoke-testing the existing Dual-Attention runtime."
+        echo "[1/4] Adopting and smoke-testing the existing Dual-Attention runtime."
         DMP_DUAL_ATTENTION_SKIP_BUILD=1 \
             bash "$SCRIPT_DIR/build_dmp_dual_attention_ops.sh" 2>&1 \
             | tee "$LOG_DIR/dual_attention.log"
     else
-        echo "[1/3] Building and smoke-testing Dual-Attention operators for A3."
+        echo "[1/4] Building and smoke-testing Dual-Attention operators for A3."
         bash "$SCRIPT_DIR/build_dmp_dual_attention_ops.sh" 2>&1 \
             | tee "$LOG_DIR/dual_attention.log"
     fi
     mkdir -p "$(dirname "$DUAL_STAMP")"
     printf '%s\n' 'A3_DUAL_ATTENTION_RUNTIME_REVISION=4' > "$DUAL_STAMP"
 else
-    echo "[1/3] Dual-Attention runtime is already complete; skipping rebuild."
+    echo "[1/4] Dual-Attention runtime is already complete; skipping rebuild."
 fi
 
 if [[ "$FORCE_REBUILD" == "1" ]] || ! lookup_ready; then
     if [[ "$FORCE_REBUILD" != "1" ]] && lookup_artifacts_present; then
-        echo "[2/3] Adopting and smoke-testing the existing Lookup/Maintain runtime."
+        echo "[2/4] Adopting and smoke-testing the existing Lookup/Maintain runtime."
         DMP_LOOKUP_MAINTAIN_SKIP_BUILD=1 \
             bash "$SCRIPT_DIR/build_dmp_lookup_maintain.sh" 2>&1 \
             | tee "$LOG_DIR/lookup_maintain.log"
     else
-        echo "[2/3] Building and smoke-testing Lookup/Maintain operators for A3."
+        echo "[2/4] Building and smoke-testing Lookup/Maintain operators for A3."
         bash "$SCRIPT_DIR/build_dmp_lookup_maintain.sh" 2>&1 \
             | tee "$LOG_DIR/lookup_maintain.log"
     fi
     mkdir -p "$(dirname "$LOOKUP_STAMP")"
     printf '%s\n' 'A3_LOOKUP_MAINTAIN_RUNTIME_REVISION=5' > "$LOOKUP_STAMP"
 else
-    echo "[2/3] Lookup/Maintain runtime is already complete; skipping rebuild."
+    echo "[2/4] Lookup/Maintain runtime is already complete; skipping rebuild."
+fi
+
+if [[ "$FORCE_REBUILD" == "1" ]] || ! fused_ready; then
+    if [[ "$FORCE_REBUILD" != "1" ]] && fused_artifacts_present; then
+        echo "[3/4] Adopting and smoke-testing the existing fused request-pool runtime."
+        DMP_FUSED_INDEXER_SKIP_BUILD=1 \
+            bash "$SCRIPT_DIR/build_dmp_fused_indexer_kv_select.sh" 2>&1 \
+            | tee "$LOG_DIR/fused_indexer_pool.log"
+    else
+        echo "[3/4] Building and smoke-testing fused request-pool operators for A3."
+        bash "$SCRIPT_DIR/build_dmp_fused_indexer_kv_select.sh" 2>&1 \
+            | tee "$LOG_DIR/fused_indexer_pool.log"
+    fi
+    mkdir -p "$(dirname "$FUSED_STAMP")"
+    printf '%s\n' 'A3_FUSED_INDEXER_POOL_RUNTIME_REVISION=1' > "$FUSED_STAMP"
+else
+    echo "[3/4] Fused request-pool runtime is already complete; skipping rebuild."
 fi
 
 # This also deploys the offline Transformers wheels if the persistent model
@@ -85,7 +117,7 @@ fi
 bash "$SCRIPT_DIR/install_dmp_dual_attention_runtime.sh" \
     | tee "$LOG_DIR/persistent_install.log"
 
-echo "[3/3] Validating A3 libraries, Python extensions, and registrations."
+echo "[4/4] Validating A3 libraries, Python extensions, and registrations."
 bash "$SCRIPT_DIR/validate_a3_dmp_runtime.sh" 2>&1 \
     | tee "$LOG_DIR/final_validation.log"
 

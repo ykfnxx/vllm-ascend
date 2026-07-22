@@ -6,6 +6,7 @@ export VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN=1
 export VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT=0
 export VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION=0
 source "$SCRIPT_DIR/dmp_lookup_maintain_runtime_env.sh"
+export PYTHONPATH="$SCRIPT_DIR/dmp-fused-indexer-kv-select/torch_extension${PYTHONPATH:+:$PYTHONPATH}"
 
 python3 - "$SCRIPT_DIR" <<'PY'
 import ctypes
@@ -25,6 +26,10 @@ lookup_library = os.path.join(
     script_dir,
     "dmp-lookup-maintain/opp/vendors/customize/op_api/lib/libcust_opapi.so",
 )
+fused_library = os.path.join(
+    script_dir,
+    "dmp-fused-indexer-kv-select/opp/vendors/customize/op_api/lib/libcust_opapi.so",
+)
 
 base = ctypes.CDLL(base_library, mode=ctypes.RTLD_GLOBAL)
 dual = ctypes.CDLL(
@@ -33,6 +38,10 @@ dual = ctypes.CDLL(
 )
 lookup = ctypes.CDLL(
     lookup_library,
+    mode=ctypes.RTLD_LOCAL | getattr(os, "RTLD_DEEPBIND", 0),
+)
+fused = ctypes.CDLL(
+    fused_library,
     mode=ctypes.RTLD_LOCAL | getattr(os, "RTLD_DEEPBIND", 0),
 )
 
@@ -44,11 +53,15 @@ required_symbols = {
         "aclnnAsuHbmIndexMaintainAicpu",
         "aclnnDmpLookupKvGather",
     ),
+    fused_library: ("aclnnLightningIndexerDecodeUpdatePool",),
 }
 for library_path, symbols in required_symbols.items():
-    handle = {base_library: base, dual_library: dual, lookup_library: lookup}[
-        library_path
-    ]
+    handle = {
+        base_library: base,
+        dual_library: dual,
+        lookup_library: lookup,
+        fused_library: fused,
+    }[library_path]
     missing = [name for name in symbols if not hasattr(handle, name)]
     if missing:
         raise RuntimeError(f"missing symbols {missing}: {library_path}")
@@ -78,6 +91,7 @@ if missing_base_ops:
 
 import custom_ops  # noqa: F401
 import dmp_lookup_maintain_custom_ops  # noqa: F401
+import lightning_indexer_decode_custom_ops  # noqa: F401
 
 required_torch_ops = (
     (torch.ops.custom, "npu_dmp_sparse_flash_attention"),
@@ -85,6 +99,7 @@ required_torch_ops = (
     (torch.ops.dmp_lookup_maintain, "asu_hbm_index_lookup"),
     (torch.ops.dmp_lookup_maintain, "asu_hbm_index_maintain_aicpu"),
     (torch.ops.dmp_lookup_maintain, "dmp_lookup_kv_gather"),
+    (torch.ops.custom, "npu_lightning_indexer_decode_update_pool"),
 )
 missing_ops = [name for namespace, name in required_torch_ops if not hasattr(namespace, name)]
 if missing_ops:

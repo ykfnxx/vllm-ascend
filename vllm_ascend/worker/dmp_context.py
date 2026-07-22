@@ -92,6 +92,7 @@ class DMPContext:
             if (
                 self.dual_attention is not None
                 or self.lookup_maintain is not None
+                or self.fused_indexer_kv_select is not None
             ):
                 for microbatch in ("A", "B"):
                     self.get_event(f"L{layer_idx}_indexer_{microbatch}_done")

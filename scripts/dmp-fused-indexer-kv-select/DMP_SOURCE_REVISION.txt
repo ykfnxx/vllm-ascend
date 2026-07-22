@@ -1,6 +1,6 @@
 Repository: https://github.com/xwLearnsLLM/DSA_offload_ops
 Branch: ops_li_update
-Commit: 34b78bf8169c2f8e9d2ff0a319c734252ad95914
+Commit: 3f5c292a4f069716b683b147da71b3106e2ae2bc
 
-This package contains only the standalone LightningIndexerDecodeUpdate path.
-It does not contain HIXL or KVGather integration.
+This snapshot includes LightningIndexerDecodeUpdatePool request-pool support.
+It does not contain HIXL, KVGather, or a separate AICPU Maintain operator.

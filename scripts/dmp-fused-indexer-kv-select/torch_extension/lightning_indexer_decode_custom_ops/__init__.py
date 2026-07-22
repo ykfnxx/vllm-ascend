@@ -51,7 +51,7 @@ custom_ops_lib = importlib.import_module(".custom_ops_lib", __name__)
 
 _custom = getattr(torch.ops, "custom", None)
 if _custom is not None and hasattr(_custom, "npu_lightning_indexer_decode"):
-    _decode_op = getattr(_custom, "npu_lightning_indexer_decode")
+    _decode_op = _custom.npu_lightning_indexer_decode
 
     def npu_lightning_indexer_decode(
         query,
@@ -63,10 +63,10 @@ if _custom is not None and hasattr(_custom, "npu_lightning_indexer_decode"):
     ):
         return _decode_op(query, key, weights, actual_seq_lengths_key, block_table)
 
-    setattr(torch_npu, "npu_lightning_indexer_decode", npu_lightning_indexer_decode)
+    torch_npu.npu_lightning_indexer_decode = npu_lightning_indexer_decode
 
 if _custom is not None and hasattr(_custom, "npu_lightning_indexer_decode_update"):
-    _decode_update_op = getattr(_custom, "npu_lightning_indexer_decode_update")
+    _decode_update_op = _custom.npu_lightning_indexer_decode_update
 
     def npu_lightning_indexer_decode_update(
         query,
@@ -79,10 +79,37 @@ if _custom is not None and hasattr(_custom, "npu_lightning_indexer_decode_update
     ):
         return _decode_update_op(query, key, weights, cache_slots, actual_seq_lengths_key, block_table)
 
-    setattr(torch_npu, "npu_lightning_indexer_decode_update", npu_lightning_indexer_decode_update)
+    torch_npu.npu_lightning_indexer_decode_update = npu_lightning_indexer_decode_update
+
+if _custom is not None and hasattr(_custom, "npu_lightning_indexer_decode_update_pool"):
+    _decode_update_pool_op = _custom.npu_lightning_indexer_decode_update_pool
+
+    def npu_lightning_indexer_decode_update_pool(
+        query,
+        key,
+        weights,
+        req_pool_entries,
+        cache_slots,
+        *,
+        actual_seq_lengths_key,
+        block_table,
+    ):
+        return _decode_update_pool_op(
+            query,
+            key,
+            weights,
+            req_pool_entries,
+            cache_slots,
+            actual_seq_lengths_key,
+            block_table,
+        )
+
+    torch_npu.npu_lightning_indexer_decode_update_pool = npu_lightning_indexer_decode_update_pool
 
 __all__ = ["custom_ops_lib"]
 if "npu_lightning_indexer_decode" in globals():
     __all__.append("npu_lightning_indexer_decode")
 if "npu_lightning_indexer_decode_update" in globals():
     __all__.append("npu_lightning_indexer_decode_update")
+if "npu_lightning_indexer_decode_update_pool" in globals():
+    __all__.append("npu_lightning_indexer_decode_update_pool")

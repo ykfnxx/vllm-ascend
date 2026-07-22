@@ -1316,6 +1316,7 @@ class NPUModelRunner(GPUModelRunner):
                 self._dmp_fused_indexer_kv_select = DMPFusedIndexerKVSelect(
                     self.device,
                     max_microbatch_tokens=max_microbatch_tokens,
+                    block_size=self.cache_config.block_size,
                 )
                 num_layers = self.model_config.hf_text_config.num_hidden_layers
                 state_gib = (
@@ -1327,8 +1328,9 @@ class NPUModelRunner(GPUModelRunner):
                     / (1024**3)
                 )
                 logger.info(
-                    "DMP fused Indexer+KVSelect enabled without KVGather; "
-                    "maximum cache-index state is %.2f GiB",
+                    "DMP fused Indexer+Select request pool with one local "
+                    "KVIO per microbatch enabled; maximum cache-index state "
+                    "is %.2f GiB before lazy 10K KV staging allocation",
                     state_gib,
                 )
             fused_indexer_kv_select = self._dmp_fused_indexer_kv_select

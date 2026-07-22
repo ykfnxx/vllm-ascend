@@ -13,6 +13,7 @@ export BATCH_SIZE="${BATCH_SIZE:-64}"
 export PROMPT_TOKENS="${PROMPT_TOKENS:-131072}"
 export MAX_TOKENS="${MAX_TOKENS:-10}"
 export MAX_MODEL_LEN="${MAX_MODEL_LEN:-132000}"
+export DMP_SCHEME="${DMP_SCHEME:-4}"
 
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-false}"
@@ -26,6 +27,7 @@ dmp_configure_a3_single_card_rendezvous
 runtime_artifacts_ready() {
     local dual_stamp="$SCRIPT_DIR/dmp-runtime/.a3-dual-attention-r4"
     local lookup_stamp="$SCRIPT_DIR/dmp-lookup-maintain/opp/.a3-lookup-maintain-r5"
+    local fused_stamp="$SCRIPT_DIR/dmp-fused-indexer-kv-select/opp/.a3-fused-indexer-pool-r1"
     local dual_vendor="$SCRIPT_DIR/dmp-runtime/opp/vendors/customize"
     local lookup_vendor="$SCRIPT_DIR/dmp-lookup-maintain/opp/vendors/customize"
 
@@ -33,11 +35,17 @@ runtime_artifacts_ready() {
     [[ "$(<"$dual_stamp")" == "A3_DUAL_ATTENTION_RUNTIME_REVISION=4" ]] &&
     [[ -f "$lookup_stamp" ]] &&
     [[ "$(<"$lookup_stamp")" == "A3_LOOKUP_MAINTAIN_RUNTIME_REVISION=5" ]] &&
+    [[ -f "$fused_stamp" ]] &&
+    [[ "$(<"$fused_stamp")" == "A3_FUSED_INDEXER_POOL_RUNTIME_REVISION=1" ]] &&
     [[ -f "$dual_vendor/op_api/lib/libcust_opapi.so" ]] &&
     [[ -f "$lookup_vendor/op_api/lib/libcust_opapi.so" ]] &&
+    [[ -f "$SCRIPT_DIR/dmp-fused-indexer-kv-select/opp/vendors/customize/op_api/lib/libcust_opapi.so" ]] &&
     compgen -G "$SCRIPT_DIR/dmp-runtime/python/custom_ops/*.so" >/dev/null &&
     compgen -G \
         "$SCRIPT_DIR/dmp-lookup-maintain/torch_extension/dmp_lookup_maintain_custom_ops/*.so" \
+        >/dev/null &&
+    compgen -G \
+        "$SCRIPT_DIR/dmp-fused-indexer-kv-select/torch_extension/lightning_indexer_decode_custom_ops/*.so" \
         >/dev/null
 }
 
@@ -74,5 +82,5 @@ REDUCED_MODEL_PATH="$MODEL_PATH" \
     bash "$SCRIPT_DIR/prepare_a3_single_card_model.sh"
 
 echo "[run] Local rendezvous: VLLM_HOST_IP=$VLLM_HOST_IP GLOO_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME"
-echo "[run] Starting single-card scheme 4: batch=$BATCH_SIZE prompt=$PROMPT_TOKENS output=$MAX_TOKENS"
+echo "[run] Starting single-card scheme $DMP_SCHEME: batch=$BATCH_SIZE prompt=$PROMPT_TOKENS output=$MAX_TOKENS"
 exec bash "$SCRIPT_DIR/run_example1_and_split_log.sh"

@@ -214,7 +214,9 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
         if dmp_context is None:
             raise RuntimeError("DMP segmented-attention context is not active")
         attention_runtime = (
-            dmp_context.dual_attention or dmp_context.lookup_maintain
+            dmp_context.dual_attention
+            or dmp_context.lookup_maintain
+            or dmp_context.fused_indexer_kv_select
         )
         if attention_runtime is None:
             raise RuntimeError("DMP segmented-attention runtime is not active")
@@ -237,6 +239,14 @@ class AscendMultiHeadLatentAttention(MultiHeadLatentAttentionWrapper):
                 indexer_result=indexer_result,
                 kv_cache=kv_cache,
                 attn_metadata=attn_metadata,
+            )
+        elif dmp_context.fused_indexer_kv_select is not None:
+            runtime.prepare_attention(
+                self.mla_attn.layer_name,
+                dmp_context.active_microbatch_idx,
+                indexer_result,
+                kv_cache,
+                attn_metadata,
             )
         else:
             runtime.select(

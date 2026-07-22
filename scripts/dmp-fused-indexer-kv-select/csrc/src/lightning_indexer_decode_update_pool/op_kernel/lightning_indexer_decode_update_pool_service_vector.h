@@ -9,19 +9,19 @@
  */
 
 /*!
- * \file lightning_indexer_decode_update_service_vector.h
+ * \file lightning_indexer_decode_update_pool_service_vector.h
  * \brief
  */
-#ifndef lightning_indexer_decode_update_SERVICE_VECTOR_H
-#define lightning_indexer_decode_update_SERVICE_VECTOR_H
+#ifndef lightning_indexer_decode_update_pool_SERVICE_VECTOR_H
+#define lightning_indexer_decode_update_pool_SERVICE_VECTOR_H
 
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
-#include "lightning_indexer_decode_update_common.h"
-#include "lightning_indexer_decode_update_vector.h"
+#include "lightning_indexer_decode_update_pool_common.h"
+#include "lightning_indexer_decode_update_pool_vector.h"
 
 namespace LIKernel {
 using namespace LICommon;
@@ -50,9 +50,9 @@ static_assert(LI_DECODE_UPDATE_EVICT_EXTRA_SCAN_CHUNKS <= 512,
               "LI_DECODE_UPDATE_EVICT_EXTRA_SCAN_CHUNKS must not exceed 512");
 constexpr uint32_t EVICT_EXTRA_SCAN_CHUNKS = LI_DECODE_UPDATE_EVICT_EXTRA_SCAN_CHUNKS;
 
-__aicore__ inline uint32_t HashEvictScanSeed(uint32_t actualSeqLen, uint32_t bIdx)
+__aicore__ inline uint32_t HashEvictScanSeed(uint32_t actualSeqLen, uint32_t cacheRowIdx)
 {
-    uint32_t value = actualSeqLen ^ ((bIdx + 1U) * 0x9e3779b9U);
+    uint32_t value = actualSeqLen ^ ((cacheRowIdx + 1U) * 0x9e3779b9U);
     value ^= value >> 16;
     value *= 0x7feb352dU;
     value ^= value >> 15;
@@ -112,8 +112,8 @@ private:
     constexpr static uint32_t REDUCE_BANK_CONFLICT_OFFSETS = 256;
     constexpr static uint32_t REDUCE_BANK_CONFLICT_NUM = REDUCE_BANK_CONFLICT_OFFSETS / sizeof(float);
 
-    __aicore__ inline void StartPayloadCopy(LocalTensor<int32_t> &payloadLocal, uint32_t bIdx, int32_t s2BaseIdx,
-                                            int32_t validLen, int32_t alignedLen);
+    __aicore__ inline void StartPayloadCopy(LocalTensor<int32_t> &payloadLocal, uint32_t cacheRowIdx,
+                                            int32_t s2BaseIdx, int32_t validLen, int32_t alignedLen);
     __aicore__ inline void FinishPayload(LocalTensor<int32_t> &payloadLocal, int32_t s2BaseIdx, int32_t validLen);
     __aicore__ inline void SortTopKBySlot(const LocalTensor<float> &pairLocal,
                                           const LocalTensor<float> &keyLocal,
@@ -121,19 +121,20 @@ private:
                                           LocalTensor<float> &tmpSortBuf);
     __aicore__ inline void StartScoreWrite(uint32_t bIdx, int32_t s2BaseIdx,
                                            const LocalTensor<float> &scoreLocal, int32_t alignedLen);
-    __aicore__ inline void SortEvictCandidateChunk(uint32_t bIdx, uint32_t chunkIdx, uint32_t actualSeqLen,
+    __aicore__ inline void SortEvictCandidateChunk(uint32_t bIdx, uint32_t cacheRowIdx, uint32_t chunkIdx,
+                                                   uint32_t actualSeqLen,
                                                    const LocalTensor<float> &pairOut,
                                                    LocalTensor<float> &tmpSortBuf);
     __aicore__ inline void MergeEvictCandidateChunk(const LocalTensor<float> &chunkPairLocal,
                                                      uint32_t candidateCap,
                                                      LocalTensor<float> &tmpSortBuf);
-    __aicore__ inline void MergeExtraEvictChunks512(uint32_t bIdx, uint32_t actualSeqLen,
+    __aicore__ inline void MergeExtraEvictChunks512(uint32_t bIdx, uint32_t cacheRowIdx, uint32_t actualSeqLen,
                                                     uint32_t startChunk, uint32_t chunkNum,
                                                     uint32_t firstScanOffset, uint32_t extraChunks,
                                                     LocalTensor<float> &tmpSortBuf);
-    __aicore__ inline void FindEvictCandidates(uint32_t bIdx, uint32_t actualSeqLen, uint32_t missCount,
-                                               uint32_t candidateCap, float thresholdScore,
-                                               LocalTensor<float> &tmpSortBuf);
+    __aicore__ inline void FindEvictCandidates(uint32_t bIdx, uint32_t cacheRowIdx, uint32_t actualSeqLen,
+                                               uint32_t missCount, uint32_t candidateCap,
+                                               float thresholdScore, LocalTensor<float> &tmpSortBuf);
     __aicore__ inline uint32_t CopyDecodedPayloadOut(int64_t outOffset, const LocalTensor<uint32_t> &payloadLocal,
                                                      const LocalTensor<int32_t> &indexLocal,
                                                      const LocalTensor<int32_t> &slotLocal,
@@ -142,10 +143,11 @@ private:
                                                      bool mayHaveInvalid);
     __aicore__ inline bool IsTopKIndex(const LocalTensor<int32_t> &indexLocal, uint32_t candidateIndex,
                                        uint32_t count) const;
-    __aicore__ inline bool FindFallbackEvict(uint32_t bIdx, uint32_t actualSeqLen,
+    __aicore__ inline bool FindFallbackEvict(uint32_t cacheRowIdx, uint32_t actualSeqLen,
                                              const LocalTensor<int32_t> &indexLocal, uint32_t &scanCursor,
                                              uint32_t &evictIndex, int32_t &evictSlot);
-    __aicore__ inline void UpdateCacheAndWriteTopkSlots(uint32_t bIdx, int64_t outOffset, uint32_t actualSeqLen,
+    __aicore__ inline void UpdateCacheAndWriteTopkSlots(uint32_t bIdx, uint32_t cacheRowIdx,
+                                                        int64_t outOffset, uint32_t actualSeqLen,
                                                         float thresholdScore, uint32_t missCount,
                                                         const LocalTensor<int32_t> &indexLocal,
                                                         const LocalTensor<int32_t> &scalarLocal,
@@ -223,7 +225,7 @@ __aicore__ inline void LIVector<LIT>::CleanInvalidOutput(int64_t invalidS1offset
 }
 
 template <typename LIT>
-__aicore__ inline void LIVector<LIT>::StartPayloadCopy(LocalTensor<int32_t> &payloadLocal, uint32_t bIdx,
+__aicore__ inline void LIVector<LIT>::StartPayloadCopy(LocalTensor<int32_t> &payloadLocal, uint32_t cacheRowIdx,
                                                        int32_t s2BaseIdx, int32_t validLen, int32_t alignedLen)
 {
     if (validLen < alignedLen) {
@@ -231,7 +233,8 @@ __aicore__ inline void LIVector<LIT>::StartPayloadCopy(LocalTensor<int32_t> &pay
         PipeBarrier<PIPE_V>();
         SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
     }
-    DataCopyPad(payloadLocal, cacheSlotsGm[bIdx * LICommon::ConstInfo::CACHE_SLOTS_SIZE + s2BaseIdx],
+    uint64_t rowBase = static_cast<uint64_t>(cacheRowIdx) * LICommon::ConstInfo::CACHE_SLOTS_SIZE;
+    DataCopyPad(payloadLocal, cacheSlotsGm[rowBase + static_cast<uint32_t>(s2BaseIdx)],
                 AscendC::DataCopyExtParams{1, static_cast<uint32_t>(validLen * sizeof(int32_t)), 0, 0, 0},
                 AscendC::DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
 }
@@ -290,7 +293,8 @@ __aicore__ inline void LIVector<LIT>::StartScoreWrite(uint32_t bIdx, int32_t s2B
 }
 
 template <typename LIT>
-__aicore__ inline void LIVector<LIT>::SortEvictCandidateChunk(uint32_t bIdx, uint32_t chunkIdx,
+__aicore__ inline void LIVector<LIT>::SortEvictCandidateChunk(uint32_t bIdx, uint32_t cacheRowIdx,
+                                                              uint32_t chunkIdx,
                                                               uint32_t actualSeqLen,
                                                               const LocalTensor<float> &pairOut,
                                                               LocalTensor<float> &tmpSortBuf)
@@ -315,7 +319,8 @@ __aicore__ inline void LIVector<LIT>::SortEvictCandidateChunk(uint32_t bIdx, uin
     }
     uint8_t payloadRightPadding = static_cast<uint8_t>(
         (B32_BLOCK_ALIGN_NUM - validLen % B32_BLOCK_ALIGN_NUM) % B32_BLOCK_ALIGN_NUM);
-    DataCopyPad(payloadLocal, cacheSlotsGm[bIdx * LICommon::ConstInfo::CACHE_SLOTS_SIZE + s2BaseIdx],
+    uint64_t rowBase = static_cast<uint64_t>(cacheRowIdx) * LICommon::ConstInfo::CACHE_SLOTS_SIZE;
+    DataCopyPad(payloadLocal, cacheSlotsGm[rowBase + s2BaseIdx],
                 AscendC::DataCopyExtParams{1, static_cast<uint32_t>(validLen * sizeof(int32_t)), 0, 0, 0},
                 AscendC::DataCopyPadExtParams<int32_t>{payloadRightPadding != 0, 0, payloadRightPadding,
                                                        LICommon::ConstInfo::INVALID_IDX});
@@ -360,7 +365,8 @@ __aicore__ inline void LIVector<LIT>::MergeEvictCandidateChunk(const LocalTensor
 }
 
 template <typename LIT>
-__aicore__ inline void LIVector<LIT>::MergeExtraEvictChunks512(uint32_t bIdx, uint32_t actualSeqLen,
+__aicore__ inline void LIVector<LIT>::MergeExtraEvictChunks512(uint32_t bIdx, uint32_t cacheRowIdx,
+                                                               uint32_t actualSeqLen,
                                                                uint32_t startChunk, uint32_t chunkNum,
                                                                uint32_t firstScanOffset, uint32_t extraChunks,
                                                                LocalTensor<float> &tmpSortBuf)
@@ -375,7 +381,7 @@ __aicore__ inline void LIVector<LIT>::MergeExtraEvictChunks512(uint32_t bIdx, ui
                 chunkIdx -= chunkNum;
             }
             LocalTensor<float> chunkPairLocal = globalTopkUb_[batchIdx * CHUNK_PAIR_FLOATS];
-            SortEvictCandidateChunk(bIdx, chunkIdx, actualSeqLen, chunkPairLocal, tmpSortBuf);
+            SortEvictCandidateChunk(bIdx, cacheRowIdx, chunkIdx, actualSeqLen, chunkPairLocal, tmpSortBuf);
             PipeBarrier<PIPE_V>();
         }
 
@@ -391,14 +397,15 @@ __aicore__ inline void LIVector<LIT>::MergeExtraEvictChunks512(uint32_t bIdx, ui
 }
 
 template <typename LIT>
-__aicore__ inline void LIVector<LIT>::FindEvictCandidates(uint32_t bIdx, uint32_t actualSeqLen, uint32_t missCount,
+__aicore__ inline void LIVector<LIT>::FindEvictCandidates(uint32_t bIdx, uint32_t cacheRowIdx,
+                                                          uint32_t actualSeqLen, uint32_t missCount,
                                                           uint32_t candidateCap, float thresholdScore,
                                                           LocalTensor<float> &tmpSortBuf)
 {
     InitSortOutBuf(evictCandidateUb_, candidateCap * VALUE_AND_INDEX_NUM);
     float stopKey = -thresholdScore;
     uint32_t chunkNum = CeilDiv(actualSeqLen, static_cast<uint32_t>(s2BaseSize_));
-    uint32_t startChunk = HashEvictScanSeed(actualSeqLen, bIdx) % chunkNum;
+    uint32_t startChunk = HashEvictScanSeed(actualSeqLen, cacheRowIdx) % chunkNum;
     uint32_t stopScanOffset = chunkNum;
     LocalTensor<float> chunkPairLocal = tmpSortBuf[SORT_TMP_FLOATS];
     if (candidateCap > static_cast<uint32_t>(s2BaseSize_) && candidateCap < EVICT_CANDIDATE_CAP) {
@@ -411,7 +418,7 @@ __aicore__ inline void LIVector<LIT>::FindEvictCandidates(uint32_t bIdx, uint32_
         if (chunkIdx >= chunkNum) {
             chunkIdx -= chunkNum;
         }
-        SortEvictCandidateChunk(bIdx, chunkIdx, actualSeqLen, chunkPairLocal, tmpSortBuf);
+        SortEvictCandidateChunk(bIdx, cacheRowIdx, chunkIdx, actualSeqLen, chunkPairLocal, tmpSortBuf);
         PipeBarrier<PIPE_V>();
         MergeEvictCandidateChunk(chunkPairLocal, candidateCap, tmpSortBuf);
 
@@ -433,8 +440,8 @@ __aicore__ inline void LIVector<LIT>::FindEvictCandidates(uint32_t bIdx, uint32_
                 break;
             }
             if (candidateCap == static_cast<uint32_t>(s2BaseSize_)) {
-                MergeExtraEvictChunks512(bIdx, actualSeqLen, startChunk, chunkNum, scanOffset + 1U,
-                                         extraChunks, tmpSortBuf);
+                MergeExtraEvictChunks512(bIdx, cacheRowIdx, actualSeqLen, startChunk, chunkNum,
+                                         scanOffset + 1U, extraChunks, tmpSortBuf);
                 SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
                 break;
             }
@@ -494,12 +501,12 @@ __aicore__ inline bool LIVector<LIT>::IsTopKIndex(const LocalTensor<int32_t> &in
 }
 
 template <typename LIT>
-__aicore__ inline bool LIVector<LIT>::FindFallbackEvict(uint32_t bIdx, uint32_t actualSeqLen,
+__aicore__ inline bool LIVector<LIT>::FindFallbackEvict(uint32_t cacheRowIdx, uint32_t actualSeqLen,
                                                         const LocalTensor<int32_t> &indexLocal,
                                                         uint32_t &scanCursor, uint32_t &evictIndex,
                                                         int32_t &evictSlot)
 {
-    uint32_t rowBase = bIdx * LICommon::ConstInfo::CACHE_SLOTS_SIZE;
+    uint64_t rowBase = static_cast<uint64_t>(cacheRowIdx) * LICommon::ConstInfo::CACHE_SLOTS_SIZE;
     while (scanCursor < actualSeqLen) {
         int32_t slot = cacheSlotsGm.GetValue(rowBase + scanCursor);
         uint32_t candidateIndex = scanCursor;
@@ -517,7 +524,8 @@ __aicore__ inline bool LIVector<LIT>::FindFallbackEvict(uint32_t bIdx, uint32_t 
 
 template <typename LIT>
 __aicore__ inline void LIVector<LIT>::UpdateCacheAndWriteTopkSlots(
-    uint32_t bIdx, int64_t outOffset, uint32_t actualSeqLen, float thresholdScore, uint32_t missCount,
+    uint32_t bIdx, uint32_t cacheRowIdx, int64_t outOffset, uint32_t actualSeqLen,
+    float thresholdScore, uint32_t missCount,
     const LocalTensor<int32_t> &indexLocal, const LocalTensor<int32_t> &scalarLocal,
     const LocalTensor<int32_t> &topkSlotsLocal)
 {
@@ -531,12 +539,13 @@ __aicore__ inline void LIVector<LIT>::UpdateCacheAndWriteTopkSlots(
         if (candidateCap > EVICT_CANDIDATE_CAP) {
             candidateCap = EVICT_CANDIDATE_CAP;
         }
-        FindEvictCandidates(bIdx, actualSeqLen, missCount, candidateCap, thresholdScore, SortedBasicBlock_);
+        FindEvictCandidates(bIdx, cacheRowIdx, actualSeqLen, missCount, candidateCap,
+                            thresholdScore, SortedBasicBlock_);
     }
 
     uint32_t candidateCursor = 0;
     uint32_t fallbackCursor = 0;
-    uint32_t rowBase = bIdx * LICommon::ConstInfo::CACHE_SLOTS_SIZE;
+    uint64_t rowBase = static_cast<uint64_t>(cacheRowIdx) * LICommon::ConstInfo::CACHE_SLOTS_SIZE;
     float stopKey = -thresholdScore;
     LocalTensor<uint32_t> candidateBitsLocal = evictCandidateUb_.template ReinterpretCast<uint32_t>();
     for (uint32_t missIdx = 0; missIdx < missCount; ++missIdx) {
@@ -560,7 +569,8 @@ __aicore__ inline void LIVector<LIT>::UpdateCacheAndWriteTopkSlots(
             }
         }
         if (!foundCandidate) {
-            foundCandidate = FindFallbackEvict(bIdx, actualSeqLen, indexLocal, fallbackCursor, evictIndex, evictSlot);
+            foundCandidate = FindFallbackEvict(cacheRowIdx, actualSeqLen, indexLocal, fallbackCursor,
+                                               evictIndex, evictSlot);
         }
         if (foundCandidate) {
             uint32_t missIndex = static_cast<uint32_t>(indexLocal.GetValue(missIdx));
@@ -594,7 +604,7 @@ __aicore__ inline void LIVector<LIT>::ProcessVec(const LICommon::RunInfo &info)
     int32_t mmUbStride = (s2BaseSize_ - info.actualSingleProcessSInnerSizeAlign) / B32_BLOCK_ALIGN_NUM;
     int64_t payloadBufIdx = info.s2Idx % PAYLOAD_BUF_SLOTS;
     LocalTensor<int32_t> payloadUb = payloadBuf_.Get<int32_t>()[payloadBufIdx * s2BaseSize_];
-    StartPayloadCopy(payloadUb, info.bIdx, cuBaseS2Idx, cuS2Len, s2BaseSize_);
+    StartPayloadCopy(payloadUb, info.cacheRowIdx, cuBaseS2Idx, cuS2Len, s2BaseSize_);
     LocalTensor<float> reduceOutBuff = reduceOutBuf_.Get<float>();
     LocalTensor<float> reduceOutInner = reduceOutBuff[s2BaseSize_];
     LocalTensor<float> brcBuf = brcBuf_.Get<float>();
@@ -673,8 +683,8 @@ __aicore__ inline void LIVector<LIT>::ProcessVec(const LICommon::RunInfo &info)
         uint32_t validTopkCount = info.actS2Size < BASE_TOPK ? info.actS2Size : BASE_TOPK;
         uint32_t missCount = CopyDecodedPayloadOut(outOffset, payloadLocal, indexLocal, slotLocal, scratchLocal,
                                                    BASE_TOPK, validTopkCount, info.actS2Size < BASE_TOPK);
-        UpdateCacheAndWriteTopkSlots(info.bIdx, outOffset, info.actS2Size, thresholdScore, missCount,
-                                     indexLocal, scratchLocal, slotLocal);
+        UpdateCacheAndWriteTopkSlots(info.bIdx, info.cacheRowIdx, outOffset, info.actS2Size,
+                                     thresholdScore, missCount, indexLocal, scratchLocal, slotLocal);
         outQueue_.FreeTensor(valueULocal);
     }
 }

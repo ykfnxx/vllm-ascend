@@ -16,12 +16,38 @@ export MAX_MODEL_LEN="${MAX_MODEL_LEN:-132000}"
 export VISIBLE_DEVICES="${VISIBLE_DEVICES:-0}"
 export TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 export ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-0}"
+export DMP_SCHEME="${DMP_SCHEME:-4}"
 source "$SCRIPT_DIR/a3_single_card_runtime_env.sh"
 dmp_configure_a3_single_card_rendezvous
-export VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN="${VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN:-1}"
-export VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT=0
-export VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION=0
-source "$SCRIPT_DIR/dmp_lookup_maintain_runtime_env.sh"
+case "$DMP_SCHEME" in
+  1)
+    export VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN=0
+    export VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT=0
+    export VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION=0
+    ;;
+  2)
+    export VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN=0
+    export VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT=0
+    export VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION=1
+    source "$SCRIPT_DIR/dmp_runtime_env.sh"
+    ;;
+  3)
+    export VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN=0
+    export VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT=1
+    export VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION=0
+    source "$SCRIPT_DIR/dmp_fused_indexer_runtime_env.sh"
+    ;;
+  4)
+    export VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN=1
+    export VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT=0
+    export VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION=0
+    source "$SCRIPT_DIR/dmp_lookup_maintain_runtime_env.sh"
+    ;;
+  *)
+    echo "DMP_SCHEME must be one of 1, 2, 3, or 4; got: $DMP_SCHEME" >&2
+    exit 2
+    ;;
+esac
 
 mkdir -p "$CHUNK_DIR"
 
@@ -43,6 +69,7 @@ mkdir -p "$CHUNK_DIR"
   echo "reduced_layers: ${REDUCED_LAYERS:-<not-set>}"
   echo "model_quantization: ${MODEL_QUANTIZATION:-ascend}"
   echo "enable_expert_parallel: ${ENABLE_EXPERT_PARALLEL:-0}"
+  echo "dmp_scheme: $DMP_SCHEME"
   echo "dmp_lookup_maintain: $VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN"
   echo "dmp_fused_indexer_kv_select: $VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT"
   echo "dmp_dual_attention: $VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION"

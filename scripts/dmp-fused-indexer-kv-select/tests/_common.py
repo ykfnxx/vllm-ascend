@@ -50,6 +50,7 @@ def parse_args(description):
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--cache-size", type=int, default=8192)
+    parser.add_argument("--request-pool-size", type=int, default=None)
     parser.add_argument("--min-miss-count", type=int, default=0)
     parser.add_argument("--max-miss-count", type=int, default=200)
     return parser.parse_args()
@@ -58,10 +59,12 @@ def parse_args(description):
 def validate_args(args):
     if args.bs <= 0:
         raise ValueError("bs must be positive.")
-    if args.min_seqlen < SPARSE_COUNT:
-        raise ValueError("min-seqlen must be >= 2048.")
-    if args.max_seqlen > CACHE_SLOTS_CAPACITY:
-        raise ValueError("max-seqlen must be <= 262144.")
+    if args.request_pool_size is not None and args.request_pool_size < args.bs:
+        raise ValueError("request-pool-size must be >= bs.")
+    if args.min_seqlen < 0:
+        raise ValueError("min-seqlen must be >= 0.")
+    if args.max_seqlen >= 262143:
+        raise ValueError("max-seqlen must be < 262143.")
     if args.min_seqlen > args.max_seqlen:
         raise ValueError("min-seqlen must be <= max-seqlen.")
     seqlen_value_count = args.max_seqlen - args.min_seqlen + 1
@@ -81,16 +84,10 @@ def validate_args(args):
         raise ValueError("0 <= min-miss-count <= max-miss-count <= 2048 is required.")
     if args.min_miss_count > args.max_miss_count:
         raise ValueError("min-miss-count must be <= max-miss-count.")
-    if args.cache_size < SPARSE_COUNT:
-        raise ValueError("cache-size must be >= 2048.")
-    if args.cache_size > MAX_SLOT_ID_EXCLUSIVE:
-        raise ValueError("cache-size must be <= 16383 because slot14 value 0x3fff is reserved for invalid.")
-    if args.cache_size > args.min_seqlen:
-        raise ValueError("cache-size must be <= min-seqlen.")
-    if args.cache_size + args.max_miss_count > args.min_seqlen:
-        raise ValueError(
-            "cache-size + max-miss-count must be <= min-seqlen so every request has enough candidates."
-        )
+    if args.cache_size <= SPARSE_COUNT:
+        raise ValueError("cache-size must be > 2048.")
+    if args.cache_size >= MAX_SLOT_ID_EXCLUSIVE:
+        raise ValueError("cache-size must be < 16383 because slot14 value 0x3fff is reserved for invalid.")
     active_blocks_per_batch = (args.max_seqlen + args.block_size - 1) // args.block_size
     max_blocks_per_batch = active_blocks_per_batch if args.max_blocks_per_batch is None else args.max_blocks_per_batch
     if max_blocks_per_batch < active_blocks_per_batch:
@@ -112,6 +109,10 @@ def sample_seqlens(args):
         range(args.min_seqlen, args.max_seqlen + 1),
         args.bs,
     )
+
+
+def resolve_request_pool_size(args):
+    return args.request_pool_size if args.request_pool_size is not None else args.bs + 7
 
 
 def run_decode(tensors):
@@ -164,6 +165,39 @@ def run_decode_update(tensors):
     return output[0], output[1], output[2]
 
 
+def run_decode_update_pool(tensors):
+    custom_ops = getattr(torch.ops, "custom", None)
+    custom_op = (
+        getattr(custom_ops, "npu_lightning_indexer_decode_update_pool", None)
+        if custom_ops is not None else None
+    )
+    if custom_op is not None:
+        output = custom_op(
+            tensors["query"],
+            tensors["key"],
+            tensors["weights"],
+            tensors["req_pool_entries"],
+            tensors["cache_slots"],
+            tensors["actual_seq_lengths_key"],
+            tensors["block_table"],
+        )
+    else:
+        output = torch_npu.npu_lightning_indexer_decode_update_pool(
+            tensors["query"],
+            tensors["key"],
+            tensors["weights"],
+            tensors["req_pool_entries"],
+            tensors["cache_slots"],
+            actual_seq_lengths_key=tensors["actual_seq_lengths_key"],
+            block_table=tensors["block_table"],
+        )
+    if not isinstance(output, (tuple, list)) or len(output) != 3:
+        raise RuntimeError(
+            f"Expected three outputs from npu_lightning_indexer_decode_update_pool, got {output!r}."
+        )
+    return output[0], output[1], output[2]
+
+
 def allocate_inputs(args, device):
     torch.manual_seed(args.seed)
     torch.npu.manual_seed_all(args.seed)
@@ -194,12 +228,28 @@ def allocate_inputs(args, device):
         device=device,
     ).reshape(args.bs, max_blocks_per_batch)
     cache_slots = torch.full((args.bs, CACHE_SLOTS_CAPACITY), -1, dtype=torch.int32, device=device)
+    request_pool_size = resolve_request_pool_size(args)
+    pool_generator = torch.Generator()
+    pool_generator.manual_seed(args.seed + 2)
+    req_pool_entries_cpu = torch.randperm(request_pool_size, generator=pool_generator)[:args.bs].to(torch.int32)
+    if request_pool_size > args.bs and bool((req_pool_entries_cpu < args.bs).all().item()):
+        req_pool_entries_cpu[0] = request_pool_size - 1
+    if torch.equal(req_pool_entries_cpu, torch.arange(args.bs, dtype=torch.int32)):
+        req_pool_entries_cpu = torch.roll(req_pool_entries_cpu, shifts=1)
+    req_pool_entries = req_pool_entries_cpu.to(device)
+    cache_slots_pool = torch.full(
+        (request_pool_size, CACHE_SLOTS_CAPACITY), -1, dtype=torch.int32, device=device
+    )
 
     return {
         "query": query,
         "key": key,
         "weights": weights,
         "cache_slots": cache_slots,
+        "cache_slots_pool": cache_slots_pool,
+        "req_pool_entries": req_pool_entries,
+        "req_pool_entries_cpu": req_pool_entries_cpu,
+        "request_pool_size": request_pool_size,
         "actual_seq_lengths_key": actual_seq_lengths_key,
         "block_table": block_table,
         "seqlens": seqlens,
@@ -223,18 +273,31 @@ def sample_tensor_values(pool, count, generator):
 def build_cache_slots(args, reference_cpu, seqlens):
     generator = torch.Generator()
     generator.manual_seed(args.seed + 1)
-    target_miss_count = torch.randint(
-        args.min_miss_count,
-        args.max_miss_count + 1,
-        (args.bs,),
-        generator=generator,
-        dtype=torch.int32,
-    )
+    target_miss_count = torch.zeros((args.bs,), dtype=torch.int32)
     cache_slots_cpu = torch.full((args.bs, CACHE_SLOTS_CAPACITY), -1, dtype=torch.int32)
 
     for batch_idx in range(args.bs):
         seqlen = seqlens[batch_idx]
-        miss_count = int(target_miss_count[batch_idx].item())
+        if seqlen <= args.cache_size:
+            if seqlen > 0:
+                resident_slots = torch.randperm(args.cache_size, generator=generator, dtype=torch.int32)[:seqlen]
+                cache_slots_cpu[batch_idx, :seqlen] = resident_slots
+            continue
+
+        max_feasible_miss = min(args.max_miss_count, SPARSE_COUNT, seqlen - args.cache_size)
+        if args.min_miss_count > max_feasible_miss:
+            raise ValueError(
+                f"batch {batch_idx} seqlen={seqlen} can contain at most {max_feasible_miss} misses "
+                f"with cache-size={args.cache_size}, below min-miss-count={args.min_miss_count}."
+            )
+        miss_count = int(torch.randint(
+            args.min_miss_count,
+            max_feasible_miss + 1,
+            (1,),
+            generator=generator,
+            dtype=torch.int32,
+        ).item())
+        target_miss_count[batch_idx] = miss_count
         hit_count = SPARSE_COUNT - miss_count
         other_count = args.cache_size - hit_count
 
@@ -254,34 +317,42 @@ def build_cache_slots(args, reference_cpu, seqlens):
 
 
 def check_cache_exact(args, cache_cpu, seqlens, label):
-    expected_slots = torch.arange(args.cache_size, dtype=torch.int32)
     for batch_idx in range(args.bs):
         seqlen = seqlens[batch_idx]
+        expected_count = min(seqlen, args.cache_size)
         row = cache_cpu[batch_idx]
         valid_pos = (row >= 0).nonzero(as_tuple=False).flatten()
-        if valid_pos.numel() != args.cache_size:
+        if valid_pos.numel() != expected_count:
             raise AssertionError(
-                f"{label} batch {batch_idx} has {valid_pos.numel()} valid slots, expected {args.cache_size}."
+                f"{label} batch {batch_idx} has {valid_pos.numel()} valid slots, expected {expected_count}."
             )
         if bool((valid_pos >= seqlen).any().item()):
             pos = int(valid_pos[(valid_pos >= seqlen).nonzero(as_tuple=False)[0]].item())
             raise AssertionError(
                 f"{label} batch {batch_idx} has valid slot beyond its seqlen={seqlen} at token {pos}."
             )
+        if expected_count == 0:
+            continue
         values = row[valid_pos]
         if int(values.min().item()) < 0 or int(values.max().item()) >= args.cache_size:
             raise AssertionError(
                 f"{label} batch {batch_idx} slot range is "
                 f"[{int(values.min().item())}, {int(values.max().item())}], expected [0, {args.cache_size})."
             )
-        sorted_values = torch.sort(values).values
-        if not torch.equal(sorted_values, expected_slots):
-            mismatch = (sorted_values != expected_slots).nonzero(as_tuple=False)
-            pos = int(mismatch[0].item()) if mismatch.numel() else -1
+        if torch.unique(values).numel() != expected_count:
             raise AssertionError(
-                f"{label} batch {batch_idx} slot values are not exactly 0..cache_size-1; "
-                f"first mismatch at sorted position {pos}."
+                f"{label} batch {batch_idx} has duplicate slot values."
             )
+        if expected_count == args.cache_size:
+            expected_slots = torch.arange(args.cache_size, dtype=torch.int32)
+            sorted_values = torch.sort(values).values
+            if not torch.equal(sorted_values, expected_slots):
+                mismatch = (sorted_values != expected_slots).nonzero(as_tuple=False)
+                pos = int(mismatch[0].item()) if mismatch.numel() else -1
+                raise AssertionError(
+                    f"{label} batch {batch_idx} slot values are not exactly 0..cache_size-1; "
+                    f"first mismatch at sorted position {pos}."
+                )
 
 
 def prepare_reference_and_cache(args, tensors):
@@ -295,6 +366,13 @@ def prepare_reference_and_cache(args, tensors):
     tensors["cache_slots_original_cpu"] = cache_slots_cpu
     tensors["cache_slots_original"] = cache_slots_cpu.to(tensors["cache_slots"].device)
     tensors["cache_slots"].copy_(tensors["cache_slots_original"])
+    cache_slots_pool_cpu = torch.full(
+        (tensors["request_pool_size"], CACHE_SLOTS_CAPACITY), -1, dtype=torch.int32
+    )
+    cache_slots_pool_cpu[tensors["req_pool_entries_cpu"].to(torch.long)] = cache_slots_cpu
+    tensors["cache_slots_pool_original_cpu"] = cache_slots_pool_cpu
+    tensors["cache_slots_pool_original"] = cache_slots_pool_cpu.to(tensors["cache_slots"].device)
+    tensors["cache_slots_pool"].copy_(tensors["cache_slots_pool_original"])
     tensors["target_miss_count"] = target_miss_count
     torch.npu.synchronize()
 
@@ -302,6 +380,13 @@ def prepare_reference_and_cache(args, tensors):
 def tensors_with_cache(tensors, cache_slots):
     local_tensors = dict(tensors)
     local_tensors["cache_slots"] = cache_slots
+    return local_tensors
+
+
+def tensors_with_pool_cache(tensors, cache_slots):
+    local_tensors = dict(tensors)
+    local_tensors["cache_slots"] = cache_slots
+    local_tensors["cache_slots_original"] = tensors["cache_slots_pool_original"]
     return local_tensors
 
 
@@ -313,13 +398,26 @@ def check_decode_reference(args, output_cpu, seqlens):
         raise AssertionError(f"decode sparse_indices dtype {output_cpu.dtype} != torch.int32.")
     for batch_idx, seqlen in enumerate(seqlens):
         row = output_cpu[batch_idx, 0]
-        min_index = int(row.min().item())
-        max_index = int(row.max().item())
-        if min_index < 0 or max_index >= seqlen:
+        valid_count = min(seqlen, SPARSE_COUNT)
+        valid_indices = row[:valid_count]
+        padding = row[valid_count:]
+        if valid_count > 0 and (
+            int(valid_indices.min().item()) < 0 or int(valid_indices.max().item()) >= seqlen
+        ):
             raise AssertionError(
-                f"decode batch {batch_idx} sparse_indices range [{min_index}, {max_index}] "
+                f"decode batch {batch_idx} sparse_indices range "
+                f"[{int(valid_indices.min().item())}, {int(valid_indices.max().item())}] "
                 f"is outside [0, {seqlen})."
             )
+        if torch.unique(valid_indices).numel() != valid_count:
+            raise AssertionError(f"decode batch {batch_idx} contains duplicate valid indices.")
+        if seqlen <= SPARSE_COUNT:
+            expected_indices = torch.arange(seqlen, dtype=torch.int32)
+            if not torch.equal(torch.sort(valid_indices).values, expected_indices):
+                raise AssertionError(f"decode batch {batch_idx} does not select every token for seqlen={seqlen}.")
+        if bool((padding != -1).any().item()):
+            pos = int((padding != -1).nonzero(as_tuple=False)[0].item()) + valid_count
+            raise AssertionError(f"decode batch {batch_idx} sparse_indices[{pos}] must be padding -1.")
     print("decode_reference_check=passed")
 
 
@@ -346,14 +444,25 @@ def check_update_behavior(args, tensors, output_cpu, new_cache_cpu, label):
 
     actual_counts = []
     for batch_idx in range(args.bs):
-        indices = topk_index_cpu[batch_idx, 0].to(torch.long)
-        slots = topk_slots_cpu[batch_idx, 0]
+        seqlen = tensors["seqlens"][batch_idx]
+        valid_count = min(seqlen, SPARSE_COUNT)
+        all_indices = topk_index_cpu[batch_idx, 0].to(torch.long)
+        all_slots = topk_slots_cpu[batch_idx, 0]
+        indices = all_indices[:valid_count]
+        slots = all_slots[:valid_count]
         miss_count = int(miss_count_cpu[batch_idx].item())
         expected_miss_count = int(target_miss_count[batch_idx].item())
         actual_counts.append(miss_count)
 
+        if bool((all_indices[valid_count:] != -1).any().item()):
+            pos = int((all_indices[valid_count:] != -1).nonzero(as_tuple=False)[0].item()) + valid_count
+            raise AssertionError(f"{label} batch {batch_idx} topk_index[{pos}] must be padding -1.")
+        if bool((all_slots[valid_count:] != -1).any().item()):
+            pos = int((all_slots[valid_count:] != -1).nonzero(as_tuple=False)[0].item()) + valid_count
+            raise AssertionError(f"{label} batch {batch_idx} topk_slots[{pos}] must be padding -1.")
+
         actual_sorted = torch.sort(indices).values
-        expected_sorted = torch.sort(reference_cpu[batch_idx, 0].to(torch.long)).values
+        expected_sorted = torch.sort(reference_cpu[batch_idx, 0, :valid_count].to(torch.long)).values
         if not torch.equal(actual_sorted, expected_sorted):
             mismatch = (actual_sorted != expected_sorted).nonzero(as_tuple=False)
             pos = int(mismatch[0].item()) if mismatch.numel() else -1
@@ -394,7 +503,7 @@ def check_update_behavior(args, tensors, output_cpu, new_cache_cpu, label):
                 f"got {int(old_slots_by_index[pos].item())}."
             )
 
-        if miss_count < SPARSE_COUNT:
+        if miss_count < valid_count:
             hit_old_slots = old_slots_by_index[miss_count:]
             hit_output_slots = slots[miss_count:]
             if bool((hit_old_slots == -1).any().item()):
@@ -429,6 +538,27 @@ def validate_update_op(args, tensors, runner, label):
     output_cpu = tuple(t.detach().cpu() for t in output)
     new_cache_cpu = tensors["cache_slots"].detach().cpu()
     check_update_behavior(args, tensors, output_cpu, new_cache_cpu, label)
+    print(f"{label}_behavior_check=passed")
+    return output
+
+
+def validate_update_pool_op(args, tensors, runner, label):
+    tensors["cache_slots"].copy_(tensors["cache_slots_original"])
+    output = runner(tensors)
+    torch.npu.synchronize()
+    check_output_shapes(args, output)
+    output_cpu = tuple(t.detach().cpu() for t in output)
+    new_pool_cpu = tensors["cache_slots"].detach().cpu()
+    entries = tensors["req_pool_entries_cpu"].to(torch.long)
+    new_active_cache_cpu = new_pool_cpu.index_select(0, entries)
+    check_update_behavior(args, tensors, output_cpu, new_active_cache_cpu, label)
+
+    active_mask = torch.zeros(tensors["request_pool_size"], dtype=torch.bool)
+    active_mask[entries] = True
+    old_pool_cpu = tensors["cache_slots_pool_original_cpu"]
+    if not torch.equal(new_pool_cpu[~active_mask], old_pool_cpu[~active_mask]):
+        raise AssertionError(f"{label} modified an unmapped request-pool row.")
+    print(f"{label}_unmapped_pool_rows_check=passed")
     print(f"{label}_behavior_check=passed")
     return output
 
@@ -479,7 +609,8 @@ def print_case_summary(args, tensors):
         "case "
         f"bs={args.bs} min_seqlen={args.min_seqlen} max_seqlen={args.max_seqlen} "
         f"sampled_min_seqlen={min(seqlens)} sampled_max_seqlen={max(seqlens)} dtype={args.dtype} "
-        f"cache_size={args.cache_size} min_miss_count={args.min_miss_count} "
+        f"cache_size={args.cache_size} request_pool_size={tensors['request_pool_size']} "
+        f"min_miss_count={args.min_miss_count} "
         f"max_miss_count={args.max_miss_count}"
     )
     print(f"actual_seq_lengths_key={seqlens}")
@@ -518,7 +649,9 @@ def run_correctness(args):
     check_decode_reference(args, tensors["reference_sparse_indices_cpu"], tensors["seqlens"])
     check_tensors = tensors_with_cache(tensors, tensors["cache_slots_original"].clone())
     validate_update_op(args, check_tensors, run_decode_update, "update")
-    print("all_update_correctness_checks=passed")
+    pool_tensors = tensors_with_pool_cache(tensors, tensors["cache_slots_pool_original"].clone())
+    validate_update_pool_op(args, pool_tensors, run_decode_update_pool, "update_pool")
+    print("all_update_and_pool_correctness_checks=passed")
 
 
 def run_perf(args):
@@ -526,7 +659,11 @@ def run_perf(args):
 
     decode_tensors = tensors_with_cache(tensors, tensors["cache_slots_original"].clone())
     target_tensors = tensors_with_cache(tensors, tensors["cache_slots_original"].clone())
+    pool_tensors = tensors_with_pool_cache(tensors, tensors["cache_slots_pool_original"].clone())
     _, decode_times, decode_timer = benchmark_runner(args, decode_tensors, run_decode)
     _, target_times, target_timer = benchmark_runner(args, target_tensors, run_decode_update)
+    _, pool_times, pool_timer = benchmark_runner(args, pool_tensors, run_decode_update_pool)
     timer_kind = decode_timer if decode_timer == target_timer else "mixed"
     print_perf_summary(args, tensors, "li_update", decode_times, target_times, timer_kind)
+    pool_timer_kind = decode_timer if decode_timer == pool_timer else "mixed"
+    print_perf_summary(args, tensors, "li_update_pool", decode_times, pool_times, pool_timer_kind)

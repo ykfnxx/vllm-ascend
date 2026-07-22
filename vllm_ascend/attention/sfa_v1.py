@@ -1487,7 +1487,9 @@ class AscendSFAImpl(MLAAttentionImpl):
         segmented_runtime = None
         if dmp_context is not None:
             segmented_runtime = (
-                dmp_context.dual_attention or dmp_context.lookup_maintain
+                dmp_context.dual_attention
+                or dmp_context.lookup_maintain
+                or dmp_context.fused_indexer_kv_select
             )
         if segmented_runtime is not None:
             if dmp_context.lookup_maintain is not None:
@@ -1497,6 +1499,14 @@ class AscendSFAImpl(MLAAttentionImpl):
                     indexer_result=indexer_result,
                     scale=self.scale,
                     attn_metadata=attn_metadata,
+                )
+            elif dmp_context.fused_indexer_kv_select is not None:
+                attn_output = segmented_runtime.run_attention(
+                    layer_name,
+                    dmp_context.active_microbatch_idx,
+                    indexer_result,
+                    self.scale,
+                    attn_metadata,
                 )
             else:
                 attn_output = segmented_runtime.run_miss_attention_and_merge(

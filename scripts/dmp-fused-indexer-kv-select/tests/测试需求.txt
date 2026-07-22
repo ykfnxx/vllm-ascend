@@ -1,24 +1,29 @@
 测试数据的构造标准：
   1. 每个 batch row 的 seqlen 在 MIN_SEQLEN 和 MAX_SEQLEN 闭区间内可复现地无放回随机采样；各 row 的 seqlen 保持不同。MIN_SEQLEN == MAX_SEQLEN 时保留等长测试模式。
   2. 随机构造 query 和 key 和 weight ，因此理论上 top 2048 index 理论上应该是均匀分布在整个序列里面。
-  3. 构造 miss_count 数值，在 MIN_MISS_COUNT 和 MAX_MISS_COUNT 之间随机取值 。不同 batch 的 miss_count 值不同。
-  4. cache_slots 中应该有 CACHE_SIZE 个 有效值（有效值是指非-1值），且有效值保持 unique ，且有效值的取值范围刚好是 0~CACHE_SIZE-1 。
+  3. 对于 seqlen <= CACHE_SIZE 的 row，miss_count 固定为 0；对于 seqlen > CACHE_SIZE 的 row，miss_count 在可行范围内从 MIN_MISS_COUNT 到 MAX_MISS_COUNT 随机取值。
+  4. cache_slots 中应该有 min(seqlen, CACHE_SIZE) 个有效值，且有效值保持 unique、取值位于 [0, CACHE_SIZE)。当 seqlen >= CACHE_SIZE 时，有效值集合刚好是 0~CACHE_SIZE-1。
   5. 对每个 batch row 按该 row 的实际 seqlen 构造 cache_slots：
-        5.1 从 top 2048 index 中随机挑选 (2048-miss_count) 个 index （称为 hit_index）。
-        5.2 从 top 2048 index 之外的 index （一共 seqlen-2048 个 index）中随机挑选 CACHE_SIZE-(2048-miss_count) 个（称为 other_index）。
-        5.3 把 hit_index 和 other_index 拼起来，称为 cached_index。
-        5.4 初始化 shuffled_slots = shuffle(arange(0,CACHE_SIZE))。
-        5.5 把 cache_slots 整行初始化为 -1，再设置 cache_slots[cached_index] = shuffled_slots。
+        5.1 seqlen <= CACHE_SIZE 时，缓存 [0, seqlen) 内的全部 token，不构造 miss。
+        5.2 seqlen > CACHE_SIZE 时，从 top2048 中随机挑选 (2048-miss_count) 个 hit_index。
+        5.3 从 top2048 之外随机挑选 CACHE_SIZE-(2048-miss_count) 个 other_index。
+        5.4 把 hit_index 和 other_index 拼成 cached_index，并将唯一的有效 slot 随机分配给这些 token。
 
 
-lightning_indexer_decode_update 的验收标准：对于每一个 batch 独立检验：
-  1. 算子输出的 topk_index 结果和 lightning_indexer_decode 匹配 （集合相同，顺序不一样）
-  2. 算子输出的 topk_slots 的值全部 >= 0 且 < CACHE_SIZE
-  3. 算子输出的 topk_index 作为索引去 new cache_slots 里面查找出来的 slots 应该和 topk_slots 逐项相等 。
-  4. 算子输出的 topk_index[:miss_count] 作为索引去 old cache_slots 里面查找出来的 slots 值应该都是无效值（-1）
-  5. 算子输出的 topk_index[miss_count:] 作为索引去 old cache_slots 里面查找出来的 slots 值应该和 topk_slots[miss_count:] 逐项相等
-  6. 算子输出的 new cache_slots 中应该有 CACHE_SIZE 个 有效值（有效值是指非-1值），且有效值保持 unique ，且有效值的取值范围刚好是 0~N_CACHED_TOKENS-1 。
-  7. 算子输出的 miss_count 应该刚好等于样例构造时的 miss_count ，也要等于 count(old_cache_slots[b, topk_index] == -1)
+lightning_indexer_decode_update 和 lightning_indexer_decode_update_pool 的验收标准：对于每一个 batch 独立检验：
+  1. 令 K=min(seqlen, 2048)，topk_index[:K] 与 lightning_indexer_decode[:K] 集合相同。
+  2. topk_index[K:] 和 topk_slots[K:] 全部为 -1 padding。
+  3. topk_slots[:K] 的值全部 >= 0 且 < CACHE_SIZE。
+  4. 使用 topk_index[:K] 索引 new cache_slots 得到的值与 topk_slots[:K] 逐项相等。
+  5. 使用 topk_index[:miss_count] 索引 old cache_slots 得到的值全部为 -1。
+  6. hit 后缀在 old cache_slots 中的值与 topk_slots[miss_count:K] 逐项相等。
+  7. new cache_slots 中有 min(seqlen, CACHE_SIZE) 个有效值，且有效值保持 unique；seqlen>=CACHE_SIZE 时值集合刚好是 0~CACHE_SIZE-1。
+  8. miss_count 等于样例构造值，也等于 count(old_cache_slots[b, topk_index[:K]] == -1)。
+
+request pool 额外验收：
+  1. req_pool_entries 是 [B] 的唯一 int32 pool row 映射，默认 pool_size=B+7。
+  2. pool 算子在 cache_slots[req_pool_entries[b]] 上得到与普通 update 相同的逐 batch 行语义。
+  3. 未被 req_pool_entries 映射的 pool row 在算子调用后保持逐项不变。
 
 
 
@@ -29,9 +34,9 @@ lightning_indexer_decode_update 的验收标准：对于每一个 batch 独立�
 
 一些参数约束：
 - 0 <= MIN_MISS_COUNT <= MAX_MISS_COUNT <= 2048
-- 2048 <= MIN_SEQLEN <= MAX_SEQLEN <= 262144
-- N_CACHED_TOKENS >= 2048
-- N_CACHED_TOKENS + MAX_MISS_COUNT <= MIN_SEQLEN
+- 0 <= MIN_SEQLEN <= MAX_SEQLEN < 262143
+- 2048 < CACHE_SIZE < 16383
+- 对于 seqlen > CACHE_SIZE 的 row，目标 miss_count 必须不超过 seqlen-CACHE_SIZE
 
 
 一些概念澄清：

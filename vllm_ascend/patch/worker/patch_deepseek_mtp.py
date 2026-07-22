@@ -377,19 +377,25 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
 
         # Scheme 4 uses three streams. S0 runs both LI/Lookup calls, combined
         # hit SFA, then waits for S1 before miss SFA/merge/update/MLP. S1 runs
-        # miss-only KVGather0/1; S2 runs Maintain0/1.
+        # miss-only KVGather0/1; S2 runs Maintain0/1. Scheme 3 keeps the fused
+        # Indexer+Select update on S0 and runs one local mock KVIO per
+        # microbatch on S1. Its index update is already inside the fused op, so
+        # the incompatible scheme-4 AICPU Maintain is not launched.
         s0 = torch.npu.current_stream()
         s1 = dmp_ctx.kv_loader.load_stream
         dual_attention = dmp_ctx.dual_attention
         lookup_maintain = dmp_ctx.lookup_maintain
+        fused_indexer = dmp_ctx.fused_indexer_kv_select
         segmented_attention = (
-            dual_attention is not None or lookup_maintain is not None
+            dual_attention is not None
+            or lookup_maintain is not None
+            or fused_indexer is not None
         )
         two_stream = (
             dual_attention is not None
             and dual_attention.stream_mode == "two"
         )
-        if lookup_maintain is not None:
+        if lookup_maintain is not None or fused_indexer is not None:
             indexer_a_stream = s0
         elif dual_attention is not None:
             indexer_a_stream = dual_attention.get_indexer_a_stream(s0, s1)
@@ -458,7 +464,7 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
                     )
                 indexer_a_done = dmp_ctx.get_event(f"L{layer_idx}_indexer_A_done")
                 indexer_a_done.record(indexer_a_stream)
-                if lookup_maintain is not None:
+                if lookup_maintain is not None or fused_indexer is not None:
                     layer.self_attn.mla_attn.prepare_dual_attention(indexer_out_a)
                     select_a_done = dmp_ctx.get_event(
                         f"L{layer_idx}_select_A_done"
@@ -505,6 +511,15 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
                     )
                     gather_a_done.record(s1)
 
+            elif fused_indexer is not None:
+                with dmp_ctx.enter_microbatch(0), torch.npu.stream(s1):
+                    s1.wait_event(select_a_done)
+                    layer.self_attn.mla_attn.gather_dual_attention()
+                    gather_a_done = dmp_ctx.get_event(
+                        f"L{layer_idx}_gather_A_done"
+                    )
+                    gather_a_done.record(s1)
+
             # mbB indexer on S0
             with torch.npu.stream(s0), dmp_ctx.enter_microbatch(1):
                 indexer_out_b, res_b = layer.forward_indexer_only(pos_b, hs_b, res_b, llama_4_scaling)
@@ -528,7 +543,7 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
                 if segmented_attention:
                     indexer_b_done = dmp_ctx.get_event(f"L{layer_idx}_indexer_B_done")
                     indexer_b_done.record(s0)
-                if lookup_maintain is not None:
+                if lookup_maintain is not None or fused_indexer is not None:
                     layer.self_attn.mla_attn.prepare_dual_attention(indexer_out_b)
                     select_b_done = dmp_ctx.get_event(
                         f"L{layer_idx}_select_B_done"
@@ -567,6 +582,15 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
                     maintain_b_done.record(lookup_maintain.maintain_stream)
                     last_maintain_done = maintain_b_done
 
+                with dmp_ctx.enter_microbatch(1), torch.npu.stream(s1):
+                    s1.wait_event(select_b_done)
+                    layer.self_attn.mla_attn.gather_dual_attention()
+                    gather_b_done = dmp_ctx.get_event(
+                        f"L{layer_idx}_gather_B_done"
+                    )
+                    gather_b_done.record(s1)
+
+            elif fused_indexer is not None:
                 with dmp_ctx.enter_microbatch(1), torch.npu.stream(s1):
                     s1.wait_event(select_b_done)
                     layer.self_attn.mla_attn.gather_dual_attention()

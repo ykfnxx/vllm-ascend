@@ -24,8 +24,10 @@ from standard_run_config import (
 # Use one physical NPU card by default.
 # This must be set before importing torch_npu / vLLM.
 VISIBLE_DEVICES = os.getenv("VISIBLE_DEVICES", DEFAULT_VISIBLE_DEVICES)
-# Scheme 4 r9: fixed 300 misses, no Cast, one miss-only Gather per microbatch.
-# S0 runs hit SFA before waiting for S1, then miss SFA/merge; S2=Maintain.
+# Defaults to scheme 4. The wrapper can select scheme 3 with DMP_SCHEME=3:
+# S0=fused Indexer+Select update, S1=one local mock KVIO per microbatch,
+# then S0 runs selected-cache SFA. The linked fused branch has no separate
+# AICPU Maintain because token-to-slot update is already fused into S0.
 os.environ.setdefault("VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN", "1")
 os.environ.setdefault("VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT", "0")
 os.environ.setdefault("VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION", "0")
