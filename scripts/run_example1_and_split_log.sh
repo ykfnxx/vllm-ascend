@@ -15,6 +15,9 @@ export PROMPT_TOKENS="${PROMPT_TOKENS:-131072}"
 export MAX_MODEL_LEN="${MAX_MODEL_LEN:-132000}"
 export VISIBLE_DEVICES="${VISIBLE_DEVICES:-0}"
 export TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+export ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-0}"
+source "$SCRIPT_DIR/a3_single_card_runtime_env.sh"
+dmp_configure_a3_single_card_rendezvous
 export VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN="${VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN:-1}"
 export VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT=0
 export VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION=0
@@ -34,6 +37,8 @@ mkdir -p "$CHUNK_DIR"
   echo "max_model_len: $MAX_MODEL_LEN"
   echo "visible_devices: $VISIBLE_DEVICES"
   echo "tensor_parallel_size: $TENSOR_PARALLEL_SIZE"
+  echo "vllm_host_ip: ${VLLM_HOST_IP:-<auto>}"
+  echo "gloo_socket_ifname: ${GLOO_SOCKET_IFNAME:-<auto>}"
   echo "model_path: ${MODEL_PATH:-/models/GLM-5.1-w4a8}"
   echo "reduced_layers: ${REDUCED_LAYERS:-<not-set>}"
   echo "model_quantization: ${MODEL_QUANTIZATION:-ascend}"
@@ -58,6 +63,9 @@ status=${PIPESTATUS[0]}
 set -e
 
 echo "$status" > "$OUT_DIR/EXIT_STATUS.txt"
+
+python3 "$SCRIPT_DIR/summarize_distributed_init.py" "$LOG" \
+  | tee "$OUT_DIR/DISTRIBUTED_INIT_TIMING.txt"
 
 split -l 30 -d -a 3 --additional-suffix=.txt "$LOG" "$CHUNK_DIR/part-"
 

@@ -1,4 +1,4 @@
-# DMP A3 single-card migration revision 7
+# DMP A3 single-card migration revision 8
 
 Extract this archive directly into `/root/dmp`. The first validation uses the
 smallest GLM-5.1 W4A8 prefix containing a MoE layer on one A3 card, matching the
@@ -72,6 +72,11 @@ Revision 7 validates that the image-native extension registers
 loading model weights. This prevents the former late failure where the source
 bind mount hid `vllm_ascend_C*.so` and MoE failed during dummy forward.
 
+Revision 8 keeps single-card vLLM rendezvous on `127.0.0.1` and Gloo on `lo`.
+It also reuses a previously smoke-tested operator runtime without launching
+extra `torch_npu` validation processes immediately before inference. Set
+`DMP_A3_VALIDATE_RUNTIME=1` to request the full validation again.
+
 The first invocation creates a path such as
 `/models-reduced/GLM-5.1-w4a8-4layers-dmp-r2` (the exact layer count comes
 from `first_k_dense_replace` and `moe_layer_freq`). It reads one source shard at a time,
@@ -79,10 +84,10 @@ keeps the smallest prefix containing a MoE layer plus embedding/norm/head tensor
 safetensors index, and then starts the run. The result persists on the host at
 `/root/dmp/reduced-models`, so later containers do not regenerate it.
 
-Baseline parameters:
+Default profiling parameters:
 
 ```text
-TP=1, EP=off, batch=2, prompt=2048, output=10, reduced through first MoE
+TP=1, EP=off, batch=64, prompt=131072, output=10, reduced through first MoE
 ```
 
 To choose another free A3 card:
@@ -91,8 +96,8 @@ To choose another free A3 card:
 VISIBLE_DEVICES=6 bash /workspace/scripts/run_a3_single_card_baseline.sh
 ```
 
-After the small baseline succeeds, reproduce the previously agreed profiling
-workload on the same MoE-aware reduced model:
+The default command now runs the previously agreed profiling workload. To
+override it explicitly:
 
 ```bash
 VISIBLE_DEVICES=6 BATCH_SIZE=64 PROMPT_TOKENS=131072 MAX_TOKENS=10 \
@@ -100,6 +105,10 @@ bash /workspace/scripts/run_a3_single_card_baseline.sh
 ```
 
 If 64 requests do not fit, change only `BATCH_SIZE=48` and retry.
+
+The run directory contains `DISTRIBUTED_INIT_TIMING.txt`. A successful local
+rendezvous should show `distributed_init_method=tcp://127.0.0.1:<port>` and a
+much smaller `distributed_init_seconds` than the former 841-second startup.
 
 To create a different reduced model, change the layer count. Each count gets a
 separate directory:

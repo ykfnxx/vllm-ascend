@@ -12,6 +12,7 @@ BASE_EXTENSION="$(find "$BASE_ASCEND_ROOT" -maxdepth 1 -type f \
     -name 'vllm_ascend_C*.so' -print -quit 2>/dev/null || true)"
 BASE_KERNELS="$(find "$BASE_ASCEND_ROOT" -maxdepth 1 -type f \
     -name '*vllm_ascend_kernels*.so' -print -quit 2>/dev/null || true)"
+STATIC_CHECK_ONLY="${DMP_A3_STATIC_CHECK_ONLY:-0}"
 declare -a errors=()
 
 if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
@@ -82,8 +83,9 @@ if [[ "$model_runtime_ready" != "1" ]]; then
 fi
 
 export ASCEND_RT_VISIBLE_DEVICES="$VISIBLE_DEVICES"
-native_ops_info=""
-if [[ -n "$BASE_EXTENSION" && -n "$BASE_KERNELS" && -f "$BASE_OP_API" ]]; then
+native_ops_info="not probed (fast startup)"
+if [[ "$STATIC_CHECK_ONLY" != "1" && -n "$BASE_EXTENSION" && \
+      -n "$BASE_KERNELS" && -f "$BASE_OP_API" ]]; then
     if ! native_ops_info="$(
         PYTHONPATH="/vllm-workspace/vllm-ascend${PYTHONPATH:+:$PYTHONPATH}" \
             python3 - <<'PY' 2>&1
@@ -111,8 +113,8 @@ PY
     fi
 fi
 
-device_info=""
-if command -v python3 >/dev/null 2>&1; then
+device_info="not probed (fast startup)"
+if [[ "$STATIC_CHECK_ONLY" != "1" ]] && command -v python3 >/dev/null 2>&1; then
     if ! device_info="$(python3 - <<'PY' 2>&1
 import torch_npu
 
