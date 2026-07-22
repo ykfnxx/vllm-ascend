@@ -1,4 +1,4 @@
-# DMP A3 single-card migration revision 8
+# DMP A3 single-card migration revision 9
 
 Extract this archive directly into `/root/dmp`. The first validation uses the
 smallest GLM-5.1 W4A8 prefix containing a MoE layer on one A3 card, matching the
@@ -10,6 +10,8 @@ earlier reduced-model workflow. The complete model at
 - `vllm-ascend-0.18.0-copy`: vLLM Ascend source with DMP Lookup/Maintain r9.
 - `scripts/pip-cache-dual-attention`: scheme-4 SFA/merge operator source.
 - `scripts/dmp-lookup-maintain`: Lookup/Maintain/KVGather operator source.
+- `scripts/dmp-fused-indexer-kv-select`: `ops_li_update` fused
+  Indexer+Select request-pool operator source.
 - Scripts for the A3 container, custom-op build, offline model reduction,
   profiling, and 30-line log splitting.
 
@@ -58,6 +60,19 @@ Run one command after entering the container:
 VISIBLE_DEVICES=0 bash /workspace/scripts/run_a3_single_card_baseline.sh
 ```
 
+The default remains scheme 4. Run the updated scheme 3 explicitly with:
+
+```bash
+DMP_SCHEME=3 VISIBLE_DEVICES=0 \
+  bash /workspace/scripts/run_a3_single_card_baseline.sh
+```
+
+Scheme 3 runs both fused Indexer+Select calls on S0 and one local 2K KVIO per
+microbatch on S1, followed by selected-cache SFA on S0. The fused operator
+already updates token-to-slot state. The upstream branch does not provide a
+compatible reverse-state AICPU Maintain operator, so scheme 4's Maintain is
+not reused in scheme 3.
+
 This entry point checks all host mounts, required build commands, A3 base
 operators, offline wheels or persistent Transformers runtime, model paths, and
 NPU visibility. It automatically builds and smoke-tests each missing custom-op
@@ -76,6 +91,11 @@ Revision 8 keeps single-card vLLM rendezvous on `127.0.0.1` and Gloo on `lo`.
 It also reuses a previously smoke-tested operator runtime without launching
 extra `torch_npu` validation processes immediately before inference. Set
 `DMP_A3_VALIDATE_RUNTIME=1` to request the full validation again.
+
+Revision 9 adds the `ops_li_update` request-pool operator from
+`xwLearnsLLM/DSA_offload_ops` commit
+`3f5c292a4f069716b683b147da71b3106e2ae2bc`, plus isolated scheme selection so
+schemes 2 and 4 retain their existing operator paths.
 
 The first invocation creates a path such as
 `/models-reduced/GLM-5.1-w4a8-4layers-dmp-r2` (the exact layer count comes
