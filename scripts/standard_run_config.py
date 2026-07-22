@@ -122,54 +122,66 @@ def configure_dmp_runtime(visible_devices: str) -> str:
     if kv_backend not in ("local", "hixl"):
         raise ValueError("VLLM_ASCEND_DMP_KV_BACKEND must be local or hixl")
     os.environ.setdefault("VLLM_ASCEND_DMP_HIXL_CONFIG", DEFAULT_HIXL_CONFIG)
-    vendor_root = ""
-    runtime_python_path = ""
-    if fused_indexer_enabled:
-        vendor_root = os.getenv(
-            "DMP_FUSED_INDEXER_OPP_PATH", DEFAULT_FUSED_INDEXER_OPP_PATH
-        )
-        runtime_python_path = os.getenv(
-            "DMP_FUSED_INDEXER_PYTHON_PATH",
-            DEFAULT_FUSED_INDEXER_PYTHON_PATH,
-        )
-        for dependency_python_path in (
-            os.getenv(
-                "DMP_LOOKUP_MAINTAIN_PYTHON_PATH",
-                DEFAULT_LOOKUP_MAINTAIN_PYTHON_PATH,
-            ),
-            os.getenv(
-                "DMP_DUAL_ATTENTION_PYTHON_PATH",
-                DEFAULT_DUAL_ATTENTION_PYTHON_PATH,
-            ),
-        ):
-            if dependency_python_path not in sys.path:
-                sys.path.insert(0, dependency_python_path)
-    elif lookup_maintain_enabled:
-        vendor_root = os.getenv(
-            "DMP_LOOKUP_MAINTAIN_OPP_PATH",
-            DEFAULT_LOOKUP_MAINTAIN_OPP_PATH,
-        )
-        runtime_python_path = os.getenv(
-            "DMP_LOOKUP_MAINTAIN_PYTHON_PATH",
-            DEFAULT_LOOKUP_MAINTAIN_PYTHON_PATH,
-        )
-        dual_python_path = os.getenv(
-            "DMP_DUAL_ATTENTION_PYTHON_PATH",
-            DEFAULT_DUAL_ATTENTION_PYTHON_PATH,
-        )
-        if dual_python_path not in sys.path:
-            sys.path.insert(0, dual_python_path)
-    elif dual_attention_enabled:
-        vendor_root = os.getenv(
-            "DMP_DUAL_ATTENTION_OPP_PATH", DEFAULT_DUAL_ATTENTION_OPP_PATH
-        )
-        runtime_python_path = os.getenv(
-            "DMP_DUAL_ATTENTION_PYTHON_PATH",
-            DEFAULT_DUAL_ATTENTION_PYTHON_PATH,
-        )
+    fused_opp_path = os.getenv(
+        "DMP_FUSED_INDEXER_OPP_PATH", DEFAULT_FUSED_INDEXER_OPP_PATH
+    )
+    fused_python_path = os.getenv(
+        "DMP_FUSED_INDEXER_PYTHON_PATH", DEFAULT_FUSED_INDEXER_PYTHON_PATH
+    )
+    lookup_opp_path = os.getenv(
+        "DMP_LOOKUP_MAINTAIN_OPP_PATH", DEFAULT_LOOKUP_MAINTAIN_OPP_PATH
+    )
+    lookup_python_path = os.getenv(
+        "DMP_LOOKUP_MAINTAIN_PYTHON_PATH", DEFAULT_LOOKUP_MAINTAIN_PYTHON_PATH
+    )
+    dual_opp_path = os.getenv(
+        "DMP_DUAL_ATTENTION_OPP_PATH", DEFAULT_DUAL_ATTENTION_OPP_PATH
+    )
+    dual_python_path = os.getenv(
+        "DMP_DUAL_ATTENTION_PYTHON_PATH", DEFAULT_DUAL_ATTENTION_PYTHON_PATH
+    )
 
-    if runtime_python_path and runtime_python_path not in sys.path:
-        sys.path.insert(0, runtime_python_path)
+    vendor_root = ""
+    selected_python_paths: list[str] = []
+    if fused_indexer_enabled:
+        vendor_root = fused_opp_path
+        selected_python_paths = [
+            fused_python_path,
+            lookup_python_path,
+            dual_python_path,
+        ]
+    elif lookup_maintain_enabled:
+        vendor_root = lookup_opp_path
+        selected_python_paths = [lookup_python_path, dual_python_path]
+    elif dual_attention_enabled:
+        vendor_root = dual_opp_path
+        selected_python_paths = [dual_python_path]
+
+    removable_python_paths = {
+        os.path.normpath(path)
+        for path in (
+            DEFAULT_FUSED_INDEXER_PYTHON_PATH,
+            DEFAULT_LOOKUP_MAINTAIN_PYTHON_PATH,
+            DEFAULT_DUAL_ATTENTION_PYTHON_PATH,
+            fused_python_path,
+            lookup_python_path,
+            dual_python_path,
+        )
+    }
+    sys.path[:] = [
+        path
+        for path in sys.path
+        if not path or os.path.normpath(path) not in removable_python_paths
+    ]
+    sys.path[:0] = selected_python_paths
+    current_pythonpath = [
+        path
+        for path in os.getenv("PYTHONPATH", "").split(os.pathsep)
+        if path and os.path.normpath(path) not in removable_python_paths
+    ]
+    os.environ["PYTHONPATH"] = os.pathsep.join(
+        [*selected_python_paths, *current_pythonpath]
+    )
     if dual_attention_enabled and kv_backend == "hixl":
         hixl_python_path = os.getenv("DMP_HIXL_PYTHON_PATH", DEFAULT_HIXL_PYTHON_PATH)
         if hixl_python_path not in sys.path:
@@ -177,7 +189,9 @@ def configure_dmp_runtime(visible_devices: str) -> str:
 
     removable_vendor_roots = (
         os.path.normpath(DEFAULT_FUSED_INDEXER_OPP_PATH),
+        os.path.normpath(fused_opp_path),
         os.path.normpath(DEFAULT_LOOKUP_MAINTAIN_OPP_PATH),
+        os.path.normpath(lookup_opp_path),
         os.path.normpath(
             os.path.join(
                 DEFAULT_LOOKUP_MAINTAIN_OPP_PATH,
@@ -185,7 +199,11 @@ def configure_dmp_runtime(visible_devices: str) -> str:
                 "aicpu_transformer",
             )
         ),
+        os.path.normpath(
+            os.path.join(lookup_opp_path, "op_impl", "aicpu_transformer")
+        ),
         os.path.normpath(DEFAULT_DUAL_ATTENTION_OPP_PATH),
+        os.path.normpath(dual_opp_path),
         os.path.normpath(LEGACY_DUAL_ATTENTION_OPP_PATH),
     )
     selected_opp_paths = []
@@ -194,14 +212,8 @@ def configure_dmp_runtime(visible_devices: str) -> str:
         if fused_indexer_enabled:
             selected_opp_paths.extend(
                 (
-                    os.getenv(
-                        "DMP_LOOKUP_MAINTAIN_OPP_PATH",
-                        DEFAULT_LOOKUP_MAINTAIN_OPP_PATH,
-                    ),
-                    os.getenv(
-                        "DMP_DUAL_ATTENTION_OPP_PATH",
-                        DEFAULT_DUAL_ATTENTION_OPP_PATH,
-                    ),
+                    lookup_opp_path,
+                    dual_opp_path,
                 )
             )
         elif lookup_maintain_enabled:
@@ -212,10 +224,7 @@ def configure_dmp_runtime(visible_devices: str) -> str:
                 os.path.join(vendor_root, "op_impl", "aicpu_transformer"),
             )
             selected_opp_paths.append(
-                os.getenv(
-                    "DMP_DUAL_ATTENTION_OPP_PATH",
-                    DEFAULT_DUAL_ATTENTION_OPP_PATH,
-                )
+                dual_opp_path
             )
     removable_vendor_roots = (
         *removable_vendor_roots,
@@ -232,38 +241,27 @@ def configure_dmp_runtime(visible_devices: str) -> str:
 
     # The bundled extension opens libcust_opapi.so by name. Keep its library
     # first and keep the selected custom copy out of LD_LIBRARY_PATH.
-    selected_op_api_path = (
-        os.path.normpath(os.path.join(vendor_root, "op_api", "lib"))
-        if vendor_root
-        else ""
-    )
-    legacy_dual_op_api_path = os.path.normpath(
-        os.path.join(LEGACY_DUAL_ATTENTION_OPP_PATH, "op_api", "lib")
-    )
-    persistent_dual_op_api_path = os.path.normpath(
-        os.path.join(
-            os.getenv(
-                "DMP_DUAL_ATTENTION_OPP_PATH",
-                DEFAULT_DUAL_ATTENTION_OPP_PATH,
-            ),
-            "op_api",
-            "lib",
-        )
-    )
     vllm_op_api_path = os.path.normpath(
         os.getenv("VLLM_ASCEND_OP_API_PATH", DEFAULT_VLLM_ASCEND_OP_API_PATH)
     )
+    removable_op_api_paths = {
+        os.path.normpath(os.path.join(path, "op_api", "lib"))
+        for path in (
+            DEFAULT_FUSED_INDEXER_OPP_PATH,
+            fused_opp_path,
+            DEFAULT_LOOKUP_MAINTAIN_OPP_PATH,
+            lookup_opp_path,
+            DEFAULT_DUAL_ATTENTION_OPP_PATH,
+            dual_opp_path,
+            LEGACY_DUAL_ATTENTION_OPP_PATH,
+        )
+    }
+    removable_op_api_paths.add(vllm_op_api_path)
     ld_paths = [
         path
         for path in os.getenv("LD_LIBRARY_PATH", "").split(os.pathsep)
         if path
-        and os.path.normpath(path)
-        not in (
-            selected_op_api_path,
-            legacy_dual_op_api_path,
-            persistent_dual_op_api_path,
-            vllm_op_api_path,
-        )
+        and os.path.normpath(path) not in removable_op_api_paths
     ]
     os.environ["LD_LIBRARY_PATH"] = os.pathsep.join([vllm_op_api_path, *ld_paths])
     return vendor_root

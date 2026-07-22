@@ -34,6 +34,8 @@ export DMP_LOOKUP_MAINTAIN_INSTALL_OPP_PATH="${DMP_LOOKUP_MAINTAIN_INSTALL_OPP_P
 _dmp_lookup_vendor="$DMP_LOOKUP_MAINTAIN_INSTALL_OPP_PATH/vendors/customize"
 _dmp_lookup_aicpu_repo="$_dmp_lookup_vendor/op_impl/aicpu_transformer"
 _dmp_lookup_python="$DMP_LOOKUP_MAINTAIN_ROOT/torch_extension"
+_dmp_lookup_fused_vendor="${DMP_FUSED_INDEXER_OPP_PATH:-$_dmp_lookup_script_dir/dmp-fused-indexer-kv-select/opp/vendors/customize}"
+_dmp_lookup_fused_python="${DMP_FUSED_INDEXER_PYTHON_PATH:-$_dmp_lookup_script_dir/dmp-fused-indexer-kv-select/torch_extension}"
 export DMP_LOOKUP_MAINTAIN_OPP_PATH="$_dmp_lookup_vendor"
 export DMP_LOOKUP_MAINTAIN_AICPU_OPP_PATH="$_dmp_lookup_aicpu_repo"
 export DMP_LOOKUP_MAINTAIN_PYTHON_PATH="$_dmp_lookup_python"
@@ -96,7 +98,18 @@ if [[ "$VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN" == "1" ]]; then
         echo "Run /workspace/scripts/build_dmp_dual_attention_ops.sh first." >&2
         return 1 2>/dev/null || exit 1
     fi
-    export PYTHONPATH="$_dmp_lookup_python:$_dmp_lookup_dual_python${PYTHONPATH:+:$PYTHONPATH}"
+    _dmp_lookup_filtered_python=""
+    IFS=':' read -r -a _dmp_lookup_python_entries <<< "${PYTHONPATH:-}"
+    for _dmp_lookup_entry in "${_dmp_lookup_python_entries[@]}"; do
+        [[ -n "$_dmp_lookup_entry" ]] || continue
+        case "${_dmp_lookup_entry%/}" in
+            "${_dmp_lookup_fused_python%/}"|"${_dmp_lookup_python%/}"|"${_dmp_lookup_dual_python%/}"|"${_dmp_model_runtime%/}")
+                continue
+                ;;
+        esac
+        _dmp_lookup_filtered_python="${_dmp_lookup_filtered_python:+${_dmp_lookup_filtered_python}:}${_dmp_lookup_entry}"
+    done
+    export PYTHONPATH="$_dmp_lookup_python:$_dmp_lookup_dual_python:$_dmp_model_runtime${_dmp_lookup_filtered_python:+:${_dmp_lookup_filtered_python}}"
 
     _dmp_lookup_filtered_opp=""
     IFS=':' read -r -a _dmp_lookup_opp_entries <<< "${ASCEND_CUSTOM_OPP_PATH:-}"
@@ -105,6 +118,7 @@ if [[ "$VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN" == "1" ]]; then
         [[ "${_dmp_lookup_entry%/}" == "${_dmp_lookup_vendor%/}" ]] && continue
         [[ "${_dmp_lookup_entry%/}" == "${_dmp_lookup_aicpu_repo%/}" ]] && continue
         [[ "${_dmp_lookup_entry%/}" == "${DMP_DUAL_ATTENTION_OPP_PATH%/}" ]] && continue
+        [[ "${_dmp_lookup_entry%/}" == "${_dmp_lookup_fused_vendor%/}" ]] && continue
         _dmp_lookup_filtered_opp="${_dmp_lookup_filtered_opp:+${_dmp_lookup_filtered_opp}:}${_dmp_lookup_entry}"
     done
     # CANN 8.5 discovers a custom AICPU kernel only when its suffixed
@@ -117,9 +131,11 @@ if [[ "$_dmp_lookup_nounset_was_on" == "1" ]]; then
 fi
 unset _dmp_lookup_nounset_was_on _dmp_lookup_script_dir \
     _dmp_lookup_mode_count _dmp_lookup_vendor _dmp_lookup_aicpu_repo \
-    _dmp_lookup_python _dmp_lookup_dual_python \
+    _dmp_lookup_python _dmp_lookup_fused_vendor _dmp_lookup_fused_python \
+    _dmp_lookup_dual_python \
     _dmp_model_runtime _dmp_transformers_wheel _dmp_huggingface_wheel \
     _dmp_model_wheel _dmp_lookup_filtered_opp _dmp_lookup_opp_entries \
+    _dmp_lookup_filtered_python _dmp_lookup_python_entries \
     _dmp_lookup_entry DMP_RESOLVED_TRANSFORMERS_WHEEL \
     DMP_RESOLVED_HUGGINGFACE_HUB_WHEEL
 unset -f dmp_resolve_model_runtime_wheels
