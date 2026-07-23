@@ -219,6 +219,9 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         self._prefill_layer_topk: dict[
             ReqType, dict[int, list[int]]
         ] = {}
+        # Keep the default INFO signal to one line per request. Per-layer
+        # confirmation remains available at DEBUG level.
+        self._local_topk_init_logged_requests: set[ReqType] = set()
 
 
     def _get_full_attention_group_id(self, kv_cache_config) -> int:
@@ -630,6 +633,23 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             if layer_topk is None:
                 continue
             layer_topk.pop(int(layer_id), None)
+            logger.debug(
+                "DSA local resident slots initialized from final-Prefill "
+                "TopK: request=%s, layer=%d, resident_tokens=%d",
+                request_id,
+                int(layer_id),
+                self._hbm_resident_tokens,
+            )
+            if request_id not in self._local_topk_init_logged_requests:
+                logger.info(
+                    "DSA local resident initialization is using the final-"
+                    "Prefill TopK: request=%s, first_layer=%d, "
+                    "resident_tokens=%d",
+                    request_id,
+                    int(layer_id),
+                    self._hbm_resident_tokens,
+                )
+                self._local_topk_init_logged_requests.add(request_id)
             if not layer_topk:
                 self._prefill_layer_topk.pop(request_id, None)
 
@@ -1141,6 +1161,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
 
     def request_finished_in_worker(self, request_id):
         self._prefill_layer_topk.pop(request_id, None)
+        self._local_topk_init_logged_requests.discard(request_id)
         self._clear_full_dump_done(request_id)
         pool_idx = int(self.resident_token_pool.get_index(request_id))
         self.kv_backend.release_request(
@@ -1150,6 +1171,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
 
     def request_preempted_in_worker(self, request_id):
         self._prefill_layer_topk.pop(request_id, None)
+        self._local_topk_init_logged_requests.discard(request_id)
         self._clear_full_dump_done(request_id)
         pool_idx = int(self.resident_token_pool.get_index(request_id))
         self.kv_backend.release_request(

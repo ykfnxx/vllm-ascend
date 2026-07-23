@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -273,6 +274,7 @@ def test_prefill_capture_uses_last_query_row_and_keeps_valid_prompt_topk():
 def test_non_pd_initialization_uses_per_layer_final_prefill_topk():
     manager = DSASparseV1.__new__(DSASparseV1)
     manager._hbm_resident_tokens = 6
+    manager._local_topk_init_logged_requests = set()
     manager._prefill_layer_topk = {
         "local-request": {
             3: [9, 3, 16, 4],
@@ -305,10 +307,14 @@ def test_non_pd_initialization_uses_per_layer_final_prefill_topk():
     )
     assert layer3_tokens.tolist() == [[9, 3, 4, 0, 1, 2]]
     assert initialized == ["local-request"]
-    manager._consume_local_prefill_layer_topk(
-        layer_id=3,
-        request_ids=initialized,
-    )
+    with patch("vllm_ascend.dsa_sparse.dsa_sparse.logger") as mock_logger:
+        manager._consume_local_prefill_layer_topk(
+            layer_id=3,
+            request_ids=initialized,
+        )
+        mock_logger.info.assert_called_once()
+        assert "final-Prefill TopK" in mock_logger.info.call_args.args[0]
+        mock_logger.debug.assert_called_once()
     assert manager._prefill_layer_topk == {
         "local-request": {4: [7, 6]}
     }
@@ -320,10 +326,13 @@ def test_non_pd_initialization_uses_per_layer_final_prefill_topk():
         )
     )
     assert layer4_tokens.tolist() == [[7, 6, 0, 1, 2, 3]]
-    manager._consume_local_prefill_layer_topk(
-        layer_id=4,
-        request_ids=initialized,
-    )
+    with patch("vllm_ascend.dsa_sparse.dsa_sparse.logger") as mock_logger:
+        manager._consume_local_prefill_layer_topk(
+            layer_id=4,
+            request_ids=initialized,
+        )
+        mock_logger.info.assert_not_called()
+        mock_logger.debug.assert_called_once()
     assert manager._prefill_layer_topk == {}
 
 
