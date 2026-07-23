@@ -36,6 +36,39 @@ mock KV backend、并发请求和 Ascend profiler。除特别说明外，命令�
 `NPUPlatform.import_kernels` 中追加已安装包内的 AIV 和 AICPU OPP 路径。
 单算子脚本会在导入 `torch_npu` 之前主动设置该变量。
 
+### A3 8 卡 16 die Docker 编译
+
+在 A3 宿主机的仓库根目录执行：
+
+```bash
+./examples/dsa_sparse/build_a3_docker.sh \
+  --log-dir /data/vllm-logs
+```
+
+宿主机脚本会检查 `/dev/davinci0` 到 `/dev/davinci15`、初始化 git
+submodule、创建或复用 `vllm-ascend-dsa-build` 容器，并调用容器内脚本完成
+editable build、custom-op/AICPU OPP 编译和静态诊断。默认使用
+`quay.io/ascend/vllm-ascend:v0.18.0-a3` 和
+`SOC_VERSION=ascend910_9391`。
+
+如需同时挂载模型目录供后续服务验证：
+
+```bash
+./examples/dsa_sparse/build_a3_docker.sh \
+  --log-dir /data/vllm-logs \
+  --model-dir /data/models
+```
+
+只创建容器、不立即编译：
+
+```bash
+./examples/dsa_sparse/build_a3_docker.sh --create-only
+```
+
+完整参数使用 `--help` 查看。默认编译日志保存在
+`/tmp/vllm-ascend-a3-build-logs/vllm-ascend-build.log`，或者位于
+`--log-dir` 指定的宿主机目录。
+
 ## 推荐验证顺序
 
 建议按照以下顺序缩小问题范围：
