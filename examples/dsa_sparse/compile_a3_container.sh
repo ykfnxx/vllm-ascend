@@ -25,10 +25,15 @@ nnal_env=/usr/local/Ascend/nnal/atb/set_env.sh
 [[ -f "${toolkit_env}" ]] || fail "CANN environment script is missing: ${toolkit_env}"
 [[ -f "${nnal_env}" ]] || fail "NNAL environment script is missing: ${nnal_env}"
 
+# The openEuler ATB environment script reads variables such as ZSH_VERSION
+# without a default. Temporarily disable nounset while sourcing vendor scripts,
+# then restore the strict-mode setting for the build itself.
+set +u
 # shellcheck disable=SC1091
 source "${toolkit_env}"
 # shellcheck disable=SC1091
 source "${nnal_env}"
+set -u
 
 export ASCEND_HOME_PATH
 export SOC_VERSION
