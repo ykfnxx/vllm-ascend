@@ -11,6 +11,7 @@ mock KV backend、并发请求和 Ascend profiler。除特别说明外，命令�
 | [check_asu_hbm_index_ops.py](../../check_asu_hbm_index_ops.py) | 对照 CPU 参考实现检查 lookup 和 maintain 功能 | 是 | 否 |
 | [smoke_asu_hbm_index_npugraph.py](smoke_asu_hbm_index_npugraph.py) | 检查两个算子能否进入 `npugraph_ex` 并回放 | 是 | 否 |
 | [benchmark_asu_hbm_index_ops.py](benchmark_asu_hbm_index_ops.py) | 测量单算子在不同 batch 下的 NPU 执行时间 | 是 | 否 |
+| [compare_asu_hbm_index_maintain_modes.py](compare_asu_hbm_index_maintain_modes.py) | 对比单个 Maintain 的 eager 与 ACL NPU Graph replay 时延，并可分别采集 trace | 是 | 否 |
 | [profile_asu_hbm_index_ops.py](profile_asu_hbm_index_ops.py) | 单独采集一个 ASU 算子并直接解析 profiler 数据 | 是 | 否 |
 | [serve_glm5_dsa_sparse.sh](serve_glm5_dsa_sparse.sh) | 以 mock KV backend 启动 DSA Sparse 服务 | 是 | 脚本负责启动 |
 | [diagnose_glm5_dsa_sparse_env.py](diagnose_glm5_dsa_sparse_env.py) | 静态检查运行中服务、安装包、模型和日志 | 否 | 是 |
@@ -178,6 +179,30 @@ python3 examples/dsa_sparse/benchmark_asu_hbm_index_ops.py \
 
 当 `--miss-count 0` 时 maintain 会直接处理 `free_head == 0` 的场景，接近
 空操作；测试实际淘汰开销时应使用非零值。
+
+### Maintain eager 与 ACL NPU Graph 对比
+
+以下脚本只捕获一个 Maintain，不包含 Lookup、KVGather 或其他模型算子。
+eager 和 graph 模式使用相同算子、Tensor 地址、stream、reset、seed、warmup
+和 NPU Event 计时边界，唯一预期差异是直接调用或
+`torch.npu.NPUGraph.replay()`：
+
+```bash
+python3 examples/dsa_sparse/compare_asu_hbm_index_maintain_modes.py \
+  --batch-size 32 \
+  --miss-count 300 \
+  --skip-check \
+  --warmup-iterations 10 \
+  --iterations 100 \
+  --profile-output-dir /data/asu-profiles/maintain-eager-vs-graph \
+  --output-json /data/dsa-benchmark/maintain-eager-vs-graph.json
+```
+
+合成固定 workload 的 Maintain 不维护动态 `free_head` 语义，因此需要
+`--skip-check`。不传 `--profile-output-dir` 时只执行 NPU Event benchmark；
+传入后会在 `eager/` 和 `graph/` 下分别生成 Level2 trace，以便直接比较
+AICPU task duration。该脚本使用当前分支的 `_C_ascend` 算子和 128K
+workspace，不代表 DMP 独立扩展的 144K 算子结果。
 
 ### 单算子 trace 采集及直接解析
 
