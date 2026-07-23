@@ -85,6 +85,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--fresh-maintain-tensors",
+        action="store_true",
+        help=(
+            "preallocate and retain a distinct set of all Maintain input "
+            "tensors for every warmup and timed call; allocation and "
+            "initialization are excluded from NPU event timing"
+        ),
+    )
+    parser.add_argument(
         "--skip-check",
         action="store_true",
         help="skip functional output/state checks before benchmarking",
@@ -130,6 +139,10 @@ def validate_args(args: argparse.Namespace) -> list[int]:
         raise ValueError(f"--miss-count must be in [0, {QUERY_COUNT}]")
     if any(batch_size <= 0 for batch_size in args.batch_sizes):
         raise ValueError("all --batch-sizes values must be greater than 0")
+    if args.fresh_maintain_tensors and args.op == "lookup":
+        raise ValueError(
+            "--fresh-maintain-tensors only applies to --op maintain or --op all"
+        )
     return list(dict.fromkeys(args.batch_sizes))
 
 
@@ -247,6 +260,32 @@ def move_case_to_device(host_case: HostCase, device: Any) -> DeviceCase:
     )
 
 
+def clone_maintain_case_inputs(case: DeviceCase) -> DeviceCase:
+    """Clone every tensor passed to one Maintain invocation.
+
+    The immutable baseline is shared because it is not passed to the operator.
+    Tensors used only by Lookup are also shared.
+    """
+    return DeviceCase(
+        baseline_state=case.baseline_state,
+        mutable_state=tuple(tensor.clone() for tensor in case.baseline_state),
+        req_pool_entries=case.req_pool_entries.clone(),
+        query_index=case.query_index,
+        lookup_mask=case.lookup_mask,
+        expected_slots=case.expected_slots.clone(),
+        expected_misses=case.expected_misses,
+    )
+
+
+def maintain_input_bytes(case: DeviceCase) -> int:
+    tensors = (
+        *case.baseline_state,
+        case.req_pool_entries,
+        case.expected_slots,
+    )
+    return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+
 def call_lookup(torch, case: DeviceCase, batch_size: int):
     index, slot_to_index, free_slots, free_head = case.mutable_state
     return torch.ops._C_ascend.asu_hbm_index_lookup(
@@ -353,25 +392,48 @@ def check_case(
 def benchmark_case(
     torch,
     case: DeviceCase,
-    invoke: Callable[[], Any],
+    invoke: Callable[[DeviceCase], Any],
     warmup_iterations: int,
     iterations: int,
+    fresh_maintain_tensors: bool,
 ) -> list[float]:
-    for _ in range(warmup_iterations):
-        case.reset()
+    fresh_cases = (
+        [
+            clone_maintain_case_inputs(case)
+            for _ in range(warmup_iterations + iterations)
+        ]
+        if fresh_maintain_tensors
+        else None
+    )
+    if fresh_cases is not None:
+        # Complete all clones before warmup so allocation and initialization
+        # cannot enter any measured event interval. Retaining the full list
+        # prevents the allocator from reusing an earlier tensor address.
         torch.npu.synchronize()
-        output = invoke()
+
+    for warmup_idx in range(warmup_iterations):
+        active_case = (
+            fresh_cases[warmup_idx] if fresh_cases is not None else case
+        )
+        active_case.reset()
+        torch.npu.synchronize()
+        output = invoke(active_case)
         torch.npu.synchronize()
         del output
 
     start = torch.npu.Event(enable_timing=True)
     end = torch.npu.Event(enable_timing=True)
     samples_ms = []
-    for _ in range(iterations):
-        case.reset()
+    for iteration_idx in range(iterations):
+        active_case = (
+            fresh_cases[warmup_iterations + iteration_idx]
+            if fresh_cases is not None
+            else case
+        )
+        active_case.reset()
         torch.npu.synchronize()
         start.record()
-        output = invoke()
+        output = invoke(active_case)
         end.record()
         torch.npu.synchronize()
         samples_ms.append(float(start.elapsed_time(end)))
@@ -443,6 +505,7 @@ def main() -> None:
         f"misses/request={args.miss_count}, warmup={args.warmup_iterations}, "
         f"iterations={args.iterations}"
     )
+    print(f"[INFO] fresh_maintain_tensors={args.fresh_maintain_tensors}")
 
     results = []
     for op_name in operators:
@@ -462,10 +525,26 @@ def main() -> None:
                 )
 
             if op_name == "lookup":
-                invoke = partial(call_lookup, torch, case, batch_size)
+                invoke = partial(call_lookup, torch, batch_size=batch_size)
             else:
                 invoke = partial(
-                    call_maintain, torch, case, batch_size, args.seed
+                    call_maintain,
+                    torch,
+                    batch_size=batch_size,
+                    seed=args.seed,
+                )
+
+            fresh_maintain_tensors = (
+                args.fresh_maintain_tensors and op_name == "maintain"
+            )
+            if fresh_maintain_tensors:
+                tensor_set_count = args.warmup_iterations + args.iterations
+                estimated_bytes = maintain_input_bytes(case) * tensor_set_count
+                print(
+                    "[INFO] fresh Maintain tensor pool: "
+                    f"sets={tensor_set_count}, "
+                    f"estimated_npu_bytes={estimated_bytes} "
+                    f"({estimated_bytes / (1024 ** 3):.3f} GiB)"
                 )
 
             samples_ms = benchmark_case(
@@ -474,10 +553,12 @@ def main() -> None:
                 invoke,
                 args.warmup_iterations,
                 args.iterations,
+                fresh_maintain_tensors,
             )
             result = summarize(
                 op_name, batch_size, args.miss_count, samples_ms
             )
+            result["fresh_maintain_tensors"] = fresh_maintain_tensors
             results.append(result)
             print_result(result)
 
@@ -500,6 +581,7 @@ def main() -> None:
                 "warmup_iterations": args.warmup_iterations,
                 "iterations": args.iterations,
                 "seed": args.seed,
+                "fresh_maintain_tensors": args.fresh_maintain_tensors,
             },
             "results": results,
         }

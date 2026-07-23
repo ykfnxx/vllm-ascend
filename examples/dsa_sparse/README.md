@@ -149,6 +149,7 @@ python3 examples/dsa_sparse/benchmark_asu_hbm_index_ops.py \
   --op maintain \
   --batch-sizes 1 2 4 8 16 \
   --miss-count 1024 \
+  --fresh-maintain-tensors \
   --warmup-iterations 10 \
   --iterations 100 \
   --output-json /data/dsa-benchmark/maintain.json
@@ -163,8 +164,13 @@ python3 examples/dsa_sparse/benchmark_asu_hbm_index_ops.py \
 - 每个请求固定输入 2048 个 query；
 - `--miss-count` 控制 lookup 的 miss 数和 maintain 的淘汰数，范围为
   0 到 2048；
-- 每次 warmup 和采样前恢复同一份索引状态；
-- 状态恢复和恢复后的同步位于 NPU Event 计时区间之外；
+- `--fresh-maintain-tensors` 为每次 maintain warmup 和正式计时预分配并保留
+  一套独立的算子输入 tensor，用于排除连续调用复用相同物理地址的影响；
+  tensor 分配和初始化不计入 NPU Event 时延，但显存占用会随
+  `warmup-iterations + iterations` 线性增长；
+- 每次 warmup 和采样前恢复同一份索引状态；启用
+  `--fresh-maintain-tensors` 后，恢复目标改为每轮地址不同的预分配状态；
+- 状态恢复或独立 tensor 的预分配及其同步位于 NPU Event 计时区间之外；
 - 每个 case 计时前都会先执行一次功能检查。
 
 终端输出 `mean`、`median`、`p95`、`min` 和 `requests/s`。JSON 还包含
