@@ -46,10 +46,17 @@ command -v bisheng >/dev/null 2>&1 || fail "bisheng is missing after loading CAN
 command -v cmake >/dev/null 2>&1 || fail "cmake is required"
 command -v g++ >/dev/null 2>&1 || fail "g++ is required"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required"
-[[ -n "${HCCL_STRUCT_FILE_PATH:-}" ]] || \
-  fail "HCCL_STRUCT_FILE_PATH is not set by the A3 CANN environment"
-[[ -f "${HCCL_STRUCT_FILE_PATH}" ]] || \
-  fail "HCCL structure file does not exist: ${HCCL_STRUCT_FILE_PATH}"
+
+bundled_hccl_struct_path="${REPO_ROOT}/csrc/utils/inc/kernel/moe_distribute_base.h"
+if [[ -n "${HCCL_STRUCT_FILE_PATH:-}" ]]; then
+  [[ -f "${HCCL_STRUCT_FILE_PATH}" ]] || \
+    fail "HCCL structure file does not exist: ${HCCL_STRUCT_FILE_PATH}"
+  printf 'HCCL header: %s (CANN environment)\n' "${HCCL_STRUCT_FILE_PATH}"
+else
+  [[ -f "${bundled_hccl_struct_path}" ]] || \
+    fail "bundled HCCL structure file is missing: ${bundled_hccl_struct_path}"
+  printf 'HCCL header: %s (bundled fallback)\n' "${bundled_hccl_struct_path}"
+fi
 
 cd "${REPO_ROOT}"
 mkdir -p "$(dirname "${BUILD_LOG_PATH}")"

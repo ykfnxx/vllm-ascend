@@ -39,8 +39,22 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
             exit 1
         fi
     fi
-    # for dispatch_gmm_combine_decode
-    yes | cp "${HCCL_STRUCT_FILE_PATH}" "${ROOT_DIR}/csrc/utils/inc/kernel"
+    # Prefer the HCCL structure header supplied by the image when available.
+    # The repository also carries a compatible copy for A3 images (for
+    # example openEuler variants) that do not export HCCL_STRUCT_FILE_PATH.
+    BUNDLED_HCCL_STRUCT_PATH="${ROOT_DIR}/csrc/utils/inc/kernel/moe_distribute_base.h"
+    if [[ -n "${HCCL_STRUCT_FILE_PATH:-}" ]]; then
+        if [[ ! -f "${HCCL_STRUCT_FILE_PATH}" ]]; then
+            echo "HCCL structure file does not exist: ${HCCL_STRUCT_FILE_PATH}"
+            exit 1
+        fi
+        cp -f "${HCCL_STRUCT_FILE_PATH}" "${BUNDLED_HCCL_STRUCT_PATH}"
+    elif [[ -f "${BUNDLED_HCCL_STRUCT_PATH}" ]]; then
+        echo "HCCL_STRUCT_FILE_PATH is not set; using bundled moe_distribute_base.h"
+    else
+        echo "cannot find bundled moe_distribute_base.h"
+        exit 1
+    fi
 
     CUSTOM_OPS_ARRAY=(
         "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
