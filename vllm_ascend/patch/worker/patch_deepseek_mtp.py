@@ -375,9 +375,12 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
                                     dtype=pos_b.dtype, device=pos_b.device)
             pos_b = torch.cat([pos_b, pad_pos_b])
 
-        # Scheme 4 uses three streams. S0 runs both LI/Lookup calls, combined
-        # hit SFA, then waits for S1 before miss SFA/merge/update/MLP. S1 runs
-        # miss-only KVGather0/1; S2 runs Maintain0/1. Scheme 3 keeps the fused
+        # Scheme 4 normally uses three streams. S0 runs both LI/Lookup calls,
+        # combined hit SFA, then waits for S1 before miss
+        # SFA/merge/update/MLP. S1 runs miss-only KVGather0/1; S2 runs
+        # Maintain0/1. The diagnostic serial-Maintain topology instead appends
+        # both Maintain calls to S0 after each layer's MLP, eliminating their
+        # overlap with that layer's AICore/AIV work. Scheme 3 keeps the fused
         # Indexer+Select update on S0 and runs one local mock KVIO per
         # microbatch on S1. Its index update is already inside the fused op, so
         # the incompatible scheme-4 AICPU Maintain is not launched.
@@ -386,6 +389,10 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
         dual_attention = dmp_ctx.dual_attention
         lookup_maintain = dmp_ctx.lookup_maintain
         fused_indexer = dmp_ctx.fused_indexer_kv_select
+        serialize_maintain = (
+            lookup_maintain is not None
+            and envs.VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN
+        )
         segmented_attention = (
             dual_attention is not None
             or lookup_maintain is not None
@@ -409,7 +416,7 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
         if dual_attention is not None and not two_stream:
             dual_attention.select_stream.wait_event(fork_event)
             dual_attention.gather_stream.wait_event(fork_event)
-        if lookup_maintain is not None:
+        if lookup_maintain is not None and not serialize_maintain:
             lookup_maintain.maintain_stream.wait_event(fork_event)
         previous_layer_done = None
         last_maintain_done = None
@@ -422,7 +429,12 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
         # SSD offload (classify_topk_indices + async_load_blocks +
         # wait_load_complete) is skipped during capture since it involves
         # variable-length ops and host-side IO that cannot be captured.
-        print("[DMP] dmp_forward graph_capture={}!".format(is_capturing))
+        print(
+            "[DMP] dmp_forward graph_capture={} maintain_mode={}!".format(
+                is_capturing,
+                "serial-s0" if serialize_maintain else "overlap-s2",
+            )
+        )
         for layer_idx in range(num_layers):
             layer = layers[layer_idx]
             forward_context.layer_idx = self.start_layer + layer_idx
@@ -491,17 +503,20 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
                     gather_a_done.record(dual_attention.gather_stream)
 
             elif lookup_maintain is not None:
-                with torch.npu.stream(lookup_maintain.maintain_stream):
-                    lookup_maintain.maintain_stream.wait_event(select_a_done)
-                    lookup_maintain.maintain(
-                        layer_idx=self.start_layer + layer_idx,
-                        microbatch_idx=0,
-                    )
-                    maintain_a_done = dmp_ctx.get_event(
-                        f"L{layer_idx}_maintain_A_done"
-                    )
-                    maintain_a_done.record(lookup_maintain.maintain_stream)
-                    last_maintain_done = maintain_a_done
+                if not serialize_maintain:
+                    with torch.npu.stream(lookup_maintain.maintain_stream):
+                        lookup_maintain.maintain_stream.wait_event(select_a_done)
+                        lookup_maintain.maintain(
+                            layer_idx=self.start_layer + layer_idx,
+                            microbatch_idx=0,
+                        )
+                        maintain_a_done = dmp_ctx.get_event(
+                            f"L{layer_idx}_maintain_A_done"
+                        )
+                        maintain_a_done.record(
+                            lookup_maintain.maintain_stream
+                        )
+                        last_maintain_done = maintain_a_done
 
                 with dmp_ctx.enter_microbatch(0), torch.npu.stream(s1):
                     s1.wait_event(select_a_done)
@@ -570,17 +585,20 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
                     gather_b_done.record(dual_attention.gather_stream)
 
             elif lookup_maintain is not None:
-                with torch.npu.stream(lookup_maintain.maintain_stream):
-                    lookup_maintain.maintain_stream.wait_event(select_b_done)
-                    lookup_maintain.maintain(
-                        layer_idx=self.start_layer + layer_idx,
-                        microbatch_idx=1,
-                    )
-                    maintain_b_done = dmp_ctx.get_event(
-                        f"L{layer_idx}_maintain_B_done"
-                    )
-                    maintain_b_done.record(lookup_maintain.maintain_stream)
-                    last_maintain_done = maintain_b_done
+                if not serialize_maintain:
+                    with torch.npu.stream(lookup_maintain.maintain_stream):
+                        lookup_maintain.maintain_stream.wait_event(select_b_done)
+                        lookup_maintain.maintain(
+                            layer_idx=self.start_layer + layer_idx,
+                            microbatch_idx=1,
+                        )
+                        maintain_b_done = dmp_ctx.get_event(
+                            f"L{layer_idx}_maintain_B_done"
+                        )
+                        maintain_b_done.record(
+                            lookup_maintain.maintain_stream
+                        )
+                        last_maintain_done = maintain_b_done
 
                 with dmp_ctx.enter_microbatch(1), torch.npu.stream(s1):
                     s1.wait_event(select_b_done)
@@ -708,14 +726,31 @@ if envs.VLLM_ASCEND_ENABLE_DMP:
                     layer, hs_a, res_a, hs_b, res_b
                 )
 
+            if serialize_maintain:
+                # Maintain updates state consumed by the next decode replay,
+                # not by this layer's SFA or MLP. Appending both invocations to
+                # S0 here guarantees they cannot overlap any earlier operator
+                # in this layer and keeps their graph addresses unchanged.
+                with torch.npu.stream(s0):
+                    lookup_maintain.maintain(
+                        layer_idx=self.start_layer + layer_idx,
+                        microbatch_idx=0,
+                    )
+                    lookup_maintain.maintain(
+                        layer_idx=self.start_layer + layer_idx,
+                        microbatch_idx=1,
+                    )
+
             # The next layer's S1 indexer consumes hs_a/res_a produced by
-            # this MLP, so it must wait for S0 explicitly.
+            # this MLP. In serial-Maintain mode the event also orders the next
+            # layer after both S0 Maintain calls.
             previous_layer_done = dmp_ctx.get_event(
                 f"L{layer_idx}_mlp_done")
             previous_layer_done.record(s0)
 
-        # Maintain is state for the next decode replay. Joining only the final
-        # S2 event is sufficient because all Maintain calls share one stream.
+        # In overlap mode Maintain is state for the next decode replay.
+        # Joining only the final S2 event is sufficient because all Maintain
+        # calls share one stream. Serial mode already executes them on S0.
         if last_maintain_done is not None:
             s0.wait_event(last_maintain_done)
 

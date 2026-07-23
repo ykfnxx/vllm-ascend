@@ -24,23 +24,27 @@ case "$DMP_SCHEME" in
     export VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN=0
     export VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT=0
     export VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION=0
+    export VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN=0
     ;;
   2)
     export VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN=0
     export VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT=0
     export VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION=1
+    export VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN=0
     source "$SCRIPT_DIR/dmp_runtime_env.sh"
     ;;
   3)
     export VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN=0
     export VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT=1
     export VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION=0
+    export VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN=0
     source "$SCRIPT_DIR/dmp_fused_indexer_runtime_env.sh"
     ;;
   4)
     export VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN=1
     export VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT=0
     export VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION=0
+    export VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN="${VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN:-0}"
     source "$SCRIPT_DIR/dmp_lookup_maintain_runtime_env.sh"
     ;;
   *)
@@ -73,6 +77,7 @@ mkdir -p "$CHUNK_DIR"
   echo "enable_expert_parallel: ${ENABLE_EXPERT_PARALLEL:-0}"
   echo "dmp_scheme: $DMP_SCHEME"
   echo "dmp_lookup_maintain: $VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN"
+  echo "dmp_serialize_maintain: $VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN"
   echo "dmp_fused_indexer_kv_select: $VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT"
   echo "dmp_dual_attention: $VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION"
   echo "dmp_stream_mode: ${VLLM_ASCEND_DMP_STREAM_MODE:-<unused>}"

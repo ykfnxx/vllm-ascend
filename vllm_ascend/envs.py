@@ -124,6 +124,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN": lambda: bool(
         int(os.getenv("VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN", "0"))
     ),
+    # Diagnostic Scheme-4 topology. When enabled, do not overlap AICPU
+    # Maintain on S2. Run mb0/mb1 Maintain serially on S0 after the layer's
+    # sparse attention and MLP instead. Default keeps the production overlap.
+    "VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN", "0"))
+    ),
     # Enable the experimental Dual-Attention data path inside DMP. This path
     # requires the KVSelect, KVGather, custom SparseFlashAttention, and
     # DaAttentionMerge operators from the pip-cache dual-attention branch.

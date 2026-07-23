@@ -14,6 +14,7 @@ export PROMPT_TOKENS="${PROMPT_TOKENS:-131072}"
 export MAX_TOKENS="${MAX_TOKENS:-10}"
 export MAX_MODEL_LEN="${MAX_MODEL_LEN:-132000}"
 export DMP_SCHEME="${DMP_SCHEME:-4}"
+export VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN="${VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN:-0}"
 
 export HCCL_OP_EXPANSION_MODE="${HCCL_OP_EXPANSION_MODE:-AIV}"
 export OMP_PROC_BIND="${OMP_PROC_BIND:-false}"
@@ -87,5 +88,5 @@ REDUCED_MODEL_PATH="$MODEL_PATH" \
     bash "$SCRIPT_DIR/prepare_a3_single_card_model.sh"
 
 echo "[run] Local rendezvous: VLLM_HOST_IP=$VLLM_HOST_IP GLOO_SOCKET_IFNAME=$GLOO_SOCKET_IFNAME"
-echo "[run] Starting single-card scheme $DMP_SCHEME: batch=$BATCH_SIZE prompt=$PROMPT_TOKENS output=$MAX_TOKENS"
+echo "[run] Starting single-card scheme $DMP_SCHEME: batch=$BATCH_SIZE prompt=$PROMPT_TOKENS output=$MAX_TOKENS serialize_maintain=$VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN"
 exec bash "$SCRIPT_DIR/run_example1_and_split_log.sh"

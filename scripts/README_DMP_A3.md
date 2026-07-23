@@ -149,11 +149,31 @@ confirm the reduced-model profile, then change one memory dimension at a time.
 
 ## Expected scheme-4 timeline
 
+The default topology overlaps Maintain on S2:
+
 ```text
 S0: LI0 -> Lookup0 -> LI1 -> Lookup1 -> preattn -> hit SFA -> wait -> miss SFA -> merge -> update -> MLP
 S1:          miss KVGather0                    -> miss KVGather1
 S2:          Maintain0                         -> Maintain1
 ```
+
+To diagnose the full-graph Maintain latency without concurrent AICore/AIV
+work, place both Maintain calls at the serial tail of each layer:
+
+```bash
+VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN=1 DMP_SCHEME=4 VISIBLE_DEVICES=0 \
+bash /workspace/scripts/run_a3_single_card_baseline.sh
+```
+
+```text
+S0: LI0 -> Lookup0 -> LI1 -> Lookup1 -> preattn -> hit SFA -> wait -> miss SFA -> merge -> update -> MLP -> Maintain0 -> Maintain1
+S1:          miss KVGather0                    -> miss KVGather1
+S2: idle
+```
+
+This diagnostic topology keeps the same graph-stable Maintain input/output
+tensors. It changes only stream placement and ordering; the default remains
+the overlapped S2 topology.
 
 Profiling data and 30-line log chunks are written below
 `/workspace/scripts/logs`.

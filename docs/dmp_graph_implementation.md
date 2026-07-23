@@ -192,3 +192,8 @@ The graph topology is S0=LI0/Lookup0/LI1/Lookup1/combined-preattn/hit-SFA/wait/
 miss-SFA/merge/update/MLP, S1=KVGather0/KVGather1, and
 S2=Maintain0/Maintain1. The profiling workload fixes 300 misses and 300
 maintain evictions per request.
+
+For concurrency diagnosis, `VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN=1` moves
+Maintain0 and Maintain1 from S2 to the tail of S0 after each layer's MLP. The
+next layer is ordered after both calls. The operator inputs and graph-stable
+addresses are unchanged; only stream placement and overlap are removed.

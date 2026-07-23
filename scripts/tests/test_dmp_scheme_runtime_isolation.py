@@ -66,6 +66,9 @@ class TestDmpSchemeRuntimeIsolation(unittest.TestCase):
                 os.environ["LD_LIBRARY_PATH"],
                 f"{config.DEFAULT_VLLM_ASCEND_OP_API_PATH}:/keep/lib",
             )
+            self.assertEqual(
+                os.environ["VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN"], "0"
+            )
 
     def test_scheme4_removes_scheme3_state(self) -> None:
         environment = self._base_environment()
@@ -93,6 +96,43 @@ class TestDmpSchemeRuntimeIsolation(unittest.TestCase):
                 os.environ["LD_LIBRARY_PATH"],
                 f"{config.DEFAULT_VLLM_ASCEND_OP_API_PATH}:/keep/lib",
             )
+            self.assertEqual(
+                os.environ["VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN"], "0"
+            )
+
+    def test_scheme4_allows_serial_maintain(self) -> None:
+        environment = self._base_environment()
+        environment.update(
+            {
+                "VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT": "0",
+                "VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN": "1",
+                "VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION": "0",
+                "VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN": "1",
+            }
+        )
+        with patch.dict(os.environ, environment, clear=True):
+            vendor_root = config.configure_dmp_runtime("0")
+
+            self.assertEqual(vendor_root, "/test/lookup-opp")
+            self.assertEqual(
+                os.environ["VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN"], "1"
+            )
+
+    def test_serial_maintain_requires_scheme4(self) -> None:
+        environment = self._base_environment()
+        environment.update(
+            {
+                "VLLM_ASCEND_ENABLE_DMP_FUSED_INDEXER_KV_SELECT": "1",
+                "VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN": "0",
+                "VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION": "0",
+                "VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN": "1",
+            }
+        )
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(
+                ValueError, "requires VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN=1"
+            ):
+                config.configure_dmp_runtime("0")
 
 
 if __name__ == "__main__":

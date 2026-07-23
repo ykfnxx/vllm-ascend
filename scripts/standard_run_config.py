@@ -98,6 +98,16 @@ def configure_dmp_runtime(visible_devices: str) -> str:
     dual_attention_enabled = (
         os.environ.setdefault("VLLM_ASCEND_ENABLE_DMP_DUAL_ATTENTION", "0") == "1"
     )
+    serialize_maintain = os.environ.setdefault(
+        "VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN", "0"
+    )
+    if serialize_maintain not in ("0", "1"):
+        raise ValueError("VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN must be 0 or 1")
+    if serialize_maintain == "1" and not lookup_maintain_enabled:
+        raise ValueError(
+            "VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN=1 requires "
+            "VLLM_ASCEND_ENABLE_DMP_LOOKUP_MAINTAIN=1"
+        )
     if (
         sum((fused_indexer_enabled, lookup_maintain_enabled, dual_attention_enabled))
         > 1
@@ -106,7 +116,9 @@ def configure_dmp_runtime(visible_devices: str) -> str:
             "DMP Fused Indexer+KVSelect, Lookup/Maintain, and "
             "Dual-Attention modes are mutually exclusive"
         )
-    # Scheme 4 uses S0=LI/Lookup/hit SFA/miss SFA, S1=Gather, S2=Maintain.
+    # Scheme 4 normally uses S0=LI/Lookup/hit SFA/miss SFA, S1=Gather,
+    # S2=Maintain. VLLM_ASCEND_DMP_SERIALIZE_MAINTAIN=1 instead appends both
+    # Maintain calls to S0 after each layer's MLP for concurrency diagnosis.
     # The following topology switch applies to scheme 2:
     # two: S0=A/B indexer + hit/miss SFA + merge + MLP;
     #      S1=A/B KVSelect + KVGather.
