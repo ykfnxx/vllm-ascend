@@ -25,6 +25,13 @@ from vllm_ascend.dsa_sparse.dsa_forward_batch import (
     _build_forward_batches_from_dsa_meta)
 from vllm_ascend.dsa_sparse.dsa_graph_buffers import DSAGraphBuffersMixin
 from vllm_ascend.dsa_sparse.dsa_kv_backend import DSAKVBackend
+from vllm_ascend.dsa_sparse.dsa_pd import (
+    DSA_PD_INITIAL_TRANSPORT_KVIO,
+    DSA_PD_INITIAL_TRANSPORT_MOONCAKE,
+    DSAKVIOPDRequest,
+    build_pd_resident_token_ids,
+    get_dsa_kvio_pd_manifest,
+)
 from vllm_ascend.dsa_sparse.dsa_attention_layout import (
     materialize_query_position_metadata, slice_position_row,
     resolve_full_block_table_tensor, select_forward_shared_metadata)
@@ -203,6 +210,19 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             device="cpu",
         )
         self._lookup_maintain_seed = 0
+        self._pd_initialized_requests: set[ReqType] = set()
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        self._parallel_rank = int(getattr(parallel_config, "rank", 0))
+        kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+        self._capture_pd_prefill_topk = bool(
+            getattr(vllm_config.cache_config, "dsa_kv_backend", None)
+            == "kvio"
+            and kv_transfer_config is not None
+            and kv_transfer_config.is_kv_producer
+        )
+        self._pd_prefill_layer_topk: dict[
+            ReqType, dict[int, list[int]]
+        ] = {}
 
 
     def _get_full_attention_group_id(self, kv_cache_config) -> int:
@@ -236,6 +256,14 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         return self._get_full_attention_group_id(kv_cache_config)
 
     def should_release_full_cache_after_prefill(self, request) -> bool:
+        if (
+            get_dsa_kvio_pd_manifest(request.kv_transfer_params) is not None
+            and ReqStage.coerce(request.dsa_req_stage).is_sparse_decode
+        ):
+            # The D-side request was allocated directly in compact resident
+            # layout. Releasing "prefill full cache" here would incorrectly
+            # free its initialized lookup blocks.
+            return False
         if request.num_prompt_tokens <= self._enable_dsa_prompt_len:
             return False
         # Once sparse cache is enabled, completed prefill MLA full blocks must
@@ -319,6 +347,13 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         resident_positions = query_position_metadata["resident_positions"]
         sparse_budgets = scheduler_output.req_dsa_sparse_budget_tokens
         req_stages = scheduler_output.req_dsa_stage
+        connector_metadata = getattr(
+            scheduler_output, "kv_connector_metadata", None)
+        pd_requests = {
+            request.request_id: request
+            for request in getattr(connector_metadata, "dsa_requests", ())
+            if isinstance(request, DSAKVIOPDRequest)
+        }
 
         for (req_id, num_scheduled_tokens) in scheduler_output.num_scheduled_tokens.items():
             req_state = requests[req_id]
@@ -353,13 +388,19 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             num_output_tokens = len(req_state.output_token_ids)
             sparse_budget_tokens = int(sparse_budgets[req_id])
             req_stage = ReqStage(req_stages[req_id])
+            pd_request = pd_requests.get(req_id)
             sparse_decode_enabled = (
                 req_stage.is_sparse_decode
                 and sparse_budget_tokens > 0
-                and num_output_tokens > 0
+                and (
+                    num_output_tokens > 0
+                    or pd_request is not None
+                    or req_id in self._pd_initialized_requests
+                )
                 and int(resident_valid_seq_len) >= 0
             )
-            query_positions_needed = (num_output_tokens > 0)
+            query_positions_needed = (
+                num_output_tokens > 0 or pd_request is not None)
             dense_query_positions = []
             resident_query_positions = []
             if query_positions_needed:
@@ -370,6 +411,21 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             if _query_position_row_is_empty(resident_query_positions):
                 resident_query_positions = dense_query_positions
             resident_pool_idx = self.resident_token_pool.acquire(req_id)
+            if pd_request is not None:
+                try:
+                    self._initialize_pd_request(
+                        request_id=req_id,
+                        resident_pool_idx=resident_pool_idx,
+                        pd_request=pd_request,
+                    )
+                except Exception:
+                    # A failed initial materialization must not leave a
+                    # request row bound to partially initialized P/D data.
+                    self._rollback_pd_request_initialization(
+                        request_id=req_id,
+                        resident_pool_idx=resident_pool_idx,
+                    )
+                    raise
 
             # Query positions are recorded in both dense/indexer and resident
             # spaces because sparse SFA consumes resident positions after the
@@ -384,6 +440,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
                                        # a sparse resident window yet.
                                        resident_valid_seq_len=resident_valid_seq_len,
                                        vllm_budget_block_ids=req_block_ids[full_attention_group_id],
+                                       indexer_block_ids=req_block_ids[indexer_group_id],
                                        block_size=self._vllm_blk_size,
                                        query_start_loc=query_start_loc,
                                        query_len=query_len,
@@ -394,6 +451,9 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
                                        dsa_sparse_enabled=sparse_decode_enabled,
                                        dsa_sparse_budget_tokens=sparse_budget_tokens,
                                        resident_pool_idx=resident_pool_idx,
+                                       pd_remote_loaded=(
+                                           req_id
+                                           in self._pd_initialized_requests),
                                        )
         (
             self.forward_sparse_decode_batch,
@@ -443,6 +503,61 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
     """
     Worker侧逻辑
     """
+    def capture_pd_prefill_last_token_topk(
+        self,
+        layer_name: str,
+        topk_indices: torch.Tensor,
+    ) -> None:
+        """Capture each final-Prefill row's per-layer TopK on a P worker."""
+        if not self._capture_pd_prefill_topk or self.dsa_meta is None:
+            return
+        layer_id = int(layer_name.split(".")[2])
+        for req_meta in self.dsa_meta.requests:
+            if not req_meta.is_last_prefill_chunk or req_meta.query_len <= 0:
+                continue
+            row_index = int(req_meta.query_start_loc + req_meta.query_len - 1)
+            if row_index >= int(topk_indices.shape[0]):
+                raise RuntimeError(
+                    "DSA KVIO cannot locate the last Prefill token's TopK "
+                    f"row: request={req_meta.request_id}, row={row_index}, "
+                    f"topk_rows={int(topk_indices.shape[0])}"
+                )
+            # This is one intentional device-to-host synchronization per local
+            # layer at the P/D handoff boundary.  Decode lookup remains fully
+            # tensorized; only the compact 2048-position seed enters control
+            # plane metadata.
+            row_topk = (
+                topk_indices[row_index]
+                .detach()
+                .reshape(-1)
+                .to(device="cpu", dtype=torch.int64)
+                .tolist()
+            )
+            dense_tail_start = int(req_meta.forward_plan.dense_tail_start)
+            seen: set[int] = set()
+            filtered_topk: list[int] = []
+            for raw_token_id in row_topk:
+                token_id = int(raw_token_id)
+                if (
+                    token_id < 0
+                    or token_id >= dense_tail_start
+                    or token_id in seen
+                ):
+                    continue
+                filtered_topk.append(token_id)
+                seen.add(token_id)
+            self._pd_prefill_layer_topk.setdefault(
+                req_meta.request_id, {}
+            )[layer_id] = filtered_topk
+
+    def take_pd_prefill_layer_topk(
+        self,
+    ) -> dict[ReqType, dict[int, list[int]]]:
+        """Drain P-worker TopK metadata for connector worker output."""
+        captured = self._pd_prefill_layer_topk
+        self._pd_prefill_layer_topk = {}
+        return captured
+
     def _mark_full_dump_done(
         self,
         resident_pool_indices: torch.Tensor,
@@ -480,9 +595,20 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
 
     def register_kv_cache_tensors(self, kv_cache_config,
                                   kv_caches: dict[str, object]) -> None:
-        """Register every local MLA cache region before model execution."""
+        """Register every local Indexer/MLA region before model execution."""
         full_group_id = self._get_full_attention_group_id(kv_cache_config)
+        indexer_group_id = self._get_indexer_group_id(kv_cache_config)
         full_group = kv_cache_config.kv_cache_groups[full_group_id]
+        indexer_group = kv_cache_config.kv_cache_groups[indexer_group_id]
+        indexer_caches_by_layer: dict[int, torch.Tensor] = {}
+        for indexer_layer_name in indexer_group.layer_names:
+            indexer_cache = kv_caches[indexer_layer_name]
+            if not torch.is_tensor(indexer_cache):
+                raise RuntimeError(
+                    "DSA requires one Indexer cache tensor for "
+                    f"{indexer_layer_name}")
+            indexer_layer_id = int(indexer_layer_name.split(".")[2])
+            indexer_caches_by_layer[indexer_layer_id] = indexer_cache
         for layer_name in full_group.layer_names:
             layer_cache = kv_caches[layer_name]
             if not isinstance(layer_cache, (tuple, list)) or len(
@@ -490,13 +616,141 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
                 raise RuntimeError(
                     f"DSA requires MLA nope/rope cache tensors for {layer_name}")
             layer_id = int(layer_name.split(".")[2])
+            indexer_cache = indexer_caches_by_layer.get(layer_id)
+            if indexer_cache is None:
+                raise RuntimeError(
+                    "DSA could not match an Indexer cache to MLA layer "
+                    f"{layer_name}")
             self.kv_backend.register_layer_cache(
                 layer_id=layer_id,
                 block_size=int(self._vllm_blk_size),
                 nopek_cache=layer_cache[0],
                 ropek_cache=layer_cache[1],
+                indexer_cache=indexer_cache,
             )
         self.kv_backend.finalize_cache_registration()
+
+    def _initialize_pd_request(
+        self,
+        *,
+        request_id: ReqType,
+        resident_pool_idx: int,
+        pd_request: DSAKVIOPDRequest,
+    ) -> None:
+        """Finalize a D-side compact layout materialized by KVIO/Mooncake."""
+        if request_id in self._pd_initialized_requests:
+            return
+        manifest = pd_request.manifest
+        manifest.validate()
+        if manifest.block_size != int(self._vllm_blk_size):
+            raise ValueError(
+                "DSA KVIO P/D worker block size mismatch: producer="
+                f"{manifest.block_size}, consumer={self._vllm_blk_size}")
+        if manifest.index_capacity != int(
+                self.resident_token_pool.index_capacity):
+            raise ValueError(
+                "DSA KVIO P/D worker lookup index capacity mismatch")
+        if manifest.resident_tokens != int(
+                self.resident_token_pool.resident_tokens):
+            raise ValueError(
+                "DSA KVIO P/D worker resident token count mismatch")
+        if manifest.free_slot_tokens != int(
+                self.resident_token_pool.free_slot_tokens):
+            raise ValueError(
+                "DSA KVIO P/D worker free-slot token count mismatch")
+
+        expected_indexer_blocks = (
+            manifest.stored_token_count + self._vllm_blk_size - 1
+        ) // self._vllm_blk_size
+        if len(pd_request.indexer_block_ids) < expected_indexer_blocks:
+            raise RuntimeError(
+                "DSA KVIO P/D Indexer block table is too short: "
+                f"expected={expected_indexer_blocks}, "
+                f"actual={len(pd_request.indexer_block_ids)}")
+        required_resident_slots = (
+            manifest.tail_slot_start + manifest.tail_token_count)
+        expected_resident_blocks = (
+            required_resident_slots + self._vllm_blk_size - 1
+        ) // self._vllm_blk_size
+        if len(pd_request.resident_block_ids) < expected_resident_blocks:
+            raise RuntimeError(
+                "DSA KVIO P/D resident block table is too short: "
+                f"expected={expected_resident_blocks}, "
+                f"actual={len(pd_request.resident_block_ids)}")
+
+        layer_topk_token_ids = pd_request.layer_topk_by_rank.get(
+            self._parallel_rank
+        )
+        if layer_topk_token_ids is None:
+            raise RuntimeError(
+                "DSA KVIO P/D metadata has no layer TopK for D worker rank "
+                f"{self._parallel_rank}"
+            )
+        layer_resident_token_ids = {
+            int(layer_id): build_pd_resident_token_ids(
+                topk_token_ids=topk_token_ids,
+                stored_token_count=manifest.stored_token_count,
+                block_size=manifest.block_size,
+                resident_token_count=manifest.resident_token_count,
+            )
+            for layer_id, topk_token_ids in layer_topk_token_ids.items()
+        }
+
+        self.kv_backend.bind_request(
+            request_id=request_id,
+            request_pool_idx=resident_pool_idx,
+            remote_request_id=manifest.remote_request_id,
+        )
+        if pd_request.initial_transport == DSA_PD_INITIAL_TRANSPORT_KVIO:
+            self.kv_backend.load_pd_request(
+                request_pool_idx=resident_pool_idx,
+                stored_token_count=manifest.stored_token_count,
+                layer_resident_token_ids=layer_resident_token_ids,
+                tail_token_start=manifest.tail_token_start,
+                tail_token_count=manifest.tail_token_count,
+                tail_slot_start=manifest.tail_slot_start,
+                indexer_block_ids=pd_request.indexer_block_ids,
+                resident_block_ids=pd_request.resident_block_ids,
+            )
+        elif (
+            pd_request.initial_transport
+            != DSA_PD_INITIAL_TRANSPORT_MOONCAKE
+        ):
+            raise ValueError(
+                "Unsupported DSA P/D initial transport: "
+                f"{pd_request.initial_transport!r}")
+        self.resident_token_pool.initialize_request_layer_mappings(
+            request_id=request_id,
+            layer_token_ids=layer_resident_token_ids,
+        )
+        self.full_dump_done_by_pool[int(resident_pool_idx)].fill_(True)
+        self._pd_initialized_requests.add(request_id)
+        logger.info(
+            "DSA P/D request initialized: req_id=%s, remote_req_id=%d, "
+            "transport=%s, stored_tokens=%d, indexer_blocks=%d, "
+            "resident_blocks=%d",
+            request_id,
+            manifest.remote_request_id,
+            pd_request.initial_transport,
+            manifest.stored_token_count,
+            len(pd_request.indexer_block_ids),
+            len(pd_request.resident_block_ids),
+        )
+
+    def _rollback_pd_request_initialization(
+        self,
+        *,
+        request_id: ReqType,
+        resident_pool_idx: int,
+    ) -> None:
+        """Release worker-local state after failed P/D materialization."""
+        self._clear_full_dump_done(request_id)
+        self.kv_backend.release_request(
+            request_id=request_id,
+            request_pool_idx=resident_pool_idx,
+        )
+        self.resident_token_pool.release(request_id)
+        self._pd_initialized_requests.discard(request_id)
 
     def _build_layer_runtime_batch(
         self,
@@ -743,6 +997,9 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
                 logical_block_index_rows=dump_tables.logical_block_index_rows,
                 block_key_rows=dump_tables.block_hash_rows,
                 source_block_id_rows=dump_tables.block_id_rows,
+                source_indexer_block_id_rows=(
+                    dump_tables.indexer_block_id_rows),
+                valid_token_count_rows=dump_tables.valid_token_count_rows,
             )
 
         self._mark_full_dump_done(
@@ -796,18 +1053,22 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
                                                      attn_metadata)
 
     def request_finished_in_worker(self, request_id):
+        self._pd_prefill_layer_topk.pop(request_id, None)
         self._clear_full_dump_done(request_id)
         pool_idx = int(self.resident_token_pool.get_index(request_id))
         self.kv_backend.release_request(
             request_id=request_id, request_pool_idx=pool_idx)
         self.resident_token_pool.release(request_id)
+        self._pd_initialized_requests.discard(request_id)
 
     def request_preempted_in_worker(self, request_id):
+        self._pd_prefill_layer_topk.pop(request_id, None)
         self._clear_full_dump_done(request_id)
         pool_idx = int(self.resident_token_pool.get_index(request_id))
         self.kv_backend.release_request(
             request_id=request_id, request_pool_idx=pool_idx)
         self.resident_token_pool.release(request_id)
+        self._pd_initialized_requests.discard(request_id)
 
     def execute_begin(self, scheduler_output: SchedulerOutput):
         pass
@@ -862,6 +1123,91 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         req_blocks = full_manager.req_to_blocks[request_id]
         req_blocks.append(preserved_tail_block)
 
+    def _allocate_pd_sparse_slots(
+        self,
+        kv_cache_manager: KVCacheManager,
+        request: Request,
+        resident_valid_seq_len: int,
+        num_new_tokens: int,
+        *,
+        num_new_computed_tokens: int,
+        num_external_computed_tokens: int,
+        num_lookahead_tokens: int,
+        delay_cache_blocks: bool,
+        num_encoder_tokens: int,
+    ) -> KVCacheBlocks | None:
+        manifest = get_dsa_kvio_pd_manifest(request.kv_transfer_params)
+        if manifest is None or num_external_computed_tokens <= 0:
+            return None
+        if resident_valid_seq_len == INVALID_SLOT:
+            raise RuntimeError(
+                "DSA KVIO P/D external load did not produce a sparse "
+                "resident allocation plan")
+        if (
+            num_new_computed_tokens > 0
+            or num_lookahead_tokens > 0
+            or delay_cache_blocks
+            or num_encoder_tokens > 0
+        ):
+            raise RuntimeError(
+                "DSA KVIO P/D compact allocation does not support local "
+                "prefix blocks, lookahead, async load, or encoder blocks")
+        if num_external_computed_tokens != manifest.stored_token_count:
+            raise RuntimeError(
+                "DSA KVIO P/D external token count does not match manifest: "
+                f"{num_external_computed_tokens} vs "
+                f"{manifest.stored_token_count}")
+
+        coordinator = kv_cache_manager.coordinator
+        block_pool = kv_cache_manager.block_pool
+        full_group_id = self._get_full_attention_group_id(
+            kv_cache_manager.kv_cache_config)
+        indexer_group_id = self._get_indexer_group_id(
+            kv_cache_manager.kv_cache_config)
+        full_manager = coordinator.single_type_managers[full_group_id]
+        indexer_manager = coordinator.single_type_managers[indexer_group_id]
+
+        dense_slots = min(
+            int(num_external_computed_tokens) + int(num_new_tokens),
+            kv_cache_manager.max_model_len,
+        )
+        indexer_blocks_need = indexer_manager.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=dense_slots,
+            new_computed_blocks=[],
+            total_computed_tokens=int(num_external_computed_tokens),
+            num_tokens_main_model=dense_slots,
+        )
+        resident_blocks_need = full_manager.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=int(resident_valid_seq_len),
+            new_computed_blocks=[],
+            total_computed_tokens=int(resident_valid_seq_len),
+            num_tokens_main_model=int(resident_valid_seq_len),
+        )
+        if (
+            indexer_blocks_need
+            > self._get_group_num_free_blocks(block_pool, indexer_group_id)
+            or resident_blocks_need
+            > self._get_group_num_free_blocks(block_pool, full_group_id)
+        ):
+            return None
+
+        indexer_manager.allocate_new_blocks(
+            request.request_id,
+            dense_slots,
+            dense_slots,
+        )
+        full_manager.allocate_new_blocks(
+            request.request_id,
+            int(resident_valid_seq_len),
+            int(resident_valid_seq_len),
+        )
+        request.dsa_req_stage = request.dsa_next_req_stage
+        request.dsa_resident_valid_seq_len = int(resident_valid_seq_len)
+        request.dsa_sparse_budget_tokens = self._hbm_sparse_budget_tokens
+        return KVCacheBlocks(coordinator.get_blocks(request.request_id))
+
     def dsa_alloc_slots_wrap(
         self,
         kv_cache_manager: KVCacheManager,
@@ -894,6 +1240,22 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             if dense_blocks is not None:
                 request.dsa_req_stage = request.dsa_next_req_stage
             return dense_blocks
+
+        if (
+            num_external_computed_tokens > 0
+            and get_dsa_kvio_pd_manifest(request.kv_transfer_params) is not None
+        ):
+            return self._allocate_pd_sparse_slots(
+                kv_cache_manager,
+                request,
+                resident_valid_seq_len,
+                num_new_tokens,
+                num_new_computed_tokens=num_new_computed_tokens,
+                num_external_computed_tokens=num_external_computed_tokens,
+                num_lookahead_tokens=num_lookahead_tokens,
+                delay_cache_blocks=delay_cache_blocks,
+                num_encoder_tokens=num_encoder_tokens,
+            )
 
         if (request.num_computed_tokens < request.num_prompt_tokens
                 or resident_valid_seq_len == INVALID_SLOT):
@@ -1018,7 +1380,11 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             return KVCacheBlocks(coordinator.get_blocks(request.request_id))
 
 
-    def plan_decode_resident_slots(self, request: Request):
+    def plan_decode_resident_slots(
+        self,
+        request: Request,
+        num_external_computed_tokens: int = 0,
+    ):
         # This scheduler-side planner is the single stage-advance point for DSA
         # cache layout. It both returns the resident MLA/full-cache slot count
         # for sparse decode and writes the request stage metadata consumed by
@@ -1032,6 +1398,30 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         request.dsa_sparse_budget_tokens = 0
         if not self._is_sparse_cache_enabled():
             return INVALID_SLOT
+        manifest = get_dsa_kvio_pd_manifest(request.kv_transfer_params)
+        if manifest is not None and int(num_external_computed_tokens) > 0:
+            manifest.validate()
+            if int(num_external_computed_tokens) != manifest.stored_token_count:
+                raise RuntimeError(
+                    "DSA KVIO P/D scheduler token count does not match its "
+                    f"manifest: {num_external_computed_tokens} vs "
+                    f"{manifest.stored_token_count}")
+            if request.num_tokens <= self._enable_dsa_prompt_len:
+                raise ValueError(
+                    "DSA KVIO P/D compact handoff requires a request longer "
+                    f"than {self._enable_dsa_prompt_len} tokens, got "
+                    f"{request.num_tokens}")
+            candidate_full_blocks = (
+                manifest.stored_token_count // self._vllm_blk_size)
+            tail_slots_need = (
+                request.num_tokens
+                - candidate_full_blocks * self._vllm_blk_size)
+            return self._plan_sparse_decode_resident_slots(
+                request=request,
+                candidate_full_blocks=candidate_full_blocks,
+                tail_slots_need=tail_slots_need,
+                previous_stage=ReqStage.PREFILL,
+            )
         if request.num_computed_tokens < request.num_prompt_tokens:
             return INVALID_SLOT
         if request.num_output_tokens == 0:  # prefill/chunked_prefill

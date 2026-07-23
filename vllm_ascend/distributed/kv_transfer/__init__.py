@@ -57,3 +57,15 @@ def register_connector():
         "vllm_ascend.distributed.kv_transfer.kv_pool.lmcache_ascend_connector",
         "LMCacheConnectorV1",
     )
+
+    KVConnectorFactory.register_connector(
+        "DSAKVIOConnector",
+        "vllm_ascend.distributed.kv_transfer.dsa_kvio_connector",
+        "DSAKVIOConnector",
+    )
+
+    KVConnectorFactory.register_connector(
+        "DSAMooncakeConnector",
+        "vllm_ascend.distributed.kv_transfer.dsa_mooncake_connector",
+        "DSAMooncakeConnector",
+    )

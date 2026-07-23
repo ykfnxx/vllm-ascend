@@ -37,9 +37,12 @@ class FakeKVIOOps:
         self.destroy_calls += 1
 
 
-def encode_request_id(request_id: str) -> int:
+def encode_request_id(request_id: str, namespace: str = "") -> int:
+    encoded_request = (
+        f"{namespace}\0{request_id}" if namespace else request_id
+    )
     digest = hashlib.blake2b(
-        request_id.encode("utf-8"), digest_size=8).digest()
+        encoded_request.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, byteorder="little") & 0x7FFFFFFFFFFFFFFF
 
 
@@ -161,6 +164,45 @@ def test_kvio_backend_translates_block_put_offsets_and_waits():
     assert ops.wait_calls == [[1]]
 
 
+def test_kvio_backend_namespaces_lazy_request_binding():
+    ops = FakeKVIOOps()
+    backend = KVIODSAKVBackend(
+        model_id=7,
+        pd_flag=1,
+        max_model_len=8,
+        request_namespace="prefill-engine",
+        ops_module=ops,
+    )
+    nopek_cache = torch.zeros((1, 2, 1, 3), dtype=torch.float32)
+    ropek_cache = torch.zeros((1, 2, 1, 1), dtype=torch.float32)
+    backend.register_layer_cache(
+        layer_id=0,
+        block_size=2,
+        nopek_cache=nopek_cache,
+        ropek_cache=ropek_cache,
+    )
+    backend.finalize_cache_registration()
+
+    backend.put_blocks(
+        layer_id=0,
+        request_ids=["request-0"],
+        request_pool_indices=[0],
+        logical_block_index_rows=[[0]],
+        block_key_rows=[["block-0"]],
+        source_block_id_rows=[[0]],
+    )
+
+    namespaced_request_id = encode_request_id(
+        "request-0",
+        namespace="prefill-engine",
+    )
+    assert namespaced_request_id != encode_request_id("request-0")
+    assert ops.put_calls[0][4] == [
+        namespaced_request_id,
+        namespaced_request_id,
+    ]
+
+
 def test_kvio_backend_translates_token_get_offsets_and_closes():
     ops = FakeKVIOOps()
     backend = KVIODSAKVBackend(
@@ -215,3 +257,86 @@ def test_kvio_backend_translates_token_get_offsets_and_closes():
     backend.close()
     backend.close()
     assert ops.destroy_calls == 1
+
+
+def test_kvio_backend_transfers_indexer_partial_tail_and_pd_layout():
+    ops = FakeKVIOOps()
+    backend = KVIODSAKVBackend(
+        model_id=7,
+        pd_flag=1,
+        max_model_len=8,
+        ops_module=ops,
+    )
+    indexer_cache = torch.zeros((4, 2, 1, 2), dtype=torch.float32)
+    nopek_cache = torch.zeros((4, 2, 1, 3), dtype=torch.float32)
+    ropek_cache = torch.zeros((4, 2, 1, 1), dtype=torch.float32)
+    backend.register_layer_cache(
+        layer_id=0,
+        block_size=2,
+        nopek_cache=nopek_cache,
+        ropek_cache=ropek_cache,
+        indexer_cache=indexer_cache,
+    )
+    backend.finalize_cache_registration()
+
+    assert ops.init_args == (
+        [
+            indexer_cache.data_ptr(),
+            nopek_cache.data_ptr(),
+            ropek_cache.data_ptr(),
+        ],
+        [
+            indexer_cache.numel() * indexer_cache.element_size(),
+            nopek_cache.numel() * nopek_cache.element_size(),
+            ropek_cache.numel() * ropek_cache.element_size(),
+        ],
+    )
+
+    remote_request_id = encode_request_id("prefill-request")
+    backend.put_blocks(
+        layer_id=0,
+        request_ids=["prefill-request"],
+        request_pool_indices=[1],
+        logical_block_index_rows=[[0, 1]],
+        block_key_rows=[["block-0"]],
+        source_block_id_rows=[[2, 3]],
+        source_indexer_block_id_rows=[[1, 0]],
+        valid_token_count_rows=[3],
+    )
+    assert ops.put_calls == [(
+        1,
+        7,
+        1,
+        [0, 1, 2, 0, 1, 2],
+        [remote_request_id] * 6,
+        [16, 48, 16, 0, 72, 24],
+        [0, 64, 160, 16, 88, 168],
+        [16, 24, 8, 8, 12, 4],
+    )]
+
+    backend.bind_request(
+        request_id="decode-request",
+        request_pool_idx=2,
+        remote_request_id=remote_request_id,
+    )
+    backend.load_pd_request(
+        request_pool_idx=2,
+        stored_token_count=5,
+        layer_resident_token_ids={0: [0, 2]},
+        tail_token_start=4,
+        tail_token_count=1,
+        tail_slot_start=4,
+        indexer_block_ids=[3, 2, 1],
+        resident_block_ids=[1, 0, 3],
+    )
+    assert ops.get_calls == [(
+        2,
+        7,
+        1,
+        [0, 0, 0, 1, 1, 1, 2, 2, 2],
+        [remote_request_id] * 9,
+        [48, 32, 16, 24, 36, 72, 8, 12, 24],
+        [0, 16, 32, 64, 88, 112, 160, 168, 176],
+        [16, 16, 8, 12, 12, 12, 4, 4, 4],
+    )]
+    assert ops.wait_calls == [[1], [2]]

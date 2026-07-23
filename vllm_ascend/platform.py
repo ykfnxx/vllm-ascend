@@ -464,6 +464,7 @@ class NPUPlatform(Platform):
         from vllm_ascend.dsa_sparse.dsa_config import (
             DSA_SPARSE_SUPPORTED_ARCHITECTURES,
             is_dsa_sparse_config_enabled,
+            validate_dsa_kv_transfer_config,
         )
 
         dsa_sparse_enabled = is_dsa_sparse_config_enabled(vllm_config)
@@ -486,8 +487,7 @@ class NPUPlatform(Platform):
                 raise ValueError("DSA sparse offload does not support context parallelism")
             if vllm_config.speculative_config is not None:
                 raise ValueError("DSA sparse offload does not support speculative decoding")
-            if vllm_config.kv_transfer_config is not None:
-                raise ValueError("DSA sparse offload does not support KV transfer")
+            validate_dsa_kv_transfer_config(vllm_config)
             if ascend_config.enable_sparse_c8:
                 raise ValueError("DSA sparse offload does not support Sparse C8")
             if envs_ascend.VLLM_ASCEND_BALANCE_SCHEDULING:

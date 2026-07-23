@@ -16,6 +16,10 @@ from typing import Any
 from vllm_ascend.dsa_sparse.dsa_graph_gate import (
     DSA_ROW_MODE_DECODE_GRAPH_CONFIG_KEY,
 )
+from vllm_ascend.dsa_sparse.dsa_pd import (
+    DSA_KVIO_CONNECTOR_NAME,
+    DSA_MOONCAKE_CONNECTOR_NAME,
+)
 from vllm_ascend.dsa_sparse.dsa_resident_pool import (
     DSA_LOOKUP_QUERY_TOKENS,
     DSA_LOOKUP_RESIDENT_TOKENS,
@@ -225,3 +229,63 @@ def is_dsa_sparse_config_enabled(vllm_config: Any) -> bool:
         return False
     dsa_config = additional_config.get(DSA_SPARSE_ADDITIONAL_CONFIG_KEY)
     return isinstance(dsa_config, dict) and bool(dsa_config.get("enabled"))
+
+
+def validate_dsa_kv_transfer_config(vllm_config: Any) -> None:
+    """Validate KV-transfer paths supported by DSA sparse offload."""
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_transfer_config is None:
+        return
+
+    cache_config = vllm_config.cache_config
+    kv_connector = getattr(kv_transfer_config, "kv_connector", None)
+    kv_role = getattr(kv_transfer_config, "kv_role", None)
+    supported_connectors = {
+        DSA_KVIO_CONNECTOR_NAME,
+        DSA_MOONCAKE_CONNECTOR_NAME,
+    }
+    if kv_connector not in supported_connectors:
+        raise ValueError(
+            "DSA sparse offload supports KV transfer only through one of "
+            f"{sorted(supported_connectors)}, got {kv_connector!r}")
+    if getattr(cache_config, "dsa_kv_backend", None) != "kvio":
+        raise ValueError(
+            f"{kv_connector} requires "
+            "dsa_sparse_config['kv_backend']='kvio'")
+    if kv_role not in {"kv_producer", "kv_consumer"}:
+        raise ValueError(
+            f"{kv_connector} requires kv_role to be "
+            "'kv_producer' or 'kv_consumer'")
+    if (
+        kv_role == "kv_consumer"
+        and bool(getattr(cache_config, "enable_prefix_caching", False))
+    ):
+        raise ValueError(
+            f"{kv_connector} requires prefix caching to be "
+            "disabled on the D node")
+    if kv_connector == DSA_MOONCAKE_CONNECTOR_NAME:
+        get_extra_config = getattr(
+            kv_transfer_config, "get_from_extra_config", None)
+        if not callable(get_extra_config):
+            raise ValueError(
+                f"{DSA_MOONCAKE_CONNECTOR_NAME} requires "
+                "kv_connector_extra_config for P/D topology")
+        prefill = get_extra_config("prefill", {})
+        decode = get_extra_config("decode", {})
+        required = {"tp_size", "dp_size"}
+        if not isinstance(prefill, dict) or not isinstance(decode, dict):
+            raise ValueError(
+                f"{DSA_MOONCAKE_CONNECTOR_NAME} P/D topology must be dicts")
+        if not required.issubset(prefill) or not required.issubset(decode):
+            raise ValueError(
+                f"{DSA_MOONCAKE_CONNECTOR_NAME} requires tp_size and "
+                "dp_size in both prefill and decode topology")
+        if (
+            int(prefill["tp_size"]) != int(decode["tp_size"])
+            or int(prefill["dp_size"]) != int(decode["dp_size"])
+            or int(prefill.get("pp_size", 1)) != 1
+            or int(decode.get("pp_size", 1)) != 1
+        ):
+            raise ValueError(
+                f"{DSA_MOONCAKE_CONNECTOR_NAME} currently requires "
+                "matching P/D TP and DP sizes with PP=1")

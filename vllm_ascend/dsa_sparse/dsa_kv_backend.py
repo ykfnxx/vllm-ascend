@@ -33,6 +33,7 @@ class DSAKVBackend(ABC):
         block_size: int,
         nopek_cache: torch.Tensor,
         ropek_cache: torch.Tensor,
+        indexer_cache: torch.Tensor | None = None,
     ) -> None:
         """Register stable NPU cache tensors for one MLA layer."""
 
@@ -50,8 +51,36 @@ class DSAKVBackend(ABC):
         logical_block_index_rows: list[list[int]],
         block_key_rows: list[list],
         source_block_id_rows: list[list[int]],
+        source_indexer_block_id_rows: list[list[int]] | None = None,
+        valid_token_count_rows: list[int] | None = None,
     ) -> None:
         """Write complete HBM blocks to backend-owned storage."""
+
+    def bind_request(
+        self,
+        *,
+        request_id,
+        request_pool_idx: int,
+        remote_request_id: int | None = None,
+    ) -> None:
+        """Bind a local D request row to the P-side remote request id."""
+        return
+
+    def load_pd_request(
+        self,
+        *,
+        request_pool_idx: int,
+        stored_token_count: int,
+        layer_resident_token_ids: dict[int, list[int]],
+        tail_token_start: int,
+        tail_token_count: int,
+        tail_slot_start: int,
+        indexer_block_ids: list[int],
+        resident_block_ids: list[int],
+    ) -> None:
+        """Materialize P-side caches into the D-side dense/resident layout."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support DSA P/D loading")
 
     @abstractmethod
     def load_tokens_into(
@@ -79,7 +108,9 @@ class MockDSAKVBackend(DSAKVBackend):
     """Storage-free backend that fills miss destinations with mock values."""
 
     def __init__(self, seed: int = 0) -> None:
-        self._layer_caches: dict[int, tuple[int, torch.Tensor, torch.Tensor]] = {}
+        self._layer_caches: dict[
+            int, tuple[int, torch.Tensor, torch.Tensor, torch.Tensor | None]
+        ] = {}
         self._random = random.Random(int(seed))
         self._put_logged = False
         self._load_logged = False
@@ -102,11 +133,13 @@ class MockDSAKVBackend(DSAKVBackend):
         block_size: int,
         nopek_cache: torch.Tensor,
         ropek_cache: torch.Tensor,
+        indexer_cache: torch.Tensor | None = None,
     ) -> None:
         self._layer_caches[int(layer_id)] = (
             int(block_size),
             self._squeeze_cache_head_dim(nopek_cache),
             self._squeeze_cache_head_dim(ropek_cache),
+            indexer_cache,
         )
 
     def put_blocks(
@@ -118,6 +151,8 @@ class MockDSAKVBackend(DSAKVBackend):
         logical_block_index_rows: list[list[int]],
         block_key_rows: list[list],
         source_block_id_rows: list[list[int]],
+        source_indexer_block_id_rows: list[list[int]] | None = None,
+        valid_token_count_rows: list[int] | None = None,
     ) -> None:
         if not self._put_logged:
             logger.info(
@@ -138,7 +173,7 @@ class MockDSAKVBackend(DSAKVBackend):
         load_mask: torch.Tensor,
         destination_block_table: torch.Tensor,
     ) -> None:
-        block_size, nopek_cache, ropek_cache = self._layer_caches[int(
+        block_size, nopek_cache, ropek_cache, _ = self._layer_caches[int(
             layer_id)]
         row_indices, token_indices = load_mask.to(
             dtype=torch.bool).nonzero(as_tuple=True)
@@ -181,9 +216,12 @@ def create_dsa_kv_backend(vllm_config) -> DSAKVBackend:
     if backend_name == "kvio":
         from vllm_ascend.dsa_sparse.dsa_kvio_backend import KVIODSAKVBackend
 
+        kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
         return KVIODSAKVBackend(
             model_id=int(vllm_config.cache_config.dsa_kvio_model_id),
             pd_flag=int(vllm_config.cache_config.dsa_kvio_pd_flag),
             max_model_len=int(vllm_config.model_config.max_model_len),
+            request_namespace=str(
+                getattr(kv_transfer_config, "engine_id", "")),
         )
     raise ValueError(f"Unsupported DSA KV backend: {backend_name}")

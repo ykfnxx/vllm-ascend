@@ -112,6 +112,7 @@ from vllm_ascend.dsa_sparse.dsa_graph_gate import (
     is_dsa_row_mode_decode_graph_expected_eager,
     is_dsa_row_mode_decode_graph_enabled,
 )
+from vllm_ascend.dsa_sparse.dsa_pd import DSA_MOONCAKE_CONNECTOR_NAME
 from vllm_ascend.dsa_sparse.dsa_trace import (
     DSA_TRACE_CONFIG_KEY,
     configure_dsa_trace,
@@ -3299,11 +3300,24 @@ class NPUModelRunner(GPUModelRunner):
                     assert isinstance(current_kv_cache_spec, AttentionSpec)
 
                     if isinstance(current_kv_cache_spec, IndexerKVSpec):
-                        tensor = torch.zeros(
-                            kv_cache_tensor.size,
-                            dtype=torch.int8,
-                            device=self.device,
+                        kv_transfer_config = (
+                            self.vllm_config.kv_transfer_config)
+                        use_dsa_mooncake = (
+                            kv_transfer_config is not None
+                            and kv_transfer_config.kv_connector
+                            == DSA_MOONCAKE_CONNECTOR_NAME
                         )
+                        tensor_size = (
+                            kv_cache_tensor.size + alignment
+                            if use_dsa_mooncake
+                            else kv_cache_tensor.size
+                        )
+                        tensor = torch.zeros(
+                            tensor_size, dtype=torch.int8,
+                            device=self.device)
+                        if use_dsa_mooncake:
+                            tensor = self._align_memory(
+                                tensor, alignment)[:kv_cache_tensor.size]
                         for layer_name_inner in kv_cache_tensor.shared_by:
                             kv_cache_raw_tensors[layer_name_inner] = tensor
                         continue

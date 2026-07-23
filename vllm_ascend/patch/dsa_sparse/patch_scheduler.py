@@ -98,8 +98,15 @@ def _has_ready_decode(self: Scheduler) -> bool:
     return False
 
 
-def _estimate_resident_slots(self: Scheduler, request: Request) -> int:
-    return self.dsa_scheduler_mgr.plan_decode_resident_slots(request)
+def _estimate_resident_slots(
+    self: Scheduler,
+    request: Request,
+    num_external_computed_tokens: int = 0,
+) -> int:
+    return self.dsa_scheduler_mgr.plan_decode_resident_slots(
+        request,
+        num_external_computed_tokens=num_external_computed_tokens,
+    )
 
 
 def _install_allocate_slots_wrapper(self: Scheduler) -> None:
@@ -114,7 +121,10 @@ def _install_allocate_slots_wrapper(self: Scheduler) -> None:
             return original_allocate_slots(
                 request, num_new_tokens, *args, **kwargs
             )
-        resident_valid_seq_len = self._estimate_dsa_resident_slots(request)
+        resident_valid_seq_len = self._estimate_dsa_resident_slots(
+            request,
+            int(kwargs.get("num_external_computed_tokens", 0)),
+        )
         kv_cache_manager._dsa_inside_allocate_slots = True
         try:
             return self.dsa_scheduler_mgr.dsa_alloc_slots_wrap(
@@ -297,6 +307,20 @@ def _preempt_request(
 
 @wraps(_original_update_from_output)
 def _update_from_output(self: Scheduler, scheduler_output, model_runner_output):
+    if _is_dsa_enabled(self) and self.connector is not None:
+        connector_output = getattr(
+            model_runner_output, "kv_connector_output", None
+        )
+        consume_prefill_seeds = getattr(
+            self.connector,
+            "update_dsa_prefill_seeds_before_request_finish",
+            None,
+        )
+        if connector_output is not None and callable(consume_prefill_seeds):
+            # vLLM normally delivers worker metadata after processing stopped
+            # requests.  DSA needs the final-Prefill TopK while
+            # request_finished is constructing the same step's route params.
+            consume_prefill_seeds(connector_output)
     outputs = _original_update_from_output(
         self, scheduler_output, model_runner_output
     )

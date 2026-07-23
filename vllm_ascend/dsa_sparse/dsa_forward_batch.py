@@ -56,6 +56,7 @@ class DSAModelForwardMeta:
             num_computed_tokens: int,
             resident_valid_seq_len: int,
             vllm_budget_block_ids: list[int],
+            indexer_block_ids: list[int],
             block_size,
             query_start_loc: int,
             query_len: int,
@@ -66,6 +67,7 @@ class DSAModelForwardMeta:
             dsa_sparse_enabled: bool = False,
             dsa_sparse_budget_tokens: int = 0,
             resident_pool_idx: int = -1,
+            pd_remote_loaded: bool = False,
     ):
         req_meta = ReqMeta(request_id=request_id,
                            index_in_batch=index_in_batch,
@@ -75,6 +77,7 @@ class DSAModelForwardMeta:
                            num_computed_tokens=num_computed_tokens,
                            resident_valid_seq_len=resident_valid_seq_len,
                            vllm_budget_block_ids=vllm_budget_block_ids,
+                           indexer_block_ids=indexer_block_ids,
                            block_size=block_size,
                            query_start_loc=query_start_loc,
                            query_len=query_len,
@@ -88,7 +91,8 @@ class DSAModelForwardMeta:
                                else resident_query_positions),
                            dsa_sparse_enabled=dsa_sparse_enabled,
                            dsa_sparse_budget_tokens=dsa_sparse_budget_tokens,
-                           resident_pool_idx=resident_pool_idx)
+                           resident_pool_idx=resident_pool_idx,
+                           pd_remote_loaded=pd_remote_loaded)
         self.requests.append(req_meta)
 
 
@@ -316,7 +320,9 @@ class DSAFullBlockDumpTables:
     request_pool_indices: list[int]
     block_hash_rows: list[list]
     block_id_rows: list[list[int]]
+    indexer_block_id_rows: list[list[int]]
     logical_block_index_rows: list[list[int]]
+    valid_token_count_rows: list[int]
 
     def __bool__(self) -> bool:
         return bool(self.request_ids)
@@ -328,7 +334,9 @@ class DSAFullBlockDumpTables:
             request_pool_indices=[],
             block_hash_rows=[],
             block_id_rows=[],
+            indexer_block_id_rows=[],
             logical_block_index_rows=[],
+            valid_token_count_rows=[],
         )
 
 
@@ -377,7 +385,9 @@ def _build_forward_batches_from_dsa_meta(
     dump_request_pool_indices: list[int] = []
     dump_block_hash_rows: list[list] = []
     dump_block_id_rows: list[list[int]] = []
+    dump_indexer_block_id_rows: list[list[int]] = []
     dump_logical_block_index_rows: list[list[int]] = []
+    dump_valid_token_count_rows: list[int] = []
     prefill_done_pool_indices: list[int] = []
 
     for req_meta in dsa_meta.requests:
@@ -389,27 +399,47 @@ def _build_forward_batches_from_dsa_meta(
 
         block_hashes: list = []
         block_ids: list[int] = []
+        indexer_block_ids: list[int] = []
         logical_block_indices: list[int] = []
+        valid_token_count = 0
         mark_prefill_done = False
-        if req_meta.num_output_tokens == 0 and req_meta.is_last_prefill_chunk:
+        if (
+            req_meta.num_output_tokens == 0
+            and req_meta.is_last_prefill_chunk
+            and not req_meta.pd_remote_loaded
+        ):
             full_hashes = req_meta.req_context_full_blk_hashes
-            num_full_blocks = len(full_hashes)
-            if num_full_blocks > 0:
-                block_hashes = list(full_hashes)
+            valid_token_count = int(req_meta.num_prompt_tokens)
+            num_blocks = (
+                valid_token_count + req_meta.block_size - 1
+            ) // req_meta.block_size
+            if num_blocks > 0:
+                # Prefix-cache hashes only exist for complete blocks. KVIO
+                # also persists the final partial block, so keep all row-wise
+                # metadata aligned and use ``None`` for its non-cacheable key.
+                block_hashes = list(full_hashes[:num_blocks]) + [None] * max(
+                    0, num_blocks - len(full_hashes))
                 block_ids = [
                     int(block_id)
                     for block_id in req_meta.vllm_budget_block_ids[
-                        :num_full_blocks]
+                        :num_blocks]
                 ]
-                logical_block_indices = list(range(num_full_blocks))
+                indexer_block_ids = [
+                    int(block_id)
+                    for block_id in req_meta.indexer_block_ids[:num_blocks]
+                ]
+                logical_block_indices = list(range(num_blocks))
             mark_prefill_done = True
-        elif (req_meta.num_output_tokens > 0
+        elif ((req_meta.num_output_tokens > 0 or req_meta.pd_remote_loaded)
               and req_meta.is_full_block_need_dump_in_decode
               and req_meta.req_context_full_blk_hashes):
             logical_block_idx = len(req_meta.req_context_full_blk_hashes) - 1
             block_hashes = [req_meta.req_context_full_blk_hashes[-1]]
             block_ids = [int(req_meta.vllm_budget_block_ids[-1])]
+            indexer_block_ids = [int(req_meta.indexer_block_ids[-1])]
             logical_block_indices = [logical_block_idx]
+            valid_token_count = (
+                logical_block_idx + 1) * req_meta.block_size
             logger.debug(
                 "========== DSA DECODE FULL BLOCK DUMP =========="
                 " req_id=%s prompt_tokens=%s output_tokens=%s "
@@ -432,9 +462,11 @@ def _build_forward_batches_from_dsa_meta(
             dump_request_pool_indices.append(resident_pool_idx)
             dump_block_hash_rows.append(block_hashes)
             dump_block_id_rows.append(block_ids)
+            dump_indexer_block_id_rows.append(indexer_block_ids)
             dump_logical_block_index_rows.append(logical_block_indices)
+            dump_valid_token_count_rows.append(valid_token_count)
 
-        if req_meta.num_output_tokens <= 0:
+        if req_meta.num_output_tokens <= 0 and not req_meta.pd_remote_loaded:
             continue
         topk_plan = ReqSparseDecodeForwardPlan.from_req_meta(req_meta)
         if resident_pool_idx < 0 or topk_plan.query_len <= 0:
@@ -467,7 +499,9 @@ def _build_forward_batches_from_dsa_meta(
         row_modes.append(int(DSADecodeRowMode.SPARSE if is_sparse_row
                              else DSADecodeRowMode.DENSE))
         lookup_init_mask.append(
-            is_sparse_row and req_meta.stage.is_enter_sparse_decode)
+            is_sparse_row
+            and req_meta.stage.is_enter_sparse_decode
+            and not req_meta.pd_remote_loaded)
         resident_pool_indices.append(resident_pool_idx)
         query_start_locs.append(query_start)
         query_lens.append(query_len)
@@ -652,7 +686,9 @@ def _build_forward_batches_from_dsa_meta(
             request_pool_indices=dump_request_pool_indices,
             block_hash_rows=dump_block_hash_rows,
             block_id_rows=dump_block_id_rows,
+            indexer_block_id_rows=dump_indexer_block_id_rows,
             logical_block_index_rows=dump_logical_block_index_rows,
+            valid_token_count_rows=dump_valid_token_count_rows,
         ),
         prefill_done_pool_indices_tensor=build_int_tensor(
             prefill_done_pool_indices,

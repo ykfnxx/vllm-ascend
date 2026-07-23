@@ -1560,6 +1560,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             layer_name=layer_name,
         )
 
+        if self.dsa_sparse_enabled and layer_name is not None:
+            dsa_mgr = get_dsa_mgr_worker()
+            if dsa_mgr is not None:
+                dsa_mgr.capture_pd_prefill_last_token_topk(
+                    layer_name, topk_indices
+                )
+
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
         )

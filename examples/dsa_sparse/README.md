@@ -282,13 +282,167 @@ backend 和 KVIO 标识改为：
 }
 ```
 
-KV cache 分配完成后，框架会把每个本地 MLA 层的 nope/rope tensor 地址和
-字节长度一次性传给 `aiv_init`。完整 block 使用同步的
-`aiv_put_batch + aiv_wait` 写入远端；lookup miss 使用同步的
+KV cache 分配完成后，框架会按 layer id 和 Indexer/nope/rope 的固定顺序，
+把本地 tensor 地址与字节长度一次性传给 `aiv_init`。P 侧最后一个 prefill
+chunk 会通过同步的 `aiv_put_batch + aiv_wait` 写入所有有效 prompt token，
+包括 Indexer cache、MLA nope/rope cache 和最后一个非整块 tail。普通 DSA
+Decode 中新完成的整块也沿用该路径。lookup miss 使用同步的
 `aiv_get_batch + aiv_wait` 直接写入 resident physical slot。KVIO Python
 接口只接收整数列表，因此 GET 热路径需要将一次批量地址元数据从 NPU 搬到
 CPU。当前 KVIO 接口没有远端删除 API，请求结束只清理本地 pool entry 到
 整数 request ID 的映射。
+
+### KVIO DSA 的 P/D 分离
+
+P、D 两个实例都需要启用 DSA、选择 KVIO backend，并使用
+`DSAKVIOConnector`。P 侧示例：
+
+```json
+{
+  "kv_connector": "DSAKVIOConnector",
+  "kv_role": "kv_producer",
+  "engine_id": "dsa-prefill"
+}
+```
+
+D 侧示例：
+
+```json
+{
+  "kv_connector": "DSAKVIOConnector",
+  "kv_role": "kv_consumer",
+  "engine_id": "dsa-decode"
+}
+```
+
+两侧的 `dsa_sparse_config` 都使用 `kv_backend="kvio"`，且
+`kvio_model_id`、`block_size`、模型与 TP/PP layer 映射必须一致；
+`kvio_pd_flag` 按 KVIO 部署对 P/D 角色的约定分别配置。D 侧必须关闭 prefix
+caching，且两侧不能启用 speculative decoding 或 async scheduling。当前紧凑
+初始化不支持把本地 prefix hit 与远端 DSA 状态混合：
+
+```bash
+--no-enable-prefix-caching \
+--kv-transfer-config \
+'{"kv_connector":"DSAKVIOConnector","kv_role":"kv_consumer","engine_id":"dsa-decode"}'
+```
+
+P 的最后一个 Prefill chunk 会复用每层 Lightning Indexer 已算出的最后一个
+query token TopK；每个 worker 按全局 rank 回传本地 layer TopK，scheduler 在请求
+结束前完成聚合。P 请求完成时，connector 在输出的 `kv_transfer_params` 中返回
+protocol-v3 manifest、`dsa_kvio_layer_topk_by_rank` 和 `last_token_id`。
+manifest 的 `state=READY` 只会在全部 P worker 已完成同步
+`aiv_put_batch + aiv_wait`、且 scheduler 收齐对应 rank 的最后 Prefill TopK 后
+发布。manifest 还携带 generation、P world size 和 cache layout fingerprint；
+D 在分配 block 前校验协议版本、READY、模型/布局和 P/D 拓扑，不一致立即拒绝，
+不会回退为部分读取。KVIO request id 使用 P 实例的 runtime `engine_id` 作为
+命名空间；D 直接绑定 manifest 中的远端 id，因此 D 自己的 `engine_id` 不参与
+远端 key 计算。
+
+路由层仍负责控制面交接，不负责传输 KV tensor：
+
+1. 发给 P 的请求必须设置
+   `kv_transfer_params={"do_remote_decode": true, "do_remote_prefill": false}`
+   并限制 `max_tokens=min_tokens=1`；
+2. P 响应没有 `kv_transfer_params` 时按普通请求处理，不应强行发起紧凑 DSA
+   handoff；这覆盖未完成 Prefill、短请求等情况；
+3. P 响应有 `kv_transfer_params` 时，路由层必须原样传入 D，并把
+   `last_token_id` 作为 P 已生成的首 token 追加到 D 的 token 序列。D 收到的
+   token 数应等于 manifest 的 `stored_token_count + 1`；
+4. 当前通用 proxy 示例只转发 `kv_transfer_params`，不会替业务请求追加 token
+   id；接入层必须补上这一动作，并确保最终响应只向客户端返回一次 P 首 token。
+
+manifest 包含稳定的 KVIO request id、远端有效 token 数、逻辑 block 数和
+resident/tail 布局；逐层 TopK 是紧凑索引种子。D scheduler 再把自己分配的
+dense Indexer block table 与 compact MLA resident block table 加入 worker
+metadata。
+
+D worker 在第一次模型 forward 前完成三步同步初始化：
+
+1. 从 KVIO 加载全量 Indexer cache 到 D 的 dense Indexer block table；
+2. 对每个本地 layer 先选入最后一个 Prefill token 的有效 TopK，再按历史 token
+   位置升序、排除重复和 dense tail，确定性补齐到 8192 个 resident token；
+3. 从 KVIO 加载这些逐层离散 MLA token 和非整块 tail 到 compact resident
+   table，并初始化每层独立的 `token_to_slot`、`slot_to_token`、resident count
+   和 prefill-ready 状态。resident slot 保留 TopK score 顺序，KVIO 直接按离散
+   token 地址读取；补齐部分仍按历史 token 位置顺序排列。
+
+追加到 D prompt 的 P 首 token 会在这次 forward 中直接按 sparse-decode query
+处理，而不是退回 dense Prefill。之后 D Decode 的 Lightning Indexer 仍对完整
+序列打分；历史 token 在 resident 索引中命中时直接使用本地 slot，miss 时通过
+KVIO GET 写入 lookup 分配的 resident slot，再执行 maintain。当前协议只接受
+严格大于 DSA sparse threshold
+的 D 请求（默认 block size 128 时为 10368 token）。换言之，P 已存 prompt 加
+首 token 后必须至少为 10369 token；更短请求不会发布 compact manifest。协议
+假定 P/D 的对应并行 rank 连接到同一个可跨节点访问的 KVIO 数据面，且
+`aiv_wait` 返回后 PUT 对 D 可见。
+
+该路径不创建 Mooncake transport，也不需要 Mooncake 的 side-channel/握手元
+数据；Indexer、resident MLA 初始化和后续 lookup miss 都通过 KVIO。外部路由
+仍不可省略，因为它负责 P/D 选址、一次 Prefill、字段转发和首 token 衔接。
+当前 `rdma_kv_ops` Python API 没有观察到远端 delete/TTL 调用，因此
+`request_finished`/preempt/初始化失败只释放本地 request-to-pool 绑定和 resident
+row。生产部署必须由 KVIO 服务配置 TTL/配额/后台回收；若 KVIO 不保证
+`aiv_wait` 后跨节点可见性，也不能把 `state=READY` 当成可读承诺。
+
+### Mooncake 初始传输 + KVIO 持久化
+
+如果现有 P/D 部署已经使用 Mooncake，可将两侧 connector 改为
+`DSAMooncakeConnector`，无需修改
+`kv_p2p/mooncake_connector.py` 或 Mooncake 库。P 侧示例：
+
+```json
+{
+  "kv_connector": "DSAMooncakeConnector",
+  "kv_role": "kv_producer",
+  "kv_port": 30000,
+  "engine_id": "dsa-prefill",
+  "kv_connector_extra_config": {
+    "use_ascend_direct": true,
+    "prefill": {"dp_size": 1, "tp_size": 16},
+    "decode": {"dp_size": 1, "tp_size": 16}
+  }
+}
+```
+
+D 侧使用不同的本地 `kv_port` 和 `engine_id`，其余拓扑描述保持一致：
+
+```json
+{
+  "kv_connector": "DSAMooncakeConnector",
+  "kv_role": "kv_consumer",
+  "kv_port": 30100,
+  "engine_id": "dsa-decode",
+  "kv_connector_extra_config": {
+    "use_ascend_direct": true,
+    "prefill": {"dp_size": 1, "tp_size": 16},
+    "decode": {"dp_size": 1, "tp_size": 16}
+  }
+}
+```
+
+该模式仍要求两侧 `dsa_sparse_config.kv_backend="kvio"`：KVIO 保存完整
+prompt KV，并负责 D 后续 lookup miss；Mooncake 只负责一次初始 handoff。
+当前适配器要求 P/D 的 TP、DP 和 world size 一致，且 PP=PCP=DCP=1。
+D 侧仍需关闭 prefix caching、async scheduling 和 speculative decoding。
+
+P 结束后会延迟释放原始 dense block。D 在第一次 forward 前直接通过
+Mooncake TransferEngine 从这些 block 拉取：
+
+1. 全量 Indexer cache；
+2. 每层确定性的 8192 个 resident MLA token；
+3. 最后一个非整块 dense tail。
+
+中间 2048 个 lookup 空闲槽不走网络。适配器按真实的 Indexer/MLA tensor
+地址和各自 block table 生成 scatter/gather 描述，不进入现有
+`MooncakeConnector` 不支持 DSA 异构 block 数的 HMA 分支。D 拉取成功并收到
+Mooncake ACK 后，P 才释放延迟 block；D 随后只绑定 manifest 中的 KVIO request
+id、初始化 lookup 映射，不再从 KVIO 重复加载初始 resident 数据。
+
+路由层沿用上面的同一控制面约定：原样转发整个 `kv_transfer_params`，并把
+`last_token_id` 追加到 D 的 token 序列。新增字段都位于标准
+`kv_transfer_params` 内；若现有路由已经透明转发 Mooncake 参数并完成首 token
+衔接，不需要增加新的数据传输逻辑。
 
 ### 静态诊断运行中的服务
 

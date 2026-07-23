@@ -59,11 +59,14 @@ def _build_req_forward_plan(
     vllm_budget_block_ids: list[int],
     dsa_sparse_enabled: bool,
     dsa_sparse_budget_tokens: int,
+    pd_remote_loaded: bool,
 ) -> ReqForwardPlan:
     block_size = int(block_size)
     sparse_budget_tokens = max(0, int(dsa_sparse_budget_tokens or 0))
+    pd_first_decode_query = (
+        bool(pd_remote_loaded) and int(num_output_tokens) == 0)
     is_sparse_decode = (
-        int(num_output_tokens) > 0
+        (int(num_output_tokens) > 0 or pd_first_decode_query)
         and int(resident_valid_seq_len) >= 0
         and bool(dsa_sparse_enabled)
         and sparse_budget_tokens > 0
@@ -75,9 +78,16 @@ def _build_req_forward_plan(
         max_slots=max_slots,
     )
 
-    dense_tokens_before_current_query = (
-        int(num_prompt_tokens) + max(int(num_output_tokens) - 1, 0)
-    )
+    if pd_first_decode_query:
+        # The router appends P's first generated token to the D prompt. vLLM
+        # therefore reports zero output tokens on D's first step even though
+        # the final prompt token is the current decode query.
+        dense_tokens_before_current_query = max(
+            int(num_prompt_tokens) - 1, 0)
+    else:
+        dense_tokens_before_current_query = (
+            int(num_prompt_tokens) + max(int(num_output_tokens) - 1, 0)
+        )
     dense_tail_start = (
         dense_tokens_before_current_query // block_size) * block_size
 
@@ -175,6 +185,7 @@ class ReqMeta:
     # capacity in the allocated resident tail block.
     resident_valid_seq_len: int
     vllm_budget_block_ids: list[int]
+    indexer_block_ids: list[int]
     block_size: int
     query_start_loc: int
     query_len: int
@@ -185,6 +196,7 @@ class ReqMeta:
     dsa_sparse_enabled: bool = False
     dsa_sparse_budget_tokens: int = 0
     resident_pool_idx: int = -1
+    pd_remote_loaded: bool = False
     forward_plan: ReqForwardPlan = field(init=False)
 
     def __post_init__(self) -> None:
@@ -203,11 +215,12 @@ class ReqMeta:
             vllm_budget_block_ids=self.vllm_budget_block_ids,
             dsa_sparse_enabled=self.dsa_sparse_enabled,
             dsa_sparse_budget_tokens=self.dsa_sparse_budget_tokens,
+            pd_remote_loaded=self.pd_remote_loaded,
         )
 
     @property
     def is_full_block_need_dump_in_decode(self) -> bool:
-        assert self.num_output_tokens > 0
+        assert self.num_output_tokens > 0 or self.pd_remote_loaded
         return (self.num_prompt_tokens + self.num_output_tokens) % self.block_size == 0
 
     @property

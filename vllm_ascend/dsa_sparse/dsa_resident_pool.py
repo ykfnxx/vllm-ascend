@@ -155,6 +155,56 @@ class DSAResidentTokenPool:
     def clear_request(self, request_id: Hashable) -> None:
         self._clear_index(self._require_index(request_id))
 
+    def initialize_request_layer_mappings(
+        self,
+        *,
+        request_id: Hashable,
+        layer_token_ids: dict[int, list[int]],
+    ) -> None:
+        """Install independent token-to-slot mappings for local layers."""
+        pool_idx = self._require_index(request_id)
+        if not layer_token_ids:
+            raise ValueError("DSA per-layer resident mappings must not be empty")
+
+        for raw_layer_id, raw_token_ids in layer_token_ids.items():
+            layer_id = self._normalize_layer_id(int(raw_layer_id))
+            token_ids = [int(token_id) for token_id in raw_token_ids]
+            token_count = len(token_ids)
+            if token_count <= 0:
+                raise ValueError(
+                    f"DSA layer {layer_id} resident mapping is empty"
+                )
+            if token_count > self.resident_tokens:
+                raise ValueError(
+                    f"DSA layer {layer_id} resident mapping exceeds capacity"
+                )
+            if len(set(token_ids)) != token_count:
+                raise ValueError(
+                    f"DSA layer {layer_id} resident mapping has duplicates"
+                )
+            if min(token_ids) < 0 or max(token_ids) >= self.index_capacity:
+                raise ValueError(
+                    f"DSA layer {layer_id} resident token exceeds index capacity"
+                )
+
+            tokens = torch.as_tensor(
+                token_ids,
+                dtype=torch.long,
+                device=self.device,
+            )
+            slots = torch.arange(
+                token_count,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._token_to_slot[layer_id, pool_idx].index_copy_(
+                0, tokens, slots
+            )
+            self._slot_to_token[
+                layer_id, pool_idx, :token_count
+            ].copy_(tokens.to(dtype=torch.int32))
+            self._cached_counts[pool_idx, layer_id] = token_count
+
     def get_layer_resource_view_by_index(
         self,
         pool_indices,
