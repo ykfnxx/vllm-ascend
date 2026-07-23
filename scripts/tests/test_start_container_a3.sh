@@ -68,17 +68,26 @@ docker() {
 export -f docker
 
 SOURCE_ROOT="$TEST_ROOT/repos/vllm-ascend"
+RUNTIME_BUNDLE_ROOT="$TEST_ROOT/runtime-bundle"
 mkdir -p \
     "$SOURCE_ROOT/vllm_ascend" \
     "$SOURCE_ROOT/scripts" \
+    "$RUNTIME_BUNDLE_ROOT/pip-cache-dual-attention/op/ascendc/cmake" \
+    "$RUNTIME_BUNDLE_ROOT/pip-cache-dual-attention/op/ascendc/src/utils/inc/log/inner" \
+    "$RUNTIME_BUNDLE_ROOT/dmp-runtime" \
     "$TEST_ROOT/models" \
     "$TEST_ROOT/reduced-models"
 : > "$SOURCE_ROOT/requirements.txt"
+: > "$RUNTIME_BUNDLE_ROOT/pip-cache-dual-attention/op/ascendc/cmake/config.cmake"
+: > "$RUNTIME_BUNDLE_ROOT/pip-cache-dual-attention/op/ascendc/cmake/func.cmake"
+: > "$RUNTIME_BUNDLE_ROOT/pip-cache-dual-attention/op/ascendc/src/utils/inc/log/ops_log.h"
+: > "$RUNTIME_BUNDLE_ROOT/pip-cache-dual-attention/op/ascendc/src/utils/inc/log/inner/dfx_base.h"
 
 run_start() {
     DMP_ROOT="$TEST_ROOT" \
     DMP_A3_SOURCE_ROOT="$SOURCE_ROOT" \
     DMP_A3_SCRIPT_ROOT="$SOURCE_ROOT/scripts" \
+    DMP_A3_RUNTIME_BUNDLE_ROOT="$RUNTIME_BUNDLE_ROOT" \
     MODEL_HOST_PATH="$TEST_ROOT/models" \
     REDUCED_MODELS_HOST_PATH="$TEST_ROOT/reduced-models" \
     MOCK_IMAGE_ID="$1" \
@@ -92,6 +101,12 @@ grep -F -- \
     "-v $SOURCE_ROOT/vllm_ascend:/vllm-workspace/vllm-ascend/vllm_ascend" \
     "$MOCK_LOG" >/dev/null
 grep -F -- "-v $SOURCE_ROOT/scripts:/workspace/scripts" "$MOCK_LOG" >/dev/null
+grep -F -- \
+    "-v $RUNTIME_BUNDLE_ROOT/pip-cache-dual-attention/op/ascendc/cmake:/workspace/scripts/pip-cache-dual-attention/op/ascendc/cmake" \
+    "$MOCK_LOG" >/dev/null
+grep -F -- \
+    "-v $RUNTIME_BUNDLE_ROOT/dmp-runtime:/workspace/scripts/dmp-runtime" \
+    "$MOCK_LOG" >/dev/null
 [[ "$(<"$SOURCE_ROOT/vllm_ascend/.dmp-a3-native-image-id")" == \
    "sha256:a3-image-one" ]]
 [[ "$(grep -c '^create$' "$MOCK_LOG")" == "1" ]]

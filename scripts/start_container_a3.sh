@@ -10,14 +10,31 @@ REDUCED_MODELS_HOST_PATH="${REDUCED_MODELS_HOST_PATH:-$PREFIX/reduced-models}"
 REDUCED_MODELS_CONTAINER_PATH="${REDUCED_MODELS_CONTAINER_PATH:-/models-reduced}"
 SOURCE_ROOT="${DMP_A3_SOURCE_ROOT:-/home/ykf/repos/vllm-ascend}"
 SCRIPT_ROOT="${DMP_A3_SCRIPT_ROOT:-$SOURCE_ROOT/scripts}"
+RUNTIME_BUNDLE_ROOT="${DMP_A3_RUNTIME_BUNDLE_ROOT:-$PREFIX/scripts}"
 ASCEND_PACKAGE_ROOT="$SOURCE_ROOT/vllm_ascend"
 BUNDLED_OPS="$ASCEND_PACKAGE_ROOT/_cann_ops_custom"
 NATIVE_IMAGE_STAMP="$ASCEND_PACKAGE_ROOT/.dmp-a3-native-image-id"
 IMAGE_PACKAGE_ROOT="/vllm-workspace/vllm-ascend/vllm_ascend"
+DUAL_CMAKE_MOUNT="$RUNTIME_BUNDLE_ROOT/pip-cache-dual-attention/op/ascendc/cmake:/workspace/scripts/pip-cache-dual-attention/op/ascendc/cmake"
+DUAL_UTILS_MOUNT="$RUNTIME_BUNDLE_ROOT/pip-cache-dual-attention/op/ascendc/src/utils/inc:/workspace/scripts/pip-cache-dual-attention/op/ascendc/src/utils/inc"
+LOOKUP_EXTENSION_MOUNT="$RUNTIME_BUNDLE_ROOT/dmp-lookup-maintain/torch_extension/dmp_lookup_maintain_custom_ops:/workspace/scripts/dmp-lookup-maintain/torch_extension/dmp_lookup_maintain_custom_ops"
+FUSED_EXTENSION_MOUNT="$RUNTIME_BUNDLE_ROOT/dmp-fused-indexer-kv-select/torch_extension/lightning_indexer_decode_custom_ops:/workspace/scripts/dmp-fused-indexer-kv-select/torch_extension/lightning_indexer_decode_custom_ops"
 
 for path in "$MODEL_HOST_PATH" "$SOURCE_ROOT/vllm_ascend" "$SCRIPT_ROOT"; do
     if [[ ! -e "$path" ]]; then
         echo "Required path is missing: $path" >&2
+        exit 1
+    fi
+done
+runtime_bundle_files=(
+    "$RUNTIME_BUNDLE_ROOT/pip-cache-dual-attention/op/ascendc/cmake/config.cmake"
+    "$RUNTIME_BUNDLE_ROOT/pip-cache-dual-attention/op/ascendc/cmake/func.cmake"
+    "$RUNTIME_BUNDLE_ROOT/pip-cache-dual-attention/op/ascendc/src/utils/inc/log/ops_log.h"
+    "$RUNTIME_BUNDLE_ROOT/pip-cache-dual-attention/op/ascendc/src/utils/inc/log/inner/dfx_base.h"
+)
+for runtime_bundle_file in "${runtime_bundle_files[@]}"; do
+    if [[ ! -f "$runtime_bundle_file" ]]; then
+        echo "Required Dual-Attention build support is missing: $runtime_bundle_file" >&2
         exit 1
     fi
 done
@@ -140,9 +157,51 @@ args=(
     -v "$MODEL_HOST_PATH:$MODEL_CONTAINER_PATH:ro"
     -v "$REDUCED_MODELS_HOST_PATH:$REDUCED_MODELS_CONTAINER_PATH"
     -v "$SCRIPT_ROOT:/workspace/scripts"
+    -v "$DUAL_CMAKE_MOUNT"
+    -v "$DUAL_UTILS_MOUNT"
     -v "$SOURCE_ROOT/vllm_ascend:/vllm-workspace/vllm-ascend/vllm_ascend"
     -v "$SOURCE_ROOT/requirements.txt:/vllm-workspace/vllm-ascend/requirements.txt:ro"
 )
+
+# Reuse persistent build/runtime directories from the complete offline bundle
+# when they are present. Missing artifacts are rebuilt into the active checkout
+# instead of masking its source package with an empty bind mount.
+if [[ -d "$RUNTIME_BUNDLE_ROOT/dmp-runtime" ]]; then
+    args+=(
+        -v "$RUNTIME_BUNDLE_ROOT/dmp-runtime:/workspace/scripts/dmp-runtime"
+    )
+fi
+if [[ -d "$RUNTIME_BUNDLE_ROOT/dmp-model-runtime" ]]; then
+    args+=(
+        -v "$RUNTIME_BUNDLE_ROOT/dmp-model-runtime:/workspace/scripts/dmp-model-runtime"
+    )
+fi
+if [[ -f "$RUNTIME_BUNDLE_ROOT/dmp-lookup-maintain/opp/vendors/customize/op_api/lib/libcust_opapi.so" ]]; then
+    args+=(
+        -v "$RUNTIME_BUNDLE_ROOT/dmp-lookup-maintain/opp:/workspace/scripts/dmp-lookup-maintain/opp"
+    )
+fi
+if compgen -G \
+    "$RUNTIME_BUNDLE_ROOT/dmp-lookup-maintain/torch_extension/dmp_lookup_maintain_custom_ops/*.so" \
+    >/dev/null; then
+    args+=(
+        -v
+        "$LOOKUP_EXTENSION_MOUNT"
+    )
+fi
+if [[ -f "$RUNTIME_BUNDLE_ROOT/dmp-fused-indexer-kv-select/opp/vendors/customize/op_api/lib/libcust_opapi.so" ]]; then
+    args+=(
+        -v "$RUNTIME_BUNDLE_ROOT/dmp-fused-indexer-kv-select/opp:/workspace/scripts/dmp-fused-indexer-kv-select/opp"
+    )
+fi
+if compgen -G \
+    "$RUNTIME_BUNDLE_ROOT/dmp-fused-indexer-kv-select/torch_extension/lightning_indexer_decode_custom_ops/*.so" \
+    >/dev/null; then
+    args+=(
+        -v
+        "$FUSED_EXTENSION_MOUNT"
+    )
+fi
 
 if [[ -e /usr/local/bin/npu-smi ]]; then
     args+=(-v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro)
@@ -153,6 +212,7 @@ fi
 echo "Starting $CONTAINER_NAME from $IMAGE"
 echo "Source checkout: $SOURCE_ROOT"
 echo "Runtime scripts: $SCRIPT_ROOT -> /workspace/scripts"
+echo "Runtime bundle overlays: $RUNTIME_BUNDLE_ROOT"
 echo "Model: $MODEL_HOST_PATH -> $MODEL_CONTAINER_PATH"
 echo "Reduced models: $REDUCED_MODELS_HOST_PATH -> $REDUCED_MODELS_CONTAINER_PATH"
 echo "Offline wheels: $PREFIX/*.whl -> /dmp-host/*.whl (read-only)"

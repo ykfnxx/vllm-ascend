@@ -1,15 +1,19 @@
 # DMP A3 single-card migration revision 10
 
 Keep the offline wheels and reduced-model directory under `/root/dmp`. The
-active source checkout is `/home/ykf/repos/vllm-ascend`; the container mounts
-code and scripts directly from that checkout. The first validation uses the
-smallest GLM-5.1 W4A8 prefix containing a MoE layer on one A3 card. The complete
-model at `/mnt/models/GLM-5.1-w4a8` is mounted read-only and is never changed.
+active Python source and runtime scripts come from
+`/home/ykf/repos/vllm-ascend`; missing Dual-Attention build support and
+persistent operator outputs are overlaid from `/root/dmp/scripts`. The first
+validation uses the smallest GLM-5.1 W4A8 prefix containing a MoE layer on one
+A3 card. The complete model at
+`/mnt/models/GLM-5.1-w4a8` is mounted read-only and is never changed.
 
 ## Included code
 
-- `/home/ykf/repos/vllm-ascend`: active vLLM Ascend checkout. Both the Python
-  package and runtime scripts are mounted from this same branch.
+- `/home/ykf/repos/vllm-ascend`: active vLLM Ascend Python and runtime-script
+  checkout.
+- `/root/dmp/scripts`: complete offline bundle. Only missing AscendC build
+  support and existing persistent operator/runtime directories are overlaid.
 - `scripts/pip-cache-dual-attention`: scheme-4 SFA/merge operator source.
 - `scripts/dmp-lookup-maintain`: Lookup/Maintain/KVGather operator source.
 - `scripts/dmp-fused-indexer-kv-select`: `ops_li_update` fused
@@ -38,6 +42,7 @@ Defaults:
 image:          quay.io/ascend/vllm-ascend:v0.18.0-a3-openeuler
 source:         /home/ykf/repos/vllm-ascend
 scripts:        /home/ykf/repos/vllm-ascend/scripts
+runtime bundle: /root/dmp/scripts
 full model:     /mnt/models/GLM-5.1-w4a8
 reduced models: /root/dmp/reduced-models
 container:      vllm-ascend-a3-dmp
@@ -54,14 +59,17 @@ starting the container:
 
 The start script mounts `/root/dmp` read-only at `/dmp-host`. Build/run scripts
 locate both wheels automatically and install them into the persistent host
-directory
-`/home/ykf/repos/vllm-ascend/scripts/dmp-model-runtime/python`. No manual
-`pip install` is required, and later containers reuse the installed runtime.
+directory `/root/dmp/scripts/dmp-model-runtime/python`. No manual `pip install`
+is required, and later containers reuse the installed runtime.
 
-The source checkout and `/workspace/scripts` come from the same repository by
-default. Override them only as a pair with `DMP_A3_SOURCE_ROOT` and
-`DMP_A3_SCRIPT_ROOT`; otherwise a stale bundle can capture an older graph
-topology even when the intended branch was updated elsewhere.
+The active checkout is the parent mount for `/workspace/scripts`, so new launch
+flags, logging, and runtime validation always match the Python graph code.
+Nested mounts add the Dual-Attention CMake templates/common headers and reuse
+existing `dmp-runtime`, model runtime, Lookup/Maintain, and Fused Indexer
+artifacts from the offline bundle. Missing artifacts are rebuilt into the
+checkout rather than hiding current source with an empty bundle directory.
+`DMP_A3_SOURCE_ROOT`, `DMP_A3_SCRIPT_ROOT`, and
+`DMP_A3_RUNTIME_BUNDLE_ROOT` override the three host roots.
 
 ## One-command container run
 
