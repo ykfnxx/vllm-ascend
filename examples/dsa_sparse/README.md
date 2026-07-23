@@ -292,6 +292,13 @@ Decode 中新完成的整块也沿用该路径。lookup miss 使用同步的
 CPU。当前 KVIO 接口没有远端删除 API，请求结束只清理本地 pool entry 到
 整数 request ID 的映射。
 
+非 P/D 分离路径也会保留每层最后一个 Prefill query 的 TopK。第一次进入
+sparse decode 时，每层先按 TopK score 顺序选取有效历史 token，排除当前
+dense tail 和重复位置，再按历史位置升序补齐到 8192 个 resident token；
+这些 token 依次写入 resident slot `[0, 8192)`。完成初始化后，本次 Decode
+实时计算的 TopK 再进入正常的 lookup、miss load 和 maintain。因而 Prefill
+TopK 只决定初始 resident membership，不替代 Decode 阶段的逐 token TopK。
+
 ### KVIO DSA 的 P/D 分离
 
 P、D 两个实例都需要启用 DSA、选择 KVIO backend，并使用

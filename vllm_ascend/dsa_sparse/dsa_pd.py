@@ -302,14 +302,14 @@ def build_pd_resident_token_ids(
     block_size = int(block_size)
     resident_token_count = int(resident_token_count)
     if stored_token_count <= 0 or block_size <= 0:
-        raise ValueError("DSA KVIO resident initialization needs valid counts")
+        raise ValueError("DSA resident initialization needs valid counts")
     if resident_token_count <= 0:
-        raise ValueError("DSA KVIO resident initialization cannot be empty")
+        raise ValueError("DSA resident initialization cannot be empty")
 
     dense_tail_start = (stored_token_count // block_size) * block_size
     if dense_tail_start < resident_token_count:
         raise ValueError(
-            "DSA KVIO P/D history before the dense tail is too short for "
+            "DSA history before the dense tail is too short for "
             "resident initialization: "
             f"history={dense_tail_start}, resident={resident_token_count}"
         )
@@ -340,7 +340,7 @@ def build_pd_resident_token_ids(
 
     if len(selected) != resident_token_count:
         raise RuntimeError(
-            "DSA KVIO could not build a complete resident initialization"
+            "DSA could not build a complete resident initialization"
         )
     return selected
 

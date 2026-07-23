@@ -213,14 +213,10 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         self._pd_initialized_requests: set[ReqType] = set()
         parallel_config = getattr(vllm_config, "parallel_config", None)
         self._parallel_rank = int(getattr(parallel_config, "rank", 0))
-        kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
-        self._capture_pd_prefill_topk = bool(
-            getattr(vllm_config.cache_config, "dsa_kv_backend", None)
-            == "kvio"
-            and kv_transfer_config is not None
-            and kv_transfer_config.is_kv_producer
-        )
-        self._pd_prefill_layer_topk: dict[
+        # Every DSA request captures the final Prefill query's per-layer TopK.
+        # A local Decode consumes it directly when seeding resident slots; a
+        # P/D producer drains the same compact seed through its connector.
+        self._prefill_layer_topk: dict[
             ReqType, dict[int, list[int]]
         ] = {}
 
@@ -503,29 +499,37 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
     """
     Worker侧逻辑
     """
-    def capture_pd_prefill_last_token_topk(
+    def capture_prefill_last_token_topk(
         self,
         layer_name: str,
         topk_indices: torch.Tensor,
     ) -> None:
-        """Capture each final-Prefill row's per-layer TopK on a P worker."""
-        if not self._capture_pd_prefill_topk or self.dsa_meta is None:
+        """Capture every final-Prefill row's per-layer TopK.
+
+        Keep valid prompt positions in score order. Tail exclusion is deferred
+        until resident initialization because a short prompt can enter sparse
+        decode only after later dense-decode tokens extend its history.
+        """
+        if self.dsa_meta is None:
             return
         layer_id = int(layer_name.split(".")[2])
         for req_meta in self.dsa_meta.requests:
-            if not req_meta.is_last_prefill_chunk or req_meta.query_len <= 0:
+            if (
+                not req_meta.is_last_prefill_chunk
+                or req_meta.query_len <= 0
+                or bool(getattr(req_meta, "pd_remote_loaded", False))
+            ):
                 continue
             row_index = int(req_meta.query_start_loc + req_meta.query_len - 1)
             if row_index >= int(topk_indices.shape[0]):
                 raise RuntimeError(
-                    "DSA KVIO cannot locate the last Prefill token's TopK "
+                    "DSA cannot locate the last Prefill token's TopK "
                     f"row: request={req_meta.request_id}, row={row_index}, "
                     f"topk_rows={int(topk_indices.shape[0])}"
                 )
-            # This is one intentional device-to-host synchronization per local
-            # layer at the P/D handoff boundary.  Decode lookup remains fully
-            # tensorized; only the compact 2048-position seed enters control
-            # plane metadata.
+            # This is one intentional device-to-host synchronization per layer
+            # at the final-Prefill boundary. Decode lookup remains tensorized;
+            # only the compact 2048-position seed is retained across forwards.
             row_topk = (
                 topk_indices[row_index]
                 .detach()
@@ -533,20 +537,20 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
                 .to(device="cpu", dtype=torch.int64)
                 .tolist()
             )
-            dense_tail_start = int(req_meta.forward_plan.dense_tail_start)
+            prompt_token_count = int(req_meta.num_prompt_tokens)
             seen: set[int] = set()
             filtered_topk: list[int] = []
             for raw_token_id in row_topk:
                 token_id = int(raw_token_id)
                 if (
                     token_id < 0
-                    or token_id >= dense_tail_start
+                    or token_id >= prompt_token_count
                     or token_id in seen
                 ):
                     continue
                 filtered_topk.append(token_id)
                 seen.add(token_id)
-            self._pd_prefill_layer_topk.setdefault(
+            self._prefill_layer_topk.setdefault(
                 req_meta.request_id, {}
             )[layer_id] = filtered_topk
 
@@ -554,9 +558,80 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         self,
     ) -> dict[ReqType, dict[int, list[int]]]:
         """Drain P-worker TopK metadata for connector worker output."""
-        captured = self._pd_prefill_layer_topk
-        self._pd_prefill_layer_topk = {}
+        captured = self._prefill_layer_topk
+        self._prefill_layer_topk = {}
         return captured
+
+    def _build_local_resident_initial_token_ids(
+        self,
+        *,
+        layer_id: int,
+        forward_batch: DSAForwardSparseDecodeBatch,
+    ) -> tuple[torch.Tensor | None, list[ReqType]]:
+        """Build TopK-first resident seeds for local non-P/D initialization."""
+        if not forward_batch.has_lookup_init_rows:
+            return None, []
+        req_meta_by_id = {
+            req_meta.request_id: req_meta
+            for req_meta in self.dsa_meta.requests
+        }
+        default_tokens = list(range(self._hbm_resident_tokens))
+        token_rows: list[list[int]] = []
+        initialized_request_ids: list[ReqType] = []
+        for request_id in forward_batch.request_ids:
+            req_meta = req_meta_by_id.get(request_id)
+            should_initialize = (
+                req_meta is not None
+                and req_meta.forward_plan.is_sparse_decode
+                and req_meta.stage.is_enter_sparse_decode
+                and not req_meta.pd_remote_loaded
+            )
+            if not should_initialize:
+                token_rows.append(default_tokens)
+                continue
+            layer_topk = self._prefill_layer_topk.get(
+                request_id, {}
+            ).get(int(layer_id))
+            if layer_topk is None:
+                raise RuntimeError(
+                    "DSA local resident initialization is missing the final "
+                    "Prefill TopK: "
+                    f"request={request_id}, layer={int(layer_id)}"
+                )
+            stored_token_count = (
+                int(req_meta.forward_plan.dense_tail_start)
+                + int(req_meta.forward_plan.tail_valid_token_count)
+            )
+            token_rows.append(build_pd_resident_token_ids(
+                topk_token_ids=layer_topk,
+                stored_token_count=stored_token_count,
+                block_size=int(req_meta.block_size),
+                resident_token_count=self._hbm_resident_tokens,
+            ))
+            initialized_request_ids.append(request_id)
+        return (
+            torch.tensor(
+                token_rows,
+                dtype=torch.int32,
+                device=forward_batch.batch_hbm_block_table.device,
+            ),
+            initialized_request_ids,
+        )
+
+    def _consume_local_prefill_layer_topk(
+        self,
+        *,
+        layer_id: int,
+        request_ids: list[ReqType],
+    ) -> None:
+        """Release one layer's Prefill seed after successful local init."""
+        for request_id in request_ids:
+            layer_topk = self._prefill_layer_topk.get(request_id)
+            if layer_topk is None:
+                continue
+            layer_topk.pop(int(layer_id), None)
+            if not layer_topk:
+                self._prefill_layer_topk.pop(request_id, None)
 
     def _mark_full_dump_done(
         self,
@@ -865,6 +940,13 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
                 "lightning-indexer topk indices aligned with decode rows; "
                 "the legacy sparse-only path is disabled.")
         forward_batch = self.forward_sparse_decode_batch
+        (
+            initial_resident_token_ids,
+            locally_initialized_request_ids,
+        ) = self._build_local_resident_initial_token_ids(
+            layer_id=layer_id,
+            forward_batch=forward_batch,
+        )
         if forward_batch.batch_row_indices == list(
                 range(len(forward_batch.batch_row_indices))):
             selection_topk = full_batch_topk
@@ -891,7 +973,12 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             row_modes=forward_batch.row_modes_tensor,
             lookup_init_mask=forward_batch.lookup_init_mask_tensor,
             has_lookup_init_rows=forward_batch.has_lookup_init_rows,
+            initial_resident_token_ids=initial_resident_token_ids,
             maintain_seed=self._lookup_maintain_seed,
+        )
+        self._consume_local_prefill_layer_topk(
+            layer_id=layer_id,
+            request_ids=locally_initialized_request_ids,
         )
         sparse_attention_indices = lookup_result.attention_indices
         self._commit_lookup_resident_metadata(layer_batch)
@@ -1053,7 +1140,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
                                                      attn_metadata)
 
     def request_finished_in_worker(self, request_id):
-        self._pd_prefill_layer_topk.pop(request_id, None)
+        self._prefill_layer_topk.pop(request_id, None)
         self._clear_full_dump_done(request_id)
         pool_idx = int(self.resident_token_pool.get_index(request_id))
         self.kv_backend.release_request(
@@ -1062,7 +1149,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         self._pd_initialized_requests.discard(request_id)
 
     def request_preempted_in_worker(self, request_id):
-        self._pd_prefill_layer_topk.pop(request_id, None)
+        self._prefill_layer_topk.pop(request_id, None)
         self._clear_full_dump_done(request_id)
         pool_idx = int(self.resident_token_pool.get_index(request_id))
         self.kv_backend.release_request(

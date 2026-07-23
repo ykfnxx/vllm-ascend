@@ -58,15 +58,25 @@ class AscendDSAOpsBackend:
         initialize_rows: torch.Tensor,
         resident_tokens: int,
         selection_block_table: torch.Tensor,
+        initial_resident_token_ids: torch.Tensor,
     ) -> None:
         pool_rows = pool_entries.to(dtype=torch.long)
         batch_size = int(pool_rows.numel())
-        tokens = torch.arange(
+        tokens = initial_resident_token_ids.to(
+            device=pool_entries.device,
+            dtype=torch.int32,
+        ).contiguous()
+        expected_shape = (batch_size, int(resident_tokens))
+        if tuple(tokens.shape) != expected_shape:
+            raise ValueError(
+                "DSA resident initialization token shape mismatch: "
+                f"actual={tuple(tokens.shape)}, expected={expected_shape}"
+            )
+        slots = torch.arange(
             resident_tokens,
             dtype=torch.int32,
             device=pool_entries.device,
         ).view(1, -1).expand(batch_size, -1)
-        slots = tokens
         init_mask = initialize_rows.view(-1, 1).expand(-1, resident_tokens)
 
         kv_backend.load_tokens_into(
@@ -133,6 +143,7 @@ class AscendDSAOpsBackend:
         row_modes: torch.Tensor,
         lookup_init_mask: torch.Tensor,
         has_lookup_init_rows: bool,
+        initial_resident_token_ids: torch.Tensor | None,
         maintain_seed: int,
     ) -> DSALookupOutput:
         device = selection_block_table.device
@@ -152,6 +163,10 @@ class AscendDSAOpsBackend:
             device=device, dtype=torch.long).reshape(-1)
 
         if has_lookup_init_rows:
+            if initial_resident_token_ids is None:
+                raise RuntimeError(
+                    "DSA resident initialization requires Prefill TopK seeds"
+                )
             if not self._resident_init_logged:
                 logger.info(
                     "DSA sparse invoking resident initialization: "
@@ -167,6 +182,7 @@ class AscendDSAOpsBackend:
                 initialize_rows=lookup_init_mask,
                 resident_tokens=int(resident_tokens),
                 selection_block_table=selection_block_table,
+                initial_resident_token_ids=initial_resident_token_ids,
             )
             if not self._resident_init_logged:
                 logger.info(

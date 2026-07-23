@@ -1563,7 +1563,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.dsa_sparse_enabled and layer_name is not None:
             dsa_mgr = get_dsa_mgr_worker()
             if dsa_mgr is not None:
-                dsa_mgr.capture_pd_prefill_last_token_topk(
+                dsa_mgr.capture_prefill_last_token_topk(
                     layer_name, topk_indices
                 )
 

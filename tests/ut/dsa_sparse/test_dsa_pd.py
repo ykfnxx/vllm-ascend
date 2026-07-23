@@ -3,6 +3,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_ascend.dsa_sparse.dsa_ascend_ops_backend import (
+    AscendDSAOpsBackend,
+)
 from vllm_ascend.dsa_sparse.dsa_config import (
     validate_dsa_kv_transfer_config,
 )
@@ -26,7 +29,10 @@ from vllm_ascend.dsa_sparse.dsa_pd import (
     serialize_dsa_kvio_layer_topk,
 )
 from vllm_ascend.dsa_sparse.dsa_req_meta import ReqMeta
-from vllm_ascend.dsa_sparse.dsa_resident_pool import DSAResidentTokenPool
+from vllm_ascend.dsa_sparse.dsa_resident_pool import (
+    DSAResidentLookupState,
+    DSAResidentTokenPool,
+)
 from vllm_ascend.dsa_sparse.dsa_sparse import DSASparseV1
 from vllm_ascend.dsa_sparse.dsa_types import ReqStage
 
@@ -238,30 +244,147 @@ def test_pd_layer_topk_round_trips_json_rank_and_layer_keys():
     assert get_dsa_kvio_layer_topk(transfer_params) == layer_topk_by_rank
 
 
-def test_pd_capture_uses_last_query_row_and_filters_dense_tail():
+def test_prefill_capture_uses_last_query_row_and_keeps_valid_prompt_topk():
     manager = DSASparseV1.__new__(DSASparseV1)
-    manager._capture_pd_prefill_topk = True
-    manager._pd_prefill_layer_topk = {}
+    manager._prefill_layer_topk = {}
     manager.dsa_meta = SimpleNamespace(requests=[SimpleNamespace(
         request_id="prefill-request",
         is_last_prefill_chunk=True,
         query_start_loc=0,
         query_len=2,
+        num_prompt_tokens=18,
         forward_plan=SimpleNamespace(dense_tail_start=16),
     )])
     topk_indices = torch.tensor([
-        [[1, 2, 3, 4]],
-        [[9, 3, 3, 16]],
+        [[1, 2, 3, 4, 5]],
+        [[9, 3, 3, 16, 18]],
     ], dtype=torch.int32)
 
-    manager.capture_pd_prefill_last_token_topk(
+    manager.capture_prefill_last_token_topk(
         "model.layers.3.self_attn", topk_indices
     )
 
     assert manager.take_pd_prefill_layer_topk() == {
-        "prefill-request": {3: [9, 3]}
+        "prefill-request": {3: [9, 3, 16]}
     }
     assert manager.take_pd_prefill_layer_topk() == {}
+
+
+def test_non_pd_initialization_uses_per_layer_final_prefill_topk():
+    manager = DSASparseV1.__new__(DSASparseV1)
+    manager._hbm_resident_tokens = 6
+    manager._prefill_layer_topk = {
+        "local-request": {
+            3: [9, 3, 16, 4],
+            4: [7, 6],
+        }
+    }
+    req_meta = SimpleNamespace(
+        request_id="local-request",
+        block_size=4,
+        stage=ReqStage.ENTER_SPARSE_DECODE,
+        pd_remote_loaded=False,
+        forward_plan=SimpleNamespace(
+            is_sparse_decode=True,
+            dense_tail_start=16,
+            tail_valid_token_count=2,
+        ),
+    )
+    manager.dsa_meta = SimpleNamespace(requests=[req_meta])
+    forward_batch = SimpleNamespace(
+        has_lookup_init_rows=True,
+        request_ids=["local-request"],
+        batch_hbm_block_table=torch.zeros((1, 2), dtype=torch.int32),
+    )
+
+    layer3_tokens, initialized = (
+        manager._build_local_resident_initial_token_ids(
+            layer_id=3,
+            forward_batch=forward_batch,
+        )
+    )
+    assert layer3_tokens.tolist() == [[9, 3, 4, 0, 1, 2]]
+    assert initialized == ["local-request"]
+    manager._consume_local_prefill_layer_topk(
+        layer_id=3,
+        request_ids=initialized,
+    )
+    assert manager._prefill_layer_topk == {
+        "local-request": {4: [7, 6]}
+    }
+
+    layer4_tokens, initialized = (
+        manager._build_local_resident_initial_token_ids(
+            layer_id=4,
+            forward_batch=forward_batch,
+        )
+    )
+    assert layer4_tokens.tolist() == [[7, 6, 0, 1, 2, 3]]
+    manager._consume_local_prefill_layer_topk(
+        layer_id=4,
+        request_ids=initialized,
+    )
+    assert manager._prefill_layer_topk == {}
+
+
+def test_non_pd_initialization_requires_final_prefill_topk():
+    manager = DSASparseV1.__new__(DSASparseV1)
+    manager._hbm_resident_tokens = 6
+    manager._prefill_layer_topk = {}
+    manager.dsa_meta = SimpleNamespace(requests=[SimpleNamespace(
+        request_id="local-request",
+        block_size=4,
+        stage=ReqStage.ENTER_SPARSE_DECODE,
+        pd_remote_loaded=False,
+        forward_plan=SimpleNamespace(
+            is_sparse_decode=True,
+            dense_tail_start=16,
+            tail_valid_token_count=2,
+        ),
+    )])
+    forward_batch = SimpleNamespace(
+        has_lookup_init_rows=True,
+        request_ids=["local-request"],
+        batch_hbm_block_table=torch.zeros((1, 2), dtype=torch.int32),
+    )
+
+    with pytest.raises(RuntimeError, match="missing the final Prefill TopK"):
+        manager._build_local_resident_initial_token_ids(
+            layer_id=3,
+            forward_batch=forward_batch,
+        )
+
+
+def test_resident_row_initialization_maps_selected_tokens_to_slots():
+    loaded: dict = {}
+    kv_backend = SimpleNamespace(
+        load_tokens_into=lambda **kwargs: loaded.update(kwargs)
+    )
+    lookup_state = DSAResidentLookupState(
+        token_to_slot=torch.full((1, 32), -1, dtype=torch.int32),
+        slot_to_token=torch.full((1, 6), -1, dtype=torch.int32),
+        free_slots=torch.tensor([[4, 5]], dtype=torch.int32),
+        free_head=torch.zeros((1, 16), dtype=torch.int32),
+    )
+    initial_tokens = torch.tensor([[9, 3, 4, 0]], dtype=torch.int32)
+
+    AscendDSAOpsBackend()._initialize_resident_rows(
+        layer_id=3,
+        kv_backend=kv_backend,
+        state=lookup_state,
+        pool_entries=torch.tensor([0], dtype=torch.int32),
+        initialize_rows=torch.tensor([True]),
+        resident_tokens=4,
+        selection_block_table=torch.tensor([[7]], dtype=torch.int32),
+        initial_resident_token_ids=initial_tokens,
+    )
+
+    assert loaded["token_positions"].tolist() == [[9, 3, 4, 0]]
+    assert loaded["destination_slots"].tolist() == [[0, 1, 2, 3]]
+    assert lookup_state.slot_to_token[0, :4].tolist() == [9, 3, 4, 0]
+    assert lookup_state.token_to_slot[0, [9, 3, 4, 0]].tolist() == [
+        0, 1, 2, 3
+    ]
 
 
 def test_pd_first_d_query_uses_sparse_layout_without_reinitializing_lookup():
