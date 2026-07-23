@@ -11,7 +11,7 @@ mock KV backend、并发请求和 Ascend profiler。除特别说明外，命令�
 | [check_asu_hbm_index_ops.py](../../check_asu_hbm_index_ops.py) | 对照 CPU 参考实现检查 lookup 和 maintain 功能 | 是 | 否 |
 | [smoke_asu_hbm_index_npugraph.py](smoke_asu_hbm_index_npugraph.py) | 检查两个算子能否进入 `npugraph_ex` 并回放 | 是 | 否 |
 | [benchmark_asu_hbm_index_ops.py](benchmark_asu_hbm_index_ops.py) | 测量单算子在不同 batch 下的 NPU 执行时间 | 是 | 否 |
-| [compare_asu_hbm_index_maintain_modes.py](compare_asu_hbm_index_maintain_modes.py) | 对比单个 Maintain 的 eager 与 ACL NPU Graph replay 时延，并可分别采集 trace | 是 | 否 |
+| [compare_asu_hbm_index_maintain_modes.py](compare_asu_hbm_index_maintain_modes.py) | 对比多层双 microbatch Maintain 序列的 eager 与 ACL NPU Graph replay 时延，并可分别采集 trace | 是 | 否 |
 | [profile_asu_hbm_index_ops.py](profile_asu_hbm_index_ops.py) | 单独采集一个 ASU 算子并直接解析 profiler 数据 | 是 | 否 |
 | [serve_glm5_dsa_sparse.sh](serve_glm5_dsa_sparse.sh) | 以 mock KV backend 启动 DSA Sparse 服务 | 是 | 脚本负责启动 |
 | [diagnose_glm5_dsa_sparse_env.py](diagnose_glm5_dsa_sparse_env.py) | 静态检查运行中服务、安装包、模型和日志 | 否 | 是 |
@@ -182,14 +182,18 @@ python3 examples/dsa_sparse/benchmark_asu_hbm_index_ops.py \
 
 ### Maintain eager 与 ACL NPU Graph 对比
 
-以下脚本只捕获一个 Maintain，不包含 Lookup、KVGather 或其他模型算子。
-eager 和 graph 模式使用相同算子、Tensor 地址、stream、reset、seed、warmup
-和 NPU Event 计时边界，唯一预期差异是直接调用或
+以下脚本捕获一个与 DMP Scheme 4 类似的 Maintain 序列：默认使用
+4 层、每层 2 个 microbatch，共 8 个独立 workspace，并在同一个 stream
+上顺序调用。它不包含 Lookup、KVGather 或其他模型算子。eager 和 graph
+模式使用相同算子、调用顺序、Tensor 地址、stream、reset、seed 序列、
+warmup 和 NPU Event 计时边界，唯一预期差异是直接调用完整序列或
 `torch.npu.NPUGraph.replay()`：
 
 ```bash
 python3 examples/dsa_sparse/compare_asu_hbm_index_maintain_modes.py \
   --batch-size 32 \
+  --num-layers 4 \
+  --microbatches-per-layer 2 \
   --miss-count 300 \
   --skip-check \
   --warmup-iterations 10 \
@@ -197,6 +201,14 @@ python3 examples/dsa_sparse/compare_asu_hbm_index_maintain_modes.py \
   --profile-output-dir /data/asu-profiles/maintain-eager-vs-graph \
   --output-json /data/dsa-benchmark/maintain-eager-vs-graph.json
 ```
+
+每个 sample 的 NPU Event 覆盖完整 `层数 × microbatch 数` 调用序列，reset
+全部 workspace 后只同步一次，并且 reset 和同步都位于计时区间之外。终端和
+JSON 同时报告完整序列时延和 `per_maintain_mean`；后者是序列平均时延除以
+调用数，不是逐算子 Event 测量。复现具体 DMP 整网时，应把
+`--num-layers` 设置为 `RUN_INFO.txt` 中的 `reduced_layers`，并保持
+`--microbatches-per-layer 2`。独立 workspace 的 NPU 显存占用随
+`num-layers × microbatches-per-layer` 线性增长。
 
 合成固定 workload 的 Maintain 不维护动态 `free_head` 语义，因此需要
 `--skip-check`。不传 `--profile-output-dir` 时只执行 NPU Event benchmark；

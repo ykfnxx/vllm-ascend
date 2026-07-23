@@ -24,6 +24,8 @@ SPEC.loader.exec_module(COMPARISON)
 def make_args(**overrides):
     values = {
         "batch_size": 32,
+        "num_layers": 4,
+        "microbatches_per_layer": 2,
         "miss_count": 300,
         "capture_warmup_iterations": 3,
         "warmup_iterations": 10,
@@ -47,12 +49,53 @@ def test_validate_args_rejects_invalid_iteration_count() -> None:
         raise AssertionError("expected invalid iteration count to fail")
 
 
+def test_validate_args_rejects_invalid_sequence_shape() -> None:
+    for field, message in (
+        ("num_layers", "--num-layers must be greater than 0"),
+        (
+            "microbatches_per_layer",
+            "--microbatches-per-layer must be greater than 0",
+        ),
+    ):
+        try:
+            COMPARISON.validate_args(make_args(**{field: 0}))
+        except ValueError as exc:
+            assert str(exc) == message
+        else:
+            raise AssertionError(f"expected invalid {field} to fail")
+
+
+def test_build_invocation_layout_uses_layer_major_seed_order() -> None:
+    assert COMPARISON.build_invocation_layout(
+        num_layers=2,
+        microbatches_per_layer=2,
+        base_seed=10,
+    ) == [
+        (0, 0, 10),
+        (0, 1, 11),
+        (1, 0, 12),
+        (1, 1, 13),
+    ]
+
+
 def test_summarize_mode_preserves_samples_and_mode() -> None:
     result = COMPARISON.summarize_mode(
-        "graph", batch_size=32, miss_count=300, samples_ms=[0.1, 0.2]
+        "graph",
+        batch_size=32,
+        miss_count=300,
+        num_layers=2,
+        microbatches_per_layer=2,
+        samples_ms=[0.4, 0.8],
     )
 
     assert result["mode"] == "graph"
-    assert result["operator"] == "maintain_graph"
-    assert math.isclose(result["mean_ms"], 0.15)
-    assert result["samples_ms"] == [0.1, 0.2]
+    assert result["operator"] == "maintain_sequence_graph"
+    assert result["invocations_per_sequence"] == 4
+    assert result["request_invocations_per_sequence"] == 128
+    assert math.isclose(result["mean_ms"], 0.6)
+    assert math.isclose(result["per_invocation_mean_ms"], 0.15)
+    assert math.isclose(result["sequences_per_second"], 1000.0 / 0.6)
+    assert math.isclose(
+        result["requests_per_second"], 4 * 32 * 1000.0 / 0.6
+    )
+    assert result["samples_ms"] == [0.4, 0.8]
