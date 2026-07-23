@@ -1,13 +1,15 @@
 # DMP A3 single-card migration revision 10
 
-Extract this archive directly into `/root/dmp`. The first validation uses the
-smallest GLM-5.1 W4A8 prefix containing a MoE layer on one A3 card, matching the
-earlier reduced-model workflow. The complete model at
-`/mnt/models/GLM-5.1-w4a8` is mounted read-only and is never changed.
+Keep the offline wheels and reduced-model directory under `/root/dmp`. The
+active source checkout is `/home/ykf/repos/vllm-ascend`; the container mounts
+code and scripts directly from that checkout. The first validation uses the
+smallest GLM-5.1 W4A8 prefix containing a MoE layer on one A3 card. The complete
+model at `/mnt/models/GLM-5.1-w4a8` is mounted read-only and is never changed.
 
 ## Included code
 
-- `vllm-ascend-0.18.0-copy`: vLLM Ascend source with DMP Lookup/Maintain r9.
+- `/home/ykf/repos/vllm-ascend`: active vLLM Ascend checkout. Both the Python
+  package and runtime scripts are mounted from this same branch.
 - `scripts/pip-cache-dual-attention`: scheme-4 SFA/merge operator source.
 - `scripts/dmp-lookup-maintain`: Lookup/Maintain/KVGather operator source.
 - `scripts/dmp-fused-indexer-kv-select`: `ops_li_update` fused
@@ -23,16 +25,19 @@ is refreshed automatically if the image changes.
 ## Host commands
 
 ```bash
-cd /root/dmp
-bash verify_bundle.sh
+cd /home/ykf/repos/vllm-ascend
+git switch dmp-a3-single-ops
+git pull --ff-only origin dmp-a3-single-ops
 bash scripts/preflight_a3.sh
-bash scripts/start_contianer1.sh
+bash scripts/start_container_a3.sh
 ```
 
 Defaults:
 
 ```text
 image:          quay.io/ascend/vllm-ascend:v0.18.0-a3-openeuler
+source:         /home/ykf/repos/vllm-ascend
+scripts:        /home/ykf/repos/vllm-ascend/scripts
 full model:     /mnt/models/GLM-5.1-w4a8
 reduced models: /root/dmp/reduced-models
 container:      vllm-ascend-a3-dmp
@@ -49,8 +54,14 @@ starting the container:
 
 The start script mounts `/root/dmp` read-only at `/dmp-host`. Build/run scripts
 locate both wheels automatically and install them into the persistent host
-directory `/root/dmp/scripts/dmp-model-runtime/python`. No manual `pip install`
-is required, and later containers reuse the installed runtime.
+directory
+`/home/ykf/repos/vllm-ascend/scripts/dmp-model-runtime/python`. No manual
+`pip install` is required, and later containers reuse the installed runtime.
+
+The source checkout and `/workspace/scripts` come from the same repository by
+default. Override them only as a pair with `DMP_A3_SOURCE_ROOT` and
+`DMP_A3_SCRIPT_ROOT`; otherwise a stale bundle can capture an older graph
+topology even when the intended branch was updated elsewhere.
 
 ## One-command container run
 

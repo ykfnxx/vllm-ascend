@@ -21,7 +21,11 @@ docker() {
         create)
             printf 'create\n' >> "$MOCK_LOG"
             ;;
-        start|rm|run)
+        start|rm)
+            return 0
+            ;;
+        run)
+            printf 'run %s\n' "$*" >> "$MOCK_LOG"
             return 0
             ;;
         cp)
@@ -63,16 +67,18 @@ docker() {
 }
 export -f docker
 
-SOURCE_ROOT="$TEST_ROOT/vllm-ascend-0.18.0-copy"
+SOURCE_ROOT="$TEST_ROOT/repos/vllm-ascend"
 mkdir -p \
     "$SOURCE_ROOT/vllm_ascend" \
-    "$TEST_ROOT/scripts" \
+    "$SOURCE_ROOT/scripts" \
     "$TEST_ROOT/models" \
     "$TEST_ROOT/reduced-models"
 : > "$SOURCE_ROOT/requirements.txt"
 
 run_start() {
     DMP_ROOT="$TEST_ROOT" \
+    DMP_A3_SOURCE_ROOT="$SOURCE_ROOT" \
+    DMP_A3_SCRIPT_ROOT="$SOURCE_ROOT/scripts" \
     MODEL_HOST_PATH="$TEST_ROOT/models" \
     REDUCED_MODELS_HOST_PATH="$TEST_ROOT/reduced-models" \
     MOCK_IMAGE_ID="$1" \
@@ -82,6 +88,10 @@ run_start() {
 run_start sha256:a3-image-one
 compgen -G "$SOURCE_ROOT/vllm_ascend/vllm_ascend_C*.so" >/dev/null
 compgen -G "$SOURCE_ROOT/vllm_ascend/*vllm_ascend_kernels*.so" >/dev/null
+grep -F -- \
+    "-v $SOURCE_ROOT/vllm_ascend:/vllm-workspace/vllm-ascend/vllm_ascend" \
+    "$MOCK_LOG" >/dev/null
+grep -F -- "-v $SOURCE_ROOT/scripts:/workspace/scripts" "$MOCK_LOG" >/dev/null
 [[ "$(<"$SOURCE_ROOT/vllm_ascend/.dmp-a3-native-image-id")" == \
    "sha256:a3-image-one" ]]
 [[ "$(grep -c '^create$' "$MOCK_LOG")" == "1" ]]
