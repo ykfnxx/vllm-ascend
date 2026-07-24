@@ -75,6 +75,88 @@ class TestAscendSFABackend(TestBase):
         self.assertIsNotNone(impl_cls)
 
 
+class TestAscendSFAKVCacheComposition(TestBase):
+    def test_compose_returns_main_cache_without_indexer(self):
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.has_indexer = False
+        main_cache = (torch.empty(1), torch.empty(2))
+
+        self.assertIs(impl._compose_sfa_kv_cache(main_cache), main_cache)
+
+    def test_compose_main_and_indexer_cache_four_layouts(self):
+        main_k = torch.empty(1)
+        main_v = torch.empty(2)
+        packed_main = torch.empty(3)
+        indexer_k = torch.empty(4)
+        indexer_scale = torch.empty(5)
+
+        for main_c8, indexer_c8, main_cache, indexer_cache, expected in (
+            (
+                False,
+                False,
+                (main_k, main_v),
+                (indexer_k,),
+                (main_k, main_v, indexer_k),
+            ),
+            (
+                True,
+                False,
+                (packed_main,),
+                (indexer_k,),
+                (packed_main, indexer_k),
+            ),
+            (
+                False,
+                True,
+                (main_k, main_v),
+                (indexer_k, indexer_scale),
+                (main_k, main_v, indexer_k, indexer_scale),
+            ),
+            (
+                True,
+                True,
+                (packed_main,),
+                (indexer_k, indexer_scale),
+                (packed_main, indexer_k, indexer_scale),
+            ),
+        ):
+            with self.subTest(main_c8=main_c8, indexer_c8=indexer_c8):
+                impl = AscendSFAImpl.__new__(AscendSFAImpl)
+                impl.has_indexer = True
+                impl.enable_sparse_sfa_c8 = main_c8
+                impl.enable_sparse_li_c8 = indexer_c8
+                impl.indexer = SimpleNamespace(
+                    k_cache=SimpleNamespace(kv_cache=indexer_cache),
+                )
+
+                composed = impl._compose_sfa_kv_cache(main_cache)
+
+                self.assertEqual(len(composed), len(expected))
+                for actual_tensor, expected_tensor in zip(composed, expected):
+                    self.assertIs(actual_tensor, expected_tensor)
+
+    def test_forward_composes_cache_before_attention_work(self):
+        class CompositionReached(Exception):
+            pass
+
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        main_cache = (torch.empty(1), torch.empty(2))
+        impl._compose_sfa_kv_cache = MagicMock(
+            side_effect=CompositionReached,
+        )
+
+        with self.assertRaises(CompositionReached):
+            impl.forward(
+                layer_name="model.layers.0.self_attn.attn",
+                hidden_states=torch.empty(1),
+                kv_cache=main_cache,
+                attn_metadata=object(),
+                output=torch.empty(1),
+            )
+
+        impl._compose_sfa_kv_cache.assert_called_once_with(main_cache)
+
+
 class TestAscendSFADeviceOperator(TestBase):
     def _make_common_inputs(self):
         ql_nope = torch.randn(3, 4, 8)

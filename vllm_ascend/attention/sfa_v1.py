@@ -651,7 +651,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         # The user-facing switches control these layouts independently, and
         # layers without an indexer only apply the SFA setting.
         self.enable_sparse_sfa_c8 = ascend_config.enable_sparse_sfa_c8
-        self.enable_sparse_li_c8 = self.has_indexer and ascend_config.is_sparse_li_c8_layer(self.layer_name)
+        self.enable_sparse_li_c8 = self.has_indexer and ascend_config.is_sparse_li_c8_layer(self.indexer.k_cache.prefix)
         if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8:
             if get_ascend_device_type() == AscendDeviceType.A5:
                 self.c8_k_cache_dtype = torch.float8_e4m3fn
@@ -1537,6 +1537,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         """
         return
 
+    def _compose_sfa_kv_cache(
+        self,
+        kv_cache: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, ...]:
+        if not self.has_indexer:
+            return kv_cache
+        return (*kv_cache, *self.indexer.k_cache.kv_cache)
+
     def forward(
         self,
         layer_name,
@@ -1554,6 +1562,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                     if is_hidden_layer(layer):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
+
+        kv_cache = self._compose_sfa_kv_cache(kv_cache)
 
         cos = attn_metadata.cos
         sin = attn_metadata.sin
