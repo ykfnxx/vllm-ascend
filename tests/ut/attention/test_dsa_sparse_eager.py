@@ -11,6 +11,8 @@ from vllm_ascend.attention.dsa_sparse import (
     DSASparseCacheConfig,
     DSASparseCohort,
     DSASparseCohortKey,
+    DSASparseEagerBatchContext,
+    DSASparseEagerContextRouter,
     DSASparseEagerCoordinator,
     DSASparseLayerBinding,
     DSASparseLayerHotCache,
@@ -136,6 +138,55 @@ class RecordingIOOperator:
     def wait_write(self, *, context, completion, hot_planes):
         del context, completion, hot_planes
         self.events.append("wait_write")
+
+
+@dataclass
+class FailingWaitIOOperator(RecordingIOOperator):
+    failed_wait: str
+
+    def wait_read(self, *, context, completion, hot_planes):
+        super().wait_read(
+            context=context,
+            completion=completion,
+            hot_planes=hot_planes,
+        )
+        if self.failed_wait == "read":
+            raise RuntimeError("read completion failed")
+
+    def wait_write(self, *, context, completion, hot_planes):
+        super().wait_write(
+            context=context,
+            completion=completion,
+            hot_planes=hot_planes,
+        )
+        if self.failed_wait == "write":
+            raise RuntimeError("write completion failed")
+
+
+@dataclass
+class FailingOnceWaitIOOperator(RecordingIOOperator):
+    failed_wait: str
+    has_failed: bool = False
+
+    def wait_read(self, *, context, completion, hot_planes):
+        super().wait_read(
+            context=context,
+            completion=completion,
+            hot_planes=hot_planes,
+        )
+        if self.failed_wait == "read" and not self.has_failed:
+            self.has_failed = True
+            raise RuntimeError("read completion failed once")
+
+    def wait_write(self, *, context, completion, hot_planes):
+        super().wait_write(
+            context=context,
+            completion=completion,
+            hot_planes=hot_planes,
+        )
+        if self.failed_wait == "write" and not self.has_failed:
+            self.has_failed = True
+            raise RuntimeError("write completion failed once")
 
 
 def build_coordinator(
@@ -595,3 +646,398 @@ def test_freeze_keeps_cohort_metadata_and_plan_map_immutable():
             plan_key,
             device="cpu",
         )
+
+
+def begin_dynamic_batch(
+    coordinator,
+    cohort_key,
+    plan_key,
+    *,
+    num_sfa_queries=None,
+):
+    return DSASparseEagerBatchContext.begin(
+        coordinator,
+        cohort_key,
+        plan_key,
+        request_ids=["request-a", "request-b"],
+        query_positions=torch.tensor([5, 9], dtype=torch.int32),
+        query_counts=[1, 1],
+        seq_lens=torch.tensor([7, 10], dtype=torch.int32),
+        block_table=torch.tensor(
+            [
+                [0, 1, 2, 3, 4, 5, 6, 7],
+                [8, 9, 10, 11, 12, 13, 14, 15],
+            ],
+            dtype=torch.int32,
+        ),
+        num_sfa_queries=num_sfa_queries,
+    )
+
+
+def test_dynamic_eager_batch_packs_lanes_and_returns_active_sfa_view():
+    (
+        coordinator,
+        cohort_key,
+        plan_key,
+        events,
+        _transfer_counts,
+    ) = build_coordinator(
+        has_misses=False,
+        layer_names=("layer.0",),
+    )
+    context = begin_dynamic_batch(coordinator, cohort_key, plan_key)
+
+    assert context.step.plan.query_positions.tolist() == [5, -1, 9, -1]
+    target = context.main_write_target("layer.0")
+    assert target.reserved_slot_mapping.tolist() == [8, 20]
+    context.submit_newest_write("layer.0")
+
+    def existing_sfa(resolution):
+        assert resolution.local_sparse_indices.shape == (2, 4)
+        assert resolution.hot_block_table.shape == (2, 3)
+        events.append("existing_sfa")
+        return torch.tensor([42])
+
+    result = context.run_layer_attention(
+        "layer.0",
+        torch.zeros((2, 1, 4), dtype=torch.int32),
+        existing_sfa,
+    )
+    context.finish()
+
+    assert result.tolist() == [42]
+    assert events == [
+        "prepare_newest",
+        "write_async:region:layer.0",
+        "lookup",
+        "read_async:region:layer.0",
+        "wait_read",
+        "existing_sfa",
+        "wait_write",
+    ]
+
+
+def test_dynamic_eager_batch_keeps_padding_out_of_lookup_and_cache_writes():
+    (
+        coordinator,
+        cohort_key,
+        plan_key,
+        _events,
+        _transfer_counts,
+    ) = build_coordinator(
+        has_misses=False,
+        layer_names=("layer.0",),
+    )
+    context = begin_dynamic_batch(
+        coordinator,
+        cohort_key,
+        plan_key,
+        num_sfa_queries=6,
+    )
+
+    target = context.main_write_target("layer.0")
+    assert target.reserved_slot_mapping.tolist() == [8, 20, -1, -1, -1, -1]
+    context.submit_newest_write("layer.0")
+
+    def existing_sfa(resolution):
+        assert resolution.local_sparse_indices.shape == (6, 4)
+        assert resolution.local_sparse_indices[2:].eq(-1).all()
+        return torch.tensor([42])
+
+    result = context.run_layer_attention(
+        "layer.0",
+        torch.zeros((6, 1, 4), dtype=torch.int32),
+        existing_sfa,
+    )
+    context.finish()
+
+    assert result.tolist() == [42]
+    assert context.step.plan.valid_topk_counts.tolist() == [4, 0, 4, 0]
+
+
+def test_dynamic_batch_begin_retires_step_when_sfa_view_copy_fails(
+    monkeypatch,
+):
+    (
+        coordinator,
+        cohort_key,
+        plan_key,
+        _events,
+        _transfer_counts,
+    ) = build_coordinator(
+        has_misses=False,
+        layer_names=("layer.0",),
+    )
+    original_begin_step = coordinator.begin_step
+
+    class FailingSource:
+        def __init__(self, plan, original_tensor):
+            self.plan = plan
+            self.original_tensor = original_tensor
+
+        def __getitem__(self, _index):
+            object.__setattr__(
+                self.plan,
+                "newest_destination_hot_row_ids",
+                self.original_tensor,
+            )
+            raise RuntimeError("SFA view copy failed")
+
+    def begin_then_fail_copy(*args, **kwargs):
+        step = original_begin_step(*args, **kwargs)
+        original_tensor = step.plan.newest_destination_hot_row_ids
+        object.__setattr__(
+            step.plan,
+            "newest_destination_hot_row_ids",
+            FailingSource(step.plan, original_tensor),
+        )
+        return step
+
+    monkeypatch.setattr(
+        coordinator,
+        "begin_step",
+        begin_then_fail_copy,
+    )
+    with pytest.raises(RuntimeError, match="SFA view copy failed"):
+        begin_dynamic_batch(coordinator, cohort_key, plan_key)
+
+    monkeypatch.setattr(
+        coordinator,
+        "begin_step",
+        original_begin_step,
+    )
+    next_context = begin_dynamic_batch(coordinator, cohort_key, plan_key)
+    next_context.abort()
+
+
+def test_layer_router_keeps_two_indexcache_cohorts_independent():
+    (
+        coordinator,
+        first_cohort_key,
+        first_plan_key,
+        events,
+        _transfer_counts,
+    ) = build_coordinator(
+        has_misses=False,
+        layer_names=("layer.0", "layer.1"),
+        freeze=False,
+    )
+    config = coordinator.config
+    second_cohort_key = DSASparseCohortKey(
+        name="shared-indexer-1",
+        role="target",
+    )
+    second_plan_key = DSASparsePlanKey(
+        token_capacity=4,
+        request_capacity=2,
+        query_lane_capacity=2,
+        role="target",
+    )
+    coordinator.register_cohort(
+        DSASparseCohort(
+            key=second_cohort_key,
+            leader_layer="layer.2",
+            state=DSASparseResidencyState.allocate(
+                config,
+                second_cohort_key,
+                device="cpu",
+            ),
+            plans={
+                second_plan_key: DSASparsePlan.allocate(
+                    config,
+                    second_plan_key,
+                    device="cpu",
+                )
+            },
+        )
+    )
+    for layer_name in ("layer.2", "layer.3"):
+        coordinator.register_layer(
+            DSASparseLayerBinding(
+                layer_name=layer_name,
+                cohort=second_cohort_key,
+                hot_cache=DSASparseLayerHotCache.allocate(
+                    DSASparseLayerLayout(
+                        layer_name=layer_name,
+                        plane_dtypes=(torch.bfloat16, torch.bfloat16),
+                        plane_row_shapes=((1, 8), (1, 2)),
+                    ),
+                    config,
+                    device="cpu",
+                ),
+                io_context=f"context:{layer_name}",
+                io_region=f"region:{layer_name}",
+                read_completion=object(),
+                write_completion=object(),
+            )
+        )
+    coordinator.freeze()
+
+    first_context = begin_dynamic_batch(
+        coordinator,
+        first_cohort_key,
+        first_plan_key,
+    )
+    second_context = begin_dynamic_batch(
+        coordinator,
+        second_cohort_key,
+        second_plan_key,
+    )
+    router = DSASparseEagerContextRouter(
+        {
+            "layer.0": first_context,
+            "layer.1": first_context,
+            "layer.2": second_context,
+            "layer.3": second_context,
+        }
+    )
+
+    for layer_name in ("layer.0", "layer.1", "layer.2", "layer.3"):
+        router.main_write_target(layer_name)
+        router.submit_newest_write(layer_name)
+        router.run_layer_attention(
+            layer_name,
+            torch.zeros((2, 4), dtype=torch.int32),
+            lambda resolution: torch.tensor([resolution.hot_main_cache[0].shape[0]]),
+        )
+
+    router.finish()
+
+    assert events.count("lookup") == 2
+    assert router.context_for("layer.0") is first_context
+    assert router.context_for("layer.3") is second_context
+
+
+def test_layer_router_aborts_every_cohort_after_finish_failure():
+    events = []
+
+    class RecordingContext:
+        num_sfa_queries = 2
+
+        def __init__(self, name, *, fail_finish=False):
+            self.name = name
+            self.fail_finish = fail_finish
+
+        def finish(self):
+            events.append(f"finish:{self.name}")
+            if self.fail_finish:
+                raise RuntimeError("finish failed")
+
+        def abort(self):
+            events.append(f"abort:{self.name}")
+
+    first_context = RecordingContext("first")
+    second_context = RecordingContext("second", fail_finish=True)
+    router = DSASparseEagerContextRouter(
+        {
+            "layer.0": first_context,
+            "layer.1": second_context,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="finish failed"):
+        router.finish()
+
+    assert events == [
+        "finish:first",
+        "finish:second",
+        "abort:first",
+        "abort:second",
+    ]
+
+
+@pytest.mark.parametrize("failed_wait", ["read", "write"])
+def test_completion_failure_poisons_coordinator(failed_wait):
+    (
+        coordinator,
+        cohort_key,
+        plan_key,
+        events,
+        transfer_counts,
+    ) = build_coordinator(
+        has_misses=False,
+        layer_names=("layer.0",),
+    )
+    coordinator.io_operator = FailingWaitIOOperator(
+        events,
+        transfer_counts,
+        failed_wait,
+    )
+    context = begin_dynamic_batch(coordinator, cohort_key, plan_key)
+    context.submit_newest_write("layer.0")
+
+    with pytest.raises(RuntimeError, match=f"{failed_wait} completion failed"):
+        context.run_layer_attention(
+            "layer.0",
+            torch.zeros((2, 4), dtype=torch.int32),
+            lambda _resolution: torch.tensor([42]),
+        )
+    with pytest.raises(RuntimeError, match="Failed to join DSA Sparse I/O"):
+        context.abort()
+    with pytest.raises(RuntimeError, match="poisoned"):
+        begin_dynamic_batch(coordinator, cohort_key, plan_key)
+
+
+@pytest.mark.parametrize("failed_wait", ["read", "write"])
+def test_first_completion_failure_remains_poisoned_after_successful_abort_join(
+    failed_wait,
+):
+    (
+        coordinator,
+        cohort_key,
+        plan_key,
+        events,
+        transfer_counts,
+    ) = build_coordinator(
+        has_misses=False,
+        layer_names=("layer.0",),
+    )
+    coordinator.io_operator = FailingOnceWaitIOOperator(
+        events,
+        transfer_counts,
+        failed_wait,
+    )
+    context = begin_dynamic_batch(coordinator, cohort_key, plan_key)
+    context.submit_newest_write("layer.0")
+
+    with pytest.raises(RuntimeError, match="completion failed once"):
+        context.run_layer_attention(
+            "layer.0",
+            torch.zeros((2, 4), dtype=torch.int32),
+            lambda _resolution: torch.tensor([42]),
+        )
+    context.abort()
+
+    with pytest.raises(RuntimeError, match="poisoned"):
+        begin_dynamic_batch(coordinator, cohort_key, plan_key)
+
+
+def test_failed_attention_joins_write_and_batch_can_abort():
+    (
+        coordinator,
+        cohort_key,
+        plan_key,
+        events,
+        _transfer_counts,
+    ) = build_coordinator(
+        has_misses=False,
+        layer_names=("layer.0",),
+    )
+    context = begin_dynamic_batch(coordinator, cohort_key, plan_key)
+    context.submit_newest_write("layer.0")
+
+    def failed_sfa(_resolution):
+        raise RuntimeError("SFA failed")
+
+    with pytest.raises(RuntimeError, match="SFA failed"):
+        context.run_layer_attention(
+            "layer.0",
+            torch.zeros((2, 4), dtype=torch.int32),
+            failed_sfa,
+        )
+
+    assert events[-1] == "wait_write"
+    context.abort()
+
+    next_context = begin_dynamic_batch(coordinator, cohort_key, plan_key)
+    next_context.abort()

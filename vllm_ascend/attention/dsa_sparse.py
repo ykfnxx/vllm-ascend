@@ -603,6 +603,9 @@ class DSASparseEagerStep:
     request_ids: tuple[Hashable, ...]
     lookup_complete: bool = False
     write_submitted_layers: set[str] = field(default_factory=set)
+    write_joined_layers: set[str] = field(default_factory=set)
+    read_submitted_layers: set[str] = field(default_factory=set)
+    read_joined_layers: set[str] = field(default_factory=set)
     completed_layers: set[str] = field(default_factory=set)
 
 
@@ -628,6 +631,7 @@ class DSASparseEagerCoordinator:
         self._region_identities: set[object] = set()
         self._completion_identities: set[object] = set()
         self._frozen = False
+        self._failure: Exception | None = None
 
     def register_cohort(
         self,
@@ -639,9 +643,11 @@ class DSASparseEagerCoordinator:
         self._cohorts[cohort.key] = cohort
 
     def acquire_request(self, request_id: Hashable) -> CacheSeatLease:
+        self._require_healthy()
         return self.seat_manager.acquire(request_id)
 
     def release_request(self, request_id: Hashable) -> CacheSeatLease:
+        self._require_healthy()
         self.assert_request_idle(request_id)
         return self.seat_manager.release(request_id)
 
@@ -730,6 +736,7 @@ class DSASparseEagerCoordinator:
         seq_lens: torch.Tensor,
         block_table: torch.Tensor,
     ) -> DSASparseEagerStep:
+        self._require_healthy()
         if not self._frozen:
             raise RuntimeError("DSA Sparse coordinator must be frozen before execution.")
         cohort = self._get_cohort(cohort_key)
@@ -779,15 +786,19 @@ class DSASparseEagerCoordinator:
         binding = self._get_step_layer(step, layer_name)
         if layer_name in step.write_submitted_layers:
             raise RuntimeError(f"Newest write was already submitted for {layer_name!r}.")
-        self.io_operator.write_async(
-            context=binding.io_context,
-            region=binding.io_region,
-            destination_global_slots=step.plan.write_global_slots,
-            source_hot_row_ids=step.plan.write_destination_hot_row_ids,
-            valid_mask=step.plan.write_valid_mask,
-            hot_planes=binding.hot_cache.planes,
-            completion=binding.write_completion,
-        )
+        try:
+            self.io_operator.write_async(
+                context=binding.io_context,
+                region=binding.io_region,
+                destination_global_slots=step.plan.write_global_slots,
+                source_hot_row_ids=step.plan.write_destination_hot_row_ids,
+                valid_mask=step.plan.write_valid_mask,
+                hot_planes=binding.hot_cache.planes,
+                completion=binding.write_completion,
+            )
+        except Exception as exc:
+            self._poison(exc)
+            raise
         step.write_submitted_layers.add(layer_name)
 
     def prepare_lookup(
@@ -835,31 +846,39 @@ class DSASparseEagerCoordinator:
         if layer_name in step.completed_layers:
             raise RuntimeError(f"DSA Sparse layer {layer_name!r} already completed this step.")
 
-        self.io_operator.read_async(
-            context=binding.io_context,
-            region=binding.io_region,
-            source_global_slots=step.plan.read_source_global_slots,
-            destination_hot_row_ids=(step.plan.read_destination_hot_row_ids),
-            valid_mask=step.plan.read_valid_mask,
-            hot_planes=binding.hot_cache.planes,
-            completion=binding.read_completion,
-        )
-        self.io_operator.wait_read(
-            context=binding.io_context,
-            completion=binding.read_completion,
-            hot_planes=binding.hot_cache.planes,
-        )
-        resolution = DSASparseResolution(
-            hot_main_cache=binding.hot_cache.planes,
-            local_sparse_indices=step.plan.resolved_hot_indices,
-            hot_block_table=step.plan.hot_block_table,
-        )
-        output = attention(resolution)
-        self.io_operator.wait_write(
-            context=binding.io_context,
-            completion=binding.write_completion,
-            hot_planes=binding.hot_cache.planes,
-        )
+        try:
+            self.io_operator.read_async(
+                context=binding.io_context,
+                region=binding.io_region,
+                source_global_slots=step.plan.read_source_global_slots,
+                destination_hot_row_ids=(step.plan.read_destination_hot_row_ids),
+                valid_mask=step.plan.read_valid_mask,
+                hot_planes=binding.hot_cache.planes,
+                completion=binding.read_completion,
+            )
+        except Exception as exc:
+            self._poison(exc)
+            raise
+        step.read_submitted_layers.add(layer_name)
+        try:
+            try:
+                self.io_operator.wait_read(
+                    context=binding.io_context,
+                    completion=binding.read_completion,
+                    hot_planes=binding.hot_cache.planes,
+                )
+            except Exception as exc:
+                self._poison(exc)
+                raise
+            step.read_joined_layers.add(layer_name)
+            resolution = DSASparseResolution(
+                hot_main_cache=binding.hot_cache.planes,
+                local_sparse_indices=step.plan.resolved_hot_indices,
+                hot_block_table=step.plan.hot_block_table,
+            )
+            output = attention(resolution)
+        finally:
+            self._join_write(step, binding)
         step.completed_layers.add(layer_name)
         return output
 
@@ -874,6 +893,39 @@ class DSASparseEagerCoordinator:
                 f"Cannot finish DSA Sparse step before all layer writes are joined, pending layers: {pending_layers}."
             )
         del self._active_steps[step.cohort.key]
+
+    def abort_step(self, step: DSASparseEagerStep) -> None:
+        """Join submitted I/O and retire a failed eager step."""
+
+        self._assert_active_step(step)
+        first_error: Exception | None = None
+        try:
+            for layer_key, binding in self._layers.items():
+                if binding.cohort != step.cohort.key:
+                    continue
+                layer_name = layer_key.layer_name
+                if layer_name in step.read_submitted_layers and layer_name not in step.read_joined_layers:
+                    try:
+                        self.io_operator.wait_read(
+                            context=binding.io_context,
+                            completion=binding.read_completion,
+                            hot_planes=binding.hot_cache.planes,
+                        )
+                        step.read_joined_layers.add(layer_name)
+                    except Exception as exc:
+                        if first_error is None:
+                            first_error = exc
+                if layer_name in step.write_submitted_layers and layer_name not in step.write_joined_layers:
+                    try:
+                        self._join_write(step, binding)
+                    except Exception as exc:
+                        if first_error is None:
+                            first_error = exc
+        finally:
+            del self._active_steps[step.cohort.key]
+        if first_error is not None:
+            self._poison(first_error)
+            raise RuntimeError("Failed to join DSA Sparse I/O while aborting an eager step.") from first_error
 
     def _get_cohort(
         self,
@@ -898,9 +950,35 @@ class DSASparseEagerCoordinator:
         if self._active_steps.get(step.cohort.key) is not step:
             raise RuntimeError("DSA Sparse step is not the active cohort owner.")
 
+    def _join_write(
+        self,
+        step: DSASparseEagerStep,
+        binding: DSASparseLayerBinding,
+    ) -> None:
+        if binding.layer_name in step.write_joined_layers:
+            return
+        try:
+            self.io_operator.wait_write(
+                context=binding.io_context,
+                completion=binding.write_completion,
+                hot_planes=binding.hot_cache.planes,
+            )
+        except Exception as exc:
+            self._poison(exc)
+            raise
+        step.write_joined_layers.add(binding.layer_name)
+
     def _require_mutable(self) -> None:
         if self._frozen:
             raise RuntimeError("DSA Sparse coordinator resources are frozen.")
+
+    def _require_healthy(self) -> None:
+        if self._failure is not None:
+            raise RuntimeError("DSA Sparse coordinator is poisoned after an I/O completion failure.") from self._failure
+
+    def _poison(self, failure: Exception) -> None:
+        if self._failure is None:
+            self._failure = failure
 
     @staticmethod
     def _copy_exact(
@@ -919,3 +997,379 @@ class DSASparseEagerCoordinator:
         except TypeError:
             return ("identity", id(resource))
         return ("value", type(resource), resource)
+
+
+@dataclass(frozen=True)
+class DSASparseMainWriteTarget:
+    hot_main_cache: tuple[torch.Tensor, ...]
+    reserved_slot_mapping: torch.Tensor
+
+
+class DSASparseEagerAttentionContext(Protocol):
+    """Layer-facing context consumed by the existing SFA wrapper."""
+
+    @property
+    def num_sfa_queries(self) -> int: ...
+
+    def main_write_target(
+        self,
+        layer_name: str,
+    ) -> DSASparseMainWriteTarget: ...
+
+    def submit_newest_write(self, layer_name: str) -> None: ...
+
+    def run_layer_attention(
+        self,
+        layer_name: str,
+        semantic_topk_positions: torch.Tensor,
+        attention: Callable[[DSASparseResolution], torch.Tensor],
+    ) -> torch.Tensor: ...
+
+
+class DSASparseEagerBatchContext:
+    """Execution-scoped adapter between dynamic eager batches and fixed plans."""
+
+    def __init__(
+        self,
+        *,
+        coordinator: DSASparseEagerCoordinator,
+        step: DSASparseEagerStep,
+        active_plan_indices: torch.Tensor,
+        sfa_slot_mapping: torch.Tensor,
+        sfa_local_sparse_indices: torch.Tensor,
+    ) -> None:
+        self.coordinator = coordinator
+        self.step = step
+        self.active_plan_indices = active_plan_indices
+        self._sfa_slot_mapping = sfa_slot_mapping
+        self._sfa_local_sparse_indices = sfa_local_sparse_indices
+        self._closed = False
+
+    @classmethod
+    def begin(
+        cls,
+        coordinator: DSASparseEagerCoordinator,
+        cohort_key: DSASparseCohortKey,
+        plan_key: DSASparsePlanKey,
+        *,
+        request_ids: list[Hashable],
+        query_positions: torch.Tensor,
+        query_counts: list[int],
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        num_sfa_queries: int | None = None,
+    ) -> "DSASparseEagerBatchContext":
+        cohort = coordinator.get_cohort(cohort_key)
+        try:
+            plan = cohort.plans[plan_key]
+        except KeyError as exc:
+            raise KeyError(f"DSA Sparse plan {plan_key!r} is not registered for cohort {cohort_key!r}.") from exc
+        cls._validate_dynamic_inputs(
+            plan,
+            request_ids=request_ids,
+            query_positions=query_positions,
+            query_counts=query_counts,
+            seq_lens=seq_lens,
+            block_table=block_table,
+            num_sfa_queries=num_sfa_queries,
+        )
+
+        active_indices = [
+            row * plan.key.query_lane_capacity + lane for row, count in enumerate(query_counts) for lane in range(count)
+        ]
+        num_active_queries = len(active_indices)
+        if num_sfa_queries is None:
+            num_sfa_queries = num_active_queries
+        active_plan_indices = torch.tensor(
+            active_indices,
+            dtype=torch.long,
+            device=plan.query_positions.device,
+        )
+        fixed_query_positions = torch.full_like(
+            plan.query_positions,
+            INVALID_INDEX,
+        )
+        fixed_query_valid_mask = torch.zeros_like(plan.query_valid_mask)
+        fixed_query_positions[active_plan_indices] = query_positions
+        fixed_query_valid_mask[active_plan_indices] = True
+
+        fixed_seq_lens = torch.zeros_like(plan.seq_lens)
+        fixed_seq_lens[: len(request_ids)] = seq_lens
+        fixed_block_table = torch.full_like(plan.block_table, INVALID_INDEX)
+        fixed_block_table[: len(request_ids)] = block_table
+
+        sfa_slot_mapping = torch.full(
+            (num_sfa_queries,),
+            INVALID_INDEX,
+            dtype=plan.newest_destination_hot_row_ids.dtype,
+            device=plan.newest_destination_hot_row_ids.device,
+        )
+        sfa_local_sparse_indices = torch.full(
+            (
+                num_sfa_queries,
+                plan.topk_positions.shape[1],
+            ),
+            INVALID_INDEX,
+            dtype=plan.resolved_hot_indices.dtype,
+            device=plan.resolved_hot_indices.device,
+        )
+        step = coordinator.begin_step(
+            cohort_key,
+            plan_key,
+            request_ids=request_ids,
+            query_positions=fixed_query_positions,
+            query_valid_mask=fixed_query_valid_mask,
+            seq_lens=fixed_seq_lens,
+            block_table=fixed_block_table,
+        )
+        try:
+            sfa_slot_mapping[:num_active_queries] = plan.newest_destination_hot_row_ids[active_plan_indices]
+        except BaseException as exc:
+            try:
+                coordinator.abort_step(step)
+            except BaseException as cleanup_exc:
+                if hasattr(exc, "add_note"):
+                    exc.add_note(f"DSA Sparse begin cleanup also failed: {cleanup_exc!r}")
+            raise
+        return cls(
+            coordinator=coordinator,
+            step=step,
+            active_plan_indices=active_plan_indices,
+            sfa_slot_mapping=sfa_slot_mapping,
+            sfa_local_sparse_indices=sfa_local_sparse_indices,
+        )
+
+    @property
+    def num_active_queries(self) -> int:
+        return self.active_plan_indices.shape[0]
+
+    @property
+    def num_sfa_queries(self) -> int:
+        return self._sfa_slot_mapping.shape[0]
+
+    def main_write_target(
+        self,
+        layer_name: str,
+    ) -> DSASparseMainWriteTarget:
+        self._require_open()
+        binding = self.coordinator.get_layer_binding(
+            self.step.cohort.key,
+            layer_name,
+        )
+        return DSASparseMainWriteTarget(
+            hot_main_cache=binding.hot_cache.planes,
+            reserved_slot_mapping=self._sfa_slot_mapping,
+        )
+
+    def submit_newest_write(self, layer_name: str) -> None:
+        self._require_open()
+        self.coordinator.submit_newest_write(self.step, layer_name)
+
+    def run_layer_attention(
+        self,
+        layer_name: str,
+        semantic_topk_positions: torch.Tensor,
+        attention: Callable[[DSASparseResolution], torch.Tensor],
+    ) -> torch.Tensor:
+        self._require_open()
+        semantic_topk_positions = self._normalize_topk(semantic_topk_positions)
+        if not self.step.lookup_complete:
+            if layer_name != self.step.cohort.leader_layer:
+                raise RuntimeError("DSA Sparse cohort leader must resolve semantic Top-K before follower layers.")
+            fixed_topk_positions = torch.full_like(
+                self.step.plan.topk_positions,
+                INVALID_INDEX,
+            )
+            fixed_valid_topk_counts = torch.zeros_like(self.step.plan.valid_topk_counts)
+            fixed_topk_positions[self.active_plan_indices] = semantic_topk_positions
+            fixed_valid_topk_counts[self.active_plan_indices] = (semantic_topk_positions >= 0).sum(
+                dim=-1,
+                dtype=fixed_valid_topk_counts.dtype,
+            )
+            self.coordinator.prepare_lookup(
+                self.step,
+                topk_positions=fixed_topk_positions,
+                valid_topk_counts=fixed_valid_topk_counts,
+            )
+
+        def active_attention(
+            resolution: DSASparseResolution,
+        ) -> torch.Tensor:
+            self._sfa_local_sparse_indices.fill_(INVALID_INDEX)
+            self._sfa_local_sparse_indices[: self.num_active_queries] = resolution.local_sparse_indices[
+                self.active_plan_indices
+            ]
+            active_resolution = DSASparseResolution(
+                hot_main_cache=resolution.hot_main_cache,
+                local_sparse_indices=self._sfa_local_sparse_indices,
+                hot_block_table=resolution.hot_block_table[: len(self.step.request_ids)],
+            )
+            return attention(active_resolution)
+
+        return self.coordinator.run_layer_attention(
+            self.step,
+            layer_name,
+            active_attention,
+        )
+
+    def finish(self) -> None:
+        self._require_open()
+        self.coordinator.finish_step(self.step)
+        self._closed = True
+
+    def abort(self) -> None:
+        if self._closed:
+            return
+        try:
+            self.coordinator.abort_step(self.step)
+        finally:
+            self._closed = True
+
+    def _normalize_topk(
+        self,
+        semantic_topk_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        if semantic_topk_positions.ndim == 3 and semantic_topk_positions.shape[1] == 1:
+            semantic_topk_positions = semantic_topk_positions.squeeze(1)
+        expected_shape = (
+            self.num_sfa_queries,
+            self.step.plan.topk_positions.shape[1],
+        )
+        if semantic_topk_positions.shape != expected_shape:
+            raise ValueError(
+                f"semantic_topk_positions shape must be {expected_shape}, got {tuple(semantic_topk_positions.shape)}."
+            )
+        return semantic_topk_positions[: self.num_active_queries]
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("DSA Sparse eager batch context is closed.")
+
+    @staticmethod
+    def _validate_dynamic_inputs(
+        plan: DSASparsePlan,
+        *,
+        request_ids: list[Hashable],
+        query_positions: torch.Tensor,
+        query_counts: list[int],
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        num_sfa_queries: int | None,
+    ) -> None:
+        num_requests = len(request_ids)
+        if num_requests > plan.key.request_capacity:
+            raise ValueError("request_ids exceeds the DSA Sparse plan request capacity.")
+        if len(query_counts) != num_requests:
+            raise ValueError("query_counts must contain one entry per request.")
+        if any(
+            isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= plan.key.query_lane_capacity
+            for count in query_counts
+        ):
+            raise ValueError("Each query count must fit the DSA Sparse query-lane capacity.")
+        if query_positions.shape != (sum(query_counts),):
+            raise ValueError("query_positions must contain exactly the active query lanes.")
+        if num_sfa_queries is not None:
+            if isinstance(num_sfa_queries, bool) or not isinstance(num_sfa_queries, int):
+                raise ValueError("num_sfa_queries must be an integer.")
+            if num_sfa_queries < sum(query_counts):
+                raise ValueError("num_sfa_queries must cover every active query.")
+        if seq_lens.shape != (num_requests,):
+            raise ValueError("seq_lens must contain one value per request.")
+        expected_block_shape = (
+            num_requests,
+            plan.block_table.shape[1],
+        )
+        if block_table.shape != expected_block_shape:
+            raise ValueError(f"block_table shape must be {expected_block_shape}, got {tuple(block_table.shape)}.")
+
+
+class DSASparseEagerContextRouter:
+    """Route each sparse layer to its IndexCache residency cohort."""
+
+    def __init__(
+        self,
+        layer_contexts: Mapping[str, DSASparseEagerBatchContext],
+    ) -> None:
+        if not layer_contexts:
+            raise ValueError("DSA Sparse eager context router requires at least one layer.")
+        contexts = tuple({id(context): context for context in layer_contexts.values()}.values())
+        num_sfa_queries = contexts[0].num_sfa_queries
+        if any(context.num_sfa_queries != num_sfa_queries for context in contexts[1:]):
+            raise ValueError("All DSA Sparse layer contexts must use the same SFA query view.")
+        self._layer_contexts = MappingProxyType(dict(layer_contexts))
+        self._contexts = contexts
+        self._num_sfa_queries = num_sfa_queries
+        self._closed = False
+
+    @property
+    def num_sfa_queries(self) -> int:
+        return self._num_sfa_queries
+
+    @property
+    def contexts(self) -> tuple[DSASparseEagerBatchContext, ...]:
+        return self._contexts
+
+    def context_for(
+        self,
+        layer_name: str,
+    ) -> DSASparseEagerBatchContext:
+        try:
+            return self._layer_contexts[layer_name]
+        except KeyError as exc:
+            raise KeyError(f"DSA Sparse layer {layer_name!r} has no eager cohort context.") from exc
+
+    def main_write_target(
+        self,
+        layer_name: str,
+    ) -> DSASparseMainWriteTarget:
+        return self.context_for(layer_name).main_write_target(layer_name)
+
+    def submit_newest_write(self, layer_name: str) -> None:
+        self.context_for(layer_name).submit_newest_write(layer_name)
+
+    def run_layer_attention(
+        self,
+        layer_name: str,
+        semantic_topk_positions: torch.Tensor,
+        attention: Callable[[DSASparseResolution], torch.Tensor],
+    ) -> torch.Tensor:
+        return self.context_for(layer_name).run_layer_attention(
+            layer_name,
+            semantic_topk_positions,
+            attention,
+        )
+
+    def finish(self) -> None:
+        if self._closed:
+            raise RuntimeError("DSA Sparse eager context router is closed.")
+        try:
+            for context in self._contexts:
+                context.finish()
+        except BaseException as exc:
+            try:
+                self._abort_contexts()
+            except BaseException as cleanup_exc:
+                if hasattr(exc, "add_note"):
+                    exc.add_note(f"DSA Sparse cohort cleanup also failed: {cleanup_exc!r}")
+            raise
+        finally:
+            self._closed = True
+
+    def abort(self) -> None:
+        if self._closed:
+            return
+        try:
+            self._abort_contexts()
+        finally:
+            self._closed = True
+
+    def _abort_contexts(self) -> None:
+        first_error: BaseException | None = None
+        for context in self._contexts:
+            try:
+                context.abort()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise RuntimeError("Failed to abort all DSA Sparse eager cohort contexts.") from first_error
