@@ -128,6 +128,14 @@ def _get_config_bool(configs: tuple[Any, ...], attr: str) -> bool:
     return False
 
 
+def _wait_for_sfa_main_cache(
+    layer_name: str,
+    dsa_sparse_context: DSASparseEagerAttentionContext | None,
+) -> None:
+    if dsa_sparse_context is None:
+        wait_for_kv_layer_from_connector(layer_name)
+
+
 class AscendSFABackend(AttentionBackend):
     accept_output_buffer: bool = True
 
@@ -1678,7 +1686,10 @@ class AscendSFAImpl(MLAAttentionImpl):
 
             # Prolog updates the paged KV cache in place. Wait for the prompt
             # blocks before writing the first Decode token into their tail block.
-            wait_for_kv_layer_from_connector(layer_name)
+            _wait_for_sfa_main_cache(
+                layer_name,
+                dsa_sparse_context,
+            )
             hidden_states, ql_nope, q_pe, q_c, _, _ = self._sfa_preprocess_with_prolog_v3(
                 hidden_states=hidden_states,
                 kv_cache=kv_cache,
@@ -1710,7 +1721,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
             else:
                 k_li, k_li_scale = None, None
-            wait_for_kv_layer_from_connector(layer_name)
+            _wait_for_sfa_main_cache(
+                layer_name,
+                dsa_sparse_context,
+            )
         # native
         else:
             assert self.fused_qkv_a_proj is not None, "q lora is required for DSA."
@@ -1739,7 +1753,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             else:
                 k_li, k_li_scale = None, None
 
-            wait_for_kv_layer_from_connector(layer_name)
+            _wait_for_sfa_main_cache(
+                layer_name,
+                dsa_sparse_context,
+            )
 
             if self.enable_dsa_cp:
                 assert slot_mapping_cp is not None

@@ -90,13 +90,14 @@ def load_dsa_sparse_config(vllm_config: object) -> DSASparseConfig | None:
     _require_parallel_size(parallel_config, "decode_context_parallel_size")
     _require_parallel_size(parallel_config, "prefill_context_parallel_size")
 
-    max_query_tokens_per_request = _get_max_query_tokens_per_request(vllm_config)
     index_topk = _get_index_topk(model_config)
     device_buffer_size = raw_config.get("device_buffer_size")
     if kv_role == "kv_producer":
+        max_query_tokens_per_request = 1
         if device_buffer_size is not None:
             raise ValueError("dsa_sparse_config.device_buffer_size is Decode-only and must not be set for kv_producer.")
     else:
+        max_query_tokens_per_request = _get_max_query_tokens_per_request(vllm_config)
         if isinstance(device_buffer_size, bool) or not isinstance(device_buffer_size, int):
             raise ValueError("dsa_sparse_config.device_buffer_size must be a positive integer for kv_consumer.")
         if device_buffer_size <= 0:
@@ -149,9 +150,12 @@ def _get_max_query_tokens_per_request(vllm_config: object) -> int:
         int,
     ):
         raise ValueError("num_speculative_tokens must be an integer for DSA Sparse.")
-    if not 0 <= num_speculative_tokens <= 3:
-        raise ValueError("DSA Sparse eager currently supports 0 to 3 speculative tokens.")
-    return 1 + num_speculative_tokens
+    if num_speculative_tokens != 0:
+        raise ValueError(
+            "This DSA Sparse eager milestone supports target decode only; "
+            "speculative tokens require a separate draft Hot Cache runtime."
+        )
+    return 1
 
 
 def _require_parallel_size(parallel_config: object, field: str) -> None:

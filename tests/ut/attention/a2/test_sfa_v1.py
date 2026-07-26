@@ -20,11 +20,40 @@ from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
     AscendSFAMetadata,
     AscendSFAMetadataBuilder,
+    _wait_for_sfa_main_cache,
     custom_kv_rmsnorm_rope,
 )
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.utils import enable_dsa_cp
+
+
+class TestDSASparseConnectorWait(TestBase):
+    @patch("vllm_ascend.attention.sfa_v1.wait_for_kv_layer_from_connector")
+    def test_hot_cache_context_skips_main_connector_wait(
+        self,
+        mock_wait,
+    ):
+        _wait_for_sfa_main_cache(
+            "model.layers.0.self_attn.attn",
+            object(),
+        )
+
+        mock_wait.assert_not_called()
+
+    @patch("vllm_ascend.attention.sfa_v1.wait_for_kv_layer_from_connector")
+    def test_baseline_keeps_main_connector_wait(
+        self,
+        mock_wait,
+    ):
+        layer_name = "model.layers.0.self_attn.attn"
+
+        _wait_for_sfa_main_cache(
+            layer_name,
+            None,
+        )
+
+        mock_wait.assert_called_once_with(layer_name)
 
 
 class TestAscendSFABackend(TestBase):
