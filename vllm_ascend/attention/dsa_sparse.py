@@ -170,6 +170,10 @@ class CacheSeatManager:
     def num_free_seats(self) -> int:
         return len(self._free_seats)
 
+    @property
+    def active_request_ids(self) -> tuple[Hashable, ...]:
+        return tuple(owner for owner in self._seat_owner if owner is not None)
+
     def acquire(self, request_id: Hashable) -> CacheSeatLease:
         if request_id in self._request_to_lease:
             raise ValueError(f"Request {request_id!r} already owns a DSA Sparse cache seat.")
@@ -638,9 +642,12 @@ class DSASparseEagerCoordinator:
         return self.seat_manager.acquire(request_id)
 
     def release_request(self, request_id: Hashable) -> CacheSeatLease:
+        self.assert_request_idle(request_id)
+        return self.seat_manager.release(request_id)
+
+    def assert_request_idle(self, request_id: Hashable) -> None:
         if any(request_id in step.request_ids for step in self._active_steps.values()):
             raise RuntimeError("Cannot release a DSA Sparse request while its step has pending layer I/O.")
-        return self.seat_manager.release(request_id)
 
     def register_layer(
         self,
