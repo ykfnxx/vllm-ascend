@@ -952,6 +952,41 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
         runner.input_batch = SimpleNamespace(req_ids=["request-a", "request-b", None])
         return runner
 
+    @patch("vllm_ascend.worker.model_runner_v1.create_dsa_sparse_eager_stub_runtime")
+    def test_initialize_stub_runtime_after_fixed_hbm_reservation(
+        self,
+        mock_create_runtime,
+    ):
+        runner = self._build_runner()
+        runner.device = torch.device("cpu")
+        runner._dsa_sparse_fixed_hbm_breakdown = object()
+        cache_config = object()
+        cohort_layouts = (object(),)
+        runner._get_dsa_sparse_cache_config = MagicMock(
+            return_value=cache_config,
+        )
+        runner._get_dsa_sparse_eager_cohort_layouts = MagicMock(
+            return_value=cohort_layouts,
+        )
+        runtime = MagicMock()
+        mock_create_runtime.return_value = runtime
+
+        runner._initialize_dsa_sparse_eager_stub_runtime()
+
+        mock_create_runtime.assert_called_once_with(
+            cache_config,
+            cohort_layouts,
+            device=torch.device("cpu"),
+        )
+        self.assertIs(runner.dsa_sparse_eager_runtime, runtime)
+
+    def test_initialize_stub_runtime_requires_fixed_hbm_reservation(self):
+        runner = self._build_runner()
+        runner._dsa_sparse_fixed_hbm_breakdown = None
+
+        with self.assertRaisesRegex(RuntimeError, "must be reserved"):
+            runner._initialize_dsa_sparse_eager_stub_runtime()
+
     def test_bind_and_begin_target_batch(self):
         runner = self._build_runner()
         runtime = MagicMock()

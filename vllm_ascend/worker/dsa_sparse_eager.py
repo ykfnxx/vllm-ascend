@@ -10,11 +10,23 @@ from typing import Protocol, cast
 import torch
 
 from vllm_ascend.attention.dsa_sparse import (
+    CacheSeatLease,
+    DSASparseCacheConfig,
+    DSASparseCohort,
     DSASparseCohortKey,
     DSASparseEagerBatchContext,
     DSASparseEagerContextRouter,
     DSASparseEagerCoordinator,
+    DSASparseLayerBinding,
+    DSASparseLayerHotCache,
+    DSASparseLayerLayout,
+    DSASparsePlan,
     DSASparsePlanKey,
+    DSASparseResidencyState,
+    UnimplementedDSASparseIndexOperator,
+)
+from vllm_ascend.attention.dsa_sparse_io import (
+    UnimplementedDSASparseIOOperator,
 )
 
 
@@ -50,6 +62,149 @@ class DSASparseEagerCohortDescriptor:
             raise ValueError("The DSA Sparse eager cohort leader must be one of its layers.")
         if self.cohort_key.role != "target" or self.plan_key.role != "target":
             raise ValueError("begin_target_batch only accepts target DSA Sparse cohorts.")
+
+
+@dataclass(frozen=True)
+class DSASparseEagerCohortLayout:
+    """Ordered local Main layouts sharing one target residency cohort."""
+
+    cohort_name: str
+    layer_layouts: tuple[DSASparseLayerLayout, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.layer_layouts, tuple):
+            object.__setattr__(
+                self,
+                "layer_layouts",
+                tuple(self.layer_layouts),
+            )
+        if not self.cohort_name:
+            raise ValueError("A DSA Sparse eager cohort name must not be empty.")
+        if not self.layer_layouts:
+            raise ValueError("A DSA Sparse eager cohort must contain at least one Main layout.")
+        layer_names = tuple(layout.layer_name for layout in self.layer_layouts)
+        if len(set(layer_names)) != len(layer_names):
+            raise ValueError("A DSA Sparse eager cohort cannot contain duplicate Main layers.")
+
+    @property
+    def leader_layer(self) -> str:
+        return self.layer_layouts[0].layer_name
+
+    @property
+    def layer_names(self) -> tuple[str, ...]:
+        return tuple(layout.layer_name for layout in self.layer_layouts)
+
+
+@dataclass(frozen=True, eq=False)
+class _UnimplementedDSASparseIOResource:
+    """Identity-only resource until the backend bridge owns real handles."""
+
+    layer_name: str
+    purpose: str
+
+
+def create_dsa_sparse_eager_stub_runtime(
+    config: DSASparseCacheConfig,
+    cohort_layouts: Iterable[DSASparseEagerCohortLayout],
+    *,
+    device: torch.device | str,
+) -> DSASparseEagerRuntime:
+    """Allocate and freeze the current target-only eager stub runtime.
+
+    The initialization path owns real Hot Cache, residency-state, and plan
+    tensors. Index and I/O calls deliberately use the existing fail-fast stubs
+    until their device operators and backend bridge are implemented.
+    """
+
+    cohort_layouts = tuple(cohort_layouts)
+    if not cohort_layouts:
+        raise ValueError("DSA Sparse eager runtime requires at least one cohort layout.")
+
+    cohort_names = tuple(layout.cohort_name for layout in cohort_layouts)
+    if len(set(cohort_names)) != len(cohort_names):
+        raise ValueError("DSA Sparse eager cohort names must be unique.")
+    all_layer_names = [layer_name for cohort_layout in cohort_layouts for layer_name in cohort_layout.layer_names]
+    if len(set(all_layer_names)) != len(all_layer_names):
+        raise ValueError("Each DSA Sparse Main layer must belong to exactly one eager cohort.")
+
+    coordinator = DSASparseEagerCoordinator(
+        config,
+        index_operator=UnimplementedDSASparseIndexOperator(),
+        io_operator=UnimplementedDSASparseIOOperator(),
+    )
+    plan_key = DSASparsePlanKey(
+        token_capacity=(config.max_num_seqs * config.max_query_tokens_per_request),
+        request_capacity=config.max_num_seqs,
+        query_lane_capacity=config.max_query_tokens_per_request,
+        role="target",
+    )
+    descriptors: list[DSASparseEagerCohortDescriptor] = []
+    for cohort_layout in cohort_layouts:
+        cohort_key = DSASparseCohortKey(
+            name=cohort_layout.cohort_name,
+            role="target",
+        )
+        coordinator.register_cohort(
+            DSASparseCohort(
+                key=cohort_key,
+                leader_layer=cohort_layout.leader_layer,
+                state=DSASparseResidencyState.allocate(
+                    config,
+                    cohort_key,
+                    device=device,
+                ),
+                plans={
+                    plan_key: DSASparsePlan.allocate(
+                        config,
+                        plan_key,
+                        device=device,
+                    )
+                },
+            )
+        )
+        for layer_layout in cohort_layout.layer_layouts:
+            layer_name = layer_layout.layer_name
+            coordinator.register_layer(
+                DSASparseLayerBinding(
+                    layer_name=layer_name,
+                    cohort=cohort_key,
+                    hot_cache=DSASparseLayerHotCache.allocate(
+                        layer_layout,
+                        config,
+                        device=device,
+                    ),
+                    io_context=_UnimplementedDSASparseIOResource(
+                        layer_name,
+                        "context",
+                    ),
+                    io_region=_UnimplementedDSASparseIOResource(
+                        layer_name,
+                        "region",
+                    ),
+                    read_completion=_UnimplementedDSASparseIOResource(
+                        layer_name,
+                        "read_completion",
+                    ),
+                    write_completion=_UnimplementedDSASparseIOResource(
+                        layer_name,
+                        "write_completion",
+                    ),
+                )
+            )
+        descriptors.append(
+            DSASparseEagerCohortDescriptor(
+                cohort_key=cohort_key,
+                plan_key=plan_key,
+                layer_names=cohort_layout.layer_names,
+                leader_layer=cohort_layout.leader_layer,
+            )
+        )
+
+    coordinator.freeze()
+    return DSASparseEagerRuntime(
+        coordinator,
+        descriptors,
+    )
 
 
 class DSASparseEagerExecution:
@@ -147,6 +302,16 @@ class DSASparseEagerRuntime:
         if not self.cohort_descriptors:
             raise ValueError("DSA Sparse eager runtime requires at least one cohort.")
         self._validate_descriptors()
+
+    def acquire_request(self, request_id: Hashable) -> CacheSeatLease:
+        """Admit a dual-ready request into a stable Decode cache seat."""
+
+        return self.coordinator.acquire_request(request_id)
+
+    def release_request(self, request_id: Hashable) -> CacheSeatLease:
+        """Release an idle request after its backend region is retired."""
+
+        return self.coordinator.release_request(request_id)
 
     def begin_target_batch(
         self,

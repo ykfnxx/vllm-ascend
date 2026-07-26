@@ -172,8 +172,10 @@ from vllm_ascend.utils import (
     vllm_version_is,
 )
 from vllm_ascend.worker.dsa_sparse_eager import (
+    DSASparseEagerCohortLayout,
     DSASparseEagerExecution,
     DSASparseEagerRuntime,
+    create_dsa_sparse_eager_stub_runtime,
 )
 from vllm_ascend.worker.dsa_sparse_external_main import (
     DSASparseExternalMainSpecs,
@@ -359,6 +361,9 @@ class NPUModelRunner(GPUModelRunner):
         )
         self._dsa_sparse_fixed_hbm_breakdown: (
             DSASparseFixedHBMBreakdown | None
+        ) = None
+        self._dsa_sparse_eager_cohort_layouts: (
+            tuple[DSASparseEagerCohortLayout, ...] | None
         ) = None
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
@@ -630,6 +635,27 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError("The DSA Sparse eager runtime is already bound.")
         self.dsa_sparse_eager_runtime = runtime
 
+    def _initialize_dsa_sparse_eager_stub_runtime(self) -> None:
+        """Allocate and bind target-only fixed tensors with operator stubs."""
+
+        config = self.ascend_config.dsa_sparse_config
+        if config is None or not getattr(config, "is_consumer", False):
+            return
+        if getattr(self, "dsa_sparse_eager_runtime", None) is not None:
+            return
+
+        if self._dsa_sparse_fixed_hbm_breakdown is None:
+            raise RuntimeError(
+                "DSA Sparse fixed HBM must be reserved before eager runtime "
+                "allocation."
+            )
+        runtime = create_dsa_sparse_eager_stub_runtime(
+            self._get_dsa_sparse_cache_config(),
+            self._get_dsa_sparse_eager_cohort_layouts(),
+            device=self.device,
+        )
+        self.bind_dsa_sparse_eager_runtime(runtime)
+
     def _uses_dsa_sparse_external_main(self) -> bool:
         config = getattr(self.ascend_config, "dsa_sparse_config", None)
         return getattr(config, "kv_role", None) == "kv_consumer"
@@ -652,28 +678,8 @@ class NPUModelRunner(GPUModelRunner):
                 "DSA Sparse fixed HBM can be calculated only after load_model()."
             )
 
-        layer_layouts, cohort_count = (
-            self._get_dsa_sparse_memory_layouts_and_cohorts()
-        )
-        device_buffer_size = config.device_buffer_size
-        if (
-            isinstance(device_buffer_size, bool)
-            or not isinstance(device_buffer_size, int)
-            or device_buffer_size <= 0
-        ):
-            raise RuntimeError(
-                "DSA Sparse Decode device_buffer_size must be a positive integer."
-            )
-        cache_config = DSASparseCacheConfig(
-            max_num_seqs=self.max_num_reqs,
-            max_model_len=self.model_config.max_model_len,
-            block_size=self.block_size,
-            device_buffer_size=device_buffer_size,
-            max_query_tokens_per_request=(
-                config.max_query_tokens_per_request
-            ),
-            index_topk=config.index_topk,
-        )
+        layer_layouts, cohort_count = self._get_dsa_sparse_memory_layouts_and_cohorts()
+        cache_config = self._get_dsa_sparse_cache_config()
         breakdown = calculate_dsa_sparse_fixed_hbm_bytes(
             cache_config,
             layer_layouts,
@@ -684,10 +690,57 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_sparse_fixed_hbm_breakdown = breakdown
         return breakdown.fixed_hbm_bytes
 
+    def _get_dsa_sparse_cache_config(self) -> DSASparseCacheConfig:
+        config = self.ascend_config.dsa_sparse_config
+        if config is None or getattr(config, "kv_role", None) != "kv_consumer":
+            raise RuntimeError(
+                "DSA Sparse Decode cache config requires an enabled KV consumer."
+            )
+        device_buffer_size = config.device_buffer_size
+        if (
+            isinstance(device_buffer_size, bool)
+            or not isinstance(device_buffer_size, int)
+            or device_buffer_size <= 0
+        ):
+            raise RuntimeError(
+                "DSA Sparse Decode device_buffer_size must be a positive integer."
+            )
+        return DSASparseCacheConfig(
+            max_num_seqs=self.max_num_reqs,
+            max_model_len=self.model_config.max_model_len,
+            block_size=self.block_size,
+            device_buffer_size=device_buffer_size,
+            max_query_tokens_per_request=(
+                config.max_query_tokens_per_request
+            ),
+            index_topk=config.index_topk,
+        )
+
     def _get_dsa_sparse_memory_layouts_and_cohorts(
         self,
     ) -> tuple[tuple[DSASparseLayerLayout, ...], int]:
         """Inspect local sparse MLA modules without guessing cohort sharing."""
+
+        cohort_layouts = self._get_dsa_sparse_eager_cohort_layouts()
+        layer_layouts = tuple(
+            layer_layout
+            for cohort_layout in cohort_layouts
+            for layer_layout in cohort_layout.layer_layouts
+        )
+        return layer_layouts, len(cohort_layouts)
+
+    def _get_dsa_sparse_eager_cohort_layouts(
+        self,
+    ) -> tuple[DSASparseEagerCohortLayout, ...]:
+        """Group ordered local Main layouts by their IndexCache leader."""
+
+        cached_layouts = getattr(
+            self,
+            "_dsa_sparse_eager_cohort_layouts",
+            None,
+        )
+        if cached_layouts is not None:
+            return cached_layouts
 
         if not self.use_sparse:
             raise RuntimeError(
@@ -739,8 +792,7 @@ class NPUModelRunner(GPUModelRunner):
                 "local MLAAttention modules have the same model-layer index."
             )
 
-        layer_layouts: list[DSASparseLayerLayout] = []
-        cohort_count = 0
+        grouped_layouts: list[list[DSASparseLayerLayout]] = []
         for _, layer_name, attn_module in ordered_layers:
             impl = getattr(attn_module, "impl", None)
             skip_topk = getattr(impl, "skip_topk", None)
@@ -750,21 +802,29 @@ class NPUModelRunner(GPUModelRunner):
                     f"for layer {layer_name!r}: skip_topk is unavailable."
                 )
             if skip_topk:
-                if cohort_count == 0:
+                if not grouped_layouts:
                     raise RuntimeError(
                         "The first local DSA Sparse MLAAttention layer cannot "
                         "reuse a previous IndexCache cohort."
                     )
             else:
-                cohort_count += 1
-            layer_layouts.append(
+                grouped_layouts.append([])
+            grouped_layouts[-1].append(
                 self._get_dsa_sparse_layer_layout(
                     layer_name,
                     attn_module,
                 )
             )
 
-        return tuple(layer_layouts), cohort_count
+        cohort_layouts = tuple(
+            DSASparseEagerCohortLayout(
+                cohort_name=cohort_layouts[0].layer_name,
+                layer_layouts=tuple(cohort_layouts),
+            )
+            for cohort_layouts in grouped_layouts
+        )
+        self._dsa_sparse_eager_cohort_layouts = cohort_layouts
+        return cohort_layouts
 
     def _get_dsa_sparse_layer_layout(
         self,
@@ -4088,6 +4148,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        self._initialize_dsa_sparse_eager_stub_runtime()
         # TODO: refactor the logic of attention
         if (
             self.speculative_config

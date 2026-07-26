@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, fields, is_dataclass
 
 import pytest
 import torch
 
 from tests.ut.attention.test_dsa_sparse_eager import build_coordinator
 from vllm_ascend.attention.dsa_sparse import (
+    DSASparseCacheConfig,
     DSASparseCohort,
     DSASparseCohortKey,
     DSASparseLayerBinding,
@@ -19,7 +21,12 @@ from vllm_ascend.attention.dsa_sparse import (
 )
 from vllm_ascend.worker.dsa_sparse_eager import (
     DSASparseEagerCohortDescriptor,
+    DSASparseEagerCohortLayout,
     DSASparseEagerRuntime,
+    create_dsa_sparse_eager_stub_runtime,
+)
+from vllm_ascend.worker.dsa_sparse_memory import (
+    calculate_dsa_sparse_fixed_hbm_bytes,
 )
 
 
@@ -157,6 +164,114 @@ def _add_second_cohort(coordinator):
             )
         )
     return cohort_key, plan_key
+
+
+def _logical_tensor_bytes(*values) -> int:
+    seen_tensors: set[int] = set()
+
+    def visit(value) -> int:
+        if isinstance(value, torch.Tensor):
+            identity = id(value)
+            if identity in seen_tensors:
+                return 0
+            seen_tensors.add(identity)
+            return value.numel() * value.element_size()
+        if is_dataclass(value):
+            return sum(visit(getattr(value, field.name)) for field in fields(value))
+        if isinstance(value, Mapping):
+            return sum(visit(item) for item in value.values())
+        if isinstance(value, (tuple, list)):
+            return sum(visit(item) for item in value)
+        return 0
+
+    return sum(visit(value) for value in values)
+
+
+def test_stub_factory_allocates_target_resources_and_keeps_stubs_explicit():
+    config = DSASparseCacheConfig(
+        max_num_seqs=2,
+        max_model_len=32,
+        block_size=4,
+        device_buffer_size=4,
+        max_query_tokens_per_request=1,
+        index_topk=4,
+    )
+    layer_layouts = (
+        DSASparseLayerLayout(
+            layer_name="layer.0",
+            plane_dtypes=(torch.bfloat16, torch.bfloat16),
+            plane_row_shapes=((1, 8), (1, 2)),
+        ),
+        DSASparseLayerLayout(
+            layer_name="layer.1",
+            plane_dtypes=(torch.bfloat16, torch.bfloat16),
+            plane_row_shapes=((1, 8), (1, 2)),
+        ),
+    )
+    runtime = create_dsa_sparse_eager_stub_runtime(
+        config,
+        [
+            DSASparseEagerCohortLayout(
+                cohort_name="target-indexer-0",
+                layer_layouts=layer_layouts,
+            )
+        ],
+        device="cpu",
+    )
+
+    descriptor = runtime.cohort_descriptors[0]
+    cohort = runtime.coordinator.get_cohort(descriptor.cohort_key)
+    assert descriptor.layer_names == ("layer.0", "layer.1")
+    assert cohort.leader_layer == "layer.0"
+    assert cohort.state.token_to_hot.shape == (2, 32)
+    assert cohort.plans[descriptor.plan_key].key.request_capacity == 2
+    layer_0 = runtime.coordinator.get_layer_binding(
+        descriptor.cohort_key,
+        "layer.0",
+    )
+    layer_1 = runtime.coordinator.get_layer_binding(
+        descriptor.cohort_key,
+        "layer.1",
+    )
+    assert layer_0.hot_cache.planes[0].data_ptr() != (layer_1.hot_cache.planes[0].data_ptr())
+
+    fixed_objects = [
+        cohort.state,
+        *cohort.plans.values(),
+        layer_0.hot_cache,
+        layer_1.hot_cache,
+    ]
+    breakdown = calculate_dsa_sparse_fixed_hbm_bytes(
+        config,
+        layer_layouts,
+        cohort_count=1,
+        max_sfa_queries=2,
+    )
+    assert _logical_tensor_bytes(*fixed_objects) == (breakdown.core_fixed_tensor_bytes)
+
+    metadata = FakeMetadata(
+        num_input_tokens=1,
+        num_actual_tokens=1,
+    )
+    batch_arguments = {
+        "request_ids": ["request-a"],
+        "query_positions": torch.tensor([5], dtype=torch.int32),
+        "query_counts": [1],
+        "layer_metadata": {
+            "layer.0": metadata,
+            "layer.1": metadata,
+        },
+    }
+    with pytest.raises(KeyError, match="does not own"):
+        runtime.begin_target_batch(**batch_arguments)
+
+    runtime.acquire_request("request-a")
+    with pytest.raises(
+        NotImplementedError,
+        match="newest-state operator",
+    ):
+        runtime.begin_target_batch(**batch_arguments)
+    runtime.release_request("request-a")
 
 
 def test_success_attaches_one_router_to_shared_metadata_and_finishes():
