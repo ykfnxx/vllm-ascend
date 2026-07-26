@@ -55,6 +55,7 @@ class TestNPUPlatform(TestBase):
         mock_ascend_config.enable_mc2_hierarchy_comm = False
         mock_ascend_config.enable_fused_mc2 = False
         mock_ascend_config.enable_flashcomm1 = False
+        mock_ascend_config.enable_sp_by_pass = False
         mock_ascend_config.SLO_limits_for_dynamic_batch = -1
         mock_ascend_config.enable_shared_expert_dp = False
         mock_ascend_config.dsa_sparse_config = None
@@ -106,6 +107,8 @@ class TestNPUPlatform(TestBase):
             ("cudagraph_mode", CUDAGraphMode.FULL, "cudagraph_mode=NONE"),
             ("kv_connector", None, "P/D KV connector"),
             ("kv_load_failure_policy", "recompute", "local prefill recompute"),
+            ("enable_flashcomm1", True, "sequence-parallel"),
+            ("enable_shared_expert_dp", True, "sequence-parallel"),
         ],
     )
     @patch("vllm_ascend.platform.model_uses_sfa_sparse", return_value=True)
@@ -128,6 +131,8 @@ class TestNPUPlatform(TestBase):
             vllm_config.compilation_config.cudagraph_mode = value
         elif field in {"kv_connector", "kv_load_failure_policy"}:
             setattr(vllm_config.kv_transfer_config, field, value)
+        elif field in {"enable_flashcomm1", "enable_shared_expert_dp"}:
+            setattr(ascend_config, field, value)
         else:
             setattr(vllm_config, field, value)
 

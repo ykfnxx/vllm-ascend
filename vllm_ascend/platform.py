@@ -470,6 +470,10 @@ class NPUPlatform(Platform):
             raise ValueError("This DSA Sparse milestone is eager-only and requires cudagraph_mode=NONE.")
         if ascend_config.xlite_graph_config.enabled:
             raise ValueError("DSA Sparse eager does not support xlite graph execution.")
+        if ascend_config.enable_flashcomm1 or ascend_config.enable_sp_by_pass or ascend_config.enable_shared_expert_dp:
+            raise ValueError(
+                "DSA Sparse eager supports tensor parallelism but does not yet support sequence-parallel token padding."
+            )
 
         kv_transfer_config = vllm_config.kv_transfer_config
         if not getattr(kv_transfer_config, "kv_connector", None):

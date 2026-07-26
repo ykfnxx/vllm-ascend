@@ -10,6 +10,7 @@ from tests.ut.attention.utils import patch_distributed_groups
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import init_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.dsa_sparse import DSASparseResolution
 
 if "torch_npu._inductor" not in sys.modules:
     sys.modules["torch_npu._inductor"] = MagicMock()
@@ -155,6 +156,47 @@ class TestAscendSFAKVCacheComposition(TestBase):
             )
 
         impl._compose_sfa_kv_cache.assert_called_once_with(main_cache)
+
+    def test_hot_cache_adapter_only_replaces_sfa_cache_addressing(self):
+        impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        ql_nope = torch.empty(2, 4, 8)
+        q_pe = torch.empty(2, 4, 2)
+        hot_main_cache = (
+            torch.empty(8, 1, 1, 8),
+            torch.empty(8, 1, 1, 2),
+        )
+        local_indices = torch.zeros((2, 4), dtype=torch.int32)
+        hot_block_table = torch.arange(8, dtype=torch.int32).view(2, 4)
+        resolution = DSASparseResolution(
+            hot_main_cache=hot_main_cache,
+            local_sparse_indices=local_indices,
+            hot_block_table=hot_block_table,
+        )
+        attn_metadata = SimpleNamespace(
+            block_table=torch.full((2, 4), 99, dtype=torch.int32),
+        )
+        seq_lens = torch.tensor([1, 2], dtype=torch.int32)
+        expected = torch.empty_like(ql_nope)
+
+        with patch.object(
+            DeviceOperator,
+            "execute_sparse_flash_attention_process",
+            return_value=expected,
+        ) as mock_sfa:
+            result = impl._execute_dsa_sparse_hot_cache_attention(
+                ql_nope,
+                q_pe,
+                resolution,
+                attn_metadata,
+                seq_lens,
+                seq_lens,
+            )
+
+        self.assertIs(result, expected)
+        call_args = mock_sfa.call_args
+        self.assertIs(call_args.args[3], hot_main_cache)
+        self.assertIs(call_args.args[4], local_indices)
+        self.assertIs(call_args.kwargs["block_table"], hot_block_table)
 
 
 class TestAscendSFADeviceOperator(TestBase):
