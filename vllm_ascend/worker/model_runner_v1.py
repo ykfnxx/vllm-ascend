@@ -47,6 +47,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models.extract_hidden_states import CacheOnlyAttentionLayer
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.sequence import IntermediateTensors
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv, round_up
@@ -106,6 +107,10 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
+from vllm_ascend.attention.dsa_sparse import (
+    DSASparseCacheConfig,
+    DSASparseLayerLayout,
+)
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import (
@@ -169,6 +174,14 @@ from vllm_ascend.utils import (
 from vllm_ascend.worker.dsa_sparse_eager import (
     DSASparseEagerExecution,
     DSASparseEagerRuntime,
+)
+from vllm_ascend.worker.dsa_sparse_external_main import (
+    DSASparseExternalMainSpecs,
+    add_external_main_metadata,
+)
+from vllm_ascend.worker.dsa_sparse_memory import (
+    DSASparseFixedHBMBreakdown,
+    calculate_dsa_sparse_fixed_hbm_bytes,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPAsyncSpecDecodeRebuildResult, PCPManager
@@ -341,6 +354,12 @@ class NPUModelRunner(GPUModelRunner):
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
         self.dsa_sparse_eager_runtime: DSASparseEagerRuntime | None = None
+        self._dsa_sparse_external_main_specs = (
+            DSASparseExternalMainSpecs.empty()
+        )
+        self._dsa_sparse_fixed_hbm_breakdown: (
+            DSASparseFixedHBMBreakdown | None
+        ) = None
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -610,6 +629,204 @@ class NPUModelRunner(GPUModelRunner):
         if self.dsa_sparse_eager_runtime is not None:
             raise RuntimeError("The DSA Sparse eager runtime is already bound.")
         self.dsa_sparse_eager_runtime = runtime
+
+    def _uses_dsa_sparse_external_main(self) -> bool:
+        config = getattr(self.ascend_config, "dsa_sparse_config", None)
+        return getattr(config, "kv_role", None) == "kv_consumer"
+
+    def get_dsa_sparse_fixed_hbm_bytes(self) -> int:
+        """Calculate and cache the fixed Decode-side HBM reservation."""
+
+        config = getattr(self.ascend_config, "dsa_sparse_config", None)
+        if getattr(config, "kv_role", None) != "kv_consumer":
+            return 0
+        cached_breakdown = getattr(
+            self,
+            "_dsa_sparse_fixed_hbm_breakdown",
+            None,
+        )
+        if cached_breakdown is not None:
+            return cached_breakdown.fixed_hbm_bytes
+        if not hasattr(self, "model"):
+            raise RuntimeError(
+                "DSA Sparse fixed HBM can be calculated only after load_model()."
+            )
+
+        layer_layouts, cohort_count = (
+            self._get_dsa_sparse_memory_layouts_and_cohorts()
+        )
+        device_buffer_size = config.device_buffer_size
+        if (
+            isinstance(device_buffer_size, bool)
+            or not isinstance(device_buffer_size, int)
+            or device_buffer_size <= 0
+        ):
+            raise RuntimeError(
+                "DSA Sparse Decode device_buffer_size must be a positive integer."
+            )
+        cache_config = DSASparseCacheConfig(
+            max_num_seqs=self.max_num_reqs,
+            max_model_len=self.model_config.max_model_len,
+            block_size=self.block_size,
+            device_buffer_size=device_buffer_size,
+            max_query_tokens_per_request=(
+                config.max_query_tokens_per_request
+            ),
+            index_topk=config.index_topk,
+        )
+        breakdown = calculate_dsa_sparse_fixed_hbm_bytes(
+            cache_config,
+            layer_layouts,
+            cohort_count=cohort_count,
+            max_sfa_queries=self.max_num_tokens,
+            backend_auxiliary_bytes=0,
+        )
+        self._dsa_sparse_fixed_hbm_breakdown = breakdown
+        return breakdown.fixed_hbm_bytes
+
+    def _get_dsa_sparse_memory_layouts_and_cohorts(
+        self,
+    ) -> tuple[tuple[DSASparseLayerLayout, ...], int]:
+        """Inspect local sparse MLA modules without guessing cohort sharing."""
+
+        if not self.use_sparse:
+            raise RuntimeError(
+                "DSA Sparse Decode requires sparse MLAAttention modules."
+            )
+        attn_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,
+        )
+        ordered_layers: list[tuple[int, str, MLAAttention]] = []
+        for layer_name, attn_module in attn_layers.items():
+            if not isinstance(attn_module, MLAAttention):
+                continue
+            try:
+                layer_index = extract_layer_index(layer_name)
+            except (
+                AssertionError,
+                IndexError,
+                TypeError,
+                ValueError,
+            ) as error:
+                raise RuntimeError(
+                    "Cannot identify the model-layer order for DSA Sparse "
+                    f"MLA layer {layer_name!r}."
+                ) from error
+            if (
+                isinstance(layer_index, bool)
+                or not isinstance(layer_index, int)
+                or layer_index < 0
+            ):
+                raise RuntimeError(
+                    "Cannot identify the model-layer order for DSA Sparse "
+                    f"MLA layer {layer_name!r}."
+                )
+            ordered_layers.append(
+                (layer_index, layer_name, attn_module),
+            )
+
+        if not ordered_layers:
+            raise RuntimeError(
+                "No local sparse MLAAttention layers were found for the "
+                "DSA Sparse Decode HBM budget."
+            )
+        ordered_layers.sort(key=lambda layer: layer[0])
+        layer_indices = [layer_index for layer_index, _, _ in ordered_layers]
+        if len(set(layer_indices)) != len(layer_indices):
+            raise RuntimeError(
+                "DSA Sparse cannot determine cohort order because multiple "
+                "local MLAAttention modules have the same model-layer index."
+            )
+
+        layer_layouts: list[DSASparseLayerLayout] = []
+        cohort_count = 0
+        for _, layer_name, attn_module in ordered_layers:
+            impl = getattr(attn_module, "impl", None)
+            skip_topk = getattr(impl, "skip_topk", None)
+            if not isinstance(skip_topk, bool):
+                raise RuntimeError(
+                    "DSA Sparse cannot identify IndexCache cohort ownership "
+                    f"for layer {layer_name!r}: skip_topk is unavailable."
+                )
+            if skip_topk:
+                if cohort_count == 0:
+                    raise RuntimeError(
+                        "The first local DSA Sparse MLAAttention layer cannot "
+                        "reuse a previous IndexCache cohort."
+                    )
+            else:
+                cohort_count += 1
+            layer_layouts.append(
+                self._get_dsa_sparse_layer_layout(
+                    layer_name,
+                    attn_module,
+                )
+            )
+
+        return tuple(layer_layouts), cohort_count
+
+    def _get_dsa_sparse_layer_layout(
+        self,
+        layer_name: str,
+        attn_module: MLAAttention,
+    ) -> DSASparseLayerLayout:
+        impl = getattr(attn_module, "impl", None)
+        enable_sparse_sfa_c8 = getattr(
+            impl,
+            "enable_sparse_sfa_c8",
+            None,
+        )
+        if not isinstance(enable_sparse_sfa_c8, bool):
+            raise RuntimeError(
+                "DSA Sparse Main cache layout is unavailable for layer "
+                f"{layer_name!r}."
+            )
+        kv_lora_rank = getattr(attn_module, "kv_lora_rank", None)
+        qk_rope_head_dim = getattr(
+            attn_module,
+            "qk_rope_head_dim",
+            None,
+        )
+        for dimension_name, dimension in (
+            ("kv_lora_rank", kv_lora_rank),
+            ("qk_rope_head_dim", qk_rope_head_dim),
+        ):
+            if (
+                isinstance(dimension, bool)
+                or not isinstance(dimension, int)
+                or dimension <= 0
+            ):
+                raise RuntimeError(
+                    f"DSA Sparse layer {layer_name!r} has invalid "
+                    f"{dimension_name}={dimension!r}."
+                )
+
+        if enable_sparse_sfa_c8:
+            return DSASparseLayerLayout(
+                layer_name=layer_name,
+                plane_dtypes=(self.c8_k_cache_dtype,),
+                plane_row_shapes=(
+                    (
+                        1,
+                        get_sfa_qsfa_packed_head_dim(
+                            kv_lora_rank,
+                            qk_rope_head_dim,
+                        ),
+                    ),
+                ),
+            )
+        return DSASparseLayerLayout(
+            layer_name=layer_name,
+            plane_dtypes=(
+                self.kv_cache_dtype,
+                self.kv_cache_dtype,
+            ),
+            plane_row_shapes=(
+                (1, kv_lora_rank),
+                (1, qk_rope_head_dim),
+            ),
+        )
 
     def _begin_dsa_sparse_eager_execution(
         self,
@@ -3843,6 +4060,19 @@ class NPUModelRunner(GPUModelRunner):
             cache size of each layer
         """
         kv_cache_config = deepcopy(kv_cache_config)
+        if self._uses_dsa_sparse_external_main():
+            external_main_specs = self._dsa_sparse_external_main_specs
+            assert external_main_specs, (
+                "DSA Sparse Decode Main specs are unavailable. "
+                "get_kv_cache_spec() must run before initialize_kv_cache()."
+            )
+            add_external_main_metadata(
+                kv_cache_config,
+                external_main_specs,
+            )
+            self.runner_only_attn_layers.update(
+                external_main_specs.layer_names
+            )
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
         self._mamba_copy_bufs = None
@@ -3966,6 +4196,8 @@ class NPUModelRunner(GPUModelRunner):
                     num_attn_module,
                 )
 
+        self._bind_dsa_sparse_external_main_placeholders()
+
         if self.enable_hamming_sparse is True:
             from vllm_ascend.worker.kvcomp_utils import init_and_bind_hashk_cache
             init_and_bind_hashk_cache(
@@ -3978,6 +4210,54 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         return kv_caches
+
+    def _bind_dsa_sparse_external_main_placeholders(self) -> None:
+        """Bind zero-block Main cache tensors without exporting their storage."""
+
+        if not self._uses_dsa_sparse_external_main():
+            return
+
+        external_main_specs = self._dsa_sparse_external_main_specs
+        for layer_name, spec in external_main_specs.by_layer.items():
+            shape_prefix = (
+                0,
+                spec.block_size,
+                spec.num_kv_heads,
+            )
+            if spec.cache_sparse_sfa_c8:
+                placeholder = (
+                    torch.empty(
+                        (*shape_prefix, spec.head_size),
+                        dtype=spec.dtype,
+                        device=self.device,
+                    ),
+                )
+            else:
+                k_dim, v_dim = self._get_attention_kv_cache_dims(
+                    layer_name,
+                    spec,
+                )
+                assert k_dim + v_dim == spec.head_size, (
+                    f"Invalid Main cache dimensions for {layer_name}: "
+                    f"{k_dim} + {v_dim} != {spec.head_size}."
+                )
+                placeholder = (
+                    torch.empty(
+                        (*shape_prefix, k_dim),
+                        dtype=spec.dtype,
+                        device=self.device,
+                    ),
+                    torch.empty(
+                        (*shape_prefix, v_dim),
+                        dtype=spec.dtype,
+                        device=self.device,
+                    ),
+                )
+
+            assert all(cache.shape[0] == 0 for cache in placeholder)
+            self.compilation_config.static_forward_context[
+                layer_name
+            ].kv_cache = placeholder
 
     def _get_layer_kv_cache_specs(self, kv_cache_config: KVCacheConfig) -> dict[str, KVCacheSpec]:
         layer_kv_cache_spec: dict[str, KVCacheSpec] = {}
@@ -4817,10 +5097,15 @@ class NPUModelRunner(GPUModelRunner):
             format. Layers that do not need KV cache are not included.
         """
 
+        self._dsa_sparse_external_main_specs = (
+            DSASparseExternalMainSpecs.empty()
+        )
         if has_ec_transfer() and get_ec_transfer().is_producer:
             return {}
 
-        kv_cache_spec: dict[str, list[KVCacheSpec]] = defaultdict(list)
+        kv_cache_spec: dict[str, KVCacheSpec] = {}
+        external_main_specs: dict[str, AscendMLAAttentionSpec] = {}
+        use_external_main = self._uses_dsa_sparse_external_main()
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 
@@ -4865,7 +5150,7 @@ class NPUModelRunner(GPUModelRunner):
                         )
                         dtype = self.kv_cache_dtype
 
-                    kv_cache_spec[layer_name] = AscendMLAAttentionSpec(
+                    main_spec = AscendMLAAttentionSpec(
                         block_size=self.block_size,
                         num_kv_heads=1,
                         head_size=head_size,
@@ -4873,6 +5158,10 @@ class NPUModelRunner(GPUModelRunner):
                         cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                         cache_sparse_sfa_c8=impl.enable_sparse_sfa_c8,
                     )
+                    if use_external_main:
+                        external_main_specs[layer_name] = main_spec
+                    else:
+                        kv_cache_spec[layer_name] = main_spec
                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if getattr(attn_module.impl, "fa_quant_layer", False):
                         head_size = attn_module.head_size + attn_module.qk_rope_head_dim
@@ -4935,6 +5224,11 @@ class NPUModelRunner(GPUModelRunner):
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
 
+        self._dsa_sparse_external_main_specs = (
+            DSASparseExternalMainSpecs.from_mapping(
+                external_main_specs,
+            )
+        )
         return kv_cache_spec
 
     def _check_and_update_cudagraph_mode(

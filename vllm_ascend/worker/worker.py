@@ -72,6 +72,9 @@ from vllm_ascend.utils import (
     setup_ascend_local_comm_res,
     vllm_version_is,
 )
+from vllm_ascend.worker.dsa_sparse_memory import (
+    reserve_dsa_sparse_fixed_hbm_bytes,
+)
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
@@ -130,6 +133,8 @@ class NPUWorker(WorkerBase):
             distributed_init_method=distributed_init_method,
             is_driver_worker=is_driver_worker,
         )
+        self.dsa_sparse_config = get_ascend_config().dsa_sparse_config
+        self.dsa_sparse_fixed_hbm_bytes: int | None = None
 
         if self.cache_config.cache_dtype == "auto":
             self.cache_dtype = self.model_config.dtype
@@ -533,6 +538,7 @@ class NPUWorker(WorkerBase):
         bytes.
         """
         GiB = lambda b: b / GiB_bytes
+        dsa_sparse_fixed_hbm_bytes = self.get_dsa_sparse_fixed_hbm_bytes()
 
         # Fast path: user has explicitly specified KV cache size via
         # --kv-cache-memory. Still run profile_run() to compile the model,
@@ -550,7 +556,19 @@ class NPUWorker(WorkerBase):
                 GiB(self.init_snapshot.free_memory),
                 GiB(kv_cache_memory_bytes),
             )
-            return kv_cache_memory_bytes
+            remaining_bytes = reserve_dsa_sparse_fixed_hbm_bytes(
+                kv_cache_memory_bytes,
+                dsa_sparse_fixed_hbm_bytes,
+                source="kv_cache_memory_bytes",
+            )
+            if dsa_sparse_fixed_hbm_bytes:
+                logger.info(
+                    "Reserved %.2f GiB of the explicit KV cache budget for "
+                    "DSA Sparse fixed HBM; %.2f GiB remains for KV blocks.",
+                    GiB(dsa_sparse_fixed_hbm_bytes),
+                    GiB(remaining_bytes),
+                )
+            return remaining_bytes
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -587,7 +605,12 @@ class NPUWorker(WorkerBase):
             "To fix this, ensure consistent GPU memory allocation or "
             "isolate vLLM in its own container."
         )
-        self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
+        profiled_available_bytes = int(self.requested_memory - profile_result.non_kv_cache_memory)
+        self.available_kv_cache_memory_bytes = reserve_dsa_sparse_fixed_hbm_bytes(
+            profiled_available_bytes,
+            dsa_sparse_fixed_hbm_bytes,
+            source="automatic memory profiling",
+        )
 
         logger.debug(profile_result)
         logger.info_once(
@@ -595,6 +618,44 @@ class NPUWorker(WorkerBase):
         )
 
         return int(self.available_kv_cache_memory_bytes)
+
+    def bind_dsa_sparse_fixed_hbm_bytes(self, fixed_hbm_bytes: int) -> None:
+        """Bind the fixed Decode reservation before memory determination."""
+
+        dsa_sparse_config = getattr(self, "dsa_sparse_config", None)
+        if dsa_sparse_config is None:
+            raise RuntimeError("Cannot bind a DSA Sparse HBM reservation when DSA Sparse is disabled.")
+        if dsa_sparse_config.is_producer:
+            raise RuntimeError("DSA Sparse fixed HBM is Decode-only and cannot be bound on the KV producer.")
+        if isinstance(fixed_hbm_bytes, bool) or not isinstance(fixed_hbm_bytes, int) or fixed_hbm_bytes <= 0:
+            raise ValueError("DSA Sparse fixed HBM reservation must be a positive integer.")
+        if getattr(self, "dsa_sparse_fixed_hbm_bytes", None) is not None:
+            raise RuntimeError("DSA Sparse fixed HBM reservation is already bound.")
+        self.dsa_sparse_fixed_hbm_bytes = fixed_hbm_bytes
+
+    def get_dsa_sparse_fixed_hbm_bytes(self) -> int:
+        """Return zero for baseline/P and resolve the Decode reservation."""
+
+        dsa_sparse_config = getattr(self, "dsa_sparse_config", None)
+        if dsa_sparse_config is None or dsa_sparse_config.is_producer:
+            return 0
+        fixed_hbm_bytes = getattr(
+            self,
+            "dsa_sparse_fixed_hbm_bytes",
+            None,
+        )
+        if fixed_hbm_bytes is None:
+            provider = getattr(
+                self.model_runner,
+                "get_dsa_sparse_fixed_hbm_bytes",
+                None,
+            )
+            if not callable(provider):
+                raise RuntimeError("DSA Sparse Decode fixed HBM budget provider is unavailable.")
+            fixed_hbm_bytes = provider()
+        if isinstance(fixed_hbm_bytes, bool) or not isinstance(fixed_hbm_bytes, int) or fixed_hbm_bytes <= 0:
+            raise RuntimeError("DSA Sparse fixed HBM budget must be a positive integer.")
+        return fixed_hbm_bytes
 
     def execute_model(
         self,
