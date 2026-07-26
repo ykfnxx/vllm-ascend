@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.indexer import (
     AscendSFAIndexerBackend,
     AscendSFAIndexerMetadataBuilder,
@@ -520,6 +521,97 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
                 )
                 self.assertEqual(len(caches[main_layer_name]), 1 if main_c8 else 2)
                 self.assertEqual(len(caches[indexer_layer_name]), 2 if indexer_c8 else 1)
+
+
+class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
+    def _build_runner(self, *, consumer: bool = True):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.ascend_config = SimpleNamespace(
+            dsa_sparse_config=SimpleNamespace(
+                is_consumer=consumer,
+                is_producer=not consumer,
+            )
+        )
+        runner.dsa_sparse_eager_runtime = None
+        runner.attn_state = AscendAttentionState.DecodeOnly
+        runner.input_batch = SimpleNamespace(req_ids=["request-a", "request-b", None])
+        return runner
+
+    def test_bind_and_begin_target_batch(self):
+        runner = self._build_runner()
+        runtime = MagicMock()
+        execution = object()
+        runtime.begin_target_batch.return_value = execution
+        runner.bind_dsa_sparse_eager_runtime(runtime)
+        positions = torch.tensor([5, 9, 10, -1], dtype=torch.int64)
+        metadata = {"model.layers.0.self_attn.attn": object()}
+
+        result = runner._begin_dsa_sparse_eager_execution(
+            num_reqs=2,
+            num_scheduled_tokens=np.array([1, 2], dtype=np.int32),
+            positions=positions,
+            attn_metadata=metadata,
+        )
+
+        self.assertIs(result, execution)
+        call = runtime.begin_target_batch.call_args
+        self.assertEqual(call.kwargs["request_ids"], ["request-a", "request-b"])
+        self.assertEqual(call.kwargs["query_counts"], [1, 2])
+        self.assertTrue(
+            torch.equal(
+                call.kwargs["query_positions"],
+                torch.tensor([5, 9, 10], dtype=torch.int64),
+            )
+        )
+        self.assertIs(call.kwargs["layer_metadata"], metadata)
+
+    def test_consumer_without_runtime_fails_instead_of_falling_back(self):
+        runner = self._build_runner()
+
+        with self.assertRaisesRegex(RuntimeError, "no runtime is bound"):
+            runner._begin_dsa_sparse_eager_execution(
+                num_reqs=1,
+                num_scheduled_tokens=np.array([1], dtype=np.int32),
+                positions=torch.tensor([5]),
+                attn_metadata={},
+            )
+
+    def test_consumer_rejects_prefill_and_microbatch_metadata(self):
+        runner = self._build_runner()
+        runner.bind_dsa_sparse_eager_runtime(MagicMock())
+        runner.attn_state = AscendAttentionState.PrefillNoCache
+
+        with self.assertRaisesRegex(RuntimeError, "DecodeOnly"):
+            runner._begin_dsa_sparse_eager_execution(
+                num_reqs=1,
+                num_scheduled_tokens=np.array([1], dtype=np.int32),
+                positions=torch.tensor([5]),
+                attn_metadata={},
+            )
+
+        runner.attn_state = AscendAttentionState.DecodeOnly
+        with self.assertRaisesRegex(RuntimeError, "microbatch"):
+            runner._begin_dsa_sparse_eager_execution(
+                num_reqs=1,
+                num_scheduled_tokens=np.array([1], dtype=np.int32),
+                positions=torch.tensor([5]),
+                attn_metadata=[{}],
+            )
+
+    def test_producer_keeps_baseline_and_cannot_bind_decode_runtime(self):
+        runner = self._build_runner(consumer=False)
+
+        with self.assertRaisesRegex(RuntimeError, "Decode KV consumer"):
+            runner.bind_dsa_sparse_eager_runtime(MagicMock())
+
+        execution = runner._begin_dsa_sparse_eager_execution(
+            num_reqs=1,
+            num_scheduled_tokens=np.array([1], dtype=np.int32),
+            positions=torch.tensor([5]),
+            attn_metadata={},
+        )
+        with execution:
+            pass
 
 
 class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):

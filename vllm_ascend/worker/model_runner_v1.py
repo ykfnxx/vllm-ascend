@@ -166,6 +166,10 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
     vllm_version_is,
 )
+from vllm_ascend.worker.dsa_sparse_eager import (
+    DSASparseEagerExecution,
+    DSASparseEagerRuntime,
+)
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPAsyncSpecDecodeRebuildResult, PCPManager
 from vllm_ascend.worker.utils import AscendKVBlockZeroer, copy_snapshot_to_gpu
@@ -336,6 +340,7 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        self.dsa_sparse_eager_runtime: DSASparseEagerRuntime | None = None
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -591,6 +596,64 @@ class NPUModelRunner(GPUModelRunner):
     @property
     def use_cp(self) -> bool:
         return self.pcp_size * self.dcp_size > 1
+
+    def bind_dsa_sparse_eager_runtime(
+        self,
+        runtime: DSASparseEagerRuntime,
+    ) -> None:
+        config = self.ascend_config.dsa_sparse_config
+        if config is None or not config.is_consumer:
+            raise RuntimeError(
+                "A DSA Sparse eager runtime can only be bound on an enabled "
+                "Decode KV consumer."
+            )
+        if self.dsa_sparse_eager_runtime is not None:
+            raise RuntimeError("The DSA Sparse eager runtime is already bound.")
+        self.dsa_sparse_eager_runtime = runtime
+
+    def _begin_dsa_sparse_eager_execution(
+        self,
+        *,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+        positions: torch.Tensor,
+        attn_metadata: PerLayerAttnMetadata,
+    ) -> DSASparseEagerExecution | nullcontext[None]:
+        config = self.ascend_config.dsa_sparse_config
+        if config is None or config.is_producer:
+            return nullcontext()
+        if self.dsa_sparse_eager_runtime is None:
+            raise RuntimeError(
+                "DSA Sparse eager Decode is enabled, but no runtime is bound. "
+                "Bind the storage backend and eager I/O operator before "
+                "executing the model."
+            )
+        if self.attn_state not in {
+            AscendAttentionState.DecodeOnly,
+            AscendAttentionState.SpecDecoding,
+        }:
+            raise RuntimeError(
+                "DSA Sparse eager Decode accepts only DecodeOnly or "
+                f"SpecDecoding batches, got {self.attn_state!r}."
+            )
+        if isinstance(attn_metadata, list):
+            raise RuntimeError(
+                "DSA Sparse eager Decode does not support attention "
+                "microbatch metadata."
+            )
+
+        request_ids = list(self.input_batch.req_ids[:num_reqs])
+        query_counts = [
+            int(query_count)
+            for query_count in num_scheduled_tokens[:num_reqs]
+        ]
+        num_active_queries = sum(query_counts)
+        return self.dsa_sparse_eager_runtime.begin_target_batch(
+            request_ids=request_ids,
+            query_positions=positions[:num_active_queries],
+            query_counts=query_counts,
+            layer_metadata=attn_metadata,
+        )
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
@@ -2222,7 +2285,14 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
+        dsa_sparse_execution = self._begin_dsa_sparse_eager_execution(
+            num_reqs=num_reqs,
+            num_scheduled_tokens=num_scheduled_tokens_np,
+            positions=positions,
+            attn_metadata=attn_metadata,
+        )
         with (
+            dsa_sparse_execution,
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
                 attn_metadata,
