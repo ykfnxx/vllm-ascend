@@ -174,6 +174,8 @@ def test_plan_uses_fixed_shapes_and_hot_block_stride():
     assert plan.query_valid_mask.shape == (8,)
     assert plan.valid_topk_counts.shape == (8,)
     assert plan.topk_positions.shape == (8, 8)
+    assert plan.seq_lens.shape == (2,)
+    assert plan.block_table.shape == (2, 8)
     assert plan.newest_destination_hot_row_ids.shape == (8,)
     assert plan.write_global_slots.shape == (2, 4)
     assert plan.write_destination_hot_row_ids.shape == (2, 4)

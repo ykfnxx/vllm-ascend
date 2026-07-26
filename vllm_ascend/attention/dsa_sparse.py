@@ -16,11 +16,14 @@
 #
 
 from collections import deque
-from collections.abc import Hashable
-from dataclasses import dataclass
+from collections.abc import Callable, Hashable, Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Literal, Protocol
 
 import torch
+
+from vllm_ascend.attention.dsa_sparse_io import DSASparseIOOperator
 
 INVALID_INDEX = -1
 
@@ -103,6 +106,10 @@ class DSASparseCacheConfig:
     def total_hot_blocks(self) -> int:
         return self.max_num_seqs * self.hot_blocks_per_seat
 
+    @property
+    def max_blocks_per_request(self) -> int:
+        return _round_up(self.max_model_len, self.block_size) // self.block_size
+
 
 @dataclass(frozen=True)
 class CacheSeatLease:
@@ -110,7 +117,7 @@ class CacheSeatLease:
     epoch: int
 
 
-@dataclass
+@dataclass(frozen=True)
 class DSASparseRowMapping:
     """Fixed-size row-to-seat inputs for one eager Decode step."""
 
@@ -214,7 +221,7 @@ class CacheSeatManager:
         return out
 
 
-@dataclass
+@dataclass(frozen=True)
 class DSASparseResidencyState:
     """Device-resident token-to-hot mapping owned by one residency cohort."""
 
@@ -283,6 +290,18 @@ class DSASparseCohortKey:
 
 
 @dataclass(frozen=True)
+class DSASparseLayerKey:
+    """Unique layer identity across target and draft residency cohorts."""
+
+    cohort: DSASparseCohortKey
+    layer_name: str
+
+    def __post_init__(self) -> None:
+        if not self.layer_name:
+            raise ValueError("layer_name must not be empty.")
+
+
+@dataclass(frozen=True)
 class DSASparsePlanKey:
     """Shape key shared by eager buffers and the future captured graph path."""
 
@@ -311,7 +330,7 @@ class DSASparsePlanKey:
             raise ValueError(f"role must be either 'target' or 'draft', got {self.role!r}.")
 
 
-@dataclass
+@dataclass(frozen=True)
 class DSASparsePlan:
     """Preallocated lookup and I/O tensors for one execution shape."""
 
@@ -323,6 +342,8 @@ class DSASparsePlan:
     query_valid_mask: torch.Tensor
     valid_topk_counts: torch.Tensor
     topk_positions: torch.Tensor
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
     read_source_global_slots: torch.Tensor
     read_local_hot_slot_ids: torch.Tensor
     read_destination_hot_row_ids: torch.Tensor
@@ -402,6 +423,20 @@ class DSASparsePlan:
                 device=device,
             ),
             topk_positions=int_plan((key.token_capacity, config.index_topk)),
+            seq_lens=torch.zeros(
+                key.request_capacity,
+                dtype=torch.int32,
+                device=device,
+            ),
+            block_table=torch.full(
+                (
+                    key.request_capacity,
+                    config.max_blocks_per_request,
+                ),
+                INVALID_INDEX,
+                dtype=block_table_dtype,
+                device=device,
+            ),
             read_source_global_slots=int_plan(read_shape),
             read_local_hot_slot_ids=int_plan(read_shape),
             read_destination_hot_row_ids=int_plan(read_shape),
@@ -448,7 +483,7 @@ class DSASparseLayerLayout:
             raise ValueError("plane_dtypes and plane_row_shapes must have the same length.")
 
 
-@dataclass
+@dataclass(frozen=True)
 class DSASparseLayerHotCache:
     layer_name: str
     planes: tuple[torch.Tensor, ...]
@@ -487,7 +522,6 @@ class DSASparseIndexOperator(Protocol):
         *,
         state: DSASparseResidencyState,
         plan: DSASparsePlan,
-        block_table: torch.Tensor,
     ) -> None: ...
 
     def lookup(
@@ -495,8 +529,6 @@ class DSASparseIndexOperator(Protocol):
         *,
         state: DSASparseResidencyState,
         plan: DSASparsePlan,
-        seq_lens: torch.Tensor,
-        block_table: torch.Tensor,
     ) -> None: ...
 
 
@@ -508,3 +540,375 @@ class UnimplementedDSASparseIndexOperator:
 
     def lookup(self, **_: object) -> None:
         raise NotImplementedError("DSA Sparse lookup operator is not implemented.")
+
+
+@dataclass(frozen=True)
+class DSASparseLayerBinding:
+    """Per-layer payload and I/O resources.
+
+    Layers in the same cohort share only the plan and residency state. Their
+    Hot Cache planes, backend region, and completion resources stay separate.
+    """
+
+    layer_name: str
+    cohort: DSASparseCohortKey
+    hot_cache: DSASparseLayerHotCache
+    io_context: object
+    io_region: object
+    read_completion: object
+    write_completion: object
+
+    def __post_init__(self) -> None:
+        if self.layer_name != self.hot_cache.layer_name:
+            raise ValueError("Layer binding name must match its Hot Cache layer name.")
+
+    @property
+    def key(self) -> DSASparseLayerKey:
+        return DSASparseLayerKey(
+            cohort=self.cohort,
+            layer_name=self.layer_name,
+        )
+
+
+@dataclass(frozen=True)
+class DSASparseCohort:
+    key: DSASparseCohortKey
+    leader_layer: str
+    state: DSASparseResidencyState
+    plans: Mapping[DSASparsePlanKey, DSASparsePlan]
+
+    def __post_init__(self) -> None:
+        if self.state.cohort != self.key:
+            raise ValueError("Residency state owner must match the cohort resource key.")
+        for plan_key in self.plans:
+            if plan_key.role != self.key.role:
+                raise ValueError("Plan role must match the residency cohort role.")
+
+
+@dataclass
+class DSASparseResolution:
+    hot_main_cache: tuple[torch.Tensor, ...]
+    local_sparse_indices: torch.Tensor
+    hot_block_table: torch.Tensor
+
+
+@dataclass
+class DSASparseEagerStep:
+    cohort: DSASparseCohort
+    plan: DSASparsePlan
+    request_ids: tuple[Hashable, ...]
+    lookup_complete: bool = False
+    write_submitted_layers: set[str] = field(default_factory=set)
+    completed_layers: set[str] = field(default_factory=set)
+
+
+class DSASparseEagerCoordinator:
+    """Single eager entry point for the fixed lookup/I/O/SFA sequence."""
+
+    def __init__(
+        self,
+        config: DSASparseCacheConfig,
+        *,
+        index_operator: DSASparseIndexOperator,
+        io_operator: DSASparseIOOperator,
+        seat_manager: CacheSeatManager | None = None,
+    ) -> None:
+        self.config = config
+        self.index_operator = index_operator
+        self.io_operator = io_operator
+        self.seat_manager = seat_manager or CacheSeatManager(config.max_num_seqs)
+        self._cohorts: dict[DSASparseCohortKey, DSASparseCohort] = {}
+        self._layers: dict[DSASparseLayerKey, DSASparseLayerBinding] = {}
+        self._active_steps: dict[DSASparseCohortKey, DSASparseEagerStep] = {}
+        self._hot_plane_addresses: set[int] = set()
+        self._region_identities: set[object] = set()
+        self._completion_identities: set[object] = set()
+        self._frozen = False
+
+    def register_cohort(
+        self,
+        cohort: DSASparseCohort,
+    ) -> None:
+        self._require_mutable()
+        if cohort.key in self._cohorts:
+            raise ValueError(f"DSA Sparse cohort {cohort.key!r} is already registered.")
+        self._cohorts[cohort.key] = cohort
+
+    def acquire_request(self, request_id: Hashable) -> CacheSeatLease:
+        return self.seat_manager.acquire(request_id)
+
+    def release_request(self, request_id: Hashable) -> CacheSeatLease:
+        if any(request_id in step.request_ids for step in self._active_steps.values()):
+            raise RuntimeError("Cannot release a DSA Sparse request while its step has pending layer I/O.")
+        return self.seat_manager.release(request_id)
+
+    def register_layer(
+        self,
+        binding: DSASparseLayerBinding,
+    ) -> None:
+        self._require_mutable()
+        if binding.key in self._layers:
+            raise ValueError(f"DSA Sparse layer {binding.key!r} is already registered.")
+        cohort = self._get_cohort(binding.cohort)
+        if not cohort.leader_layer:
+            raise ValueError("DSA Sparse cohort leader layer must not be empty.")
+        plane_addresses = {plane.data_ptr() for plane in binding.hot_cache.planes}
+        if plane_addresses & self._hot_plane_addresses:
+            raise ValueError("Each DSA Sparse layer must own independent Hot Cache planes.")
+        region_identity = self._resource_identity(binding.io_region)
+        if region_identity in self._region_identities:
+            raise ValueError("Each DSA Sparse layer must own an independent I/O region.")
+        completion_identities = {
+            self._resource_identity(binding.read_completion),
+            self._resource_identity(binding.write_completion),
+        }
+        if len(completion_identities) != 2 or completion_identities & self._completion_identities:
+            raise ValueError("Each DSA Sparse layer and direction must own an independent completion resource.")
+        self._layers[binding.key] = binding
+        self._hot_plane_addresses.update(plane_addresses)
+        self._region_identities.add(region_identity)
+        self._completion_identities.update(completion_identities)
+
+    def freeze(self) -> None:
+        frozen_cohorts: dict[DSASparseCohortKey, DSASparseCohort] = {}
+        for cohort in self._cohorts.values():
+            try:
+                leader_binding = self._layers[
+                    DSASparseLayerKey(
+                        cohort=cohort.key,
+                        layer_name=cohort.leader_layer,
+                    )
+                ]
+            except KeyError as exc:
+                raise ValueError(f"DSA Sparse cohort leader {cohort.leader_layer!r} is not registered.") from exc
+            if leader_binding.cohort != cohort.key:
+                raise ValueError("DSA Sparse cohort leader must belong to its residency cohort.")
+            frozen_cohorts[cohort.key] = DSASparseCohort(
+                key=cohort.key,
+                leader_layer=cohort.leader_layer,
+                state=cohort.state,
+                plans=MappingProxyType(dict(cohort.plans)),
+            )
+        self._cohorts = frozen_cohorts
+        self._frozen = True
+
+    def get_layer_binding(
+        self,
+        cohort_key: DSASparseCohortKey,
+        layer_name: str,
+    ) -> DSASparseLayerBinding:
+        layer_key = DSASparseLayerKey(
+            cohort=cohort_key,
+            layer_name=layer_name,
+        )
+        try:
+            return self._layers[layer_key]
+        except KeyError as exc:
+            raise KeyError(f"DSA Sparse layer {layer_key!r} is not registered.") from exc
+
+    def get_cohort(
+        self,
+        cohort_key: DSASparseCohortKey,
+    ) -> DSASparseCohort:
+        return self._get_cohort(cohort_key)
+
+    def begin_step(
+        self,
+        cohort_key: DSASparseCohortKey,
+        plan_key: DSASparsePlanKey,
+        *,
+        request_ids: list[Hashable],
+        query_positions: torch.Tensor,
+        query_valid_mask: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+    ) -> DSASparseEagerStep:
+        if not self._frozen:
+            raise RuntimeError("DSA Sparse coordinator must be frozen before execution.")
+        cohort = self._get_cohort(cohort_key)
+        try:
+            plan = cohort.plans[plan_key]
+        except KeyError as exc:
+            raise KeyError(f"DSA Sparse plan {plan_key!r} is not registered for cohort {cohort_key!r}.") from exc
+        if cohort_key in self._active_steps:
+            raise RuntimeError(
+                f"Only one DSA Sparse step may mutate a residency cohort at a time, cohort={cohort_key!r}."
+            )
+
+        self.seat_manager.pack_rows(request_ids, plan.row_mapping)
+        self._copy_exact(
+            query_positions,
+            plan.query_positions,
+            "query_positions",
+        )
+        self._copy_exact(
+            query_valid_mask,
+            plan.query_valid_mask,
+            "query_valid_mask",
+        )
+        self._copy_exact(seq_lens, plan.seq_lens, "seq_lens")
+        self._copy_exact(block_table, plan.block_table, "block_table")
+        plan.topk_positions.fill_(INVALID_INDEX)
+        plan.valid_topk_counts.zero_()
+
+        self.index_operator.prepare_newest(
+            state=cohort.state,
+            plan=plan,
+        )
+        step = DSASparseEagerStep(
+            cohort=cohort,
+            plan=plan,
+            request_ids=tuple(request_ids),
+        )
+        self._active_steps[cohort_key] = step
+        return step
+
+    def submit_newest_write(
+        self,
+        step: DSASparseEagerStep,
+        layer_name: str,
+    ) -> None:
+        self._assert_active_step(step)
+        binding = self._get_step_layer(step, layer_name)
+        if layer_name in step.write_submitted_layers:
+            raise RuntimeError(f"Newest write was already submitted for {layer_name!r}.")
+        self.io_operator.write_async(
+            context=binding.io_context,
+            region=binding.io_region,
+            destination_global_slots=step.plan.write_global_slots,
+            source_hot_row_ids=step.plan.write_destination_hot_row_ids,
+            valid_mask=step.plan.write_valid_mask,
+            hot_planes=binding.hot_cache.planes,
+            completion=binding.write_completion,
+        )
+        step.write_submitted_layers.add(layer_name)
+
+    def prepare_lookup(
+        self,
+        step: DSASparseEagerStep,
+        *,
+        topk_positions: torch.Tensor,
+        valid_topk_counts: torch.Tensor,
+    ) -> None:
+        self._assert_active_step(step)
+        if step.lookup_complete:
+            raise RuntimeError("Each DSA Sparse cohort performs lookup only once per step.")
+        leader_layer = step.cohort.leader_layer
+        self._get_step_layer(step, leader_layer)
+        if leader_layer not in step.write_submitted_layers:
+            raise RuntimeError("The DSA Sparse cohort leader must submit its newest Main KV write before lookup.")
+        self._copy_exact(
+            topk_positions,
+            step.plan.topk_positions,
+            "topk_positions",
+        )
+        self._copy_exact(
+            valid_topk_counts,
+            step.plan.valid_topk_counts,
+            "valid_topk_counts",
+        )
+        self.index_operator.lookup(
+            state=step.cohort.state,
+            plan=step.plan,
+        )
+        step.lookup_complete = True
+
+    def run_layer_attention(
+        self,
+        step: DSASparseEagerStep,
+        layer_name: str,
+        attention: Callable[[DSASparseResolution], torch.Tensor],
+    ) -> torch.Tensor:
+        self._assert_active_step(step)
+        binding = self._get_step_layer(step, layer_name)
+        if not step.lookup_complete:
+            raise RuntimeError("DSA Sparse lookup must complete before layer I/O.")
+        if layer_name not in step.write_submitted_layers:
+            raise RuntimeError("Newest Main KV write must be submitted before lookup/I/O/SFA.")
+        if layer_name in step.completed_layers:
+            raise RuntimeError(f"DSA Sparse layer {layer_name!r} already completed this step.")
+
+        self.io_operator.read_async(
+            context=binding.io_context,
+            region=binding.io_region,
+            source_global_slots=step.plan.read_source_global_slots,
+            destination_hot_row_ids=(step.plan.read_destination_hot_row_ids),
+            valid_mask=step.plan.read_valid_mask,
+            hot_planes=binding.hot_cache.planes,
+            completion=binding.read_completion,
+        )
+        self.io_operator.wait_read(
+            context=binding.io_context,
+            completion=binding.read_completion,
+            hot_planes=binding.hot_cache.planes,
+        )
+        resolution = DSASparseResolution(
+            hot_main_cache=binding.hot_cache.planes,
+            local_sparse_indices=step.plan.resolved_hot_indices,
+            hot_block_table=step.plan.hot_block_table,
+        )
+        output = attention(resolution)
+        self.io_operator.wait_write(
+            context=binding.io_context,
+            completion=binding.write_completion,
+            hot_planes=binding.hot_cache.planes,
+        )
+        step.completed_layers.add(layer_name)
+        return output
+
+    def finish_step(self, step: DSASparseEagerStep) -> None:
+        self._assert_active_step(step)
+        expected_layers = {
+            layer_key.layer_name for layer_key, binding in self._layers.items() if binding.cohort == step.cohort.key
+        }
+        if step.completed_layers != expected_layers:
+            pending_layers = sorted(expected_layers - step.completed_layers)
+            raise RuntimeError(
+                f"Cannot finish DSA Sparse step before all layer writes are joined, pending layers: {pending_layers}."
+            )
+        del self._active_steps[step.cohort.key]
+
+    def _get_cohort(
+        self,
+        cohort_key: DSASparseCohortKey,
+    ) -> DSASparseCohort:
+        try:
+            return self._cohorts[cohort_key]
+        except KeyError as exc:
+            raise KeyError(f"DSA Sparse cohort {cohort_key!r} is not registered.") from exc
+
+    def _get_step_layer(
+        self,
+        step: DSASparseEagerStep,
+        layer_name: str,
+    ) -> DSASparseLayerBinding:
+        binding = self.get_layer_binding(step.cohort.key, layer_name)
+        if binding.cohort != step.cohort.key:
+            raise ValueError(f"Layer {layer_name!r} does not belong to step cohort {step.cohort.key!r}.")
+        return binding
+
+    def _assert_active_step(self, step: DSASparseEagerStep) -> None:
+        if self._active_steps.get(step.cohort.key) is not step:
+            raise RuntimeError("DSA Sparse step is not the active cohort owner.")
+
+    def _require_mutable(self) -> None:
+        if self._frozen:
+            raise RuntimeError("DSA Sparse coordinator resources are frozen.")
+
+    @staticmethod
+    def _copy_exact(
+        source: torch.Tensor,
+        destination: torch.Tensor,
+        name: str,
+    ) -> None:
+        if source.shape != destination.shape:
+            raise ValueError(f"{name} shape must be {tuple(destination.shape)}, got {tuple(source.shape)}.")
+        destination.copy_(source)
+
+    @staticmethod
+    def _resource_identity(resource: object) -> object:
+        try:
+            hash(resource)
+        except TypeError:
+            return ("identity", id(resource))
+        return ("value", type(resource), resource)
