@@ -324,7 +324,7 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
         return ge::GRAPH_FAILED;
     }
 
-    const auto* platform_info = context->GetPlatformInfo();
+    auto* platform_info = context->GetPlatformInfo();
     if (platform_info == nullptr) {
         OPS_LOG_E(context->GetNodeName(), "platform info is null.");
         return ge::GRAPH_FAILED;
