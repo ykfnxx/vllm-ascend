@@ -43,13 +43,13 @@ bool GetOneDim(
 {
     const gert::StorageShape* shape = context->GetInputShape(input_index);
     if (shape == nullptr) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(), "%s shape is null.", input_name);
         return false;
     }
     const auto& storage_shape = shape->GetStorageShape();
     if (storage_shape.GetDimNum() != 1) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(), "%s must be rank 1.", input_name);
         return false;
     }
@@ -66,13 +66,13 @@ bool GetTwoDims(
 {
     const gert::StorageShape* shape = context->GetInputShape(input_index);
     if (shape == nullptr) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(), "%s shape is null.", input_name);
         return false;
     }
     const auto& storage_shape = shape->GetStorageShape();
     if (storage_shape.GetDimNum() != 2) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(), "%s must be rank 2.", input_name);
         return false;
     }
@@ -92,7 +92,7 @@ bool SameOneDim(
         return false;
     }
     if (actual != expected) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(),
             "%s has incompatible length %ld; expected %ld.",
             input_name,
@@ -117,7 +117,7 @@ bool SameTwoDims(
         return false;
     }
     if (actual0 != expected0 || actual1 != expected1) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(),
             "%s has incompatible shape [%ld, %ld]; expected [%ld, %ld].",
             input_name,
@@ -186,19 +186,19 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
     }
 
     if (hot_seat_capacity != seat_capacity) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(),
             "tokenToHot and hotToToken seat capacities differ.");
         return ge::GRAPH_FAILED;
     }
     if (topk_query_capacity != query_capacity) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(),
             "topkPositions query dimension differs from queryPositions.");
         return ge::GRAPH_FAILED;
     }
     if (query_capacity % request_capacity != 0) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(),
             "query capacity %ld is not divisible by request capacity %ld.",
             query_capacity,
@@ -210,7 +210,7 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
         query_capacity / request_capacity;
     if (query_lane_capacity <= 0 ||
         query_lane_capacity > static_cast<int64_t>(kMaxQueryLanes)) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(),
             "query lane capacity must be in [1, %u], got %ld.",
             kMaxQueryLanes,
@@ -223,7 +223,7 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
         static_cast<uint64_t>(topk_count);
     if (protected_union_width >
         static_cast<uint64_t>(evictable_slot_count)) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(),
             "evictable slot count %ld is smaller than T*K=%lu.",
             evictable_slot_count,
@@ -234,7 +234,7 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
             static_cast<uint64_t>(topk_count) >
         static_cast<uint64_t>(
             std::numeric_limits<int32_t>::max() - 2)) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(),
             "Q*K does not fit the deterministic claim encoding.");
         return ge::GRAPH_FAILED;
@@ -246,7 +246,7 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
     if (workspace_request_capacity != request_capacity ||
         static_cast<uint64_t>(workspace_stride) !=
             required_workspace_stride) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(),
             "workspace must have shape [R, 3*S+3*256+4].");
         return ge::GRAPH_FAILED;
@@ -262,7 +262,7 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
         static_cast<uint64_t>(request_capacity) > uint32_max ||
         static_cast<uint64_t>(topk_count) > uint32_max ||
         static_cast<uint64_t>(workspace_stride) > uint32_max) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(),
             "one or more dimensions exceed the uint32 tiling ABI.");
         return ge::GRAPH_FAILED;
@@ -326,14 +326,14 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
 
     const auto* platform_info = context->GetPlatformInfo();
     if (platform_info == nullptr) {
-        OP_LOGE(context->GetNodeName(), "platform info is null.");
+        OPS_LOG_E(context->GetNodeName(), "platform info is null.");
         return ge::GRAPH_FAILED;
     }
     auto platform =
         platform_ascendc::PlatformAscendC(platform_info);
     const uint32_t aiv_count = platform.GetCoreNumAiv();
     if (aiv_count == 0U) {
-        OP_LOGE(
+        OPS_LOG_E(
             context->GetNodeName(),
             "No AIV core is available for dsa_sparse_lookup_update.");
         return ge::GRAPH_FAILED;
@@ -342,7 +342,7 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
     auto* tiling_data =
         context->GetTilingData<DsaSparseLookupUpdateTilingData>();
     if (tiling_data == nullptr) {
-        OP_LOGE(context->GetNodeName(), "tiling data is null.");
+        OPS_LOG_E(context->GetNodeName(), "tiling data is null.");
         return ge::GRAPH_FAILED;
     }
     tiling_data->seatCapacity =

@@ -146,6 +146,30 @@ class TestDSASparseLookupUpdateReference(unittest.TestCase):
         self.assertEqual(state.hot_to_token[0], [7, 8, INVALID_INDEX])
         self.assertEqual(state.lru_slots[0], [2, 0, 1])
 
+    def test_preserves_asu_single_query_lookup_lru_contract(self) -> None:
+        """Lock the original ASU SIMT lookup/allocate/evict behavior."""
+        state = make_state(max_model_len=8, slot_count=5)
+        for slot, token in enumerate([0, 1, 2, 3, 4]):
+            install(state, seat=0, slot=slot, token=token)
+        state.lru_slots[0] = [3, 0, 4, 1, 2]
+
+        slots, misses = run_one_row(
+            state,
+            [[2, 5, 5, INVALID_INDEX, 1]],
+            query_positions=[7],
+            seq_len=8,
+        )
+
+        self.assertEqual(slots, [[2, 3, 3, INVALID_INDEX, 1]])
+        self.assertEqual(
+            misses,
+            [[False, True, False, False, False]],
+        )
+        self.assertEqual(state.token_to_hot[0][3], INVALID_INDEX)
+        self.assertEqual(state.token_to_hot[0][5], 3)
+        self.assertEqual(state.hot_to_token[0], [0, 1, 2, 5, 4])
+        self.assertEqual(state.lru_slots[0], [0, 4, 3, 1, 2])
+
     def test_padding_validity_and_inactive_row_stay_invalid(self) -> None:
         state = make_state(num_seats=2, slot_count=3)
         install(state, seat=0, slot=2, token=1)
