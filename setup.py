@@ -452,8 +452,23 @@ class custom_install(install):
 
 
 ROOT_DIR = os.path.dirname(__file__)
+# The default "*[0-9]*" match also selects non-version checkpoint tags such
+# as "a5-glm5-hisparse-task1-checkpoint". Only release tags define versions.
+VERSION_GIT_DESCRIBE_COMMAND = [
+    "git",
+    "describe",
+    "--dirty",
+    "--tags",
+    "--long",
+    "--abbrev=40",
+    "--match",
+    "v[0-9]*",
+]
 try:
-    VERSION = get_version(write_to="vllm_ascend/_version.py")
+    VERSION = get_version(
+        write_to="vllm_ascend/_version.py",
+        git_describe_command=VERSION_GIT_DESCRIBE_COMMAND,
+    )
 except LookupError:
     # The checkout action in github action CI does not checkout the tag. It
     # only checks out the commit. In this case, we set a dummy version.
