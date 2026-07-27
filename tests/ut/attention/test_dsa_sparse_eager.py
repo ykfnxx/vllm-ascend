@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
-from dataclasses import FrozenInstanceError, dataclass
+from dataclasses import FrozenInstanceError, dataclass, replace
 
 import pytest
 import torch
@@ -29,59 +29,20 @@ class RecordingIndexOperator:
     events: list[str]
     has_misses: bool
 
-    def prepare_newest(self, *, state, plan):
-        self.events.append("prepare_newest")
-        config_evictable_slots = state.lru_slots.shape[1]
-        hot_stride = plan.hot_block_table.shape[1] * 4
-        row_mapping = plan.row_mapping
-
-        plan.hot_block_table.fill_(-1)
-        plan.newest_destination_hot_row_ids.fill_(-1)
-        plan.write_global_slots.fill_(-1)
-        plan.write_destination_hot_row_ids.fill_(-1)
-        plan.write_valid_mask.zero_()
-        for query_index in range(plan.key.token_capacity):
-            row = int(plan.query_to_row[query_index])
-            lane = int(plan.query_to_lane[query_index])
-            if not bool(plan.query_valid_mask[query_index]):
-                continue
-            seat = int(row_mapping.row_to_cache_seat[row])
-            local_slot = config_evictable_slots + lane
-            destination_row = seat * hot_stride + local_slot
-            plan.newest_destination_hot_row_ids[query_index] = destination_row
-            plan.write_destination_hot_row_ids[row, lane] = destination_row
-            token_position = int(plan.query_positions[query_index])
-            logical_block = token_position // 4
-            token_offset = token_position % 4
-            physical_block = int(plan.block_table[row, logical_block])
-            plan.write_global_slots[row, lane] = physical_block * 4 + token_offset
-            plan.write_valid_mask[row, lane] = True
-
-        for row in range(plan.key.request_capacity):
-            if not bool(row_mapping.row_active[row]):
-                continue
-            seat = int(row_mapping.row_to_cache_seat[row])
-            plan.hot_block_table[row].copy_(
-                torch.arange(
-                    seat * plan.hot_block_table.shape[1],
-                    (seat + 1) * plan.hot_block_table.shape[1],
-                    dtype=plan.hot_block_table.dtype,
-                )
-            )
-
-    def lookup(self, *, state, plan):
+    def lookup_update(self, *, state, plan):
         del state
-        self.events.append("lookup")
+        self.events.append("lookup_update")
         plan.resolved_hot_indices.zero_()
-        plan.read_source_global_slots.fill_(-1)
-        plan.read_local_hot_slot_ids.fill_(-1)
-        plan.read_destination_hot_row_ids.fill_(-1)
-        plan.read_valid_mask.zero_()
+        plan.miss_mask.zero_()
         if self.has_misses:
-            plan.read_source_global_slots[0, 0, 0] = 7
-            plan.read_local_hot_slot_ids[0, 0, 0] = 0
-            plan.read_destination_hot_row_ids[0, 0, 0] = 0
-            plan.read_valid_mask[0, 0, 0] = True
+            plan.miss_mask[0, 0] = True
+
+
+@dataclass
+class FailingIndexOperator(RecordingIndexOperator):
+    def lookup_update(self, **kwargs):
+        super().lookup_update(**kwargs)
+        raise RuntimeError("lookup/update failed")
 
 
 @dataclass
@@ -89,104 +50,56 @@ class RecordingIOOperator:
     events: list[str]
     transfer_counts: list[int]
 
-    def read_async(
+    def dsa_sparse_io(
         self,
         *,
         context,
         region,
-        source_global_slots,
-        destination_hot_row_ids,
-        valid_mask,
+        topk_positions,
+        resolved_hot_indices,
+        miss_mask,
+        query_to_row,
+        row_to_cache_seat,
+        block_table,
+        write_global_slots,
+        write_destination_hot_row_ids,
+        write_valid_mask,
         hot_planes,
         completion,
     ):
         del (
             context,
-            source_global_slots,
-            destination_hot_row_ids,
+            topk_positions,
+            resolved_hot_indices,
+            query_to_row,
+            row_to_cache_seat,
+            block_table,
+            write_global_slots,
+            write_destination_hot_row_ids,
+            write_valid_mask,
             hot_planes,
             completion,
         )
-        self.events.append(f"read_async:{region}")
-        self.transfer_counts.append(int(valid_mask.sum()))
-
-    def wait_read(self, *, context, completion, hot_planes):
-        del context, completion, hot_planes
-        self.events.append("wait_read")
-
-    def write_async(
-        self,
-        *,
-        context,
-        region,
-        destination_global_slots,
-        source_hot_row_ids,
-        valid_mask,
-        hot_planes,
-        completion,
-    ):
-        del (
-            context,
-            destination_global_slots,
-            source_hot_row_ids,
-            valid_mask,
-            hot_planes,
-            completion,
-        )
-        self.events.append(f"write_async:{region}")
-
-    def wait_write(self, *, context, completion, hot_planes):
-        del context, completion, hot_planes
-        self.events.append("wait_write")
+        self.events.append(f"dsa_sparse_io:{region}")
+        self.transfer_counts.append(int(miss_mask.sum()))
 
 
 @dataclass
-class FailingWaitIOOperator(RecordingIOOperator):
-    failed_wait: str
-
-    def wait_read(self, *, context, completion, hot_planes):
-        super().wait_read(
-            context=context,
-            completion=completion,
-            hot_planes=hot_planes,
-        )
-        if self.failed_wait == "read":
-            raise RuntimeError("read completion failed")
-
-    def wait_write(self, *, context, completion, hot_planes):
-        super().wait_write(
-            context=context,
-            completion=completion,
-            hot_planes=hot_planes,
-        )
-        if self.failed_wait == "write":
-            raise RuntimeError("write completion failed")
+class FailingIOOperator(RecordingIOOperator):
+    def dsa_sparse_io(self, **kwargs):
+        super().dsa_sparse_io(**kwargs)
+        raise RuntimeError("unified I/O completion failed")
 
 
 @dataclass
-class FailingOnceWaitIOOperator(RecordingIOOperator):
-    failed_wait: str
+class FailingOnceIOOperator(RecordingIOOperator):
     has_failed: bool = False
 
-    def wait_read(self, *, context, completion, hot_planes):
-        super().wait_read(
-            context=context,
-            completion=completion,
-            hot_planes=hot_planes,
-        )
-        if self.failed_wait == "read" and not self.has_failed:
+    def dsa_sparse_io(self, **kwargs):
+        super().dsa_sparse_io(**kwargs)
+        if not self.has_failed:
             self.has_failed = True
-            raise RuntimeError("read completion failed once")
-
-    def wait_write(self, *, context, completion, hot_planes):
-        super().wait_write(
-            context=context,
-            completion=completion,
-            hot_planes=hot_planes,
-        )
-        if self.failed_wait == "write" and not self.has_failed:
-            self.has_failed = True
-            raise RuntimeError("write completion failed once")
+            raise RuntimeError("unified I/O completion failed once")
 
 
 def build_coordinator(
@@ -267,8 +180,7 @@ def build_coordinator(
                 hot_cache=hot_cache,
                 io_context=f"context:{layer_name}",
                 io_region=f"region:{layer_name}",
-                read_completion=object(),
-                write_completion=object(),
+                io_completion=object(),
             )
         )
     coordinator.acquire_request("request-a")
@@ -301,6 +213,35 @@ def begin_step(
             dtype=torch.int32,
         ),
     )
+
+
+def test_begin_step_builds_hot_blocks_and_newest_descriptors():
+    coordinator, cohort_key, plan_key, _events, _counts = (
+        build_coordinator(
+            has_misses=False,
+            layer_names=("layer.0",),
+        )
+    )
+
+    step = begin_step(coordinator, cohort_key, plan_key)
+
+    assert step.plan.hot_block_table.tolist() == [
+        [0, 1, 2],
+        [3, 4, 5],
+    ]
+    assert step.plan.write_global_slots.tolist() == [
+        [5, 6],
+        [41, -1],
+    ]
+    assert step.plan.write_destination_hot_row_ids.tolist() == [
+        [8, 9],
+        [20, -1],
+    ]
+    assert step.plan.write_valid_mask.tolist() == [
+        [True, True],
+        [True, False],
+    ]
+    coordinator.abort_step(step)
 
 
 @pytest.mark.parametrize(
@@ -348,13 +289,9 @@ def test_eager_coordinator_keeps_one_fixed_flow_for_hits_and_misses(
 
     assert output.tolist() == [123]
     assert events == [
-        "prepare_newest",
-        "write_async:region:layer.0",
-        "lookup",
-        "read_async:region:layer.0",
-        "wait_read",
+        "lookup_update",
+        "dsa_sparse_io:region:layer.0",
         "existing_sfa",
-        "wait_write",
     ]
     assert transfer_counts == [expected_transfer_count]
 
@@ -390,9 +327,9 @@ def test_cohort_followers_reuse_lookup_but_keep_layer_io_resources():
     )
     coordinator.finish_step(step)
 
-    assert events.count("lookup") == 1
-    assert "read_async:region:layer.0" in events
-    assert "read_async:region:layer.1" in events
+    assert events.count("lookup_update") == 1
+    assert "dsa_sparse_io:region:layer.0" in events
+    assert "dsa_sparse_io:region:layer.1" in events
     assert transfer_counts == [0, 0]
 
 
@@ -550,8 +487,7 @@ def test_layer_registration_rejects_aliased_hot_cache():
                 hot_cache=aliased_hot_cache,
                 io_context=object(),
                 io_region=object(),
-                read_completion=object(),
-                write_completion=object(),
+                io_completion=object(),
             )
         )
 
@@ -613,8 +549,7 @@ def test_target_and_draft_may_register_the_same_layer_name():
             hot_cache=draft_hot_cache,
             io_context="context:draft:layer.0",
             io_region="region:draft:layer.0",
-            read_completion=object(),
-            write_completion=object(),
+            io_completion=object(),
         )
     )
     coordinator.freeze()
@@ -707,13 +642,9 @@ def test_dynamic_eager_batch_packs_lanes_and_returns_active_sfa_view():
 
     assert result.tolist() == [42]
     assert events == [
-        "prepare_newest",
-        "write_async:region:layer.0",
-        "lookup",
-        "read_async:region:layer.0",
-        "wait_read",
+        "lookup_update",
+        "dsa_sparse_io:region:layer.0",
         "existing_sfa",
-        "wait_write",
     ]
 
 
@@ -770,26 +701,32 @@ def test_dynamic_batch_begin_retires_step_when_sfa_view_copy_fails(
     )
     original_begin_step = coordinator.begin_step
 
-    class FailingSource:
-        def __init__(self, plan, original_tensor):
+    class FailingTensor:
+        def __init__(self, plan, original_metadata):
             self.plan = plan
-            self.original_tensor = original_tensor
+            self.original_metadata = original_metadata
 
-        def __getitem__(self, _index):
+        def view(self, *_shape):
             object.__setattr__(
                 self.plan,
-                "newest_destination_hot_row_ids",
-                self.original_tensor,
+                "batch_metadata",
+                self.original_metadata,
             )
             raise RuntimeError("SFA view copy failed")
 
     def begin_then_fail_copy(*args, **kwargs):
         step = original_begin_step(*args, **kwargs)
-        original_tensor = step.plan.newest_destination_hot_row_ids
+        original_metadata = step.plan.batch_metadata
         object.__setattr__(
             step.plan,
-            "newest_destination_hot_row_ids",
-            FailingSource(step.plan, original_tensor),
+            "batch_metadata",
+            replace(
+                original_metadata,
+                write_destination_hot_row_ids=FailingTensor(
+                    step.plan,
+                    original_metadata,
+                ),
+            ),
         )
         return step
 
@@ -867,8 +804,7 @@ def test_layer_router_keeps_two_indexcache_cohorts_independent():
                 ),
                 io_context=f"context:{layer_name}",
                 io_region=f"region:{layer_name}",
-                read_completion=object(),
-                write_completion=object(),
+                io_completion=object(),
             )
         )
     coordinator.freeze()
@@ -903,7 +839,7 @@ def test_layer_router_keeps_two_indexcache_cohorts_independent():
 
     router.finish()
 
-    assert events.count("lookup") == 2
+    assert events.count("lookup_update") == 2
     assert router.context_for("layer.0") is first_context
     assert router.context_for("layer.3") is second_context
 
@@ -946,8 +882,7 @@ def test_layer_router_aborts_every_cohort_after_finish_failure():
     ]
 
 
-@pytest.mark.parametrize("failed_wait", ["read", "write"])
-def test_completion_failure_poisons_coordinator(failed_wait):
+def test_unified_io_failure_poisons_coordinator():
     (
         coordinator,
         cohort_key,
@@ -958,30 +893,54 @@ def test_completion_failure_poisons_coordinator(failed_wait):
         has_misses=False,
         layer_names=("layer.0",),
     )
-    coordinator.io_operator = FailingWaitIOOperator(
+    coordinator.io_operator = FailingIOOperator(
         events,
         transfer_counts,
-        failed_wait,
     )
     context = begin_dynamic_batch(coordinator, cohort_key, plan_key)
     context.submit_newest_write("layer.0")
 
-    with pytest.raises(RuntimeError, match=f"{failed_wait} completion failed"):
+    with pytest.raises(RuntimeError, match="unified I/O completion failed"):
         context.run_layer_attention(
             "layer.0",
             torch.zeros((2, 4), dtype=torch.int32),
             lambda _resolution: torch.tensor([42]),
         )
-    with pytest.raises(RuntimeError, match="Failed to join DSA Sparse I/O"):
-        context.abort()
+    context.abort()
     with pytest.raises(RuntimeError, match="poisoned"):
         begin_dynamic_batch(coordinator, cohort_key, plan_key)
 
 
-@pytest.mark.parametrize("failed_wait", ["read", "write"])
-def test_first_completion_failure_remains_poisoned_after_successful_abort_join(
-    failed_wait,
-):
+def test_lookup_update_failure_poisons_coordinator():
+    (
+        coordinator,
+        cohort_key,
+        plan_key,
+        events,
+        _transfer_counts,
+    ) = build_coordinator(
+        has_misses=False,
+        layer_names=("layer.0",),
+    )
+    coordinator.index_operator = FailingIndexOperator(
+        events,
+        has_misses=False,
+    )
+    context = begin_dynamic_batch(coordinator, cohort_key, plan_key)
+    context.submit_newest_write("layer.0")
+
+    with pytest.raises(RuntimeError, match="lookup/update failed"):
+        context.run_layer_attention(
+            "layer.0",
+            torch.zeros((2, 4), dtype=torch.int32),
+            lambda _resolution: torch.tensor([42]),
+        )
+    context.abort()
+    with pytest.raises(RuntimeError, match="poisoned"):
+        begin_dynamic_batch(coordinator, cohort_key, plan_key)
+
+
+def test_first_unified_io_failure_remains_poisoned_after_abort():
     (
         coordinator,
         cohort_key,
@@ -992,10 +951,9 @@ def test_first_completion_failure_remains_poisoned_after_successful_abort_join(
         has_misses=False,
         layer_names=("layer.0",),
     )
-    coordinator.io_operator = FailingOnceWaitIOOperator(
+    coordinator.io_operator = FailingOnceIOOperator(
         events,
         transfer_counts,
-        failed_wait,
     )
     context = begin_dynamic_batch(coordinator, cohort_key, plan_key)
     context.submit_newest_write("layer.0")
@@ -1012,7 +970,7 @@ def test_first_completion_failure_remains_poisoned_after_successful_abort_join(
         begin_dynamic_batch(coordinator, cohort_key, plan_key)
 
 
-def test_failed_attention_joins_write_and_batch_can_abort():
+def test_failed_attention_can_abort_after_unified_io_returns():
     (
         coordinator,
         cohort_key,
@@ -1036,7 +994,7 @@ def test_failed_attention_joins_write_and_batch_can_abort():
             failed_sfa,
         )
 
-    assert events[-1] == "wait_write"
+    assert events[-1] == "dsa_sparse_io:region:layer.0"
     context.abort()
 
     next_context = begin_dynamic_batch(coordinator, cohort_key, plan_key)

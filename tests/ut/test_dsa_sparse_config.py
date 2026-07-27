@@ -10,6 +10,7 @@ from vllm_ascend.dsa_sparse_config import load_dsa_sparse_config
 
 def make_vllm_config(
     *,
+    io_backend: str = "mock",
     role: str = "kv_consumer",
     enforce_eager: bool = True,
     device_buffer_size: int | None = 32,
@@ -21,7 +22,7 @@ def make_vllm_config(
     index_topk: int = 8,
 ):
     dsa_config = {
-        "io_backend": "fake",
+        "io_backend": io_backend,
         "io_backend_options": {"namespace": "test"},
     }
     if device_buffer_size is not None:
@@ -90,6 +91,13 @@ def test_only_pd_roles_are_supported(role):
 def test_graph_execution_is_rejected_in_eager_milestone():
     with pytest.raises(ValueError, match="only the eager execution path"):
         load_dsa_sparse_config(make_vllm_config(enforce_eager=False))
+
+
+def test_graph_out_milestone_rejects_concrete_io_backend():
+    with pytest.raises(ValueError, match="only io_backend='mock'"):
+        load_dsa_sparse_config(
+            make_vllm_config(io_backend="vendor"),
+        )
 
 
 @pytest.mark.parametrize(

@@ -127,6 +127,7 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.dsa_sparse_config import DSA_SPARSE_MOCK_IO_BACKEND
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -175,7 +176,7 @@ from vllm_ascend.worker.dsa_sparse_eager import (
     DSASparseEagerCohortLayout,
     DSASparseEagerExecution,
     DSASparseEagerRuntime,
-    create_dsa_sparse_eager_stub_runtime,
+    create_dsa_sparse_eager_mock_runtime,
 )
 from vllm_ascend.worker.dsa_sparse_external_main import (
     DSASparseExternalMainSpecs,
@@ -635,21 +636,27 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError("The DSA Sparse eager runtime is already bound.")
         self.dsa_sparse_eager_runtime = runtime
 
-    def _initialize_dsa_sparse_eager_stub_runtime(self) -> None:
-        """Allocate and bind target-only fixed tensors with operator stubs."""
+    def _initialize_dsa_sparse_eager_mock_runtime(self) -> None:
+        """Bind the formal lookup op and explicit no-op eager I/O fixture."""
 
         config = self.ascend_config.dsa_sparse_config
         if config is None or not getattr(config, "is_consumer", False):
             return
         if getattr(self, "dsa_sparse_eager_runtime", None) is not None:
             return
+        if config.io_backend != DSA_SPARSE_MOCK_IO_BACKEND:
+            raise RuntimeError(
+                "The current DSA Sparse Graph-out milestone implements only "
+                "the explicit no-op io_backend='mock'; no concrete I/O "
+                "backend is available."
+            )
 
         if self._dsa_sparse_fixed_hbm_breakdown is None:
             raise RuntimeError(
                 "DSA Sparse fixed HBM must be reserved before eager runtime "
                 "allocation."
             )
-        runtime = create_dsa_sparse_eager_stub_runtime(
+        runtime = create_dsa_sparse_eager_mock_runtime(
             self._get_dsa_sparse_cache_config(),
             self._get_dsa_sparse_eager_cohort_layouts(),
             device=self.device,
@@ -1064,7 +1071,70 @@ class NPUModelRunner(GPUModelRunner):
                 if num_computed_tokens < req_state.num_computed_tokens:
                     req_state.prev_num_draft_len = 0
 
-        return super()._update_states(scheduler_output)
+        runtime = getattr(self, "dsa_sparse_eager_runtime", None)
+        resumed_req_ids = set(req_data.resumed_req_ids)
+        finished_req_ids = set(scheduler_output.finished_req_ids)
+        preempted_req_ids = set(
+            scheduler_output.preempted_req_ids or ()
+        )
+        mock_runtime = (
+            runtime
+            if runtime is not None and runtime.uses_mock_lifecycle
+            else None
+        )
+        retiring_req_ids = (
+            finished_req_ids
+            | preempted_req_ids
+            | resumed_req_ids
+        )
+        if mock_runtime is not None:
+            mock_runtime.preflight_mock_retire(retiring_req_ids)
+
+        deferred_correction = super()._update_states(scheduler_output)
+
+        if mock_runtime is not None:
+            for request_id in retiring_req_ids:
+                if mock_runtime.has_mock_request(request_id):
+                    mock_runtime.retire_mock_request(
+                        request_id,
+                        preempted=(
+                            request_id in preempted_req_ids
+                            or request_id in resumed_req_ids
+                        ),
+                    )
+
+            admission_order = [
+                request.req_id
+                for request in scheduler_output.scheduled_new_reqs
+            ]
+            admission_order.extend(req_data.resumed_req_ids)
+            admitted_request_ids: list[str] = []
+            try:
+                for request_id in dict.fromkeys(admission_order):
+                    mock_runtime.admit_mock_request(request_id)
+                    admitted_request_ids.append(request_id)
+            except BaseException as admission_error:
+                for request_id in reversed(admitted_request_ids):
+                    try:
+                        mock_runtime.retire_mock_request(
+                            request_id,
+                            preempted=True,
+                        )
+                    except BaseException as cleanup_error:
+                        add_note = getattr(
+                            admission_error,
+                            "add_note",
+                            None,
+                        )
+                        if add_note is not None:
+                            add_note(
+                                "DSA Sparse mock admission rollback also "
+                                f"failed for {request_id!r}: "
+                                f"{cleanup_error!r}"
+                            )
+                raise
+
+        return deferred_correction
 
     def _pad_query_start_loc_for_fia(
         self,
@@ -4148,7 +4218,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
-        self._initialize_dsa_sparse_eager_stub_runtime()
+        self._initialize_dsa_sparse_eager_mock_runtime()
         # TODO: refactor the logic of attention
         if (
             self.speculative_config

@@ -11,10 +11,12 @@ from vllm_ascend.attention.dsa_sparse import (
     DSASparseCohortKey,
     DSASparseLayerHotCache,
     DSASparseLayerLayout,
+    DSASparseBatchMetadata,
     DSASparsePlan,
     DSASparsePlanKey,
     DSASparseResidencyState,
-    UnimplementedDSASparseIndexOperator,
+    UnimplementedDSASparseLookupUpdateOperator,
+    dsa_sparse_lookup_workspace_stride,
 )
 
 
@@ -50,6 +52,18 @@ def test_cache_config_rejects_topk_union_larger_than_evictable_cache():
             block_size=16,
             device_buffer_size=31,
             max_query_tokens_per_request=4,
+            index_topk=8,
+        )
+
+
+def test_cache_config_rejects_more_than_four_query_lanes():
+    with pytest.raises(ValueError, match="operator limit of 4"):
+        DSASparseCacheConfig(
+            max_num_seqs=3,
+            max_model_len=128,
+            block_size=16,
+            device_buffer_size=40,
+            max_query_tokens_per_request=5,
             index_topk=8,
         )
 
@@ -97,7 +111,6 @@ def test_cache_seat_manager_keeps_seat_stable_across_row_reorder():
         first.epoch,
         INVALID_INDEX,
     ]
-    assert reordered.row_active.tolist() == [True, True, False]
 
 
 def test_cache_seat_reuse_increments_epoch():
@@ -143,7 +156,7 @@ def test_residency_state_excludes_reserved_slots_from_lru():
 
     assert state.cohort is cohort
     assert state.token_to_hot.shape == (3, 128)
-    assert state.hot_to_token.shape == (3, 36)
+    assert state.hot_to_token.shape == (3, 32)
     assert state.lru_slots.shape == (3, 32)
     assert state.state_seat_epoch.shape == (3,)
     assert state.lru_slots[0].tolist() == list(range(32))
@@ -161,11 +174,12 @@ def test_plan_uses_fixed_shapes_and_hot_block_stride():
     )
     plan = DSASparsePlan.allocate(config, key, device="cpu")
 
-    assert plan.read_source_global_slots.shape == (2, 4, 8)
-    assert plan.read_local_hot_slot_ids.shape == (2, 4, 8)
-    assert plan.read_destination_hot_row_ids.shape == (2, 4, 8)
-    assert plan.read_valid_mask.shape == (2, 4, 8)
     assert plan.resolved_hot_indices.shape == (8, 8)
+    assert plan.miss_mask.shape == (8, 8)
+    assert plan.workspace.shape == (
+        2,
+        dsa_sparse_lookup_workspace_stride(32),
+    )
     assert plan.hot_block_table.shape == (2, 3)
     assert plan.row_mapping.row_to_cache_seat.shape == (2,)
     assert plan.query_positions.shape == (8,)
@@ -176,7 +190,6 @@ def test_plan_uses_fixed_shapes_and_hot_block_stride():
     assert plan.topk_positions.shape == (8, 8)
     assert plan.seq_lens.shape == (2,)
     assert plan.block_table.shape == (2, 8)
-    assert plan.newest_destination_hot_row_ids.shape == (8,)
     assert plan.write_global_slots.shape == (2, 4)
     assert plan.write_destination_hot_row_ids.shape == (2, 4)
     assert plan.write_valid_mask.shape == (2, 4)
@@ -219,13 +232,42 @@ def test_layer_hot_cache_preserves_existing_sfa_plane_layout(
     assert tuple(plane.dtype for plane in hot_cache.planes) == plane_dtypes
 
 
-def test_unimplemented_index_operator_is_an_explicit_stub():
-    operator = UnimplementedDSASparseIndexOperator()
+def test_unimplemented_lookup_update_operator_is_an_explicit_stub():
+    operator = UnimplementedDSASparseLookupUpdateOperator()
 
-    with pytest.raises(NotImplementedError, match="newest-state"):
-        operator.prepare_newest()
-    with pytest.raises(NotImplementedError, match="lookup operator"):
-        operator.lookup()
+    with pytest.raises(NotImplementedError, match="lookup/update"):
+        operator.lookup_update()
+
+
+def test_plans_can_share_role_level_batch_metadata():
+    config = make_cache_config()
+    key = DSASparsePlanKey(
+        token_capacity=8,
+        request_capacity=2,
+        query_lane_capacity=4,
+        role="target",
+    )
+    metadata = DSASparseBatchMetadata.allocate(
+        config,
+        key,
+        device="cpu",
+    )
+    first = DSASparsePlan.allocate(
+        config,
+        key,
+        device="cpu",
+        batch_metadata=metadata,
+    )
+    second = DSASparsePlan.allocate(
+        config,
+        key,
+        device="cpu",
+        batch_metadata=metadata,
+    )
+
+    assert first.batch_metadata is second.batch_metadata
+    assert first.topk_positions.data_ptr() != second.topk_positions.data_ptr()
+    assert first.workspace.data_ptr() != second.workspace.data_ptr()
 
 
 def test_plan_key_rejects_non_rectangular_query_mapping():

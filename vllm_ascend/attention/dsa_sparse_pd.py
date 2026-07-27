@@ -17,6 +17,14 @@ class DSASparseSeatCoordinator(Protocol):
 
 
 class DSASparseRequestRegionBackend(Protocol):
+    """Request-region owner.
+
+    Handles must not be reused while a late completion can still reference
+    them, and ``release_request`` must be idempotent for a previously released
+    handle. This lets late generation-bearing completions be discarded
+    without an unbounded framework-side tombstone set.
+    """
+
     def release_request(self, request_handle: int) -> None: ...
 
 
@@ -88,8 +96,7 @@ class DSASparsePDLifecycle:
         self._coordinator = coordinator
         self._backend = backend
         self._requests: dict[Hashable, _DSASparseRequestState] = {}
-        self._last_generation: dict[Hashable, int] = {}
-        self._released_regions: set[tuple[Hashable, int, int]] = set()
+        self._next_generation = 1
 
     def begin_handoff(
         self,
@@ -100,8 +107,8 @@ class DSASparsePDLifecycle:
             raise RuntimeError(f"DSA Sparse request {request_id!r} already has an active handoff.")
         if not transfer_id:
             raise ValueError("DSA Sparse transfer_id must not be empty.")
-        generation = self._last_generation.get(request_id, 0) + 1
-        self._last_generation[request_id] = generation
+        generation = self._next_generation
+        self._next_generation += 1
         self._requests[request_id] = _DSASparseRequestState(
             request_id=request_id,
             generation=generation,
@@ -117,14 +124,14 @@ class DSASparsePDLifecycle:
     ) -> bool:
         state = self._get_current(completion)
         if state is None:
-            self._release_region_once(completion, request_handle)
+            self._release_region(request_handle)
             return False
         if state.main_region_handle is not None:
             if state.main_region_handle != request_handle:
                 raise RuntimeError("DSA Sparse Main region completed twice with different handles.")
             return True
         if state.failed_reason is not None:
-            self._release_region_once(completion, request_handle)
+            self._release_region(request_handle)
             return False
         self._require_waiting(state)
         state.main_region_handle = request_handle
@@ -250,13 +257,7 @@ class DSASparsePDLifecycle:
         if state.admitted:
             self._coordinator.assert_request_idle(request_id)
         if state.main_region_handle is not None:
-            self._release_region_once(
-                DSASparseTransferCompletion(
-                    request_id=request_id,
-                    generation=generation,
-                ),
-                state.main_region_handle,
-            )
+            self._release_region(state.main_region_handle)
         if state.admitted:
             self._coordinator.release_request(request_id)
         del self._requests[request_id]
@@ -285,20 +286,8 @@ class DSASparsePDLifecycle:
             )
         return state
 
-    def _release_region_once(
-        self,
-        completion: DSASparseTransferCompletion,
-        request_handle: int,
-    ) -> None:
-        release_key = (
-            completion.request_id,
-            completion.generation,
-            request_handle,
-        )
-        if release_key in self._released_regions:
-            return
+    def _release_region(self, request_handle: int) -> None:
         self._backend.release_request(request_handle)
-        self._released_regions.add(release_key)
 
     @staticmethod
     def _require_waiting(state: _DSASparseRequestState) -> None:

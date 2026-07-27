@@ -1756,6 +1756,42 @@ void store_kv_block(
 
 } 
 
+void dsa_sparse_lookup_update(
+    at::Tensor& token_to_hot,
+    at::Tensor& hot_to_token,
+    at::Tensor& lru_slots,
+    at::Tensor& state_seat_epoch,
+    const at::Tensor& row_to_cache_seat,
+    const at::Tensor& row_seat_epoch,
+    const at::Tensor& query_positions,
+    const at::Tensor& query_to_row,
+    const at::Tensor& query_to_lane,
+    const at::Tensor& query_valid_mask,
+    const at::Tensor& valid_topk_counts,
+    const at::Tensor& seq_lens,
+    const at::Tensor& topk_positions,
+    at::Tensor& resolved_hot_indices,
+    at::Tensor& miss_mask,
+    at::Tensor& workspace)
+{
+    (void)token_to_hot;
+    (void)hot_to_token;
+    (void)lru_slots;
+    (void)state_seat_epoch;
+    (void)row_to_cache_seat;
+    (void)row_seat_epoch;
+    (void)query_positions;
+    (void)query_to_row;
+    (void)query_to_lane;
+    (void)query_valid_mask;
+    (void)valid_topk_counts;
+    (void)seq_lens;
+    (void)topk_positions;
+    (void)resolved_hot_indices;
+    (void)miss_mask;
+    (void)workspace;
+}
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -1874,6 +1910,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
      // store_kv_block
     ops.impl("store_kv_block_pre", &vllm_ascend::meta::store_kv_block_metadata);
     ops.impl("store_kv_block", &vllm_ascend::meta::store_kv_block);
+    ops.impl("dsa_sparse_lookup_update",
+             &vllm_ascend::meta::dsa_sparse_lookup_update);
     // npu_fused_gdn_gating
     ops.impl("npu_fused_gdn_gating", &vllm_ascend::meta::npu_fused_gdn_gating_meta);
 }

@@ -7,6 +7,7 @@ from types import MappingProxyType
 from typing import Any, Literal
 
 DSASparseKVRole = Literal["kv_producer", "kv_consumer"]
+DSA_SPARSE_MOCK_IO_BACKEND = "mock"
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,11 @@ def load_dsa_sparse_config(vllm_config: object) -> DSASparseConfig | None:
     io_backend = raw_config.get("io_backend")
     if not isinstance(io_backend, str) or not io_backend.strip():
         raise ValueError("dsa_sparse_config.io_backend must be a non-empty string.")
+    if io_backend != DSA_SPARSE_MOCK_IO_BACKEND:
+        raise ValueError(
+            "The current DSA Sparse Graph-out milestone supports only "
+            "io_backend='mock'; no concrete I/O backend is implemented."
+        )
 
     io_backend_options = raw_config.get("io_backend_options", {})
     if not isinstance(io_backend_options, dict):

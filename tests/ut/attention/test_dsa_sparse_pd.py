@@ -206,3 +206,29 @@ def test_finish_releases_region_and_removes_request():
     assert coordinator.seat_manager.active_request_ids == ()
     with pytest.raises(KeyError, match="no active handoff"):
         lifecycle.snapshot("request-a")
+
+
+def test_long_request_churn_keeps_only_active_lifecycle_state():
+    lifecycle, coordinator, backend = make_lifecycle(max_num_seqs=1)
+
+    for index in range(1_000):
+        request_id = f"request-{index}"
+        generation = lifecycle.begin_handoff(
+            request_id,
+            f"transfer-{index}",
+        )
+        completion = DSASparseTransferCompletion(
+            request_id,
+            generation,
+        )
+        lifecycle.mark_main_region_ready(
+            completion,
+            request_handle=index,
+        )
+        lifecycle.mark_indexer_ready(completion)
+        lifecycle.admit(request_id, generation)
+        lifecycle.finish(request_id, generation)
+
+    assert lifecycle._requests == {}
+    assert coordinator.seat_manager.active_request_ids == ()
+    assert len(backend.released) == 1_000

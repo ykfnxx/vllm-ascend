@@ -26,10 +26,28 @@ import torch
 from vllm_ascend.attention.dsa_sparse_io import DSASparseIOOperator
 
 INVALID_INDEX = -1
+DSA_SPARSE_SIMT_THREADS = 256
+DSA_SPARSE_MAX_QUERY_LANES = 4
+DSA_SPARSE_WORKSPACE_COUNTERS = 4
 
 
 def _round_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
+
+
+def dsa_sparse_lookup_workspace_stride(evictable_slots: int) -> int:
+    """Return the explicit per-row int32 workspace used by the A5 SIMT op."""
+
+    if evictable_slots <= 0:
+        raise ValueError(
+            "evictable_slots must be positive, got "
+            f"{evictable_slots}."
+        )
+    return (
+        3 * evictable_slots
+        + 3 * DSA_SPARSE_SIMT_THREADS
+        + DSA_SPARSE_WORKSPACE_COUNTERS
+    )
 
 
 @dataclass(frozen=True)
@@ -66,6 +84,15 @@ class DSASparseCacheConfig:
                 "device_buffer_size must cover the complete per-request Top-K "
                 f"union, got device_buffer_size={self.device_buffer_size} and "
                 f"required={self.max_topk_union_width}."
+            )
+        if (
+            self.max_query_tokens_per_request
+            > DSA_SPARSE_MAX_QUERY_LANES
+        ):
+            raise ValueError(
+                "max_query_tokens_per_request exceeds the fused operator "
+                f"limit of {DSA_SPARSE_MAX_QUERY_LANES}, got "
+                f"{self.max_query_tokens_per_request}."
             )
 
     @property
@@ -121,7 +148,6 @@ class CacheSeatLease:
 class DSASparseRowMapping:
     """Fixed-size row-to-seat inputs for one eager Decode step."""
 
-    row_active: torch.Tensor
     row_to_cache_seat: torch.Tensor
     row_seat_epoch: torch.Tensor
 
@@ -141,11 +167,6 @@ class DSASparseRowMapping:
             device=device,
         )
         return cls(
-            row_active=torch.zeros(
-                request_capacity,
-                dtype=torch.bool,
-                device=device,
-            ),
             row_to_cache_seat=row_to_cache_seat,
             row_seat_epoch=torch.full_like(
                 row_to_cache_seat,
@@ -205,7 +226,7 @@ class CacheSeatManager:
         request_ids: list[Hashable],
         out: DSASparseRowMapping,
     ) -> DSASparseRowMapping:
-        request_capacity = out.row_active.shape[0]
+        request_capacity = out.row_to_cache_seat.shape[0]
         if len(request_ids) > request_capacity:
             raise ValueError(
                 "request_ids exceeds request_capacity, got "
@@ -214,12 +235,10 @@ class CacheSeatManager:
         if len(set(request_ids)) != len(request_ids):
             raise ValueError("Each active request may appear in only one DSA Sparse row.")
 
-        out.row_active.fill_(False)
         out.row_to_cache_seat.fill_(INVALID_INDEX)
         out.row_seat_epoch.fill_(INVALID_INDEX)
         for row, request_id in enumerate(request_ids):
             lease = self.get_lease(request_id)
-            out.row_active[row] = True
             out.row_to_cache_seat[row] = lease.seat
             out.row_seat_epoch[row] = lease.epoch
         return out
@@ -250,7 +269,7 @@ class DSASparseResidencyState:
             device=device,
         )
         hot_to_token = torch.full(
-            (config.max_num_seqs, config.managed_hot_width),
+            (config.max_num_seqs, config.device_buffer_size),
             INVALID_INDEX,
             dtype=torch.int32,
             device=device,
@@ -335,8 +354,14 @@ class DSASparsePlanKey:
 
 
 @dataclass(frozen=True)
-class DSASparsePlan:
-    """Preallocated lookup and I/O tensors for one execution shape."""
+class DSASparseBatchMetadata:
+    """Role-level fixed inputs shared by every residency cohort.
+
+    Row ownership, query mapping, the Decode block table, the synthetic Hot
+    block table, and newest write descriptors describe the batch rather than a
+    particular IndexCache cohort.  Sharing these tensors prevents one
+    row-metadata staging pass and one HBM copy per cohort.
+    """
 
     key: DSASparsePlanKey
     row_mapping: DSASparseRowMapping
@@ -344,17 +369,9 @@ class DSASparsePlan:
     query_to_row: torch.Tensor
     query_to_lane: torch.Tensor
     query_valid_mask: torch.Tensor
-    valid_topk_counts: torch.Tensor
-    topk_positions: torch.Tensor
     seq_lens: torch.Tensor
     block_table: torch.Tensor
-    read_source_global_slots: torch.Tensor
-    read_local_hot_slot_ids: torch.Tensor
-    read_destination_hot_row_ids: torch.Tensor
-    read_valid_mask: torch.Tensor
-    resolved_hot_indices: torch.Tensor
     hot_block_table: torch.Tensor
-    newest_destination_hot_row_ids: torch.Tensor
     write_global_slots: torch.Tensor
     write_destination_hot_row_ids: torch.Tensor
     write_valid_mask: torch.Tensor
@@ -367,10 +384,11 @@ class DSASparsePlan:
         *,
         device: torch.device | str,
         block_table_dtype: torch.dtype = torch.int32,
-    ) -> "DSASparsePlan":
+    ) -> "DSASparseBatchMetadata":
         if key.request_capacity > config.max_num_seqs:
             raise ValueError(
-                f"request_capacity exceeds max_num_seqs, got {key.request_capacity} and {config.max_num_seqs}."
+                "request_capacity exceeds max_num_seqs, got "
+                f"{key.request_capacity} and {config.max_num_seqs}."
             )
         if key.query_lane_capacity > config.max_query_tokens_per_request:
             raise ValueError(
@@ -379,17 +397,7 @@ class DSASparsePlan:
                 f"{config.max_query_tokens_per_request}."
             )
 
-        read_shape = (
-            key.request_capacity,
-            key.query_lane_capacity,
-            config.index_topk,
-        )
-        write_shape = (
-            key.request_capacity,
-            key.query_lane_capacity,
-        )
-
-        def int_plan(shape: tuple[int, ...]) -> torch.Tensor:
+        def int_tensor(shape: tuple[int, ...]) -> torch.Tensor:
             return torch.full(
                 shape,
                 INVALID_INDEX,
@@ -397,36 +405,29 @@ class DSASparsePlan:
                 device=device,
             )
 
+        write_shape = (
+            key.request_capacity,
+            key.query_lane_capacity,
+        )
+        flat_query_indices = torch.arange(
+            key.token_capacity,
+            dtype=torch.int32,
+            device=device,
+        )
         return cls(
             key=key,
             row_mapping=DSASparseRowMapping.allocate(
                 key.request_capacity,
                 device=device,
             ),
-            query_positions=int_plan((key.token_capacity,)),
-            query_to_row=torch.arange(
-                key.token_capacity,
-                dtype=torch.int32,
-                device=device,
-            )
-            // key.query_lane_capacity,
-            query_to_lane=torch.arange(
-                key.token_capacity,
-                dtype=torch.int32,
-                device=device,
-            )
-            % key.query_lane_capacity,
+            query_positions=int_tensor((key.token_capacity,)),
+            query_to_row=flat_query_indices // key.query_lane_capacity,
+            query_to_lane=flat_query_indices % key.query_lane_capacity,
             query_valid_mask=torch.zeros(
                 key.token_capacity,
                 dtype=torch.bool,
                 device=device,
             ),
-            valid_topk_counts=torch.zeros(
-                key.token_capacity,
-                dtype=torch.int32,
-                device=device,
-            ),
-            topk_positions=int_plan((key.token_capacity, config.index_topk)),
             seq_lens=torch.zeros(
                 key.request_capacity,
                 dtype=torch.int32,
@@ -441,15 +442,6 @@ class DSASparsePlan:
                 dtype=block_table_dtype,
                 device=device,
             ),
-            read_source_global_slots=int_plan(read_shape),
-            read_local_hot_slot_ids=int_plan(read_shape),
-            read_destination_hot_row_ids=int_plan(read_shape),
-            read_valid_mask=torch.zeros(
-                read_shape,
-                dtype=torch.bool,
-                device=device,
-            ),
-            resolved_hot_indices=int_plan((key.token_capacity, config.index_topk)),
             hot_block_table=torch.full(
                 (
                     key.request_capacity,
@@ -459,15 +451,131 @@ class DSASparsePlan:
                 dtype=block_table_dtype,
                 device=device,
             ),
-            newest_destination_hot_row_ids=int_plan((key.token_capacity,)),
-            write_global_slots=int_plan(write_shape),
-            write_destination_hot_row_ids=int_plan(write_shape),
+            write_global_slots=int_tensor(write_shape),
+            write_destination_hot_row_ids=int_tensor(write_shape),
             write_valid_mask=torch.zeros(
                 write_shape,
                 dtype=torch.bool,
                 device=device,
             ),
         )
+
+
+@dataclass(frozen=True)
+class DSASparsePlan:
+    """Cohort-private lookup outputs and workspace for one execution shape."""
+
+    key: DSASparsePlanKey
+    batch_metadata: DSASparseBatchMetadata
+    valid_topk_counts: torch.Tensor
+    topk_positions: torch.Tensor
+    resolved_hot_indices: torch.Tensor
+    miss_mask: torch.Tensor
+    workspace: torch.Tensor
+
+    @classmethod
+    def allocate(
+        cls,
+        config: DSASparseCacheConfig,
+        key: DSASparsePlanKey,
+        *,
+        device: torch.device | str,
+        block_table_dtype: torch.dtype = torch.int32,
+        batch_metadata: DSASparseBatchMetadata | None = None,
+    ) -> "DSASparsePlan":
+        if batch_metadata is None:
+            batch_metadata = DSASparseBatchMetadata.allocate(
+                config,
+                key,
+                device=device,
+                block_table_dtype=block_table_dtype,
+            )
+        elif batch_metadata.key != key:
+            raise ValueError(
+                "Shared DSA Sparse batch metadata must use the same plan key."
+            )
+
+        topk_shape = (key.token_capacity, config.index_topk)
+        return cls(
+            key=key,
+            batch_metadata=batch_metadata,
+            valid_topk_counts=torch.zeros(
+                key.token_capacity,
+                dtype=torch.int32,
+                device=device,
+            ),
+            topk_positions=torch.full(
+                topk_shape,
+                INVALID_INDEX,
+                dtype=torch.int32,
+                device=device,
+            ),
+            resolved_hot_indices=torch.full(
+                topk_shape,
+                INVALID_INDEX,
+                dtype=torch.int32,
+                device=device,
+            ),
+            miss_mask=torch.zeros(
+                topk_shape,
+                dtype=torch.bool,
+                device=device,
+            ),
+            workspace=torch.empty(
+                (
+                    key.request_capacity,
+                    dsa_sparse_lookup_workspace_stride(
+                        config.device_buffer_size
+                    ),
+                ),
+                dtype=torch.int32,
+                device=device,
+            ),
+        )
+
+    @property
+    def row_mapping(self) -> DSASparseRowMapping:
+        return self.batch_metadata.row_mapping
+
+    @property
+    def query_positions(self) -> torch.Tensor:
+        return self.batch_metadata.query_positions
+
+    @property
+    def query_to_row(self) -> torch.Tensor:
+        return self.batch_metadata.query_to_row
+
+    @property
+    def query_to_lane(self) -> torch.Tensor:
+        return self.batch_metadata.query_to_lane
+
+    @property
+    def query_valid_mask(self) -> torch.Tensor:
+        return self.batch_metadata.query_valid_mask
+
+    @property
+    def seq_lens(self) -> torch.Tensor:
+        return self.batch_metadata.seq_lens
+
+    @property
+    def block_table(self) -> torch.Tensor:
+        return self.batch_metadata.block_table
+
+    @property
+    def hot_block_table(self) -> torch.Tensor:
+        return self.batch_metadata.hot_block_table
+
+    @property
+    def write_global_slots(self) -> torch.Tensor:
+        return self.batch_metadata.write_global_slots
+
+    @property
+    def write_destination_hot_row_ids(self) -> torch.Tensor:
+        return self.batch_metadata.write_destination_hot_row_ids
+
+    @property
+    def write_valid_mask(self) -> torch.Tensor:
+        return self.batch_metadata.write_valid_mask
 
 
 @dataclass(frozen=True)
@@ -518,17 +626,10 @@ class DSASparseLayerHotCache:
         return cls(layer_name=layout.layer_name, planes=planes)
 
 
-class DSASparseIndexOperator(Protocol):
-    """Mutation contract for the future A5 lookup/state custom operators."""
+class DSASparseLookupUpdateOperator(Protocol):
+    """Mutation contract for the single fused A5 metadata custom op."""
 
-    def prepare_newest(
-        self,
-        *,
-        state: DSASparseResidencyState,
-        plan: DSASparsePlan,
-    ) -> None: ...
-
-    def lookup(
+    def lookup_update(
         self,
         *,
         state: DSASparseResidencyState,
@@ -536,14 +637,13 @@ class DSASparseIndexOperator(Protocol):
     ) -> None: ...
 
 
-class UnimplementedDSASparseIndexOperator:
-    """Explicit eager stub until the A5 lookup operators are implemented."""
+class UnimplementedDSASparseLookupUpdateOperator:
+    """Explicit fail-fast implementation for missing custom-op builds."""
 
-    def prepare_newest(self, **_: object) -> None:
-        raise NotImplementedError("DSA Sparse newest-state operator is not implemented.")
-
-    def lookup(self, **_: object) -> None:
-        raise NotImplementedError("DSA Sparse lookup operator is not implemented.")
+    def lookup_update(self, **_: object) -> None:
+        raise NotImplementedError(
+            "DSA Sparse lookup/update operator is not implemented."
+        )
 
 
 @dataclass(frozen=True)
@@ -559,8 +659,7 @@ class DSASparseLayerBinding:
     hot_cache: DSASparseLayerHotCache
     io_context: object
     io_region: object
-    read_completion: object
-    write_completion: object
+    io_completion: object
 
     def __post_init__(self) -> None:
         if self.layer_name != self.hot_cache.layer_name:
@@ -602,10 +701,8 @@ class DSASparseEagerStep:
     plan: DSASparsePlan
     request_ids: tuple[Hashable, ...]
     lookup_complete: bool = False
-    write_submitted_layers: set[str] = field(default_factory=set)
-    write_joined_layers: set[str] = field(default_factory=set)
-    read_submitted_layers: set[str] = field(default_factory=set)
-    read_joined_layers: set[str] = field(default_factory=set)
+    newest_written_layers: set[str] = field(default_factory=set)
+    io_completed_layers: set[str] = field(default_factory=set)
     completed_layers: set[str] = field(default_factory=set)
 
 
@@ -616,7 +713,7 @@ class DSASparseEagerCoordinator:
         self,
         config: DSASparseCacheConfig,
         *,
-        index_operator: DSASparseIndexOperator,
+        index_operator: DSASparseLookupUpdateOperator,
         io_operator: DSASparseIOOperator,
         seat_manager: CacheSeatManager | None = None,
     ) -> None:
@@ -671,16 +768,18 @@ class DSASparseEagerCoordinator:
         region_identity = self._resource_identity(binding.io_region)
         if region_identity in self._region_identities:
             raise ValueError("Each DSA Sparse layer must own an independent I/O region.")
-        completion_identities = {
-            self._resource_identity(binding.read_completion),
-            self._resource_identity(binding.write_completion),
-        }
-        if len(completion_identities) != 2 or completion_identities & self._completion_identities:
-            raise ValueError("Each DSA Sparse layer and direction must own an independent completion resource.")
+        completion_identity = self._resource_identity(
+            binding.io_completion
+        )
+        if completion_identity in self._completion_identities:
+            raise ValueError(
+                "Each DSA Sparse layer must own an independent unified I/O "
+                "completion resource."
+            )
         self._layers[binding.key] = binding
         self._hot_plane_addresses.update(plane_addresses)
         self._region_identities.add(region_identity)
-        self._completion_identities.update(completion_identities)
+        self._completion_identities.add(completion_identity)
 
     def freeze(self) -> None:
         frozen_cohorts: dict[DSASparseCohortKey, DSASparseCohort] = {}
@@ -735,6 +834,7 @@ class DSASparseEagerCoordinator:
         query_valid_mask: torch.Tensor,
         seq_lens: torch.Tensor,
         block_table: torch.Tensor,
+        stage_batch_metadata: bool = True,
     ) -> DSASparseEagerStep:
         self._require_healthy()
         if not self._frozen:
@@ -749,26 +849,29 @@ class DSASparseEagerCoordinator:
                 f"Only one DSA Sparse step may mutate a residency cohort at a time, cohort={cohort_key!r}."
             )
 
-        self.seat_manager.pack_rows(request_ids, plan.row_mapping)
-        self._copy_exact(
-            query_positions,
-            plan.query_positions,
-            "query_positions",
-        )
-        self._copy_exact(
-            query_valid_mask,
-            plan.query_valid_mask,
-            "query_valid_mask",
-        )
-        self._copy_exact(seq_lens, plan.seq_lens, "seq_lens")
-        self._copy_exact(block_table, plan.block_table, "block_table")
+        if stage_batch_metadata:
+            self.seat_manager.pack_rows(request_ids, plan.row_mapping)
+            self._copy_exact(
+                query_positions,
+                plan.query_positions,
+                "query_positions",
+            )
+            self._copy_exact(
+                query_valid_mask,
+                plan.query_valid_mask,
+                "query_valid_mask",
+            )
+            self._copy_exact(seq_lens, plan.seq_lens, "seq_lens")
+            self._copy_exact(
+                block_table,
+                plan.block_table,
+                "block_table",
+            )
+            self._prepare_batch_metadata(plan)
         plan.topk_positions.fill_(INVALID_INDEX)
         plan.valid_topk_counts.zero_()
-
-        self.index_operator.prepare_newest(
-            state=cohort.state,
-            plan=plan,
-        )
+        plan.resolved_hot_indices.fill_(INVALID_INDEX)
+        plan.miss_mask.zero_()
         step = DSASparseEagerStep(
             cohort=cohort,
             plan=plan,
@@ -783,23 +886,13 @@ class DSASparseEagerCoordinator:
         layer_name: str,
     ) -> None:
         self._assert_active_step(step)
-        binding = self._get_step_layer(step, layer_name)
-        if layer_name in step.write_submitted_layers:
-            raise RuntimeError(f"Newest write was already submitted for {layer_name!r}.")
-        try:
-            self.io_operator.write_async(
-                context=binding.io_context,
-                region=binding.io_region,
-                destination_global_slots=step.plan.write_global_slots,
-                source_hot_row_ids=step.plan.write_destination_hot_row_ids,
-                valid_mask=step.plan.write_valid_mask,
-                hot_planes=binding.hot_cache.planes,
-                completion=binding.write_completion,
+        self._get_step_layer(step, layer_name)
+        if layer_name in step.newest_written_layers:
+            raise RuntimeError(
+                f"Newest Hot Cache payload was already marked written for "
+                f"{layer_name!r}."
             )
-        except Exception as exc:
-            self._poison(exc)
-            raise
-        step.write_submitted_layers.add(layer_name)
+        step.newest_written_layers.add(layer_name)
 
     def prepare_lookup(
         self,
@@ -813,7 +906,7 @@ class DSASparseEagerCoordinator:
             raise RuntimeError("Each DSA Sparse cohort performs lookup only once per step.")
         leader_layer = step.cohort.leader_layer
         self._get_step_layer(step, leader_layer)
-        if leader_layer not in step.write_submitted_layers:
+        if leader_layer not in step.newest_written_layers:
             raise RuntimeError("The DSA Sparse cohort leader must submit its newest Main KV write before lookup.")
         self._copy_exact(
             topk_positions,
@@ -825,10 +918,14 @@ class DSASparseEagerCoordinator:
             step.plan.valid_topk_counts,
             "valid_topk_counts",
         )
-        self.index_operator.lookup(
-            state=step.cohort.state,
-            plan=step.plan,
-        )
+        try:
+            self.index_operator.lookup_update(
+                state=step.cohort.state,
+                plan=step.plan,
+            )
+        except Exception as exc:
+            self._poison(exc)
+            raise
         step.lookup_complete = True
 
     def run_layer_attention(
@@ -841,44 +938,41 @@ class DSASparseEagerCoordinator:
         binding = self._get_step_layer(step, layer_name)
         if not step.lookup_complete:
             raise RuntimeError("DSA Sparse lookup must complete before layer I/O.")
-        if layer_name not in step.write_submitted_layers:
+        if layer_name not in step.newest_written_layers:
             raise RuntimeError("Newest Main KV write must be submitted before lookup/I/O/SFA.")
         if layer_name in step.completed_layers:
             raise RuntimeError(f"DSA Sparse layer {layer_name!r} already completed this step.")
 
         try:
-            self.io_operator.read_async(
+            self.io_operator.dsa_sparse_io(
                 context=binding.io_context,
                 region=binding.io_region,
-                source_global_slots=step.plan.read_source_global_slots,
-                destination_hot_row_ids=(step.plan.read_destination_hot_row_ids),
-                valid_mask=step.plan.read_valid_mask,
+                topk_positions=step.plan.topk_positions,
+                resolved_hot_indices=step.plan.resolved_hot_indices,
+                miss_mask=step.plan.miss_mask,
+                query_to_row=step.plan.query_to_row,
+                row_to_cache_seat=(
+                    step.plan.row_mapping.row_to_cache_seat
+                ),
+                block_table=step.plan.block_table,
+                write_global_slots=step.plan.write_global_slots,
+                write_destination_hot_row_ids=(
+                    step.plan.write_destination_hot_row_ids
+                ),
+                write_valid_mask=step.plan.write_valid_mask,
                 hot_planes=binding.hot_cache.planes,
-                completion=binding.read_completion,
+                completion=binding.io_completion,
             )
         except Exception as exc:
             self._poison(exc)
             raise
-        step.read_submitted_layers.add(layer_name)
-        try:
-            try:
-                self.io_operator.wait_read(
-                    context=binding.io_context,
-                    completion=binding.read_completion,
-                    hot_planes=binding.hot_cache.planes,
-                )
-            except Exception as exc:
-                self._poison(exc)
-                raise
-            step.read_joined_layers.add(layer_name)
-            resolution = DSASparseResolution(
-                hot_main_cache=binding.hot_cache.planes,
-                local_sparse_indices=step.plan.resolved_hot_indices,
-                hot_block_table=step.plan.hot_block_table,
-            )
-            output = attention(resolution)
-        finally:
-            self._join_write(step, binding)
+        step.io_completed_layers.add(layer_name)
+        resolution = DSASparseResolution(
+            hot_main_cache=binding.hot_cache.planes,
+            local_sparse_indices=step.plan.resolved_hot_indices,
+            hot_block_table=step.plan.hot_block_table,
+        )
+        output = attention(resolution)
         step.completed_layers.add(layer_name)
         return output
 
@@ -890,42 +984,123 @@ class DSASparseEagerCoordinator:
         if step.completed_layers != expected_layers:
             pending_layers = sorted(expected_layers - step.completed_layers)
             raise RuntimeError(
-                f"Cannot finish DSA Sparse step before all layer writes are joined, pending layers: {pending_layers}."
+                "Cannot finish DSA Sparse step before every layer completes "
+                f"its unified I/O and SFA call, pending layers: "
+                f"{pending_layers}."
             )
         del self._active_steps[step.cohort.key]
 
     def abort_step(self, step: DSASparseEagerStep) -> None:
-        """Join submitted I/O and retire a failed eager step."""
+        """Retire a failed eager step.
 
+        The unified I/O operator establishes its read/write completion
+        dependency within the call, so there is no second eager wait phase.
+        """
         self._assert_active_step(step)
-        first_error: Exception | None = None
-        try:
-            for layer_key, binding in self._layers.items():
-                if binding.cohort != step.cohort.key:
-                    continue
-                layer_name = layer_key.layer_name
-                if layer_name in step.read_submitted_layers and layer_name not in step.read_joined_layers:
-                    try:
-                        self.io_operator.wait_read(
-                            context=binding.io_context,
-                            completion=binding.read_completion,
-                            hot_planes=binding.hot_cache.planes,
-                        )
-                        step.read_joined_layers.add(layer_name)
-                    except Exception as exc:
-                        if first_error is None:
-                            first_error = exc
-                if layer_name in step.write_submitted_layers and layer_name not in step.write_joined_layers:
-                    try:
-                        self._join_write(step, binding)
-                    except Exception as exc:
-                        if first_error is None:
-                            first_error = exc
-        finally:
-            del self._active_steps[step.cohort.key]
-        if first_error is not None:
-            self._poison(first_error)
-            raise RuntimeError("Failed to join DSA Sparse I/O while aborting an eager step.") from first_error
+        del self._active_steps[step.cohort.key]
+
+    def _prepare_batch_metadata(
+        self,
+        plan: DSASparsePlan,
+    ) -> None:
+        """Fill synthetic Hot addressing in the row-metadata stage."""
+
+        row_to_seat = plan.row_mapping.row_to_cache_seat
+        block_offsets = torch.arange(
+            self.config.hot_blocks_per_seat,
+            dtype=plan.hot_block_table.dtype,
+            device=plan.hot_block_table.device,
+        )
+        hot_blocks = (
+            row_to_seat.to(plan.hot_block_table.dtype).unsqueeze(1)
+            * self.config.hot_blocks_per_seat
+            + block_offsets.unsqueeze(0)
+        )
+        plan.hot_block_table.copy_(hot_blocks)
+        plan.hot_block_table.masked_fill_(
+            row_to_seat.unsqueeze(1) < 0,
+            INVALID_INDEX,
+        )
+
+        plan.write_global_slots.fill_(INVALID_INDEX)
+        plan.write_destination_hot_row_ids.fill_(INVALID_INDEX)
+        plan.write_valid_mask.zero_()
+
+        query_rows = plan.query_to_row.to(torch.long)
+        query_lanes = plan.query_to_lane.to(torch.long)
+        query_positions = plan.query_positions
+        query_seats = row_to_seat[query_rows]
+        query_seq_lens = plan.seq_lens[query_rows]
+        valid = (
+            plan.query_valid_mask
+            & (query_seats >= 0)
+            & (query_positions >= 0)
+            & (query_positions < query_seq_lens)
+            & (query_positions < self.config.max_model_len)
+        )
+
+        block_indices = torch.div(
+            query_positions,
+            self.config.block_size,
+            rounding_mode="floor",
+        )
+        safe_block_indices = block_indices.clamp(
+            min=0,
+            max=plan.block_table.shape[1] - 1,
+        ).to(torch.long)
+        physical_blocks = plan.block_table[
+            query_rows,
+            safe_block_indices,
+        ].to(torch.int32)
+        valid &= physical_blocks >= 0
+
+        destination_rows = (
+            query_seats
+            * self.config.hot_stride
+            + self.config.device_buffer_size
+            + plan.query_to_lane
+        ).to(torch.int32)
+        global_slots = (
+            physical_blocks * self.config.block_size
+            + torch.remainder(
+                query_positions,
+                self.config.block_size,
+            )
+        ).to(torch.int32)
+        invalid_values = torch.full_like(
+            query_positions,
+            INVALID_INDEX,
+        )
+        destination_rows = torch.where(
+            valid,
+            destination_rows,
+            invalid_values,
+        )
+        global_slots = torch.where(
+            valid,
+            global_slots,
+            invalid_values,
+        )
+
+        write_indices = (
+            query_rows * plan.key.query_lane_capacity
+            + query_lanes
+        )
+        plan.write_destination_hot_row_ids.view(-1).index_copy_(
+            0,
+            write_indices,
+            destination_rows,
+        )
+        plan.write_global_slots.view(-1).index_copy_(
+            0,
+            write_indices,
+            global_slots,
+        )
+        plan.write_valid_mask.view(-1).index_copy_(
+            0,
+            write_indices,
+            valid,
+        )
 
     def _get_cohort(
         self,
@@ -950,31 +1125,16 @@ class DSASparseEagerCoordinator:
         if self._active_steps.get(step.cohort.key) is not step:
             raise RuntimeError("DSA Sparse step is not the active cohort owner.")
 
-    def _join_write(
-        self,
-        step: DSASparseEagerStep,
-        binding: DSASparseLayerBinding,
-    ) -> None:
-        if binding.layer_name in step.write_joined_layers:
-            return
-        try:
-            self.io_operator.wait_write(
-                context=binding.io_context,
-                completion=binding.write_completion,
-                hot_planes=binding.hot_cache.planes,
-            )
-        except Exception as exc:
-            self._poison(exc)
-            raise
-        step.write_joined_layers.add(binding.layer_name)
-
     def _require_mutable(self) -> None:
         if self._frozen:
             raise RuntimeError("DSA Sparse coordinator resources are frozen.")
 
     def _require_healthy(self) -> None:
         if self._failure is not None:
-            raise RuntimeError("DSA Sparse coordinator is poisoned after an I/O completion failure.") from self._failure
+            raise RuntimeError(
+                "DSA Sparse coordinator is poisoned after an operator "
+                "failure."
+            ) from self._failure
 
     def _poison(self, failure: Exception) -> None:
         if self._failure is None:
@@ -1058,6 +1218,7 @@ class DSASparseEagerBatchContext:
         seq_lens: torch.Tensor,
         block_table: torch.Tensor,
         num_sfa_queries: int | None = None,
+        stage_batch_metadata: bool = True,
     ) -> "DSASparseEagerBatchContext":
         cohort = coordinator.get_cohort(cohort_key)
         try:
@@ -1085,24 +1246,35 @@ class DSASparseEagerBatchContext:
             dtype=torch.long,
             device=plan.query_positions.device,
         )
-        fixed_query_positions = torch.full_like(
-            plan.query_positions,
-            INVALID_INDEX,
-        )
-        fixed_query_valid_mask = torch.zeros_like(plan.query_valid_mask)
-        fixed_query_positions[active_plan_indices] = query_positions
-        fixed_query_valid_mask[active_plan_indices] = True
+        if stage_batch_metadata:
+            fixed_query_positions = torch.full_like(
+                plan.query_positions,
+                INVALID_INDEX,
+            )
+            fixed_query_valid_mask = torch.zeros_like(
+                plan.query_valid_mask
+            )
+            fixed_query_positions[active_plan_indices] = query_positions
+            fixed_query_valid_mask[active_plan_indices] = True
 
-        fixed_seq_lens = torch.zeros_like(plan.seq_lens)
-        fixed_seq_lens[: len(request_ids)] = seq_lens
-        fixed_block_table = torch.full_like(plan.block_table, INVALID_INDEX)
-        fixed_block_table[: len(request_ids)] = block_table
+            fixed_seq_lens = torch.zeros_like(plan.seq_lens)
+            fixed_seq_lens[: len(request_ids)] = seq_lens
+            fixed_block_table = torch.full_like(
+                plan.block_table,
+                INVALID_INDEX,
+            )
+            fixed_block_table[: len(request_ids)] = block_table
+        else:
+            fixed_query_positions = plan.query_positions
+            fixed_query_valid_mask = plan.query_valid_mask
+            fixed_seq_lens = plan.seq_lens
+            fixed_block_table = plan.block_table
 
         sfa_slot_mapping = torch.full(
             (num_sfa_queries,),
             INVALID_INDEX,
-            dtype=plan.newest_destination_hot_row_ids.dtype,
-            device=plan.newest_destination_hot_row_ids.device,
+            dtype=plan.write_destination_hot_row_ids.dtype,
+            device=plan.write_destination_hot_row_ids.device,
         )
         sfa_local_sparse_indices = torch.full(
             (
@@ -1121,9 +1293,14 @@ class DSASparseEagerBatchContext:
             query_valid_mask=fixed_query_valid_mask,
             seq_lens=fixed_seq_lens,
             block_table=fixed_block_table,
+            stage_batch_metadata=stage_batch_metadata,
         )
         try:
-            sfa_slot_mapping[:num_active_queries] = plan.newest_destination_hot_row_ids[active_plan_indices]
+            sfa_slot_mapping[:num_active_queries] = (
+                plan.write_destination_hot_row_ids.view(-1)[
+                    active_plan_indices
+                ]
+            )
         except BaseException as exc:
             try:
                 coordinator.abort_step(step)

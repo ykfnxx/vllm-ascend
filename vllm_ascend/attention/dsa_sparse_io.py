@@ -67,7 +67,10 @@ class DSASparseIOBackend(Protocol):
     """Control-plane backend contract.
 
     Implementations own storage. The framework owns neither a default backend
-    nor a host-memory fallback.
+    nor a host-memory fallback. Request handles must not be reused while late
+    completions can still reference them. ``release_request`` must be
+    idempotent for a handle that was already released so stale
+    generation-bearing completion cleanup needs no framework-side tombstone.
     """
 
     def capabilities(self) -> DSASparseIOCapabilities: ...
@@ -105,90 +108,134 @@ class DSASparseIOBackend(Protocol):
 
 
 class DSASparseIOOperator(Protocol):
-    """Eager data-plane call boundary shared with the future I/O bridge."""
+    """Unified Decode data-plane boundary.
 
-    def publish_async(
-        self,
-        *,
-        context: object,
-        publication: object,
-        region: object,
-        portable_block_ids: torch.Tensor,
-        source_global_slots: torch.Tensor,
-        valid_mask: torch.Tensor,
-        full_main_planes: tuple[torch.Tensor, ...],
-        completion: object,
-    ) -> None: ...
+    A production implementation derives history read addresses from the
+    semantic Top-K positions and the current Decode block table, performs the
+    newest writes and miss reads, and establishes the completion dependency
+    before returning.  Eager and graph execution intentionally share this
+    single call shape.
+    """
 
-    def wait_publish(
-        self,
-        *,
-        context: object,
-        completion: object,
-        full_main_planes: tuple[torch.Tensor, ...],
-    ) -> None: ...
-
-    def read_async(
+    def dsa_sparse_io(
         self,
         *,
         context: object,
         region: object,
-        source_global_slots: torch.Tensor,
-        destination_hot_row_ids: torch.Tensor,
-        valid_mask: torch.Tensor,
+        topk_positions: torch.Tensor,
+        resolved_hot_indices: torch.Tensor,
+        miss_mask: torch.Tensor,
+        query_to_row: torch.Tensor,
+        row_to_cache_seat: torch.Tensor,
+        block_table: torch.Tensor,
+        write_global_slots: torch.Tensor,
+        write_destination_hot_row_ids: torch.Tensor,
+        write_valid_mask: torch.Tensor,
         hot_planes: tuple[torch.Tensor, ...],
         completion: object,
-    ) -> None: ...
-
-    def wait_read(
-        self,
-        *,
-        context: object,
-        completion: object,
-        hot_planes: tuple[torch.Tensor, ...],
-    ) -> None: ...
-
-    def write_async(
-        self,
-        *,
-        context: object,
-        region: object,
-        destination_global_slots: torch.Tensor,
-        source_hot_row_ids: torch.Tensor,
-        valid_mask: torch.Tensor,
-        hot_planes: tuple[torch.Tensor, ...],
-        completion: object,
-    ) -> None: ...
-
-    def wait_write(
-        self,
-        *,
-        context: object,
-        completion: object,
-        hot_planes: tuple[torch.Tensor, ...],
     ) -> None: ...
 
 
 class UnimplementedDSASparseIOOperator:
     """Explicit eager stub until the backend bridge is implemented."""
 
-    def publish_async(self, **_: object) -> None:
-        raise NotImplementedError("DSA Sparse I/O publish operator is not implemented.")
+    def dsa_sparse_io(self, **_: object) -> None:
+        raise NotImplementedError("DSA Sparse unified I/O operator is not implemented.")
 
-    def wait_publish(self, **_: object) -> None:
-        raise NotImplementedError("DSA Sparse I/O publish wait is not implemented.")
 
-    def read_async(self, **_: object) -> None:
-        raise NotImplementedError("DSA Sparse I/O read operator is not implemented.")
+class MockDSASparseIOOperator:
+    """No-op implementation used only by the eager development runtime.
 
-    def wait_read(self, **_: object) -> None:
-        raise NotImplementedError("DSA Sparse I/O read wait is not implemented.")
+    The mock preserves the final, unconditional one-call-per-layer topology
+    and validates the static tensor contract.  It deliberately does not move
+    newest or history payload.  Consequently, a miss installed by
+    ``dsa_sparse_lookup_update`` does not contain valid payload and this mock
+    must not be used to claim model accuracy or multi-step miss correctness.
+    """
 
-    def write_async(self, **_: object) -> None:
-        raise NotImplementedError("DSA Sparse I/O write operator is not implemented.")
-
-    def wait_write(self, **_: object) -> None:
-        raise NotImplementedError("DSA Sparse I/O write wait is not implemented.")
+    def dsa_sparse_io(
+        self,
+        *,
+        context: object,
+        region: object,
+        topk_positions: torch.Tensor,
+        resolved_hot_indices: torch.Tensor,
+        miss_mask: torch.Tensor,
+        query_to_row: torch.Tensor,
+        row_to_cache_seat: torch.Tensor,
+        block_table: torch.Tensor,
+        write_global_slots: torch.Tensor,
+        write_destination_hot_row_ids: torch.Tensor,
+        write_valid_mask: torch.Tensor,
+        hot_planes: tuple[torch.Tensor, ...],
+        completion: object,
+    ) -> None:
+        del context, region, completion
+        if topk_positions.ndim != 2:
+            raise ValueError("topk_positions must be two-dimensional.")
+        if topk_positions.shape != resolved_hot_indices.shape:
+            raise ValueError(
+                "topk_positions and resolved_hot_indices must have the same "
+                "shape."
+            )
+        if miss_mask.shape != topk_positions.shape:
+            raise ValueError("miss_mask must have the Top-K tensor shape.")
+        if query_to_row.shape != (topk_positions.shape[0],):
+            raise ValueError("query_to_row must contain one row for each query.")
+        if row_to_cache_seat.ndim != 1:
+            raise ValueError("row_to_cache_seat must be one-dimensional.")
+        if block_table.ndim != 2:
+            raise ValueError("block_table must be two-dimensional.")
+        if block_table.shape[0] != row_to_cache_seat.shape[0]:
+            raise ValueError(
+                "block_table and row_to_cache_seat must have the same row "
+                "capacity."
+            )
+        if write_global_slots.shape != write_destination_hot_row_ids.shape:
+            raise ValueError(
+                "Newest write source and destination descriptors must have "
+                "the same shape."
+            )
+        if write_valid_mask.shape != write_global_slots.shape:
+            raise ValueError("write_valid_mask must have the newest descriptor shape.")
+        if write_global_slots.ndim != 2:
+            raise ValueError("Newest write descriptors must be two-dimensional.")
+        if write_global_slots.shape[0] != row_to_cache_seat.shape[0]:
+            raise ValueError(
+                "Newest write descriptors and row_to_cache_seat must have "
+                "the same row capacity."
+            )
+        if not hot_planes:
+            raise ValueError("At least one Hot Cache plane is required.")
+        if any(plane.ndim < 2 for plane in hot_planes):
+            raise ValueError("Every Hot Cache plane must use a paged layout.")
+        hot_page_shape = hot_planes[0].shape[:2]
+        if any(
+            plane.shape[:2] != hot_page_shape
+            for plane in hot_planes[1:]
+        ):
+            raise ValueError(
+                "Every Hot Cache plane must have the same block and row "
+                "dimensions."
+            )
+        if topk_positions.dtype != torch.int32:
+            raise TypeError("topk_positions must use int32.")
+        if resolved_hot_indices.dtype != torch.int32:
+            raise TypeError("resolved_hot_indices must use int32.")
+        if miss_mask.dtype != torch.bool:
+            raise TypeError("miss_mask must use bool.")
+        if query_to_row.dtype != torch.int32:
+            raise TypeError("query_to_row must use int32.")
+        if row_to_cache_seat.dtype != torch.int32:
+            raise TypeError("row_to_cache_seat must use int32.")
+        if block_table.dtype != torch.int32:
+            raise TypeError("block_table must use int32.")
+        if write_global_slots.dtype != torch.int32:
+            raise TypeError("write_global_slots must use int32.")
+        if write_destination_hot_row_ids.dtype != torch.int32:
+            raise TypeError("write_destination_hot_row_ids must use int32.")
+        if write_valid_mask.dtype != torch.bool:
+            raise TypeError("write_valid_mask must use bool.")
 
 
 DSASparseIOBackendFactory = Callable[

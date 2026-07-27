@@ -7,7 +7,10 @@ from dataclasses import dataclass, fields, is_dataclass
 import pytest
 import torch
 
-from tests.ut.attention.test_dsa_sparse_eager import build_coordinator
+from tests.ut.attention.test_dsa_sparse_eager import (
+    RecordingIndexOperator,
+    build_coordinator,
+)
 from vllm_ascend.attention.dsa_sparse import (
     DSASparseCacheConfig,
     DSASparseCohort,
@@ -23,7 +26,7 @@ from vllm_ascend.worker.dsa_sparse_eager import (
     DSASparseEagerCohortDescriptor,
     DSASparseEagerCohortLayout,
     DSASparseEagerRuntime,
-    create_dsa_sparse_eager_stub_runtime,
+    create_dsa_sparse_eager_mock_runtime,
 )
 from vllm_ascend.worker.dsa_sparse_memory import (
     calculate_dsa_sparse_fixed_hbm_bytes,
@@ -115,6 +118,15 @@ def _run_all_layers(router, *layer_names):
 
 def _add_second_cohort(coordinator):
     config = coordinator.config
+    first_cohort = coordinator.get_cohort(
+        DSASparseCohortKey(
+            name="shared-indexer-0",
+            role="target",
+        )
+    )
+    shared_batch_metadata = next(
+        iter(first_cohort.plans.values())
+    ).batch_metadata
     cohort_key = DSASparseCohortKey(
         name="shared-indexer-1",
         role="target",
@@ -139,6 +151,7 @@ def _add_second_cohort(coordinator):
                     config,
                     plan_key,
                     device="cpu",
+                    batch_metadata=shared_batch_metadata,
                 )
             },
         )
@@ -159,8 +172,7 @@ def _add_second_cohort(coordinator):
                 ),
                 io_context=f"context:{layer_name}",
                 io_region=f"region:{layer_name}",
-                read_completion=object(),
-                write_completion=object(),
+                io_completion=object(),
             )
         )
     return cohort_key, plan_key
@@ -187,7 +199,7 @@ def _logical_tensor_bytes(*values) -> int:
     return sum(visit(value) for value in values)
 
 
-def test_stub_factory_allocates_target_resources_and_keeps_stubs_explicit():
+def test_mock_factory_allocates_resources_and_runs_injected_lookup():
     config = DSASparseCacheConfig(
         max_num_seqs=2,
         max_model_len=32,
@@ -208,7 +220,8 @@ def test_stub_factory_allocates_target_resources_and_keeps_stubs_explicit():
             plane_row_shapes=((1, 8), (1, 2)),
         ),
     )
-    runtime = create_dsa_sparse_eager_stub_runtime(
+    lookup_events = []
+    runtime = create_dsa_sparse_eager_mock_runtime(
         config,
         [
             DSASparseEagerCohortLayout(
@@ -217,7 +230,12 @@ def test_stub_factory_allocates_target_resources_and_keeps_stubs_explicit():
             )
         ],
         device="cpu",
+        index_operator=RecordingIndexOperator(
+            lookup_events,
+            has_misses=False,
+        ),
     )
+    assert runtime.uses_mock_lifecycle
 
     descriptor = runtime.cohort_descriptors[0]
     cohort = runtime.coordinator.get_cohort(descriptor.cohort_key)
@@ -265,13 +283,63 @@ def test_stub_factory_allocates_target_resources_and_keeps_stubs_explicit():
     with pytest.raises(KeyError, match="does not own"):
         runtime.begin_target_batch(**batch_arguments)
 
-    runtime.acquire_request("request-a")
-    with pytest.raises(
-        NotImplementedError,
-        match="newest-state operator",
-    ):
-        runtime.begin_target_batch(**batch_arguments)
-    runtime.release_request("request-a")
+    lease = runtime.admit_mock_request("request-a")
+    assert runtime.has_mock_request("request-a")
+    assert lease.seat == 0
+    assert lease.epoch == 1
+    with runtime.begin_target_batch(**batch_arguments) as router:
+        for layer_name in ("layer.0", "layer.1"):
+            router.main_write_target(layer_name)
+            router.submit_newest_write(layer_name)
+            router.run_layer_attention(
+                layer_name,
+                torch.zeros((1, 4), dtype=torch.int32),
+                lambda resolution: torch.tensor(
+                    [resolution.hot_main_cache[0].shape[0]]
+                ),
+            )
+    assert lookup_events == ["lookup_update"]
+    runtime.retire_mock_request("request-a", preempted=False)
+    assert not runtime.has_mock_request("request-a")
+
+
+def test_mock_admission_failure_rolls_back_generation_state():
+    config = DSASparseCacheConfig(
+        max_num_seqs=1,
+        max_model_len=16,
+        block_size=4,
+        device_buffer_size=4,
+        max_query_tokens_per_request=1,
+        index_topk=4,
+    )
+    runtime = create_dsa_sparse_eager_mock_runtime(
+        config,
+        [
+            DSASparseEagerCohortLayout(
+                cohort_name="target-indexer-0",
+                layer_layouts=(
+                    DSASparseLayerLayout(
+                        layer_name="layer.0",
+                        plane_dtypes=(torch.bfloat16,),
+                        plane_row_shapes=((1, 8),),
+                    ),
+                ),
+            ),
+        ],
+        device="cpu",
+        index_operator=RecordingIndexOperator([], has_misses=False),
+    )
+    first_lease = runtime.admit_mock_request("request-a")
+
+    with pytest.raises(RuntimeError, match="No free"):
+        runtime.admit_mock_request("request-b")
+
+    runtime.retire_mock_request("request-a", preempted=False)
+    second_lease = runtime.admit_mock_request("request-b")
+
+    assert first_lease.seat == second_lease.seat == 0
+    assert second_lease.epoch == first_lease.epoch + 1
+    runtime.retire_mock_request("request-b", preempted=False)
 
 
 def test_success_attaches_one_router_to_shared_metadata_and_finishes():
@@ -282,6 +350,7 @@ def test_success_attaches_one_router_to_shared_metadata_and_finishes():
         coordinator,
         [_descriptor(cohort_key, plan_key, "layer.0", "layer.1")],
     )
+    assert not runtime.uses_mock_lifecycle
     metadata = TrackingMetadata()
 
     with runtime.begin_target_batch(
@@ -298,7 +367,7 @@ def test_success_attaches_one_router_to_shared_metadata_and_finishes():
 
     assert metadata.dsa_sparse_context is None
     assert len(metadata.context_assignments) == 2
-    assert events.count("lookup") == 1
+    assert events.count("lookup_update") == 1
 
 
 def test_multiple_cohorts_share_router_but_keep_contexts_independent():
@@ -341,7 +410,7 @@ def test_multiple_cohorts_share_router_but_keep_contexts_independent():
 
     assert first_metadata.dsa_sparse_context is None
     assert second_metadata.dsa_sparse_context is None
-    assert events.count("lookup") == 2
+    assert events.count("lookup_update") == 2
 
 
 def test_forward_exception_aborts_all_contexts_and_detaches_metadata():

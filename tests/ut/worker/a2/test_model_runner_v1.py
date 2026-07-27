@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import torch
@@ -945,6 +945,7 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
             dsa_sparse_config=SimpleNamespace(
                 is_consumer=consumer,
                 is_producer=not consumer,
+                io_backend="mock",
             )
         )
         runner.dsa_sparse_eager_runtime = None
@@ -952,8 +953,8 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
         runner.input_batch = SimpleNamespace(req_ids=["request-a", "request-b", None])
         return runner
 
-    @patch("vllm_ascend.worker.model_runner_v1.create_dsa_sparse_eager_stub_runtime")
-    def test_initialize_stub_runtime_after_fixed_hbm_reservation(
+    @patch("vllm_ascend.worker.model_runner_v1.create_dsa_sparse_eager_mock_runtime")
+    def test_initialize_mock_runtime_after_fixed_hbm_reservation(
         self,
         mock_create_runtime,
     ):
@@ -971,7 +972,7 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
         runtime = MagicMock()
         mock_create_runtime.return_value = runtime
 
-        runner._initialize_dsa_sparse_eager_stub_runtime()
+        runner._initialize_dsa_sparse_eager_mock_runtime()
 
         mock_create_runtime.assert_called_once_with(
             cache_config,
@@ -980,12 +981,22 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
         )
         self.assertIs(runner.dsa_sparse_eager_runtime, runtime)
 
-    def test_initialize_stub_runtime_requires_fixed_hbm_reservation(self):
+    def test_initialize_mock_runtime_requires_fixed_hbm_reservation(self):
         runner = self._build_runner()
         runner._dsa_sparse_fixed_hbm_breakdown = None
 
         with self.assertRaisesRegex(RuntimeError, "must be reserved"):
-            runner._initialize_dsa_sparse_eager_stub_runtime()
+            runner._initialize_dsa_sparse_eager_mock_runtime()
+
+    def test_initialize_mock_runtime_rejects_concrete_backend_name(self):
+        runner = self._build_runner()
+        runner.ascend_config.dsa_sparse_config.io_backend = "vendor"
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "explicit no-op io_backend='mock'",
+        ):
+            runner._initialize_dsa_sparse_eager_mock_runtime()
 
     def test_bind_and_begin_target_batch(self):
         runner = self._build_runner()
@@ -1062,6 +1073,125 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
         )
         with execution:
             pass
+
+    @patch(
+        "vllm_ascend.worker.model_runner_v1.GPUModelRunner._update_states",
+        return_value="deferred-correction",
+    )
+    def test_update_states_preflights_then_updates_and_transitions_mock(
+        self,
+        mock_upstream_update,
+    ):
+        runner = self._build_runner()
+        runner.use_async_scheduling = False
+        runtime = MagicMock()
+        runtime.has_mock_request.return_value = True
+        runner.dsa_sparse_eager_runtime = runtime
+        scheduler_output = SimpleNamespace(
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[],
+                num_computed_tokens=[],
+                resumed_req_ids=["resumed"],
+            ),
+            finished_req_ids={"finished"},
+            preempted_req_ids={"preempted"},
+            scheduled_new_reqs=[
+                SimpleNamespace(req_id="new"),
+            ],
+        )
+
+        result = runner._update_states(scheduler_output)
+
+        self.assertEqual(result, "deferred-correction")
+        runtime.preflight_mock_retire.assert_called_once()
+        mock_upstream_update.assert_called_once_with(scheduler_output)
+        runtime.retire_mock_request.assert_any_call(
+            "finished",
+            preempted=False,
+        )
+        runtime.retire_mock_request.assert_any_call(
+            "preempted",
+            preempted=True,
+        )
+        runtime.retire_mock_request.assert_any_call(
+            "resumed",
+            preempted=True,
+        )
+        self.assertEqual(
+            runtime.admit_mock_request.call_args_list,
+            [
+                call("new"),
+                call("resumed"),
+            ],
+        )
+
+    @patch(
+        "vllm_ascend.worker.model_runner_v1.GPUModelRunner._update_states",
+    )
+    def test_update_states_does_not_mutate_mock_lifecycle_if_upstream_fails(
+        self,
+        mock_upstream_update,
+    ):
+        runner = self._build_runner()
+        runner.use_async_scheduling = False
+        runtime = MagicMock()
+        runner.dsa_sparse_eager_runtime = runtime
+        mock_upstream_update.side_effect = RuntimeError("upstream failed")
+        scheduler_output = SimpleNamespace(
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[],
+                num_computed_tokens=[],
+                resumed_req_ids=[],
+            ),
+            finished_req_ids={"finished"},
+            preempted_req_ids=set(),
+            scheduled_new_reqs=[],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "upstream failed"):
+            runner._update_states(scheduler_output)
+
+        runtime.preflight_mock_retire.assert_called_once()
+        runtime.retire_mock_request.assert_not_called()
+        runtime.admit_mock_request.assert_not_called()
+
+    @patch(
+        "vllm_ascend.worker.model_runner_v1.GPUModelRunner._update_states",
+        return_value=None,
+    )
+    def test_update_states_rolls_back_partial_mock_admission(
+        self,
+        _mock_upstream_update,
+    ):
+        runner = self._build_runner()
+        runner.use_async_scheduling = False
+        runtime = MagicMock()
+        runtime.admit_mock_request.side_effect = [
+            object(),
+            RuntimeError("admission failed"),
+        ]
+        runner.dsa_sparse_eager_runtime = runtime
+        scheduler_output = SimpleNamespace(
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[],
+                num_computed_tokens=[],
+                resumed_req_ids=[],
+            ),
+            finished_req_ids=set(),
+            preempted_req_ids=set(),
+            scheduled_new_reqs=[
+                SimpleNamespace(req_id="new-a"),
+                SimpleNamespace(req_id="new-b"),
+            ],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "admission failed"):
+            runner._update_states(scheduler_output)
+
+        runtime.retire_mock_request.assert_called_once_with(
+            "new-a",
+            preempted=True,
+        )
 
 
 class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):

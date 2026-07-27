@@ -12,6 +12,7 @@ import torch
 from vllm_ascend.attention.dsa_sparse import (
     DSASparseCacheConfig,
     DSASparseLayerLayout,
+    dsa_sparse_lookup_workspace_stride,
 )
 
 
@@ -21,19 +22,26 @@ class DSASparseFixedHBMBreakdown:
 
     ``hot_payload_bytes`` already covers every supplied local Main layer and
     is therefore independent of ``cohort_count``. Residency state and one
-    maximum eager plan are core fixed tensors private to each cohort.
+    lookup plan are core fixed tensors private to each cohort. Role-level row
+    metadata is allocated once and shared by every target cohort.
 
-    The execution reserve covers the maximum logical bytes simultaneously
-    live in ``DSASparseEagerBatchContext``. It consists of context-lifetime
-    tensors plus the larger of the begin and lookup scratch phases. PyTorch
-    allocator alignment and future custom-operator workspace are not included.
+    ``initialization_scratch_bytes`` covers the largest explicit temporary
+    tensor used while constructing the fixed state. The execution reserve
+    covers the maximum logical bytes simultaneously live in
+    ``DSASparseEagerBatchContext``. It consists of one shared metadata staging
+    pass plus cohort-private context and lookup scratch tensors. Initialization
+    and execution do not overlap, so the fixed reservation uses the larger
+    phase peak. The fused custom-operator workspace is included in the core
+    lookup plan; PyTorch allocator alignment is not included.
     """
 
     hot_payload_bytes: int
+    batch_metadata_bytes: int
     residency_state_bytes_per_cohort: int
-    eager_plan_bytes_per_cohort: int
+    lookup_plan_bytes_per_cohort: int
+    initialization_scratch_bytes: int
+    eager_batch_staging_bytes: int
     eager_context_bytes_per_cohort: int
-    eager_begin_scratch_bytes_per_cohort: int
     eager_lookup_scratch_bytes_per_cohort: int
     cohort_count: int
     backend_auxiliary_bytes: int
@@ -43,27 +51,47 @@ class DSASparseFixedHBMBreakdown:
         return self.residency_state_bytes_per_cohort * self.cohort_count
 
     @property
-    def eager_plan_bytes(self) -> int:
-        return self.eager_plan_bytes_per_cohort * self.cohort_count
+    def lookup_plan_bytes(self) -> int:
+        return self.lookup_plan_bytes_per_cohort * self.cohort_count
 
     @property
     def core_fixed_tensor_bytes(self) -> int:
-        return self.hot_payload_bytes + self.residency_state_bytes + self.eager_plan_bytes
+        return (
+            self.hot_payload_bytes
+            + self.batch_metadata_bytes
+            + self.residency_state_bytes
+            + self.lookup_plan_bytes
+        )
 
     @property
     def eager_execution_reserve_bytes_per_cohort(self) -> int:
-        return self.eager_context_bytes_per_cohort + max(
-            self.eager_begin_scratch_bytes_per_cohort,
-            self.eager_lookup_scratch_bytes_per_cohort,
+        return (
+            self.eager_context_bytes_per_cohort
+            + self.eager_lookup_scratch_bytes_per_cohort
         )
 
     @property
     def eager_execution_reserve_bytes(self) -> int:
-        return self.eager_execution_reserve_bytes_per_cohort * self.cohort_count
+        return (
+            self.eager_batch_staging_bytes
+            + self.eager_execution_reserve_bytes_per_cohort
+            * self.cohort_count
+        )
+
+    @property
+    def runtime_peak_reserve_bytes(self) -> int:
+        return max(
+            self.initialization_scratch_bytes,
+            self.eager_execution_reserve_bytes,
+        )
 
     @property
     def fixed_hbm_bytes(self) -> int:
-        return self.core_fixed_tensor_bytes + self.eager_execution_reserve_bytes + self.backend_auxiliary_bytes
+        return (
+            self.core_fixed_tensor_bytes
+            + self.runtime_peak_reserve_bytes
+            + self.backend_auxiliary_bytes
+        )
 
 
 def calculate_dsa_sparse_fixed_hbm_bytes(
@@ -104,16 +132,18 @@ def calculate_dsa_sparse_fixed_hbm_bytes(
 
     hot_payload_bytes = sum(_hot_payload_bytes(config, layout) for layout in layouts)
     (
+        eager_batch_staging_bytes,
         eager_context_bytes,
-        eager_begin_scratch_bytes,
         eager_lookup_scratch_bytes,
     ) = _eager_execution_bytes(config, max_sfa_queries)
     return DSASparseFixedHBMBreakdown(
         hot_payload_bytes=hot_payload_bytes,
+        batch_metadata_bytes=_batch_metadata_bytes(config),
         residency_state_bytes_per_cohort=_residency_state_bytes(config),
-        eager_plan_bytes_per_cohort=_maximum_eager_plan_bytes(config),
+        lookup_plan_bytes_per_cohort=_maximum_lookup_plan_bytes(config),
+        initialization_scratch_bytes=_initialization_scratch_bytes(config),
+        eager_batch_staging_bytes=eager_batch_staging_bytes,
         eager_context_bytes_per_cohort=eager_context_bytes,
-        eager_begin_scratch_bytes_per_cohort=eager_begin_scratch_bytes,
         eager_lookup_scratch_bytes_per_cohort=eager_lookup_scratch_bytes,
         cohort_count=cohort_count,
         backend_auxiliary_bytes=backend_auxiliary_bytes,
@@ -167,7 +197,7 @@ def _residency_state_bytes(config: DSASparseCacheConfig) -> int:
                 int32,
             ),
             _tensor_bytes(
-                (config.max_num_seqs, config.managed_hot_width),
+                (config.max_num_seqs, config.device_buffer_size),
                 int32,
             ),
             _tensor_bytes(
@@ -179,44 +209,30 @@ def _residency_state_bytes(config: DSASparseCacheConfig) -> int:
     )
 
 
-def _maximum_eager_plan_bytes(config: DSASparseCacheConfig) -> int:
+def _batch_metadata_bytes(config: DSASparseCacheConfig) -> int:
     request_capacity = config.max_num_seqs
     query_lane_capacity = config.max_query_tokens_per_request
     token_capacity = request_capacity * query_lane_capacity
-    read_shape = (
-        request_capacity,
-        query_lane_capacity,
-        config.index_topk,
-    )
     write_shape = (request_capacity, query_lane_capacity)
 
     tensor_specs: tuple[tuple[Sequence[int], torch.dtype], ...] = (
         # DSASparseRowMapping
-        ((request_capacity,), torch.bool),
         ((request_capacity,), torch.int32),
         ((request_capacity,), torch.int32),
-        # DSASparsePlan
+        # DSASparseBatchMetadata
         ((token_capacity,), torch.int32),
         ((token_capacity,), torch.int32),
         ((token_capacity,), torch.int32),
         ((token_capacity,), torch.bool),
-        ((token_capacity,), torch.int32),
-        ((token_capacity, config.index_topk), torch.int32),
         ((request_capacity,), torch.int32),
         (
             (request_capacity, config.max_blocks_per_request),
             torch.int32,
         ),
-        (read_shape, torch.int32),
-        (read_shape, torch.int32),
-        (read_shape, torch.int32),
-        (read_shape, torch.bool),
-        ((token_capacity, config.index_topk), torch.int32),
         (
             (request_capacity, config.hot_blocks_per_seat),
             torch.int32,
         ),
-        ((token_capacity,), torch.int32),
         (write_shape, torch.int32),
         (write_shape, torch.int32),
         (write_shape, torch.bool),
@@ -224,11 +240,55 @@ def _maximum_eager_plan_bytes(config: DSASparseCacheConfig) -> int:
     return sum(_tensor_bytes(shape, dtype) for shape, dtype in tensor_specs)
 
 
+def _maximum_lookup_plan_bytes(config: DSASparseCacheConfig) -> int:
+    request_capacity = config.max_num_seqs
+    token_capacity = (
+        request_capacity * config.max_query_tokens_per_request
+    )
+    topk_shape = (token_capacity, config.index_topk)
+    tensor_specs: tuple[tuple[Sequence[int], torch.dtype], ...] = (
+        ((token_capacity,), torch.int32),
+        (topk_shape, torch.int32),
+        (topk_shape, torch.int32),
+        (topk_shape, torch.bool),
+        (
+            (
+                request_capacity,
+                dsa_sparse_lookup_workspace_stride(
+                    config.device_buffer_size
+                ),
+            ),
+            torch.int32,
+        ),
+    )
+    return sum(
+        _tensor_bytes(shape, dtype)
+        for shape, dtype in tensor_specs
+    )
+
+
+def _initialization_scratch_bytes(
+    config: DSASparseCacheConfig,
+) -> int:
+    """Return the largest explicit temporary in fixed-tensor construction."""
+
+    token_capacity = (
+        config.max_num_seqs * config.max_query_tokens_per_request
+    )
+    # DSASparseBatchMetadata.allocate keeps flat_query_indices[Q] alive while
+    # constructing query_to_row/query_to_lane. DSASparseResidencyState.allocate
+    # keeps arange(S) alive while cloning the expanded LRU initializer.
+    return _tensor_bytes(
+        (max(token_capacity, config.device_buffer_size),),
+        torch.int32,
+    )
+
+
 def _eager_execution_bytes(
     config: DSASparseCacheConfig,
     max_sfa_queries: int,
 ) -> tuple[int, int, int]:
-    """Return context, begin scratch, and lookup scratch bytes per cohort."""
+    """Return shared staging, context, and lookup scratch logical bytes."""
 
     request_capacity = config.max_num_seqs
     token_capacity = request_capacity * config.max_query_tokens_per_request
@@ -246,9 +306,8 @@ def _eager_execution_bytes(
         )
     )
 
-    # All four fixed-shape copies are live together before begin_step()
-    # copies them into the preallocated plan.
-    begin_scratch_bytes = sum(
+    # One role-level staging pass builds the shared fixed metadata.
+    batch_staging_bytes = sum(
         (
             _tensor_bytes((token_capacity,), torch.int32),
             _tensor_bytes((token_capacity,), torch.bool),
@@ -260,8 +319,28 @@ def _eager_execution_bytes(
                 ),
                 torch.int32,
             ),
-            # Advanced indexing of newest_destination_hot_row_ids.
-            _tensor_bytes((active_query_capacity,), torch.int32),
+            # Synthetic Hot block table.
+            _tensor_bytes(
+                (
+                    request_capacity,
+                    config.hot_blocks_per_seat,
+                ),
+                torch.int32,
+            ),
+            # Per-seat block offsets used to form the synthetic table.
+            _tensor_bytes(
+                (config.hot_blocks_per_seat,),
+                torch.int32,
+            ),
+            # query row/lane long views used by vectorized addressing.
+            2 * _tensor_bytes((token_capacity,), torch.long),
+            # seats, seq lens, block indices, physical blocks,
+            # destinations, global slots, invalid values.
+            7 * _tensor_bytes((token_capacity,), torch.int32),
+            # validity mask.
+            _tensor_bytes((token_capacity,), torch.bool),
+            # safe block and flattened write indices.
+            2 * _tensor_bytes((token_capacity,), torch.long),
         )
     )
 
@@ -291,7 +370,7 @@ def _eager_execution_bytes(
         count_temporary_bytes,
         resolved_gather_bytes,
     )
-    return context_bytes, begin_scratch_bytes, lookup_scratch_bytes
+    return batch_staging_bytes, context_bytes, lookup_scratch_bytes
 
 
 def _tensor_bytes(shape: Sequence[int], dtype: torch.dtype) -> int:

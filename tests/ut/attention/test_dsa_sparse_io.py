@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
 import pytest
+import torch
 
 from vllm_ascend.attention.dsa_sparse_io import (
     DSASparseIOBackendRegistry,
     DSASparseRegionKey,
+    MockDSASparseIOOperator,
     UnimplementedDSASparseIOOperator,
 )
 
@@ -58,22 +60,91 @@ def test_region_key_isolates_target_and_draft_graphs():
     assert target != draft
 
 
-@pytest.mark.parametrize(
-    ("method_name", "expected_message"),
-    [
-        ("publish_async", "publish operator"),
-        ("wait_publish", "publish wait"),
-        ("read_async", "read operator"),
-        ("wait_read", "read wait"),
-        ("write_async", "write operator"),
-        ("wait_write", "write wait"),
-    ],
-)
-def test_unimplemented_io_operator_is_an_explicit_stub(
-    method_name,
-    expected_message,
-):
+def test_unimplemented_io_operator_is_an_explicit_stub():
     operator = UnimplementedDSASparseIOOperator()
 
-    with pytest.raises(NotImplementedError, match=expected_message):
-        getattr(operator, method_name)()
+    with pytest.raises(NotImplementedError, match="unified I/O"):
+        operator.dsa_sparse_io()
+
+
+def _mock_io_arguments():
+    return {
+        "context": object(),
+        "region": object(),
+        "topk_positions": torch.zeros((2, 4), dtype=torch.int32),
+        "resolved_hot_indices": torch.zeros((2, 4), dtype=torch.int32),
+        "miss_mask": torch.zeros((2, 4), dtype=torch.bool),
+        "query_to_row": torch.tensor([0, 1], dtype=torch.int32),
+        "row_to_cache_seat": torch.tensor([1, 0], dtype=torch.int32),
+        "block_table": torch.zeros((2, 8), dtype=torch.int32),
+        "write_global_slots": torch.zeros((2, 1), dtype=torch.int32),
+        "write_destination_hot_row_ids": torch.zeros(
+            (2, 1),
+            dtype=torch.int32,
+        ),
+        "write_valid_mask": torch.ones((2, 1), dtype=torch.bool),
+        "hot_planes": (
+            torch.empty((4, 4, 1, 8), dtype=torch.bfloat16),
+        ),
+        "completion": object(),
+    }
+
+
+def test_mock_io_accepts_the_single_final_decode_abi():
+    MockDSASparseIOOperator().dsa_sparse_io(**_mock_io_arguments())
+
+
+def test_mock_io_leaves_miss_payload_and_descriptors_unchanged():
+    arguments = _mock_io_arguments()
+    arguments["miss_mask"][0, 0] = True
+    arguments["resolved_hot_indices"][0, 0] = 3
+    arguments["hot_planes"] = (
+        torch.full(
+            (4, 4, 1, 8),
+            7,
+            dtype=torch.bfloat16,
+        ),
+    )
+    tensor_names = (
+        "topk_positions",
+        "resolved_hot_indices",
+        "miss_mask",
+        "block_table",
+        "write_global_slots",
+        "write_destination_hot_row_ids",
+        "write_valid_mask",
+    )
+    before = {
+        name: arguments[name].clone()
+        for name in tensor_names
+    }
+    hot_before = tuple(
+        plane.clone()
+        for plane in arguments["hot_planes"]
+    )
+
+    MockDSASparseIOOperator().dsa_sparse_io(**arguments)
+
+    for name, expected in before.items():
+        assert torch.equal(arguments[name], expected)
+    for plane, expected in zip(arguments["hot_planes"], hot_before):
+        assert torch.equal(plane, expected)
+
+
+def test_mock_io_validates_shapes_without_reading_tensor_values():
+    arguments = _mock_io_arguments()
+    arguments["miss_mask"] = torch.zeros((1, 4), dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="Top-K tensor shape"):
+        MockDSASparseIOOperator().dsa_sparse_io(**arguments)
+
+
+def test_mock_io_rejects_non_int32_block_table():
+    arguments = _mock_io_arguments()
+    arguments["block_table"] = torch.zeros(
+        (2, 8),
+        dtype=torch.int64,
+    )
+
+    with pytest.raises(TypeError, match="block_table must use int32"):
+        MockDSASparseIOOperator().dsa_sparse_io(**arguments)

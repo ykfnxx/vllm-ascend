@@ -11,6 +11,7 @@ import torch
 
 from vllm_ascend.attention.dsa_sparse import (
     CacheSeatLease,
+    DSASparseBatchMetadata,
     DSASparseCacheConfig,
     DSASparseCohort,
     DSASparseCohortKey,
@@ -20,13 +21,18 @@ from vllm_ascend.attention.dsa_sparse import (
     DSASparseLayerBinding,
     DSASparseLayerHotCache,
     DSASparseLayerLayout,
+    DSASparseLookupUpdateOperator,
     DSASparsePlan,
     DSASparsePlanKey,
     DSASparseResidencyState,
-    UnimplementedDSASparseIndexOperator,
 )
 from vllm_ascend.attention.dsa_sparse_io import (
-    UnimplementedDSASparseIOOperator,
+    DSASparseIOOperator,
+    MockDSASparseIOOperator,
+)
+from vllm_ascend.attention.dsa_sparse_pd import (
+    DSASparsePDLifecycle,
+    DSASparseTransferCompletion,
 )
 
 
@@ -96,24 +102,34 @@ class DSASparseEagerCohortLayout:
 
 
 @dataclass(frozen=True, eq=False)
-class _UnimplementedDSASparseIOResource:
-    """Identity-only resource until the backend bridge owns real handles."""
+class _MockDSASparseIOResource:
+    """Identity-only resource owned by the eager no-op I/O fixture."""
 
     layer_name: str
     purpose: str
 
 
-def create_dsa_sparse_eager_stub_runtime(
+class _MockDSASparseRequestRegionBackend:
+    """Control-plane region fixture paired with the no-op data plane."""
+
+    def release_request(self, request_handle: int) -> None:
+        del request_handle
+
+
+def create_dsa_sparse_eager_mock_runtime(
     config: DSASparseCacheConfig,
     cohort_layouts: Iterable[DSASparseEagerCohortLayout],
     *,
     device: torch.device | str,
+    index_operator: DSASparseLookupUpdateOperator | None = None,
+    io_operator: DSASparseIOOperator | None = None,
 ) -> DSASparseEagerRuntime:
-    """Allocate and freeze the current target-only eager stub runtime.
+    """Allocate the target-only eager runtime with a no-op I/O fixture.
 
-    The initialization path owns real Hot Cache, residency-state, and plan
-    tensors. Index and I/O calls deliberately use the existing fail-fast stubs
-    until their device operators and backend bridge are implemented.
+    The lookup/update path uses the formal Ascend 950 custom operator unless a
+    test explicitly injects another implementation.  The I/O fixture preserves
+    the final one-call-per-layer ABI but moves no payload; it is not a storage
+    backend and cannot establish model accuracy when a history miss occurs.
     """
 
     cohort_layouts = tuple(cohort_layouts)
@@ -127,16 +143,30 @@ def create_dsa_sparse_eager_stub_runtime(
     if len(set(all_layer_names)) != len(all_layer_names):
         raise ValueError("Each DSA Sparse Main layer must belong to exactly one eager cohort.")
 
+    if index_operator is None:
+        from vllm_ascend.ops.dsa_sparse import (
+            DSASparseLookupUpdateTorchOperator,
+        )
+
+        index_operator = DSASparseLookupUpdateTorchOperator()
+    if io_operator is None:
+        io_operator = MockDSASparseIOOperator()
+
     coordinator = DSASparseEagerCoordinator(
         config,
-        index_operator=UnimplementedDSASparseIndexOperator(),
-        io_operator=UnimplementedDSASparseIOOperator(),
+        index_operator=index_operator,
+        io_operator=io_operator,
     )
     plan_key = DSASparsePlanKey(
         token_capacity=(config.max_num_seqs * config.max_query_tokens_per_request),
         request_capacity=config.max_num_seqs,
         query_lane_capacity=config.max_query_tokens_per_request,
         role="target",
+    )
+    batch_metadata = DSASparseBatchMetadata.allocate(
+        config,
+        plan_key,
+        device=device,
     )
     descriptors: list[DSASparseEagerCohortDescriptor] = []
     for cohort_layout in cohort_layouts:
@@ -158,6 +188,7 @@ def create_dsa_sparse_eager_stub_runtime(
                         config,
                         plan_key,
                         device=device,
+                        batch_metadata=batch_metadata,
                     )
                 },
             )
@@ -173,21 +204,17 @@ def create_dsa_sparse_eager_stub_runtime(
                         config,
                         device=device,
                     ),
-                    io_context=_UnimplementedDSASparseIOResource(
+                    io_context=_MockDSASparseIOResource(
                         layer_name,
                         "context",
                     ),
-                    io_region=_UnimplementedDSASparseIOResource(
+                    io_region=_MockDSASparseIOResource(
                         layer_name,
                         "region",
                     ),
-                    read_completion=_UnimplementedDSASparseIOResource(
+                    io_completion=_MockDSASparseIOResource(
                         layer_name,
-                        "read_completion",
-                    ),
-                    write_completion=_UnimplementedDSASparseIOResource(
-                        layer_name,
-                        "write_completion",
+                        "io_completion",
                     ),
                 )
             )
@@ -201,9 +228,14 @@ def create_dsa_sparse_eager_stub_runtime(
         )
 
     coordinator.freeze()
+    mock_region_backend = _MockDSASparseRequestRegionBackend()
     return DSASparseEagerRuntime(
         coordinator,
         descriptors,
+        mock_pd_lifecycle=DSASparsePDLifecycle(
+            coordinator=coordinator,
+            backend=mock_region_backend,
+        ),
     )
 
 
@@ -296,11 +328,16 @@ class DSASparseEagerRuntime:
         self,
         coordinator: DSASparseEagerCoordinator,
         cohort_descriptors: Iterable[DSASparseEagerCohortDescriptor],
+        *,
+        mock_pd_lifecycle: DSASparsePDLifecycle | None = None,
     ) -> None:
         self.coordinator = coordinator
         self.cohort_descriptors = tuple(cohort_descriptors)
         if not self.cohort_descriptors:
             raise ValueError("DSA Sparse eager runtime requires at least one cohort.")
+        self._mock_pd_lifecycle = mock_pd_lifecycle
+        self._mock_request_generations: dict[Hashable, int] = {}
+        self._next_mock_region_handle = 1
         self._validate_descriptors()
 
     def acquire_request(self, request_id: Hashable) -> CacheSeatLease:
@@ -312,6 +349,94 @@ class DSASparseEagerRuntime:
         """Release an idle request after its backend region is retired."""
 
         return self.coordinator.release_request(request_id)
+
+    def has_mock_request(self, request_id: Hashable) -> bool:
+        return request_id in self._mock_request_generations
+
+    def preflight_mock_retire(
+        self,
+        request_ids: Iterable[Hashable],
+    ) -> None:
+        """Validate every active mock request before mutating runner state."""
+
+        self._require_mock_pd_lifecycle()
+        for request_id in request_ids:
+            if self.has_mock_request(request_id):
+                self.coordinator.assert_request_idle(request_id)
+
+    @property
+    def uses_mock_lifecycle(self) -> bool:
+        return self._mock_pd_lifecycle is not None
+
+    def admit_mock_request(
+        self,
+        request_id: Hashable,
+    ) -> CacheSeatLease:
+        """Simulate dual-ready completion for the eager no-op I/O fixture."""
+
+        lifecycle = self._require_mock_pd_lifecycle()
+        if request_id in self._mock_request_generations:
+            raise RuntimeError(
+                f"DSA Sparse mock request {request_id!r} is already active."
+            )
+        handle = self._next_mock_region_handle
+        self._next_mock_region_handle += 1
+        generation = lifecycle.begin_handoff(
+            request_id,
+            f"mock-transfer-{handle}",
+        )
+        try:
+            completion = DSASparseTransferCompletion(
+                request_id=request_id,
+                generation=generation,
+            )
+            lifecycle.mark_main_region_ready(
+                completion,
+                request_handle=handle,
+            )
+            lifecycle.mark_indexer_ready(completion)
+            notifications = lifecycle.take_ready_notifications()
+            if lifecycle.ready_request_ids(notifications) != {
+                request_id
+            }:
+                raise RuntimeError(
+                    "DSA Sparse mock dual-ready completion was not "
+                    "published."
+                )
+            lease = lifecycle.admit(request_id, generation)
+        except BaseException as admission_error:
+            try:
+                lifecycle.abort_handoff(request_id, generation)
+            except BaseException as cleanup_error:
+                _add_cleanup_note(
+                    admission_error,
+                    "DSA Sparse mock admission rollback also failed: "
+                    f"{cleanup_error!r}",
+                )
+            raise
+        self._mock_request_generations[request_id] = generation
+        return lease
+
+    def retire_mock_request(
+        self,
+        request_id: Hashable,
+        *,
+        preempted: bool,
+    ) -> None:
+        """Release the mock region and stable seat at a request boundary."""
+
+        lifecycle = self._require_mock_pd_lifecycle()
+        try:
+            generation = self._mock_request_generations[request_id]
+        except KeyError as error:
+            raise KeyError(
+                f"DSA Sparse mock request {request_id!r} is not active."
+            ) from error
+        if preempted:
+            lifecycle.preempt(request_id, generation)
+        else:
+            lifecycle.finish(request_id, generation)
+        del self._mock_request_generations[request_id]
 
     def begin_target_batch(
         self,
@@ -332,7 +457,9 @@ class DSASparseEagerRuntime:
         contexts: list[DSASparseEagerBatchContext] = []
         layer_contexts: dict[str, DSASparseEagerBatchContext] = {}
         try:
-            for descriptor in self.cohort_descriptors:
+            for cohort_index, descriptor in enumerate(
+                self.cohort_descriptors
+            ):
                 leader_metadata = metadata_by_layer[descriptor.leader_layer]
                 context = self._begin_cohort(
                     descriptor,
@@ -340,6 +467,7 @@ class DSASparseEagerRuntime:
                     request_ids=request_ids,
                     query_positions=query_positions,
                     query_counts=query_counts,
+                    stage_batch_metadata=cohort_index == 0,
                 )
                 contexts.append(context)
                 layer_contexts.update(dict.fromkeys(descriptor.layer_names, context))
@@ -381,6 +509,7 @@ class DSASparseEagerRuntime:
     def _validate_descriptors(self) -> None:
         cohort_keys: set[DSASparseCohortKey] = set()
         layer_names: set[str] = set()
+        shared_batch_metadata: object | None = None
         for descriptor in self.cohort_descriptors:
             if descriptor.cohort_key in cohort_keys:
                 raise ValueError("Each DSA Sparse eager cohort may be described only once.")
@@ -399,6 +528,14 @@ class DSASparseEagerRuntime:
                 raise ValueError(
                     f"DSA Sparse plan {descriptor.plan_key!r} is not registered for cohort {descriptor.cohort_key!r}."
                 )
+            plan = cohort.plans[descriptor.plan_key]
+            if shared_batch_metadata is None:
+                shared_batch_metadata = plan.batch_metadata
+            elif plan.batch_metadata is not shared_batch_metadata:
+                raise ValueError(
+                    "All target DSA Sparse cohorts must share one role-level "
+                    "batch metadata allocation."
+                )
             for layer_name in descriptor.layer_names:
                 self.coordinator.get_layer_binding(
                     descriptor.cohort_key,
@@ -407,6 +544,13 @@ class DSASparseEagerRuntime:
 
             cohort_keys.add(descriptor.cohort_key)
             layer_names.update(descriptor.layer_names)
+
+    def _require_mock_pd_lifecycle(self) -> DSASparsePDLifecycle:
+        if self._mock_pd_lifecycle is None:
+            raise RuntimeError(
+                "This DSA Sparse eager runtime has no mock P/D lifecycle."
+            )
+        return self._mock_pd_lifecycle
 
     def _resolve_layer_metadata(
         self,
@@ -443,6 +587,7 @@ class DSASparseEagerRuntime:
         request_ids: list[Hashable],
         query_positions: torch.Tensor,
         query_counts: list[int],
+        stage_batch_metadata: bool,
     ) -> DSASparseEagerBatchContext:
         num_input_tokens = _metadata_integer(
             leader_metadata,
@@ -475,6 +620,7 @@ class DSASparseEagerRuntime:
             seq_lens=seq_lens[:num_requests],
             block_table=block_table[:num_requests],
             num_sfa_queries=num_input_tokens,
+            stage_batch_metadata=stage_batch_metadata,
         )
 
 

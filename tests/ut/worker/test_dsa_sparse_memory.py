@@ -63,22 +63,64 @@ def test_calculates_exact_fixed_tensor_bytes_without_tensor_allocation(
 
     # 24 hot rows * (6 BF16 + 5 UINT8 bytes per row).
     assert breakdown.hot_payload_bytes == 408
+    # Role-level row/query/block/newest descriptors are shared by both cohorts.
+    assert breakdown.batch_metadata_bytes == 160
     # token_to_hot + hot_to_token + LRU + seat epoch.
-    assert breakdown.residency_state_bytes_per_cohort == 216
-    # Every tensor allocated by one maximum DSASparsePlan, including row map.
-    assert breakdown.eager_plan_bytes_per_cohort == 446
+    assert breakdown.residency_state_bytes_per_cohort == 200
+    # Lookup input/output tensors plus the fused operator workspace.
+    assert breakdown.lookup_plan_bytes_per_cohort == 6468
+    # max(flat query initializer[Q=4], LRU initializer[S=7]).
+    assert breakdown.initialization_scratch_bytes == 28
     # Context: active indices + padded SFA slot/local-index buffers.
     assert breakdown.eager_context_bytes_per_cohort == 160
-    # Begin: fixed query/seq/block copies plus newest-slot gather.
-    assert breakdown.eager_begin_scratch_bytes_per_cohort == 68
+    # One shared vectorized metadata-staging pass.
+    assert breakdown.eager_batch_staging_bytes == 332
     # Lookup: fixed top-k/count plus the larger resolved-index gather.
     assert breakdown.eager_lookup_scratch_bytes_per_cohort == 112
     assert breakdown.eager_execution_reserve_bytes_per_cohort == 272
-    assert breakdown.residency_state_bytes == 432
-    assert breakdown.eager_plan_bytes == 892
-    assert breakdown.core_fixed_tensor_bytes == 1732
-    assert breakdown.eager_execution_reserve_bytes == 544
-    assert breakdown.fixed_hbm_bytes == 2287
+    assert breakdown.residency_state_bytes == 400
+    assert breakdown.lookup_plan_bytes == 12936
+    assert breakdown.core_fixed_tensor_bytes == 13904
+    assert breakdown.eager_execution_reserve_bytes == 876
+    assert breakdown.runtime_peak_reserve_bytes == 876
+    assert breakdown.fixed_hbm_bytes == 14791
+
+
+def test_initialization_scratch_can_define_the_runtime_peak():
+    config = DSASparseCacheConfig(
+        max_num_seqs=1,
+        max_model_len=128,
+        block_size=128,
+        device_buffer_size=4096,
+        max_query_tokens_per_request=1,
+        index_topk=1,
+    )
+    breakdown = calculate_dsa_sparse_fixed_hbm_bytes(
+        config,
+        (
+            DSASparseLayerLayout(
+                layer_name="layer.0",
+                plane_dtypes=(torch.uint8,),
+                plane_row_shapes=((1,),),
+            ),
+        ),
+        cohort_count=1,
+        max_sfa_queries=1,
+    )
+
+    assert breakdown.initialization_scratch_bytes == 4096 * 4
+    assert (
+        breakdown.initialization_scratch_bytes
+        > breakdown.eager_execution_reserve_bytes
+    )
+    assert (
+        breakdown.runtime_peak_reserve_bytes
+        == breakdown.initialization_scratch_bytes
+    )
+    assert breakdown.fixed_hbm_bytes == (
+        breakdown.core_fixed_tensor_bytes
+        + breakdown.initialization_scratch_bytes
+    )
 
 
 def test_breakdown_is_immutable():
