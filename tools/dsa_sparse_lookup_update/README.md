@@ -109,3 +109,43 @@ that the trace contains one of:
 - `DsaSparseLookupUpdate`
 - `dsa_sparse_lookup_update`
 - `aclnnDsaSparseLookupUpdate`
+
+## 8K resident-cache benchmark
+
+Benchmark one layer with 8192 resident slots per request and a configurable
+number of concurrent requests:
+
+```bash
+python3 tools/dsa_sparse_lookup_update/benchmark_operator.py \
+  --device npu:0 \
+  --concurrency 8
+```
+
+`--concurrency N` creates `N` active request rows and `N` cache seats in one
+batched operator invocation. Each request owns an independent, fully populated
+8192-slot cache. The default `Top-K` is 2048 and the default query-lane count is
+one.
+
+The benchmark supports:
+
+- `hit`: every Top-K entry is already resident. This measures lookup, result
+  production, and LRU hit maintenance against a full 8K cache.
+- `churn`: five disjoint 2K token groups rotate through the 8K cache. Every
+  measured invocation replaces 2K entries while the cache remains full.
+- `both`: run `hit` and `churn` independently. This is the default.
+
+For example, run only the resident-hit workload for 32 concurrent requests:
+
+```bash
+python3 tools/dsa_sparse_lookup_update/benchmark_operator.py \
+  --device npu:0 \
+  --concurrency 32 \
+  --scenario hit \
+  --warmup 20 \
+  --iterations 200
+```
+
+The event-timed region contains one batched custom-operator invocation per
+sample. Tensor allocation, cache initialization, and host-side result
+serialization are excluded. Results are printed and saved under
+`tools/dsa_sparse_lookup_update/benchmarks/`.
