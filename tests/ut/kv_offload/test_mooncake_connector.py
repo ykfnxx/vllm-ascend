@@ -906,6 +906,17 @@ class TestCoreFunctionality(unittest.TestCase):
         mock_get_meta.assert_not_called()
 
     @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
+    def test_transfer_kv_cache_dsa_sparse_mock_skips_payload(self, mock_get_meta):
+        self.thread.kv_caches_base_addr["remote_engine"] = {6666: [[0x3000]]}
+        self.thread.remote_block_size_scale["remote_engine"] = {6666: [[1]]}
+
+        with patch.dict(os.environ, {"VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE": "1"}):
+            self.thread._transfer_kv_cache_all_groups(self.test_req)
+
+        self.engine.batch_transfer_sync_read.assert_not_called()
+        mock_get_meta.assert_not_called()
+
+    @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
     def test_transfer_groups_contiguous_kernel_blocks(self, mock_get_meta):
         # Kernel-level ids now arrive pre-expanded from _get_kv_split_metadata; the
         # transfer stage only groups contiguous kernels and computes addresses.
