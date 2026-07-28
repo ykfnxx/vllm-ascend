@@ -134,6 +134,34 @@ The benchmark supports:
   measured invocation replaces 2K entries while the cache remains full.
 - `both`: run `hit` and `churn` independently. This is the default.
 
+Specify an arbitrary miss percentage:
+
+```bash
+python3 tools/dsa_sparse_lookup_update/benchmark_operator.py \
+  --device npu:0 \
+  --concurrency 8 \
+  --miss-rate 10
+```
+
+For the default `Top-K=2048`, 10% is rounded to 205 misses per request. With
+eight concurrent requests this produces 1640 misses in each batched operator
+invocation. The manifest records the requested percentage, integer miss count,
+and effective percentage.
+
+To control the integer count directly, use `--miss-count`:
+
+```bash
+python3 tools/dsa_sparse_lookup_update/benchmark_operator.py \
+  --device npu:0 \
+  --concurrency 8 \
+  --miss-count 200
+```
+
+`--miss-rate` and `--miss-count` are mutually exclusive and override
+`--scenario`. Before timing, the script executes one validation invocation and
+checks that the operator's `miss_mask` contains exactly the requested number
+of misses.
+
 For example, run only the resident-hit workload for 32 concurrent requests:
 
 ```bash

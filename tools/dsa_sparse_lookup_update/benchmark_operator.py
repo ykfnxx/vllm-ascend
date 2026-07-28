@@ -43,11 +43,26 @@ def _parse_args() -> argparse.Namespace:
         default="both",
         help=(
             "hit measures resident lookup/LRU maintenance; churn measures "
-            "full-cache miss allocation and replacement."
+            "full-cache miss allocation and replacement. Overridden by "
+            "--miss-rate or --miss-count."
         ),
     )
     parser.add_argument("--max-model-len", type=int, default=131072)
     parser.add_argument("--topk", type=int, default=DEFAULT_TOPK)
+    miss_group = parser.add_mutually_exclusive_group()
+    miss_group.add_argument(
+        "--miss-rate",
+        type=float,
+        help=(
+            "Requested miss percentage in each request's Top-K. The nearest "
+            "integer miss count is used."
+        ),
+    )
+    miss_group.add_argument(
+        "--miss-count",
+        type=int,
+        help="Exact number of misses in each request's Top-K.",
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--output", type=Path)
@@ -65,30 +80,39 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             f"topk must not exceed the 8K resident cache, got {args.topk}."
         )
+    if args.miss_rate is not None and not 0.0 <= args.miss_rate <= 100.0:
+        raise ValueError(
+            f"miss-rate must be in [0, 100], got {args.miss_rate}."
+        )
+    if args.miss_count is not None and not 0 <= args.miss_count <= args.topk:
+        raise ValueError(
+            f"miss-count must be in [0, {args.topk}], got {args.miss_count}."
+        )
     if args.max_model_len <= RESIDENT_CACHE_SLOTS:
         raise ValueError(
             "max-model-len must leave room for the 8K resident set and the "
             f"current query position; need at least {RESIDENT_CACHE_SLOTS + 1}, "
             f"got {args.max_model_len}."
         )
-    if (
-        args.scenario in ("churn", "both")
-        and RESIDENT_CACHE_SLOTS % args.topk != 0
-    ):
-        raise ValueError(
-            "topk must divide 8192 so the churn workload can fill the cache "
-            f"exactly, got topk={args.topk}."
-        )
-    churn_token_count = RESIDENT_CACHE_SLOTS + args.topk
-    if (
-        args.scenario in ("churn", "both")
-        and args.max_model_len <= churn_token_count
-    ):
-        raise ValueError(
-            "max-model-len must leave room for the 8K resident set, one "
-            "additional churn group, and the current query position; need at "
-            f"least {churn_token_count + 1}, got {args.max_model_len}."
-        )
+
+
+def _requested_miss_count(args: argparse.Namespace) -> int | None:
+    if args.miss_count is not None:
+        return args.miss_count
+    if args.miss_rate is not None:
+        return math.floor(args.topk * args.miss_rate / 100.0 + 0.5)
+    return None
+
+
+def _workloads(args: argparse.Namespace) -> list[tuple[str, int]]:
+    requested = _requested_miss_count(args)
+    if requested is not None:
+        return [("custom", requested)]
+    if args.scenario == "hit":
+        return [("hit", 0)]
+    if args.scenario == "churn":
+        return [("churn", args.topk)]
+    return [("hit", 0), ("churn", args.topk)]
 
 
 def _populate_resident_cache(
@@ -116,20 +140,43 @@ def _make_topk_groups(
     *,
     concurrency: int,
     topk: int,
+    miss_count: int,
+    max_model_len: int,
 ) -> list[Any]:
     torch = runtime.torch
-    group_count = RESIDENT_CACHE_SLOTS // topk + 1
-    return [
-        torch.arange(
-            group * topk,
-            (group + 1) * topk,
+    hit_count = topk - miss_count
+    hit_tokens = torch.arange(
+        hit_count,
+        dtype=torch.int32,
+        device=runtime.device,
+    )
+    if miss_count == 0:
+        return [
+            hit_tokens.expand(concurrency, -1).contiguous()
+        ]
+
+    replaceable_slots = RESIDENT_CACHE_SLOTS - hit_count
+    group_count = math.ceil(replaceable_slots / miss_count) + 1
+    first_miss_token = RESIDENT_CACHE_SLOTS
+    required_token_count = first_miss_token + group_count * miss_count
+    if max_model_len <= required_token_count:
+        raise ValueError(
+            "max-model-len is too small for the requested controlled-miss "
+            f"workload; need at least {required_token_count + 1}, got "
+            f"{max_model_len}."
+        )
+
+    groups = []
+    for group in range(group_count):
+        miss_tokens = torch.arange(
+            first_miss_token + group * miss_count,
+            first_miss_token + (group + 1) * miss_count,
             dtype=torch.int32,
             device=runtime.device,
         )
-        .expand(concurrency, -1)
-        .contiguous()
-        for group in range(group_count)
-    ]
+        row_topk = torch.cat((hit_tokens, miss_tokens))
+        groups.append(row_topk.expand(concurrency, -1).contiguous())
+    return groups
 
 
 def _percentile(sorted_values: list[float], percentile: float) -> float:
@@ -142,6 +189,7 @@ def _summarize_us(
     *,
     concurrency: int,
     topk: int,
+    miss_count: int,
 ) -> dict[str, float | int]:
     sorted_samples = sorted(samples_us)
     mean_us = statistics.fmean(sorted_samples)
@@ -156,29 +204,45 @@ def _summarize_us(
         "topk_entries_per_second": (
             concurrency * QUERY_LANES * topk * 1_000_000.0 / mean_us
         ),
+        "miss_count_per_request": miss_count,
+        "miss_count_per_invocation": concurrency * miss_count,
+        "effective_miss_rate_percent": miss_count * 100.0 / topk,
     }
 
 
 def _group_for_iteration(
     groups: list[Any],
-    *,
-    scenario: str,
     iteration: int,
 ) -> Any:
-    if scenario == "hit":
-        return groups[0]
-    # The cache holds all but one group. Cycling through every group makes the
-    # requested group the one that was evicted on its previous turn.
-    return groups[(iteration + len(groups) - 1) % len(groups)]
+    return groups[iteration % len(groups)]
+
+
+def _validate_device_miss_count(
+    runtime: Runtime,
+    inputs: OperatorInputs,
+    *,
+    topk_group: Any,
+    expected_total_misses: int,
+) -> None:
+    inputs.topk_positions = topk_group
+    invoke(runtime, inputs)
+    runtime.torch.npu.synchronize()
+    actual_total_misses = int(inputs.miss_mask.sum().item())
+    if actual_total_misses != expected_total_misses:
+        raise RuntimeError(
+            "Controlled-miss workload validation failed: "
+            f"expected {expected_total_misses} misses, got "
+            f"{actual_total_misses}."
+        )
 
 
 def _run_benchmark(
     runtime: Runtime,
     *,
-    scenario: str,
     concurrency: int,
     max_model_len: int,
     topk: int,
+    miss_count: int,
     warmup: int,
     iterations: int,
 ) -> dict[str, float | int]:
@@ -201,14 +265,23 @@ def _run_benchmark(
         runtime,
         concurrency=concurrency,
         topk=topk,
+        miss_count=miss_count,
+        max_model_len=max_model_len,
     )
     torch.npu.synchronize()
 
+    _validate_device_miss_count(
+        runtime,
+        inputs,
+        topk_group=groups[0],
+        expected_total_misses=concurrency * miss_count,
+    )
+
+    iteration_offset = 1
     for iteration in range(warmup):
         inputs.topk_positions = _group_for_iteration(
             groups,
-            scenario=scenario,
-            iteration=iteration,
+            iteration=iteration_offset + iteration,
         )
         invoke(runtime, inputs)
     torch.npu.synchronize()
@@ -222,8 +295,7 @@ def _run_benchmark(
     for iteration in range(iterations):
         inputs.topk_positions = _group_for_iteration(
             groups,
-            scenario=scenario,
-            iteration=warmup + iteration,
+            iteration=iteration_offset + warmup + iteration,
         )
         start_events[iteration].record()
         invoke(runtime, inputs)
@@ -238,6 +310,7 @@ def _run_benchmark(
         samples_us,
         concurrency=concurrency,
         topk=topk,
+        miss_count=miss_count,
     )
 
 
@@ -278,20 +351,20 @@ def main() -> int:
         device=args.device,
         install_root=args.install_root,
     )
-    scenarios = ("hit", "churn") if args.scenario == "both" else (args.scenario,)
+    workloads = _workloads(args)
 
     with runtime.torch.inference_mode():
         results = {
-            scenario: _run_benchmark(
+            name: _run_benchmark(
                 runtime,
-                scenario=scenario,
                 concurrency=args.concurrency,
                 max_model_len=args.max_model_len,
                 topk=args.topk,
+                miss_count=miss_count,
                 warmup=args.warmup,
                 iterations=args.iterations,
             )
-            for scenario in scenarios
+            for name, miss_count in workloads
         }
 
     manifest = {
@@ -317,6 +390,8 @@ def main() -> int:
             "max_model_len": args.max_model_len,
             "query_lanes": QUERY_LANES,
             "topk": args.topk,
+            "requested_miss_rate_percent": args.miss_rate,
+            "requested_miss_count": args.miss_count,
             "warmup": args.warmup,
             "iterations": args.iterations,
         },
