@@ -589,13 +589,17 @@ def begin_dynamic_batch(
     plan_key,
     *,
     num_sfa_queries=None,
+    query_positions_dtype: torch.dtype = torch.int32,
 ):
     return DSASparseEagerBatchContext.begin(
         coordinator,
         cohort_key,
         plan_key,
         request_ids=["request-a", "request-b"],
-        query_positions=torch.tensor([5, 9], dtype=torch.int32),
+        query_positions=torch.tensor(
+            [5, 9],
+            dtype=query_positions_dtype,
+        ),
         query_counts=[1, 1],
         seq_lens=torch.tensor([7, 10], dtype=torch.int32),
         block_table=torch.tensor(
@@ -646,6 +650,29 @@ def test_dynamic_eager_batch_packs_lanes_and_returns_active_sfa_view():
         "dsa_sparse_io:region:layer.0",
         "existing_sfa",
     ]
+
+
+def test_dynamic_eager_batch_stages_int64_runner_positions_as_int32():
+    (
+        coordinator,
+        cohort_key,
+        plan_key,
+        _events,
+        _transfer_counts,
+    ) = build_coordinator(
+        has_misses=False,
+        layer_names=("layer.0",),
+    )
+    context = begin_dynamic_batch(
+        coordinator,
+        cohort_key,
+        plan_key,
+        query_positions_dtype=torch.int64,
+    )
+
+    assert context.step.plan.query_positions.dtype == torch.int32
+    assert context.step.plan.query_positions.tolist() == [5, -1, 9, -1]
+    context.abort()
 
 
 def test_dynamic_eager_batch_keeps_padding_out_of_lookup_and_cache_writes():

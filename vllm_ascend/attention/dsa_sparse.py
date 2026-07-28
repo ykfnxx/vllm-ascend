@@ -1254,7 +1254,10 @@ class DSASparseEagerBatchContext:
             fixed_query_valid_mask = torch.zeros_like(
                 plan.query_valid_mask
             )
-            fixed_query_positions[active_plan_indices] = query_positions
+            fixed_query_positions[active_plan_indices] = query_positions.to(
+                device=fixed_query_positions.device,
+                dtype=fixed_query_positions.dtype,
+            )
             fixed_query_valid_mask[active_plan_indices] = True
 
             fixed_seq_lens = torch.zeros_like(plan.seq_lens)
