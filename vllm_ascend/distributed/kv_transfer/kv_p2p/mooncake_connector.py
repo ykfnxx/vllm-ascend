@@ -926,7 +926,7 @@ class KVCacheRecvingThread(threading.Thread):
         if not src_list:
             return
 
-        if os.getenv("VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE", "0") == "1":
+        if ascend_envs.VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE:
             logger.warning(
                 "DSA Sparse mock: skipping Mooncake KV payload transfer, "
                 "remote_request_id=%s",
