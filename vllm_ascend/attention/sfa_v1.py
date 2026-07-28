@@ -1546,7 +1546,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             ql_nope,
             q_pe,
             resolution.hot_main_cache,
-            resolution.local_sparse_indices,
+            resolution.local_sparse_indices.unsqueeze(1),
             attn_metadata,
             actual_seq_lengths_query,
             actual_seq_lengths_key,

@@ -224,7 +224,16 @@ class TestAscendSFAKVCacheComposition(TestBase):
         self.assertIs(result, expected)
         call_args = mock_sfa.call_args
         self.assertIs(call_args.args[3], hot_main_cache)
-        self.assertIs(call_args.args[4], local_indices)
+        self.assertEqual(
+            tuple(call_args.args[4].shape),
+            (2, 1, 4),
+        )
+        self.assertTrue(
+            torch.equal(
+                call_args.args[4].squeeze(1),
+                local_indices,
+            )
+        )
         self.assertIs(call_args.kwargs["block_table"], hot_block_table)
 
 
