@@ -35,10 +35,8 @@ from tests.ut.ops.dsa_sparse_lookup_update_reference import (  # noqa: E402
 class CorrectnessCase:
     name: str
     state: DSASparseLookupUpdateState
-    row_to_cache_seat: list[int]
-    row_seat_epoch: list[int]
     query_positions: list[int]
-    query_to_row: list[int]
+    query_to_req_idx: list[int]
     query_to_lane: list[int]
     query_valid_mask: list[bool]
     valid_topk_counts: list[int]
@@ -48,52 +46,49 @@ class CorrectnessCase:
 
 def _make_empty_state(
     *,
-    seats: int,
+    requests: int,
     max_model_len: int,
     slots: int,
-    epochs: list[int] | None = None,
 ) -> DSASparseLookupUpdateState:
     return DSASparseLookupUpdateState(
-        token_to_hot=[[INVALID_INDEX] * max_model_len for _ in range(seats)],
-        hot_to_token=[[INVALID_INDEX] * slots for _ in range(seats)],
-        lru_slots=[list(range(slots)) for _ in range(seats)],
-        state_seat_epoch=list(epochs) if epochs is not None else [0] * seats,
+        token_to_hot=[
+            [INVALID_INDEX] * max_model_len for _ in range(requests)
+        ],
+        hot_to_token=[[INVALID_INDEX] * slots for _ in range(requests)],
+        lru_slots=[list(range(slots)) for _ in range(requests)],
     )
 
 
 def _install(
     state: DSASparseLookupUpdateState,
     *,
-    seat: int,
+    request_index: int,
     slot: int,
     token: int,
 ) -> None:
-    state.token_to_hot[seat][token] = slot
-    state.hot_to_token[seat][slot] = token
+    state.token_to_hot[request_index][token] = slot
+    state.hot_to_token[request_index][slot] = token
 
 
 def _handcrafted_cases() -> list[CorrectnessCase]:
     mixed_state = _make_empty_state(
-        seats=2,
+        requests=2,
         max_model_len=16,
         slots=8,
-        epochs=[7, 3],
     )
-    _install(mixed_state, seat=0, slot=0, token=2)
-    _install(mixed_state, seat=0, slot=3, token=9)
-    _install(mixed_state, seat=1, slot=1, token=4)
+    _install(mixed_state, request_index=0, slot=0, token=2)
+    _install(mixed_state, request_index=0, slot=3, token=9)
+    _install(mixed_state, request_index=1, slot=1, token=4)
     mixed_state.lru_slots[0] = [1, 4, 0, 2, 5, 6, 7, 3]
     mixed_state.lru_slots[1] = [7, 6, 5, 4, 3, 2, 0, 1]
 
     mixed = CorrectnessCase(
         name="mixed_hit_duplicate_reserved_inactive_reordered",
         state=mixed_state,
-        row_to_cache_seat=[0, INVALID_INDEX],
-        row_seat_epoch=[7, 99],
         query_positions=[15, 12, 14, 13],
-        query_to_row=[0, 1, 0, 1],
+        query_to_req_idx=[0, 1, 0, 1],
         query_to_lane=[1, 0, 0, 1],
-        query_valid_mask=[True, True, True, False],
+        query_valid_mask=[True, False, True, False],
         valid_topk_counts=[4, 4, 4, 2],
         seq_lens=[16, 14],
         topk_positions=[
@@ -104,59 +99,59 @@ def _handcrafted_cases() -> list[CorrectnessCase]:
         ],
     )
 
-    reset_state = _make_empty_state(
-        seats=1,
+    resident_state = _make_empty_state(
+        requests=1,
         max_model_len=16,
         slots=4,
-        epochs=[11],
     )
-    _install(reset_state, seat=0, slot=0, token=2)
-    _install(reset_state, seat=0, slot=2, token=7)
-    reset_state.lru_slots[0] = [2, 1, 3, 0]
-    reset = CorrectnessCase(
-        name="seat_epoch_reset",
-        state=reset_state,
-        row_to_cache_seat=[0],
-        row_seat_epoch=[12],
+    _install(resident_state, request_index=0, slot=0, token=2)
+    _install(resident_state, request_index=0, slot=2, token=7)
+    resident_state.lru_slots[0] = [2, 1, 3, 0]
+    resident = CorrectnessCase(
+        name="direct_request_index_resident_reuse",
+        state=resident_state,
         query_positions=[15],
-        query_to_row=[0],
+        query_to_req_idx=[0],
         query_to_lane=[0],
         query_valid_mask=[True],
         valid_topk_counts=[4],
         seq_lens=[16],
         topk_positions=[[2, 7, 15, 5]],
     )
-    return [mixed, reset]
+    return [mixed, resident]
 
 
 def _random_state(
     rng: random.Random,
     *,
-    seats: int,
+    requests: int,
     max_model_len: int,
     slots: int,
 ) -> DSASparseLookupUpdateState:
     state = _make_empty_state(
-        seats=seats,
+        requests=requests,
         max_model_len=max_model_len,
         slots=slots,
-        epochs=[rng.randrange(0, 8) for _ in range(seats)],
     )
-    for seat in range(seats):
+    for request_index in range(requests):
         occupied = rng.randrange(0, slots + 1)
         resident_slots = rng.sample(range(slots), occupied)
         resident_tokens = rng.sample(range(max_model_len), occupied)
         for slot, token in zip(resident_slots, resident_tokens):
-            _install(state, seat=seat, slot=slot, token=token)
-        state.lru_slots[seat] = rng.sample(range(slots), slots)
+            _install(
+                state,
+                request_index=request_index,
+                slot=slot,
+                token=token,
+            )
+        state.lru_slots[request_index] = rng.sample(range(slots), slots)
     return state
 
 
 def _random_case(
     *,
     seed: int,
-    seats: int,
-    rows: int,
+    requests: int,
     max_model_len: int,
     slots: int,
     lanes: int,
@@ -165,60 +160,47 @@ def _random_case(
     rng = random.Random(seed)
     state = _random_state(
         rng,
-        seats=seats,
+        requests=requests,
         max_model_len=max_model_len,
         slots=slots,
     )
 
-    row_to_cache_seat = [INVALID_INDEX] * rows
-    active_count = rng.randrange(1, rows + 1)
-    active_rows = rng.sample(range(rows), active_count)
-    active_seats = rng.sample(range(seats), active_count)
-    for row, seat in zip(active_rows, active_seats):
-        row_to_cache_seat[row] = seat
-
-    row_seat_epoch = []
-    for row, seat in enumerate(row_to_cache_seat):
-        if seat == INVALID_INDEX:
-            row_seat_epoch.append(rng.randrange(0, 16))
-        elif rng.random() < 0.25:
-            row_seat_epoch.append(state.state_seat_epoch[seat] + 1)
-        else:
-            row_seat_epoch.append(state.state_seat_epoch[seat])
-
-    row_lane_pairs = [(row, lane) for row in range(rows) for lane in range(lanes)]
-    rng.shuffle(row_lane_pairs)
-    query_to_row = [row for row, _ in row_lane_pairs]
-    query_to_lane = [lane for _, lane in row_lane_pairs]
+    request_lane_pairs = [
+        (request_index, lane)
+        for request_index in range(requests)
+        for lane in range(lanes)
+    ]
+    rng.shuffle(request_lane_pairs)
+    query_to_req_idx = [
+        request_index for request_index, _ in request_lane_pairs
+    ]
+    query_to_lane = [lane for _, lane in request_lane_pairs]
     query_positions = [
         max_model_len - lanes + lane
-        for _, lane in row_lane_pairs
+        for _, lane in request_lane_pairs
     ]
-    query_valid_mask = [rng.random() >= 0.15 for _ in row_lane_pairs]
+    query_valid_mask = [
+        rng.random() >= 0.15 for _ in request_lane_pairs
+    ]
     valid_topk_counts = [
         topk if rng.random() >= 0.25 else rng.randrange(0, topk + 1)
-        for _ in row_lane_pairs
+        for _ in request_lane_pairs
     ]
-    seq_lens = [max_model_len] * rows
+    seq_lens = [max_model_len] * requests
 
     topk_positions: list[list[int]] = []
-    for row, lane in row_lane_pairs:
-        seat = row_to_cache_seat[row]
-        resident_tokens = (
-            [
-                token
-                for token in state.hot_to_token[seat]
-                if token != INVALID_INDEX
-            ]
-            if seat != INVALID_INDEX
-            else []
-        )
+    for request_index, lane in request_lane_pairs:
+        resident_tokens = [
+            token
+            for token in state.hot_to_token[request_index]
+            if token != INVALID_INDEX
+        ]
         current_positions = [
             max_model_len - lanes + candidate_lane
             for candidate_lane in range(lanes)
         ]
         candidates = resident_tokens + current_positions
-        row_topk = []
+        request_topk = []
         for rank in range(topk):
             selector = rng.random()
             if candidates and selector < 0.35:
@@ -229,16 +211,14 @@ def _random_case(
                 token = INVALID_INDEX
             else:
                 token = max_model_len + rank + lane
-            row_topk.append(token)
-        topk_positions.append(row_topk)
+            request_topk.append(token)
+        topk_positions.append(request_topk)
 
     return CorrectnessCase(
         name=f"random_seed_{seed}",
         state=state,
-        row_to_cache_seat=row_to_cache_seat,
-        row_seat_epoch=row_seat_epoch,
         query_positions=query_positions,
-        query_to_row=query_to_row,
+        query_to_req_idx=query_to_req_idx,
         query_to_lane=query_to_lane,
         query_valid_mask=query_valid_mask,
         valid_topk_counts=valid_topk_counts,
@@ -260,7 +240,7 @@ def _to_device_tensor(
 def _make_operator_inputs(runtime: Any, case: CorrectnessCase) -> OperatorInputs:
     torch = runtime.torch
     device = runtime.device
-    rows = len(case.row_to_cache_seat)
+    requests = len(case.state.token_to_hot)
     slots = len(case.state.hot_to_token[0])
     query_count = len(case.query_positions)
     topk = len(case.topk_positions[0])
@@ -284,33 +264,15 @@ def _make_operator_inputs(runtime: Any, case: CorrectnessCase) -> OperatorInputs
             dtype=torch.int32,
             device=device,
         ),
-        state_seat_epoch=_to_device_tensor(
-            torch,
-            case.state.state_seat_epoch,
-            dtype=torch.int32,
-            device=device,
-        ),
-        row_to_cache_seat=_to_device_tensor(
-            torch,
-            case.row_to_cache_seat,
-            dtype=torch.int32,
-            device=device,
-        ),
-        row_seat_epoch=_to_device_tensor(
-            torch,
-            case.row_seat_epoch,
-            dtype=torch.int32,
-            device=device,
-        ),
         query_positions=_to_device_tensor(
             torch,
             case.query_positions,
             dtype=torch.int32,
             device=device,
         ),
-        query_to_row=_to_device_tensor(
+        query_to_req_idx=_to_device_tensor(
             torch,
-            case.query_to_row,
+            case.query_to_req_idx,
             dtype=torch.int32,
             device=device,
         ),
@@ -356,7 +318,7 @@ def _make_operator_inputs(runtime: Any, case: CorrectnessCase) -> OperatorInputs
             device=device,
         ),
         workspace=torch.empty(
-            (rows, workspace_stride(slots)),
+            (requests, workspace_stride(slots)),
             dtype=torch.int32,
             device=device,
         ),
@@ -399,10 +361,8 @@ def _run_case(runtime: Any, case: CorrectnessCase) -> None:
     expected_state = copy.deepcopy(case.state)
     expected_resolved, expected_miss = dsa_sparse_lookup_update_reference(
         expected_state,
-        row_to_cache_seat=case.row_to_cache_seat,
-        row_seat_epoch=case.row_seat_epoch,
         query_positions=case.query_positions,
-        query_to_row=case.query_to_row,
+        query_to_req_idx=case.query_to_req_idx,
         query_to_lane=case.query_to_lane,
         query_valid_mask=case.query_valid_mask,
         valid_topk_counts=case.valid_topk_counts,
@@ -431,12 +391,6 @@ def _run_case(runtime: Any, case: CorrectnessCase) -> None:
             "lru_slots",
             inputs.lru_slots,
             expected_state.lru_slots,
-            runtime.torch.int32,
-        ),
-        (
-            "state_seat_epoch",
-            inputs.state_seat_epoch,
-            expected_state.state_seat_epoch,
             runtime.torch.int32,
         ),
         (
@@ -474,8 +428,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--install-root", type=Path)
     parser.add_argument("--random-cases", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20260728)
-    parser.add_argument("--seats", type=int, default=4)
-    parser.add_argument("--rows", type=int, default=4)
+    parser.add_argument("--requests", type=int, default=4)
     parser.add_argument("--max-model-len", type=int, default=128)
     parser.add_argument("--slots", type=int, default=32)
     parser.add_argument("--lanes", type=int, default=2)
@@ -488,8 +441,7 @@ def main() -> int:
     if args.random_cases < 0:
         raise ValueError(f"random-cases must be non-negative, got {args.random_cases}.")
     validate_dimensions(
-        seats=args.seats,
-        rows=args.rows,
+        requests=args.requests,
         max_model_len=args.max_model_len,
         slots=args.slots,
         lanes=args.lanes,
@@ -509,8 +461,7 @@ def main() -> int:
     cases.extend(
         _random_case(
             seed=args.seed + case_index,
-            seats=args.seats,
-            rows=args.rows,
+            requests=args.requests,
             max_model_len=args.max_model_len,
             slots=args.slots,
             lanes=args.lanes,

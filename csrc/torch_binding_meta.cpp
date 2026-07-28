@@ -1760,11 +1760,8 @@ void dsa_sparse_lookup_update(
     at::Tensor& token_to_hot,
     at::Tensor& hot_to_token,
     at::Tensor& lru_slots,
-    at::Tensor& state_seat_epoch,
-    const at::Tensor& row_to_cache_seat,
-    const at::Tensor& row_seat_epoch,
     const at::Tensor& query_positions,
-    const at::Tensor& query_to_row,
+    const at::Tensor& query_to_req_idx,
     const at::Tensor& query_to_lane,
     const at::Tensor& query_valid_mask,
     const at::Tensor& valid_topk_counts,
@@ -1777,11 +1774,8 @@ void dsa_sparse_lookup_update(
     (void)token_to_hot;
     (void)hot_to_token;
     (void)lru_slots;
-    (void)state_seat_epoch;
-    (void)row_to_cache_seat;
-    (void)row_seat_epoch;
     (void)query_positions;
-    (void)query_to_row;
+    (void)query_to_req_idx;
     (void)query_to_lane;
     (void)query_valid_mask;
     (void)valid_topk_counts;

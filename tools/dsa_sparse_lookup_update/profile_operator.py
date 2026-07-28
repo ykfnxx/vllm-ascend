@@ -44,9 +44,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--install-root", type=Path)
-    parser.add_argument("--scenario", choices=("steady", "fresh"), default="steady")
-    parser.add_argument("--seats", type=int, default=8)
-    parser.add_argument("--rows", type=int, default=8)
+    parser.add_argument("--requests", type=int, default=8)
     parser.add_argument("--max-model-len", type=int, default=131072)
     parser.add_argument("--slots", type=int, default=4096)
     parser.add_argument("--lanes", type=int, default=1)
@@ -57,36 +55,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--no-trace", action="store_true")
     parser.add_argument("--output-dir", type=Path)
     return parser.parse_args()
-
-
-def _make_epoch_tensors(
-    runtime: Runtime,
-    *,
-    rows: int,
-    count: int,
-    first_epoch: int,
-) -> list[Any]:
-    torch = runtime.torch
-    return [
-        torch.full(
-            (rows,),
-            first_epoch + index,
-            dtype=torch.int32,
-            device=runtime.device,
-        )
-        for index in range(count)
-    ]
-
-
-def _invoke_scenario(
-    runtime: Runtime,
-    inputs: OperatorInputs,
-    *,
-    epoch_tensor: Any | None,
-) -> None:
-    if epoch_tensor is not None:
-        inputs.row_seat_epoch = epoch_tensor
-    invoke(runtime, inputs)
 
 
 def _percentile(sorted_values: list[float], percentile: float) -> float:
@@ -110,18 +78,13 @@ def _event_benchmark(
     runtime: Runtime,
     inputs: OperatorInputs,
     *,
-    scenario: str,
     warmup: int,
     iterations: int,
-    epoch_tensors: list[Any],
 ) -> dict[str, float | int]:
     torch = runtime.torch
-    epoch_index = 0
 
     for _ in range(warmup):
-        epoch_tensor = epoch_tensors[epoch_index] if scenario == "fresh" else None
-        _invoke_scenario(runtime, inputs, epoch_tensor=epoch_tensor)
-        epoch_index += scenario == "fresh"
+        invoke(runtime, inputs)
     torch.npu.synchronize()
 
     start_events = [
@@ -133,11 +96,9 @@ def _event_benchmark(
         for _ in range(iterations)
     ]
     for iteration in range(iterations):
-        epoch_tensor = epoch_tensors[epoch_index] if scenario == "fresh" else None
         start_events[iteration].record()
-        _invoke_scenario(runtime, inputs, epoch_tensor=epoch_tensor)
+        invoke(runtime, inputs)
         end_events[iteration].record()
-        epoch_index += scenario == "fresh"
     torch.npu.synchronize()
 
     samples_us = [
@@ -182,16 +143,13 @@ def _trace(
     runtime: Runtime,
     inputs: OperatorInputs,
     *,
-    scenario: str,
     iterations: int,
-    epoch_tensors: list[Any],
     trace_dir: Path,
 ) -> None:
     profiler = _create_profiler(runtime, trace_dir)
     profiler.start()
-    for iteration in range(iterations):
-        epoch_tensor = epoch_tensors[iteration] if scenario == "fresh" else None
-        _invoke_scenario(runtime, inputs, epoch_tensor=epoch_tensor)
+    for _ in range(iterations):
+        invoke(runtime, inputs)
         profiler.step()
     runtime.torch.npu.synchronize()
     profiler.stop()
@@ -238,8 +196,7 @@ def _device_name(runtime: Runtime) -> str:
 def main() -> int:
     args = _parse_args()
     validate_dimensions(
-        seats=args.seats,
-        rows=args.rows,
+        requests=args.requests,
         max_model_len=args.max_model_len,
         slots=args.slots,
         lanes=args.lanes,
@@ -256,8 +213,7 @@ def main() -> int:
     )
     inputs = make_profile_inputs(
         runtime,
-        seats=args.seats,
-        rows=args.rows,
+        requests=args.requests,
         max_model_len=args.max_model_len,
         slots=args.slots,
         lanes=args.lanes,
@@ -272,27 +228,14 @@ def main() -> int:
     )
     output_dir.mkdir(parents=True, exist_ok=False)
 
-    event_epoch_count = args.warmup + args.iterations
-    event_epochs = (
-        _make_epoch_tensors(
-            runtime,
-            rows=args.rows,
-            count=event_epoch_count,
-            first_epoch=1,
-        )
-        if args.scenario == "fresh"
-        else []
-    )
     runtime.torch.npu.synchronize()
 
     with runtime.torch.inference_mode():
         timing = _event_benchmark(
             runtime,
             inputs,
-            scenario=args.scenario,
             warmup=args.warmup,
             iterations=args.iterations,
-            epoch_tensors=event_epochs,
         )
 
         trace_dir: Path | None = None
@@ -300,30 +243,18 @@ def main() -> int:
         if not args.no_trace:
             trace_dir = output_dir / "trace"
             trace_dir.mkdir()
-            trace_epochs = (
-                _make_epoch_tensors(
-                    runtime,
-                    rows=args.rows,
-                    count=args.profile_iters,
-                    first_epoch=event_epoch_count + 1,
-                )
-                if args.scenario == "fresh"
-                else []
-            )
             runtime.torch.npu.synchronize()
             _trace(
                 runtime,
                 inputs,
-                scenario=args.scenario,
                 iterations=args.profile_iters,
-                epoch_tensors=trace_epochs,
                 trace_dir=trace_dir,
             )
             custom_op_found = _profile_contains_custom_op(trace_dir)
 
     manifest = {
         "operator": "dsa_sparse_lookup_update",
-        "scenario": args.scenario,
+        "scenario": "steady",
         "device": args.device,
         "device_name": _device_name(runtime),
         "git_head": _git_head(),
@@ -335,8 +266,7 @@ def main() -> int:
             else None
         ),
         "shape": {
-            "seats": args.seats,
-            "rows": args.rows,
+            "requests": args.requests,
             "max_model_len": args.max_model_len,
             "slots": args.slots,
             "lanes": args.lanes,

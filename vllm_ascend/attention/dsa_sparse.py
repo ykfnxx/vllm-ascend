@@ -37,7 +37,7 @@ def _round_up(value: int, alignment: int) -> int:
 
 
 def dsa_sparse_lookup_workspace_stride(evictable_slots: int) -> int:
-    """Return the explicit per-row int32 workspace used by the A5 SIMT op."""
+    """Return the per-request int32 workspace used by the A5 SIMT op."""
 
     if evictable_slots <= 0:
         raise ValueError(
@@ -127,122 +127,64 @@ class DSASparseCacheConfig:
         return _round_up(self.managed_hot_width, self.block_size)
 
     @property
-    def hot_blocks_per_seat(self) -> int:
+    def hot_blocks_per_request(self) -> int:
         return self.hot_stride // self.block_size
 
     @property
     def total_hot_blocks(self) -> int:
-        return self.max_num_seqs * self.hot_blocks_per_seat
+        return self.max_num_seqs * self.hot_blocks_per_request
 
     @property
     def max_blocks_per_request(self) -> int:
         return _round_up(self.max_model_len, self.block_size) // self.block_size
 
 
-@dataclass(frozen=True)
-class CacheSeatLease:
-    seat: int
-    epoch: int
-
-
-@dataclass(frozen=True)
-class DSASparseRowMapping:
-    """Fixed-size row-to-seat inputs for one eager Decode step."""
-
-    row_to_cache_seat: torch.Tensor
-    row_seat_epoch: torch.Tensor
-
-    @classmethod
-    def allocate(
-        cls,
-        request_capacity: int,
-        *,
-        device: torch.device | str,
-    ) -> "DSASparseRowMapping":
-        if request_capacity <= 0:
-            raise ValueError(f"request_capacity must be positive, got {request_capacity}.")
-        row_to_cache_seat = torch.full(
-            (request_capacity,),
-            INVALID_INDEX,
-            dtype=torch.int32,
-            device=device,
-        )
-        return cls(
-            row_to_cache_seat=row_to_cache_seat,
-            row_seat_epoch=torch.full_like(
-                row_to_cache_seat,
-                INVALID_INDEX,
-            ),
-        )
-
-
-class CacheSeatManager:
-    """Own stable Decode cache seats on the request control plane."""
+class RequestIndexManager:
+    """Allocate one stable Decode request index for each admitted request."""
 
     def __init__(self, max_num_seqs: int) -> None:
         if max_num_seqs <= 0:
             raise ValueError(f"max_num_seqs must be positive, got {max_num_seqs}.")
         self.max_num_seqs = max_num_seqs
-        self._free_seats = deque(range(max_num_seqs))
-        self._seat_owner: list[Hashable | None] = [None] * max_num_seqs
-        self._seat_epoch = [0] * max_num_seqs
-        self._request_to_lease: dict[Hashable, CacheSeatLease] = {}
+        self._free_indices = deque(range(max_num_seqs))
+        self._index_owner: list[Hashable | None] = [None] * max_num_seqs
+        self._request_to_index: dict[Hashable, int] = {}
 
     @property
-    def num_free_seats(self) -> int:
-        return len(self._free_seats)
+    def num_free_indices(self) -> int:
+        return len(self._free_indices)
 
     @property
     def active_request_ids(self) -> tuple[Hashable, ...]:
-        return tuple(owner for owner in self._seat_owner if owner is not None)
+        return tuple(owner for owner in self._index_owner if owner is not None)
 
-    def acquire(self, request_id: Hashable) -> CacheSeatLease:
-        if request_id in self._request_to_lease:
-            raise ValueError(f"Request {request_id!r} already owns a DSA Sparse cache seat.")
-        if not self._free_seats:
-            raise RuntimeError("No free DSA Sparse cache seat is available.")
-
-        seat = self._free_seats.popleft()
-        self._seat_epoch[seat] += 1
-        lease = CacheSeatLease(seat=seat, epoch=self._seat_epoch[seat])
-        self._seat_owner[seat] = request_id
-        self._request_to_lease[request_id] = lease
-        return lease
-
-    def get_lease(self, request_id: Hashable) -> CacheSeatLease:
-        try:
-            return self._request_to_lease[request_id]
-        except KeyError as exc:
-            raise KeyError(f"Request {request_id!r} does not own a DSA Sparse cache seat.") from exc
-
-    def release(self, request_id: Hashable) -> CacheSeatLease:
-        lease = self.get_lease(request_id)
-        del self._request_to_lease[request_id]
-        self._seat_owner[lease.seat] = None
-        self._free_seats.append(lease.seat)
-        return lease
-
-    def pack_rows(
-        self,
-        request_ids: list[Hashable],
-        out: DSASparseRowMapping,
-    ) -> DSASparseRowMapping:
-        request_capacity = out.row_to_cache_seat.shape[0]
-        if len(request_ids) > request_capacity:
+    def acquire(self, request_id: Hashable) -> int:
+        if request_id in self._request_to_index:
             raise ValueError(
-                "request_ids exceeds request_capacity, got "
-                f"{len(request_ids)} requests for capacity {request_capacity}."
+                f"Request {request_id!r} already owns a DSA Sparse request index."
             )
-        if len(set(request_ids)) != len(request_ids):
-            raise ValueError("Each active request may appear in only one DSA Sparse row.")
+        if not self._free_indices:
+            raise RuntimeError("No free DSA Sparse request index is available.")
 
-        out.row_to_cache_seat.fill_(INVALID_INDEX)
-        out.row_seat_epoch.fill_(INVALID_INDEX)
-        for row, request_id in enumerate(request_ids):
-            lease = self.get_lease(request_id)
-            out.row_to_cache_seat[row] = lease.seat
-            out.row_seat_epoch[row] = lease.epoch
-        return out
+        request_index = self._free_indices.popleft()
+        self._index_owner[request_index] = request_id
+        self._request_to_index[request_id] = request_index
+        return request_index
+
+    def get_index(self, request_id: Hashable) -> int:
+        try:
+            return self._request_to_index[request_id]
+        except KeyError as exc:
+            raise KeyError(
+                f"Request {request_id!r} does not own a DSA Sparse request index."
+            ) from exc
+
+    def release(self, request_id: Hashable) -> int:
+        request_index = self.get_index(request_id)
+        del self._request_to_index[request_id]
+        self._index_owner[request_index] = None
+        self._free_indices.append(request_index)
+        return request_index
 
 
 @dataclass(frozen=True)
@@ -253,7 +195,6 @@ class DSASparseResidencyState:
     token_to_hot: torch.Tensor
     hot_to_token: torch.Tensor
     lru_slots: torch.Tensor
-    state_seat_epoch: torch.Tensor
 
     @classmethod
     def allocate(
@@ -284,18 +225,27 @@ class DSASparseResidencyState:
             .expand(config.max_num_seqs, -1)
             .clone()
         )
-        state_seat_epoch = torch.full(
-            (config.max_num_seqs,),
-            INVALID_INDEX,
-            dtype=torch.int32,
-            device=device,
-        )
         return cls(
             cohort=cohort,
             token_to_hot=token_to_hot,
             hot_to_token=hot_to_token,
             lru_slots=lru_slots,
-            state_seat_epoch=state_seat_epoch,
+        )
+
+    def reset_request(self, request_index: int) -> None:
+        if not 0 <= request_index < self.token_to_hot.shape[0]:
+            raise IndexError(
+                f"request_index {request_index} is outside residency capacity "
+                f"{self.token_to_hot.shape[0]}."
+            )
+        self.token_to_hot[request_index].fill_(INVALID_INDEX)
+        self.hot_to_token[request_index].fill_(INVALID_INDEX)
+        self.lru_slots[request_index].copy_(
+            torch.arange(
+                self.lru_slots.shape[1],
+                dtype=self.lru_slots.dtype,
+                device=self.lru_slots.device,
+            )
         )
 
 
@@ -358,16 +308,15 @@ class DSASparsePlanKey:
 class DSASparseBatchMetadata:
     """Role-level fixed inputs shared by every residency cohort.
 
-    Row ownership, query mapping, the Decode block table, the synthetic Hot
-    block table, and newest write descriptors describe the batch rather than a
-    particular IndexCache cohort.  Sharing these tensors prevents one
-    row-metadata staging pass and one HBM copy per cohort.
+    Stable request-index query mapping, the Decode block table, the synthetic
+    Hot block table, and newest write descriptors describe the batch rather
+    than a particular IndexCache cohort. Sharing these tensors prevents one
+    metadata staging pass and one HBM copy per cohort.
     """
 
     key: DSASparsePlanKey
-    row_mapping: DSASparseRowMapping
     query_positions: torch.Tensor
-    query_to_row: torch.Tensor
+    query_to_req_idx: torch.Tensor
     query_to_lane: torch.Tensor
     query_valid_mask: torch.Tensor
     seq_lens: torch.Tensor
@@ -415,14 +364,20 @@ class DSASparseBatchMetadata:
             dtype=torch.int32,
             device=device,
         )
+        hot_block_table = torch.arange(
+            key.request_capacity * config.hot_blocks_per_request,
+            dtype=block_table_dtype,
+            device=device,
+        ).view(
+            key.request_capacity,
+            config.hot_blocks_per_request,
+        )
         return cls(
             key=key,
-            row_mapping=DSASparseRowMapping.allocate(
-                key.request_capacity,
-                device=device,
-            ),
             query_positions=int_tensor((key.token_capacity,)),
-            query_to_row=flat_query_indices // key.query_lane_capacity,
+            query_to_req_idx=(
+                flat_query_indices // key.query_lane_capacity
+            ),
             query_to_lane=flat_query_indices % key.query_lane_capacity,
             query_valid_mask=torch.zeros(
                 key.token_capacity,
@@ -443,15 +398,7 @@ class DSASparseBatchMetadata:
                 dtype=block_table_dtype,
                 device=device,
             ),
-            hot_block_table=torch.full(
-                (
-                    key.request_capacity,
-                    config.hot_blocks_per_seat,
-                ),
-                INVALID_INDEX,
-                dtype=block_table_dtype,
-                device=device,
-            ),
+            hot_block_table=hot_block_table,
             write_global_slots=int_tensor(write_shape),
             write_destination_hot_row_ids=int_tensor(write_shape),
             write_valid_mask=torch.zeros(
@@ -535,16 +482,12 @@ class DSASparsePlan:
         )
 
     @property
-    def row_mapping(self) -> DSASparseRowMapping:
-        return self.batch_metadata.row_mapping
-
-    @property
     def query_positions(self) -> torch.Tensor:
         return self.batch_metadata.query_positions
 
     @property
-    def query_to_row(self) -> torch.Tensor:
-        return self.batch_metadata.query_to_row
+    def query_to_req_idx(self) -> torch.Tensor:
+        return self.batch_metadata.query_to_req_idx
 
     @property
     def query_to_lane(self) -> torch.Tensor:
@@ -701,6 +644,7 @@ class DSASparseEagerStep:
     cohort: DSASparseCohort
     plan: DSASparsePlan
     request_ids: tuple[Hashable, ...]
+    request_indices: tuple[int, ...]
     lookup_complete: bool = False
     newest_written_layers: set[str] = field(default_factory=set)
     io_completed_layers: set[str] = field(default_factory=set)
@@ -716,12 +660,22 @@ class DSASparseEagerCoordinator:
         *,
         index_operator: DSASparseLookupUpdateOperator,
         io_operator: DSASparseIOOperator,
-        seat_manager: CacheSeatManager | None = None,
+        request_index_manager: RequestIndexManager | None = None,
     ) -> None:
         self.config = config
         self.index_operator = index_operator
         self.io_operator = io_operator
-        self.seat_manager = seat_manager or CacheSeatManager(config.max_num_seqs)
+        self.request_index_manager = (
+            request_index_manager
+            or RequestIndexManager(config.max_num_seqs)
+        )
+        if (
+            self.request_index_manager.max_num_seqs
+            != config.max_num_seqs
+        ):
+            raise ValueError(
+                "The request-index pool capacity must equal max_num_seqs."
+            )
         self._cohorts: dict[DSASparseCohortKey, DSASparseCohort] = {}
         self._layers: dict[DSASparseLayerKey, DSASparseLayerBinding] = {}
         self._active_steps: dict[DSASparseCohortKey, DSASparseEagerStep] = {}
@@ -738,16 +692,49 @@ class DSASparseEagerCoordinator:
         self._require_mutable()
         if cohort.key in self._cohorts:
             raise ValueError(f"DSA Sparse cohort {cohort.key!r} is already registered.")
+        request_capacity = self.request_index_manager.max_num_seqs
+        state_tensors = (
+            cohort.state.token_to_hot,
+            cohort.state.hot_to_token,
+            cohort.state.lru_slots,
+        )
+        if any(
+            tensor.shape[0] != request_capacity
+            for tensor in state_tensors
+        ):
+            raise ValueError(
+                "Every residency-state tensor must cover the complete "
+                "request-index pool."
+            )
+        if any(
+            plan_key.request_capacity != request_capacity
+            for plan_key in cohort.plans
+        ):
+            raise ValueError(
+                "Every DSA Sparse plan must cover the complete "
+                "request-index pool."
+            )
         self._cohorts[cohort.key] = cohort
 
-    def acquire_request(self, request_id: Hashable) -> CacheSeatLease:
+    def acquire_request(self, request_id: Hashable) -> int:
         self._require_healthy()
-        return self.seat_manager.acquire(request_id)
+        request_index = self.request_index_manager.acquire(request_id)
+        try:
+            for cohort in self._cohorts.values():
+                cohort.state.reset_request(request_index)
+        except BaseException:
+            self.request_index_manager.release(request_id)
+            raise
+        return request_index
 
-    def release_request(self, request_id: Hashable) -> CacheSeatLease:
+    def request_index(self, request_id: Hashable) -> int:
+        self._require_healthy()
+        return self.request_index_manager.get_index(request_id)
+
+    def release_request(self, request_id: Hashable) -> int:
         self._require_healthy()
         self.assert_request_idle(request_id)
-        return self.seat_manager.release(request_id)
+        return self.request_index_manager.release(request_id)
 
     def assert_request_idle(self, request_id: Hashable) -> None:
         if any(request_id in step.request_ids for step in self._active_steps.values()):
@@ -845,6 +832,7 @@ class DSASparseEagerCoordinator:
         plan_key: DSASparsePlanKey,
         *,
         request_ids: list[Hashable],
+        request_indices: list[int],
         query_positions: torch.Tensor,
         query_valid_mask: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -863,9 +851,24 @@ class DSASparseEagerCoordinator:
             raise RuntimeError(
                 f"Only one DSA Sparse step may mutate a residency cohort at a time, cohort={cohort_key!r}."
             )
+        if len(request_indices) != len(request_ids):
+            raise ValueError(
+                "request_indices must contain one stable index per request."
+            )
+        if len(set(request_indices)) != len(request_indices):
+            raise ValueError("Active DSA Sparse request indices must be unique.")
+        for request_id, request_index in zip(
+            request_ids,
+            request_indices,
+        ):
+            expected_index = self.request_index(request_id)
+            if request_index != expected_index:
+                raise RuntimeError(
+                    f"Request {request_id!r} uses request index "
+                    f"{request_index}, expected {expected_index}."
+                )
 
         if stage_batch_metadata:
-            self.seat_manager.pack_rows(request_ids, plan.row_mapping)
             self._copy_exact(
                 query_positions,
                 plan.query_positions,
@@ -891,6 +894,7 @@ class DSASparseEagerCoordinator:
             cohort=cohort,
             plan=plan,
             request_ids=tuple(request_ids),
+            request_indices=tuple(request_indices),
         )
         self._active_steps[cohort_key] = step
         return step
@@ -965,10 +969,7 @@ class DSASparseEagerCoordinator:
                 topk_positions=step.plan.topk_positions,
                 resolved_hot_indices=step.plan.resolved_hot_indices,
                 miss_mask=step.plan.miss_mask,
-                query_to_row=step.plan.query_to_row,
-                row_to_cache_seat=(
-                    step.plan.row_mapping.row_to_cache_seat
-                ),
+                query_to_req_idx=step.plan.query_to_req_idx,
                 block_table=step.plan.block_table,
                 write_global_slots=step.plan.write_global_slots,
                 write_destination_hot_row_ids=(
@@ -1018,37 +1019,18 @@ class DSASparseEagerCoordinator:
         self,
         plan: DSASparsePlan,
     ) -> None:
-        """Fill synthetic Hot addressing in the row-metadata stage."""
-
-        row_to_seat = plan.row_mapping.row_to_cache_seat
-        block_offsets = torch.arange(
-            self.config.hot_blocks_per_seat,
-            dtype=plan.hot_block_table.dtype,
-            device=plan.hot_block_table.device,
-        )
-        hot_blocks = (
-            row_to_seat.to(plan.hot_block_table.dtype).unsqueeze(1)
-            * self.config.hot_blocks_per_seat
-            + block_offsets.unsqueeze(0)
-        )
-        plan.hot_block_table.copy_(hot_blocks)
-        plan.hot_block_table.masked_fill_(
-            row_to_seat.unsqueeze(1) < 0,
-            INVALID_INDEX,
-        )
+        """Fill newest-write descriptors using stable request indices."""
 
         plan.write_global_slots.fill_(INVALID_INDEX)
         plan.write_destination_hot_row_ids.fill_(INVALID_INDEX)
         plan.write_valid_mask.zero_()
 
-        query_rows = plan.query_to_row.to(torch.long)
+        query_req_indices = plan.query_to_req_idx.to(torch.long)
         query_lanes = plan.query_to_lane.to(torch.long)
         query_positions = plan.query_positions
-        query_seats = row_to_seat[query_rows]
-        query_seq_lens = plan.seq_lens[query_rows]
+        query_seq_lens = plan.seq_lens[query_req_indices]
         valid = (
             plan.query_valid_mask
-            & (query_seats >= 0)
             & (query_positions >= 0)
             & (query_positions < query_seq_lens)
             & (query_positions < self.config.max_model_len)
@@ -1064,13 +1046,13 @@ class DSASparseEagerCoordinator:
             max=plan.block_table.shape[1] - 1,
         ).to(torch.long)
         physical_blocks = plan.block_table[
-            query_rows,
+            query_req_indices,
             safe_block_indices,
         ].to(torch.int32)
         valid &= physical_blocks >= 0
 
         destination_rows = (
-            query_seats
+            plan.query_to_req_idx
             * self.config.hot_stride
             + self.config.device_buffer_size
             + plan.query_to_lane
@@ -1098,7 +1080,7 @@ class DSASparseEagerCoordinator:
         )
 
         write_indices = (
-            query_rows * plan.key.query_lane_capacity
+            query_req_indices * plan.key.query_lane_capacity
             + query_lanes
         )
         plan.write_destination_hot_row_ids.view(-1).index_copy_(
@@ -1210,12 +1192,14 @@ class DSASparseEagerBatchContext:
         coordinator: DSASparseEagerCoordinator,
         step: DSASparseEagerStep,
         active_plan_indices: torch.Tensor,
+        active_request_indices: torch.Tensor,
         sfa_slot_mapping: torch.Tensor,
         sfa_local_sparse_indices: torch.Tensor,
     ) -> None:
         self.coordinator = coordinator
         self.step = step
         self.active_plan_indices = active_plan_indices
+        self.active_request_indices = active_request_indices
         self._sfa_slot_mapping = sfa_slot_mapping
         self._sfa_local_sparse_indices = sfa_local_sparse_indices
         self._closed = False
@@ -1228,6 +1212,7 @@ class DSASparseEagerBatchContext:
         plan_key: DSASparsePlanKey,
         *,
         request_ids: list[Hashable],
+        request_indices: list[int],
         query_positions: torch.Tensor,
         query_counts: list[int],
         seq_lens: torch.Tensor,
@@ -1243,6 +1228,7 @@ class DSASparseEagerBatchContext:
         cls._validate_dynamic_inputs(
             plan,
             request_ids=request_ids,
+            request_indices=request_indices,
             query_positions=query_positions,
             query_counts=query_counts,
             seq_lens=seq_lens,
@@ -1251,7 +1237,12 @@ class DSASparseEagerBatchContext:
         )
 
         active_indices = [
-            row * plan.key.query_lane_capacity + lane for row, count in enumerate(query_counts) for lane in range(count)
+            request_index * plan.key.query_lane_capacity + lane
+            for request_index, count in zip(
+                request_indices,
+                query_counts,
+            )
+            for lane in range(count)
         ]
         num_active_queries = len(active_indices)
         if num_sfa_queries is None:
@@ -1261,6 +1252,11 @@ class DSASparseEagerBatchContext:
             dtype=torch.long,
             device=plan.query_positions.device,
         )
+        active_request_indices = torch.tensor(
+            request_indices,
+            dtype=torch.long,
+            device=plan.seq_lens.device,
+        )
         if stage_batch_metadata:
             fixed_query_positions = torch.full_like(
                 plan.query_positions,
@@ -1269,19 +1265,35 @@ class DSASparseEagerBatchContext:
             fixed_query_valid_mask = torch.zeros_like(
                 plan.query_valid_mask
             )
-            fixed_query_positions[active_plan_indices] = query_positions.to(
-                device=fixed_query_positions.device,
-                dtype=fixed_query_positions.dtype,
+            fixed_query_positions.index_copy_(
+                0,
+                active_plan_indices,
+                query_positions.to(
+                    device=fixed_query_positions.device,
+                    dtype=fixed_query_positions.dtype,
+                ),
             )
-            fixed_query_valid_mask[active_plan_indices] = True
+            fixed_query_valid_mask.index_fill_(
+                0,
+                active_plan_indices,
+                True,
+            )
 
             fixed_seq_lens = torch.zeros_like(plan.seq_lens)
-            fixed_seq_lens[: len(request_ids)] = seq_lens
+            fixed_seq_lens.index_copy_(
+                0,
+                active_request_indices,
+                seq_lens,
+            )
             fixed_block_table = torch.full_like(
                 plan.block_table,
                 INVALID_INDEX,
             )
-            fixed_block_table[: len(request_ids)] = block_table
+            fixed_block_table.index_copy_(
+                0,
+                active_request_indices,
+                block_table,
+            )
         else:
             fixed_query_positions = plan.query_positions
             fixed_query_valid_mask = plan.query_valid_mask
@@ -1307,6 +1319,7 @@ class DSASparseEagerBatchContext:
             cohort_key,
             plan_key,
             request_ids=request_ids,
+            request_indices=request_indices,
             query_positions=fixed_query_positions,
             query_valid_mask=fixed_query_valid_mask,
             seq_lens=fixed_seq_lens,
@@ -1330,6 +1343,7 @@ class DSASparseEagerBatchContext:
             coordinator=coordinator,
             step=step,
             active_plan_indices=active_plan_indices,
+            active_request_indices=active_request_indices,
             sfa_slot_mapping=sfa_slot_mapping,
             sfa_local_sparse_indices=sfa_local_sparse_indices,
         )
@@ -1376,10 +1390,18 @@ class DSASparseEagerBatchContext:
                 INVALID_INDEX,
             )
             fixed_valid_topk_counts = torch.zeros_like(self.step.plan.valid_topk_counts)
-            fixed_topk_positions[self.active_plan_indices] = semantic_topk_positions
-            fixed_valid_topk_counts[self.active_plan_indices] = (semantic_topk_positions >= 0).sum(
-                dim=-1,
-                dtype=fixed_valid_topk_counts.dtype,
+            fixed_topk_positions.index_copy_(
+                0,
+                self.active_plan_indices,
+                semantic_topk_positions,
+            )
+            fixed_valid_topk_counts.index_copy_(
+                0,
+                self.active_plan_indices,
+                (semantic_topk_positions >= 0).sum(
+                    dim=-1,
+                    dtype=fixed_valid_topk_counts.dtype,
+                ),
             )
             self.coordinator.prepare_lookup(
                 self.step,
@@ -1397,7 +1419,9 @@ class DSASparseEagerBatchContext:
             active_resolution = DSASparseResolution(
                 hot_main_cache=resolution.hot_main_cache,
                 local_sparse_indices=self._sfa_local_sparse_indices,
-                hot_block_table=resolution.hot_block_table[: len(self.step.request_ids)],
+                hot_block_table=resolution.hot_block_table[
+                    self.active_request_indices
+                ],
             )
             return attention(active_resolution)
 
@@ -1445,6 +1469,7 @@ class DSASparseEagerBatchContext:
         plan: DSASparsePlan,
         *,
         request_ids: list[Hashable],
+        request_indices: list[int],
         query_positions: torch.Tensor,
         query_counts: list[int],
         seq_lens: torch.Tensor,
@@ -1456,6 +1481,21 @@ class DSASparseEagerBatchContext:
             raise ValueError("request_ids exceeds the DSA Sparse plan request capacity.")
         if len(query_counts) != num_requests:
             raise ValueError("query_counts must contain one entry per request.")
+        if len(request_indices) != num_requests:
+            raise ValueError(
+                "request_indices must contain one entry per request."
+            )
+        if len(set(request_indices)) != num_requests:
+            raise ValueError("request_indices must be unique.")
+        if any(
+            isinstance(request_index, bool)
+            or not isinstance(request_index, int)
+            or not 0 <= request_index < plan.key.request_capacity
+            for request_index in request_indices
+        ):
+            raise ValueError(
+                "Each request index must fit the DSA Sparse request capacity."
+            )
         if any(
             isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= plan.key.query_lane_capacity
             for count in query_counts

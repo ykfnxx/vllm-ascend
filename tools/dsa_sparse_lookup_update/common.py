@@ -36,11 +36,8 @@ class OperatorInputs:
     token_to_hot: Any
     hot_to_token: Any
     lru_slots: Any
-    state_seat_epoch: Any
-    row_to_cache_seat: Any
-    row_seat_epoch: Any
     query_positions: Any
-    query_to_row: Any
+    query_to_req_idx: Any
     query_to_lane: Any
     query_valid_mask: Any
     valid_topk_counts: Any
@@ -55,11 +52,8 @@ class OperatorInputs:
             self.token_to_hot,
             self.hot_to_token,
             self.lru_slots,
-            self.state_seat_epoch,
-            self.row_to_cache_seat,
-            self.row_seat_epoch,
             self.query_positions,
-            self.query_to_row,
+            self.query_to_req_idx,
             self.query_to_lane,
             self.query_valid_mask,
             self.valid_topk_counts,
@@ -79,16 +73,14 @@ def workspace_stride(evictable_slots: int) -> int:
 
 def validate_dimensions(
     *,
-    seats: int,
-    rows: int,
+    requests: int,
     max_model_len: int,
     slots: int,
     lanes: int,
     topk: int,
 ) -> None:
     dimensions = {
-        "seats": seats,
-        "rows": rows,
+        "requests": requests,
         "max_model_len": max_model_len,
         "slots": slots,
         "lanes": lanes,
@@ -97,13 +89,11 @@ def validate_dimensions(
     for name, value in dimensions.items():
         if value <= 0:
             raise ValueError(f"{name} must be positive, got {value}.")
-    if rows > seats:
-        raise ValueError(f"rows must not exceed seats, got rows={rows}, seats={seats}.")
     if lanes > MAX_QUERY_LANES:
         raise ValueError(f"lanes must be at most {MAX_QUERY_LANES}, got {lanes}.")
     if slots < lanes * topk:
         raise ValueError(
-            "slots must cover the complete per-row Top-K union, got "
+            "slots must cover the complete per-request Top-K union, got "
             f"slots={slots}, lanes={lanes}, topk={topk}."
         )
 
@@ -187,16 +177,14 @@ def invoke(runtime: Runtime, inputs: OperatorInputs) -> None:
 def make_profile_inputs(
     runtime: Runtime,
     *,
-    seats: int,
-    rows: int,
+    requests: int,
     max_model_len: int,
     slots: int,
     lanes: int,
     topk: int,
 ) -> OperatorInputs:
     validate_dimensions(
-        seats=seats,
-        rows=rows,
+        requests=requests,
         max_model_len=max_model_len,
         slots=slots,
         lanes=lanes,
@@ -212,39 +200,38 @@ def make_profile_inputs(
 
     torch = runtime.torch
     device = runtime.device
-    query_count = rows * lanes
+    query_count = requests * lanes
 
     token_to_hot = torch.full(
-        (seats, max_model_len),
+        (requests, max_model_len),
         INVALID_INDEX,
         dtype=torch.int32,
         device=device,
     )
     hot_to_token = torch.full(
-        (seats, slots),
+        (requests, slots),
         INVALID_INDEX,
         dtype=torch.int32,
         device=device,
     )
     lru_slots = (
         torch.arange(slots, dtype=torch.int32, device=device)
-        .expand(seats, -1)
+        .expand(requests, -1)
         .clone()
     )
-    state_seat_epoch = torch.full(
-        (seats,),
-        INVALID_INDEX,
+    query_to_req_idx = torch.arange(
+        requests,
         dtype=torch.int32,
         device=device,
-    )
-    row_to_cache_seat = torch.arange(rows, dtype=torch.int32, device=device)
-    row_seat_epoch = torch.zeros(rows, dtype=torch.int32, device=device)
-
-    query_to_row = torch.arange(rows, dtype=torch.int32, device=device).repeat_interleave(lanes)
-    query_to_lane = torch.arange(lanes, dtype=torch.int32, device=device).repeat(rows)
+    ).repeat_interleave(lanes)
+    query_to_lane = torch.arange(
+        lanes,
+        dtype=torch.int32,
+        device=device,
+    ).repeat(requests)
     query_positions = (
         torch.arange(lanes, dtype=torch.int32, device=device)
-        .repeat(rows)
+        .repeat(requests)
         .add(max_model_len - lanes)
     )
     query_valid_mask = torch.ones(query_count, dtype=torch.bool, device=device)
@@ -255,14 +242,18 @@ def make_profile_inputs(
         device=device,
     )
     seq_lens = torch.full(
-        (rows,),
+        (requests,),
         max_model_len,
         dtype=torch.int32,
         device=device,
     )
 
-    row_topk = torch.arange(lanes * topk, dtype=torch.int32, device=device).reshape(lanes, topk)
-    topk_positions = row_topk.repeat(rows, 1)
+    request_topk = torch.arange(
+        lanes * topk,
+        dtype=torch.int32,
+        device=device,
+    ).reshape(lanes, topk)
+    topk_positions = request_topk.repeat(requests, 1)
     resolved_hot_indices = torch.full(
         (query_count, topk),
         INVALID_INDEX,
@@ -275,7 +266,7 @@ def make_profile_inputs(
         device=device,
     )
     workspace = torch.empty(
-        (rows, workspace_stride(slots)),
+        (requests, workspace_stride(slots)),
         dtype=torch.int32,
         device=device,
     )
@@ -284,11 +275,8 @@ def make_profile_inputs(
         token_to_hot=token_to_hot,
         hot_to_token=hot_to_token,
         lru_slots=lru_slots,
-        state_seat_epoch=state_seat_epoch,
-        row_to_cache_seat=row_to_cache_seat,
-        row_seat_epoch=row_seat_epoch,
         query_positions=query_positions,
-        query_to_row=query_to_row,
+        query_to_req_idx=query_to_req_idx,
         query_to_lane=query_to_lane,
         query_valid_mask=query_valid_mask,
         valid_topk_counts=valid_topk_counts,

@@ -9,7 +9,6 @@
 #include <cstdint>
 
 struct DsaSparseLookupUpdateTilingData {
-    uint32_t seatCapacity;
     uint32_t tokenPositionCapacity;
     uint32_t evictableSlotCount;
     uint32_t queryCapacity;

@@ -14,7 +14,6 @@ constexpr int32_t DSA_SPARSE_NOT_FOUND = -1;
 constexpr int32_t DSA_SPARSE_CLAIM_BASE = -2;
 
 struct DsaSparseLookupUpdateTilingData {
-    uint32_t seatCapacity;
     uint32_t tokenPositionCapacity;
     uint32_t evictableSlotCount;
     uint32_t queryCapacity;

@@ -7,7 +7,6 @@ import pytest
 import torch
 
 from vllm_ascend.attention.dsa_sparse import (
-    CacheSeatManager,
     DSASparseCacheConfig,
     DSASparseCohort,
     DSASparseCohortKey,
@@ -21,6 +20,7 @@ from vllm_ascend.attention.dsa_sparse import (
     DSASparsePlanKey,
     DSASparseResidencyState,
     DSASparseResolution,
+    RequestIndexManager,
 )
 
 
@@ -58,8 +58,7 @@ class RecordingIOOperator:
         topk_positions,
         resolved_hot_indices,
         miss_mask,
-        query_to_row,
-        row_to_cache_seat,
+        query_to_req_idx,
         block_table,
         write_global_slots,
         write_destination_hot_row_ids,
@@ -71,8 +70,7 @@ class RecordingIOOperator:
             context,
             topk_positions,
             resolved_hot_indices,
-            query_to_row,
-            row_to_cache_seat,
+            query_to_req_idx,
             block_table,
             write_global_slots,
             write_destination_hot_row_ids,
@@ -154,7 +152,7 @@ def build_coordinator(
         config,
         index_operator=RecordingIndexOperator(events, has_misses),
         io_operator=RecordingIOOperator(events, transfer_counts),
-        seat_manager=CacheSeatManager(config.max_num_seqs),
+        request_index_manager=RequestIndexManager(config.max_num_seqs),
     )
     coordinator.register_cohort(cohort)
     layout = DSASparseLayerLayout(
@@ -199,6 +197,7 @@ def begin_step(
         cohort_key,
         plan_key,
         request_ids=["request-a", "request-b"],
+        request_indices=[0, 1],
         query_positions=torch.tensor([5, 6, 9, -1], dtype=torch.int32),
         query_valid_mask=torch.tensor(
             [True, True, True, False],
@@ -389,6 +388,7 @@ def test_same_cohort_cannot_run_two_plan_shapes_concurrently():
             cohort_key,
             second_key,
             request_ids=["request-a", "request-b"],
+            request_indices=[0, 1],
             query_positions=torch.tensor([5, 9], dtype=torch.int32),
             query_valid_mask=torch.tensor([True, True]),
             seq_lens=torch.tensor([7, 10], dtype=torch.int32),
@@ -459,6 +459,78 @@ def test_request_release_waits_for_active_step_to_finish():
         coordinator.submit_newest_write(step, "layer.0")
 
     coordinator.release_request("request-a")
+
+
+def test_reused_request_index_clears_previous_residency_state():
+    (
+        coordinator,
+        cohort_key,
+        _plan_key,
+        _events,
+        _transfer_counts,
+    ) = build_coordinator(
+        has_misses=False,
+        layer_names=("layer.0",),
+    )
+    state = coordinator.get_cohort(cohort_key).state
+    state.token_to_hot[0, 7] = 3
+    state.hot_to_token[0, 3] = 7
+    state.lru_slots[0].copy_(state.lru_slots[0].flip(0))
+
+    released_index = coordinator.release_request("request-a")
+    reused_index = coordinator.acquire_request("request-c")
+
+    assert reused_index == released_index == 0
+    assert torch.all(state.token_to_hot[0] == -1)
+    assert torch.all(state.hot_to_token[0] == -1)
+    assert state.lru_slots[0].tolist() == list(
+        range(state.lru_slots.shape[1])
+    )
+
+
+def test_coordinator_rejects_plan_that_cannot_address_full_request_pool():
+    config = DSASparseCacheConfig(
+        max_num_seqs=2,
+        max_model_len=32,
+        block_size=4,
+        device_buffer_size=8,
+        max_query_tokens_per_request=2,
+        index_topk=4,
+    )
+    cohort_key = DSASparseCohortKey(
+        name="shared-indexer-0",
+        role="target",
+    )
+    undersized_plan_key = DSASparsePlanKey(
+        token_capacity=2,
+        request_capacity=1,
+        query_lane_capacity=2,
+        role="target",
+    )
+    coordinator = DSASparseEagerCoordinator(
+        config,
+        index_operator=RecordingIndexOperator([], False),
+        io_operator=RecordingIOOperator([], []),
+    )
+    cohort = DSASparseCohort(
+        key=cohort_key,
+        leader_layer="layer.0",
+        state=DSASparseResidencyState.allocate(
+            config,
+            cohort_key,
+            device="cpu",
+        ),
+        plans={
+            undersized_plan_key: DSASparsePlan.allocate(
+                config,
+                undersized_plan_key,
+                device="cpu",
+            )
+        },
+    )
+
+    with pytest.raises(ValueError, match="complete request-index pool"):
+        coordinator.register_cohort(cohort)
 
 
 def test_layer_registration_rejects_aliased_hot_cache():
@@ -596,6 +668,7 @@ def begin_dynamic_batch(
         cohort_key,
         plan_key,
         request_ids=["request-a", "request-b"],
+        request_indices=[0, 1],
         query_positions=torch.tensor(
             [5, 9],
             dtype=query_positions_dtype,
@@ -650,6 +723,47 @@ def test_dynamic_eager_batch_packs_lanes_and_returns_active_sfa_view():
         "dsa_sparse_io:region:layer.0",
         "existing_sfa",
     ]
+
+
+def test_dynamic_batch_order_does_not_change_stable_request_index():
+    (
+        coordinator,
+        cohort_key,
+        plan_key,
+        _events,
+        _transfer_counts,
+    ) = build_coordinator(
+        has_misses=False,
+        layer_names=("layer.0",),
+    )
+    context = DSASparseEagerBatchContext.begin(
+        coordinator,
+        cohort_key,
+        plan_key,
+        request_ids=["request-b", "request-a"],
+        request_indices=[1, 0],
+        query_positions=torch.tensor([9, 5], dtype=torch.int32),
+        query_counts=[1, 1],
+        seq_lens=torch.tensor([10, 7], dtype=torch.int32),
+        block_table=torch.tensor(
+            [
+                [8, 9, 10, 11, 12, 13, 14, 15],
+                [0, 1, 2, 3, 4, 5, 6, 7],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+
+    assert context.step.request_indices == (1, 0)
+    assert context.step.plan.query_positions.tolist() == [5, -1, 9, -1]
+    assert context.step.plan.seq_lens.tolist() == [7, 10]
+    assert context.step.plan.block_table.tolist() == [
+        [0, 1, 2, 3, 4, 5, 6, 7],
+        [8, 9, 10, 11, 12, 13, 14, 15],
+    ]
+    target = context.main_write_target("layer.0")
+    assert target.reserved_slot_mapping.tolist() == [20, 8]
+    context.abort()
 
 
 def test_dynamic_eager_batch_stages_int64_runner_positions_as_int32():

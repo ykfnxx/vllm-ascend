@@ -74,8 +74,7 @@ def _mock_io_arguments():
         "topk_positions": torch.zeros((2, 4), dtype=torch.int32),
         "resolved_hot_indices": torch.zeros((2, 4), dtype=torch.int32),
         "miss_mask": torch.zeros((2, 4), dtype=torch.bool),
-        "query_to_row": torch.tensor([0, 1], dtype=torch.int32),
-        "row_to_cache_seat": torch.tensor([1, 0], dtype=torch.int32),
+        "query_to_req_idx": torch.tensor([0, 1], dtype=torch.int32),
         "block_table": torch.zeros((2, 8), dtype=torch.int32),
         "write_global_slots": torch.zeros((2, 1), dtype=torch.int32),
         "write_destination_hot_row_ids": torch.zeros(

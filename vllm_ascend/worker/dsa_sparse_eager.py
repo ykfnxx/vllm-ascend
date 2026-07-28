@@ -11,7 +11,6 @@ import torch
 
 from vllm_ascend import dsa_sparse_probe
 from vllm_ascend.attention.dsa_sparse import (
-    CacheSeatLease,
     DSASparseBatchMetadata,
     DSASparseCacheConfig,
     DSASparseCohort,
@@ -355,13 +354,13 @@ class DSASparseEagerRuntime:
         self._next_mock_region_handle = 1
         self._validate_descriptors()
 
-    def acquire_request(self, request_id: Hashable) -> CacheSeatLease:
-        """Admit a dual-ready request into a stable Decode cache seat."""
+    def acquire_request(self, request_id: Hashable) -> int:
+        """Admit a dual-ready request and return its stable request index."""
 
         return self.coordinator.acquire_request(request_id)
 
-    def release_request(self, request_id: Hashable) -> CacheSeatLease:
-        """Release an idle request after its backend region is retired."""
+    def release_request(self, request_id: Hashable) -> int:
+        """Release an idle request index after its backend region is retired."""
 
         return self.coordinator.release_request(request_id)
 
@@ -386,7 +385,7 @@ class DSASparseEagerRuntime:
     def admit_mock_request(
         self,
         request_id: Hashable,
-    ) -> CacheSeatLease:
+    ) -> int:
         """Simulate dual-ready completion for the eager no-op I/O fixture."""
 
         lifecycle = self._require_mock_pd_lifecycle()
@@ -418,7 +417,7 @@ class DSASparseEagerRuntime:
                     "DSA Sparse mock dual-ready completion was not "
                     "published."
                 )
-            lease = lifecycle.admit(request_id, generation)
+            request_index = lifecycle.admit(request_id, generation)
         except BaseException as admission_error:
             try:
                 lifecycle.abort_handoff(request_id, generation)
@@ -430,7 +429,7 @@ class DSASparseEagerRuntime:
                 )
             raise
         self._mock_request_generations[request_id] = generation
-        return lease
+        return request_index
 
     def retire_mock_request(
         self,
@@ -438,7 +437,7 @@ class DSASparseEagerRuntime:
         *,
         preempted: bool,
     ) -> None:
-        """Release the mock region and stable seat at a request boundary."""
+        """Release the mock region and request index at a request boundary."""
 
         lifecycle = self._require_mock_pd_lifecycle()
         try:
@@ -465,6 +464,10 @@ class DSASparseEagerRuntime:
 
         request_ids = list(request_ids)
         query_counts = list(query_counts)
+        request_indices = [
+            self.coordinator.request_index(request_id)
+            for request_id in request_ids
+        ]
         metadata_by_layer = self._resolve_layer_metadata(layer_metadata)
         unique_metadata = _unique_by_identity(metadata_by_layer.values())
         self._reject_existing_contexts(unique_metadata)
@@ -480,6 +483,7 @@ class DSASparseEagerRuntime:
                     descriptor,
                     leader_metadata=leader_metadata,
                     request_ids=request_ids,
+                    request_indices=request_indices,
                     query_positions=query_positions,
                     query_counts=query_counts,
                     stage_batch_metadata=cohort_index == 0,
@@ -600,6 +604,7 @@ class DSASparseEagerRuntime:
         *,
         leader_metadata: DSASparseEagerLayerMetadata,
         request_ids: list[Hashable],
+        request_indices: list[int],
         query_positions: torch.Tensor,
         query_counts: list[int],
         stage_batch_metadata: bool,
@@ -630,6 +635,7 @@ class DSASparseEagerRuntime:
             descriptor.cohort_key,
             descriptor.plan_key,
             request_ids=request_ids,
+            request_indices=request_indices,
             query_positions=query_positions,
             query_counts=query_counts,
             seq_lens=seq_lens[:num_requests],

@@ -131,8 +131,6 @@ def _populate_resident_cache(
     inputs.token_to_hot[:, :RESIDENT_CACHE_SLOTS].copy_(resident)
     inputs.hot_to_token.copy_(resident)
     inputs.lru_slots.copy_(resident)
-    inputs.state_seat_epoch.zero_()
-    inputs.row_seat_epoch.zero_()
 
 
 def _make_topk_groups(
@@ -174,8 +172,10 @@ def _make_topk_groups(
             dtype=torch.int32,
             device=runtime.device,
         )
-        row_topk = torch.cat((hit_tokens, miss_tokens))
-        groups.append(row_topk.expand(concurrency, -1).contiguous())
+        request_topk = torch.cat((hit_tokens, miss_tokens))
+        groups.append(
+            request_topk.expand(concurrency, -1).contiguous()
+        )
     return groups
 
 
@@ -249,8 +249,7 @@ def _run_benchmark(
     torch = runtime.torch
     inputs = make_profile_inputs(
         runtime,
-        seats=concurrency,
-        rows=concurrency,
+        requests=concurrency,
         max_model_len=max_model_len,
         slots=RESIDENT_CACHE_SLOTS,
         lanes=QUERY_LANES,
@@ -382,7 +381,7 @@ def main() -> int:
         "workload": {
             "layer_count": 1,
             "concurrency": args.concurrency,
-            "cache_seats": args.concurrency,
+            "request_indices": args.concurrency,
             "resident_cache_slots_per_request": RESIDENT_CACHE_SLOTS,
             "total_resident_cache_slots": (
                 args.concurrency * RESIDENT_CACHE_SLOTS

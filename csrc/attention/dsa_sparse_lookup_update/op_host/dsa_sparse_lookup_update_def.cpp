@@ -37,11 +37,8 @@ public:
         AddInt32Input(*this, "tokenToHot");
         AddInt32Input(*this, "hotToToken");
         AddInt32Input(*this, "lruSlots");
-        AddInt32Input(*this, "stateSeatEpoch");
-        AddInt32Input(*this, "rowToCacheSeat");
-        AddInt32Input(*this, "rowSeatEpoch");
         AddInt32Input(*this, "queryPositions");
-        AddInt32Input(*this, "queryToRow");
+        AddInt32Input(*this, "queryToReqIdx");
         AddInt32Input(*this, "queryToLane");
         AddBoolInput(*this, "queryValidMask");
         AddInt32Input(*this, "validTopkCounts");

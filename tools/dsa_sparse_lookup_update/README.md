@@ -50,13 +50,12 @@ oracle:
 - `token_to_hot`
 - `hot_to_token`
 - `lru_slots`
-- `state_seat_epoch`
 - `resolved_hot_indices`
 - `miss_mask`
 
 The deterministic cases cover hits, duplicate misses, reserved newest slots,
-inactive rows, reordered query metadata, and epoch reset. Random cases add
-different residency, LRU, validity, Top-K, and row-to-seat combinations.
+inactive request indices, and reordered query metadata. Random cases add
+different residency, LRU, validity, Top-K, and direct request-index mappings.
 
 To use a package installed somewhere else:
 
@@ -71,28 +70,16 @@ Profile a steady-state lookup:
 
 ```bash
 python3 tools/dsa_sparse_lookup_update/profile_operator.py \
-  --scenario steady \
   --device npu:0
 ```
 
-Profile the operator-owned cache-seat reset path:
-
-```bash
-python3 tools/dsa_sparse_lookup_update/profile_operator.py \
-  --scenario fresh \
-  --device npu:0
-```
-
-Important scenario semantics:
-
-- `steady`: warmup populates the metadata cache, then the same valid Top-K
-  selection is measured as resident lookup/LRU maintenance.
-- `fresh`: every invocation receives a different seat epoch. The measured
-  operator therefore includes its internal `token_to_hot`, `hot_to_token`, and
-  LRU reset plus cold allocation.
+Warmup populates the metadata cache, then the same valid Top-K selection is
+measured as resident lookup/LRU maintenance. Request-index reuse and state
+reset belong to the lifecycle control plane and are outside this single-op
+profile.
 
 The default workload uses `T=1`, `K=2048`, and `S=4096`. Override dimensions
-with `--seats`, `--rows`, `--max-model-len`, `--slots`, `--lanes`, and
+with `--requests`, `--max-model-len`, `--slots`, `--lanes`, and
 `--topk`.
 
 Each run writes a JSON manifest and, unless `--no-trace` is passed, a parsed
@@ -121,9 +108,9 @@ python3 tools/dsa_sparse_lookup_update/benchmark_operator.py \
   --concurrency 8
 ```
 
-`--concurrency N` creates `N` active request rows and `N` cache seats in one
-batched operator invocation. Each request owns an independent, fully populated
-8192-slot cache. The default `Top-K` is 2048 and the default query-lane count is
+`--concurrency N` creates `N` active request indices in one batched operator
+invocation. Each index addresses an independent, fully populated 8192-slot
+cache directly. The default `Top-K` is 2048 and the default query-lane count is
 one.
 
 The benchmark supports:

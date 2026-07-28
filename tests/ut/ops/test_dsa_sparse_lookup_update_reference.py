@@ -17,31 +17,27 @@ from tests.ut.ops.dsa_sparse_lookup_update_reference import (
 
 def make_state(
     *,
-    num_seats: int = 1,
+    num_requests: int = 1,
     max_model_len: int = 16,
     slot_count: int = 4,
-    epochs: list[int] | None = None,
 ) -> DSASparseLookupUpdateState:
-    if epochs is None:
-        epochs = [0] * num_seats
     return DSASparseLookupUpdateState(
         token_to_hot=[[INVALID_INDEX] * max_model_len
-                      for _ in range(num_seats)],
+                      for _ in range(num_requests)],
         hot_to_token=[[INVALID_INDEX] * slot_count
-                      for _ in range(num_seats)],
-        lru_slots=[list(range(slot_count)) for _ in range(num_seats)],
-        state_seat_epoch=list(epochs),
+                      for _ in range(num_requests)],
+        lru_slots=[list(range(slot_count)) for _ in range(num_requests)],
     )
 
 
-def install(state: DSASparseLookupUpdateState, *, seat: int, slot: int,
+def install(state: DSASparseLookupUpdateState, *, request_index: int, slot: int,
             token: int) -> None:
-    if state.hot_to_token[seat][slot] != INVALID_INDEX:
+    if state.hot_to_token[request_index][slot] != INVALID_INDEX:
         raise AssertionError("test helper cannot overwrite an occupied slot")
-    if state.token_to_hot[seat][token] != INVALID_INDEX:
+    if state.token_to_hot[request_index][token] != INVALID_INDEX:
         raise AssertionError("test helper cannot install a token twice")
-    state.hot_to_token[seat][slot] = token
-    state.token_to_hot[seat][token] = slot
+    state.hot_to_token[request_index][slot] = token
+    state.token_to_hot[request_index][token] = slot
 
 
 def run_one_row(
@@ -53,7 +49,6 @@ def run_one_row(
     query_valid_mask: list[bool] | None = None,
     valid_topk_counts: list[int] | None = None,
     seq_len: int = 12,
-    epoch: int = 0,
 ) -> tuple[list[list[int]], list[list[bool]]]:
     num_queries = len(topk_positions)
     width = len(topk_positions[0]) if topk_positions else 0
@@ -68,10 +63,8 @@ def run_one_row(
         valid_topk_counts = [width] * num_queries
     return dsa_sparse_lookup_update_reference(
         state,
-        row_to_cache_seat=[0],
-        row_seat_epoch=[epoch],
         query_positions=query_positions,
-        query_to_row=[0] * num_queries,
+        query_to_req_idx=[0] * num_queries,
         query_to_lane=query_to_lane,
         query_valid_mask=query_valid_mask,
         valid_topk_counts=valid_topk_counts,
@@ -86,8 +79,8 @@ class TestDSASparseLookupUpdateReference(unittest.TestCase):
         cases = []
 
         all_resident = make_state(slot_count=4)
-        install(all_resident, seat=0, slot=0, token=2)
-        install(all_resident, seat=0, slot=2, token=5)
+        install(all_resident, request_index=0, slot=0, token=2)
+        install(all_resident, request_index=0, slot=2, token=5)
         all_resident.lru_slots[0] = [1, 3, 0, 2]
         cases.append((
             "all resident",
@@ -110,7 +103,7 @@ class TestDSASparseLookupUpdateReference(unittest.TestCase):
         ))
 
         mixed = make_state(slot_count=4)
-        install(mixed, seat=0, slot=3, token=2)
+        install(mixed, request_index=0, slot=3, token=2)
         mixed.lru_slots[0] = [1, 2, 3, 0]
         cases.append((
             "mixed",
@@ -150,7 +143,7 @@ class TestDSASparseLookupUpdateReference(unittest.TestCase):
         """Lock the original ASU SIMT lookup/allocate/evict behavior."""
         state = make_state(max_model_len=8, slot_count=5)
         for slot, token in enumerate([0, 1, 2, 3, 4]):
-            install(state, seat=0, slot=slot, token=token)
+            install(state, request_index=0, slot=slot, token=token)
         state.lru_slots[0] = [3, 0, 4, 1, 2]
 
         slots, misses = run_one_row(
@@ -170,27 +163,24 @@ class TestDSASparseLookupUpdateReference(unittest.TestCase):
         self.assertEqual(state.hot_to_token[0], [0, 1, 2, 5, 4])
         self.assertEqual(state.lru_slots[0], [0, 4, 3, 1, 2])
 
-    def test_padding_validity_and_inactive_row_stay_invalid(self) -> None:
-        state = make_state(num_seats=2, slot_count=3)
-        install(state, seat=0, slot=2, token=1)
-        install(state, seat=1, slot=1, token=3)
+    def test_padding_validity_and_inactive_request_stay_invalid(self) -> None:
+        state = make_state(num_requests=2, slot_count=3)
+        install(state, request_index=0, slot=2, token=1)
+        install(state, request_index=1, slot=1, token=3)
         state.lru_slots[0] = [0, 1, 2]
         state.lru_slots[1] = [2, 0, 1]
         inactive_before = copy.deepcopy((
             state.token_to_hot[1],
             state.hot_to_token[1],
             state.lru_slots[1],
-            state.state_seat_epoch[1],
         ))
 
         slots, misses = dsa_sparse_lookup_update_reference(
             state,
-            row_to_cache_seat=[0, INVALID_INDEX],
-            row_seat_epoch=[0, 99],
             query_positions=[5, 5, 4],
-            query_to_row=[0, 0, 1],
+            query_to_req_idx=[0, 0, 1],
             query_to_lane=[0, 1, 0],
-            query_valid_mask=[True, False, True],
+            query_valid_mask=[True, False, False],
             valid_topk_counts=[2, 4, 4],
             seq_lens=[6, 5],
             topk_positions=[
@@ -211,24 +201,21 @@ class TestDSASparseLookupUpdateReference(unittest.TestCase):
                 state.token_to_hot[1],
                 state.hot_to_token[1],
                 state.lru_slots[1],
-                state.state_seat_epoch[1],
             ),
             inactive_before,
         )
 
-    def test_duplicate_row_lane_mapping_is_rejected(self) -> None:
+    def test_duplicate_request_lane_mapping_is_rejected(self) -> None:
         state = make_state(slot_count=4)
 
         with self.assertRaisesRegex(
             ValueError,
-            r"\(request row, query lane\)",
+            r"\(request index, query lane\)",
         ):
             dsa_sparse_lookup_update_reference(
                 state,
-                row_to_cache_seat=[0],
-                row_seat_epoch=[0],
                 query_positions=[4, 5],
-                query_to_row=[0, 0],
+                query_to_req_idx=[0, 0],
                 query_to_lane=[0, 0],
                 query_valid_mask=[True, True],
                 valid_topk_counts=[1, 1],
@@ -238,8 +225,8 @@ class TestDSASparseLookupUpdateReference(unittest.TestCase):
 
     def test_free_slot_precedes_lru_eviction(self) -> None:
         state = make_state(max_model_len=8, slot_count=3)
-        install(state, seat=0, slot=0, token=0)
-        install(state, seat=0, slot=1, token=1)
+        install(state, request_index=0, slot=0, token=0)
+        install(state, request_index=0, slot=1, token=1)
         state.lru_slots[0] = [0, 1, 2]
 
         slots, misses = run_one_row(
@@ -256,8 +243,8 @@ class TestDSASparseLookupUpdateReference(unittest.TestCase):
 
     def test_eviction_clears_the_old_forward_mapping(self) -> None:
         state = make_state(max_model_len=8, slot_count=2)
-        install(state, seat=0, slot=0, token=1)
-        install(state, seat=0, slot=1, token=2)
+        install(state, request_index=0, slot=0, token=1)
+        install(state, request_index=0, slot=1, token=2)
         state.lru_slots[0] = [0, 1]
 
         slots, misses = run_one_row(
@@ -275,44 +262,19 @@ class TestDSASparseLookupUpdateReference(unittest.TestCase):
         self.assertEqual(state.hot_to_token[0], [3, 2])
         self.assertEqual(state.lru_slots[0], [1, 0])
 
-    def test_epoch_reset_discards_the_previous_owner_state(self) -> None:
-        state = make_state(max_model_len=8, slot_count=2, epochs=[7])
-        install(state, seat=0, slot=0, token=1)
-        install(state, seat=0, slot=1, token=2)
-        state.lru_slots[0] = [1, 0]
-
-        slots, misses = run_one_row(
-            state,
-            [[2]],
-            query_positions=[3],
-            seq_len=4,
-            epoch=8,
-        )
-
-        self.assertEqual(slots, [[0]])
-        self.assertEqual(misses, [[True]])
-        self.assertEqual(state.state_seat_epoch, [8])
-        self.assertEqual(state.token_to_hot[0][1], INVALID_INDEX)
-        self.assertEqual(state.token_to_hot[0][2], 0)
-        self.assertEqual(state.hot_to_token[0], [2, INVALID_INDEX])
-        self.assertEqual(state.lru_slots[0], [1, 0])
-
-    def test_row_reorder_uses_stable_cache_seat_state(self) -> None:
+    def test_reordered_query_view_uses_stable_request_index_state(self) -> None:
         state = make_state(
-            num_seats=2,
+            num_requests=2,
             max_model_len=10,
             slot_count=2,
-            epochs=[11, 22],
         )
-        install(state, seat=0, slot=1, token=2)
-        install(state, seat=1, slot=0, token=3)
+        install(state, request_index=0, slot=1, token=2)
+        install(state, request_index=1, slot=0, token=3)
 
         slots, misses = dsa_sparse_lookup_update_reference(
             state,
-            row_to_cache_seat=[1, 0],
-            row_seat_epoch=[22, 11],
             query_positions=[7, 8],
-            query_to_row=[0, 1],
+            query_to_req_idx=[1, 0],
             query_to_lane=[0, 0],
             query_valid_mask=[True, True],
             valid_topk_counts=[1, 1],
@@ -330,8 +292,8 @@ class TestDSASparseLookupUpdateReference(unittest.TestCase):
     def test_newest_uses_reserved_slots_and_invalidates_stale_mapping(
             self) -> None:
         state = make_state(max_model_len=12, slot_count=3)
-        install(state, seat=0, slot=0, token=2)
-        install(state, seat=0, slot=1, token=9)
+        install(state, request_index=0, slot=0, token=2)
+        install(state, request_index=0, slot=1, token=9)
         state.lru_slots[0] = [1, 0, 2]
 
         slots, misses = run_one_row(
@@ -353,9 +315,9 @@ class TestDSASparseLookupUpdateReference(unittest.TestCase):
 
     def test_newest_released_slot_is_free_first_even_when_mru(self) -> None:
         state = make_state(max_model_len=12, slot_count=3)
-        install(state, seat=0, slot=0, token=1)
-        install(state, seat=0, slot=1, token=2)
-        install(state, seat=0, slot=2, token=9)
+        install(state, request_index=0, slot=0, token=1)
+        install(state, request_index=0, slot=1, token=2)
+        install(state, request_index=0, slot=2, token=9)
         state.lru_slots[0] = [0, 1, 2]
 
         slots, misses = run_one_row(
@@ -376,7 +338,7 @@ class TestDSASparseLookupUpdateReference(unittest.TestCase):
     def test_mtp_union_protects_hits_and_updates_exact_lru_order(self) -> None:
         state = make_state(max_model_len=12, slot_count=5)
         for slot, token in enumerate([1, 2, 3, 4, 5]):
-            install(state, seat=0, slot=slot, token=token)
+            install(state, request_index=0, slot=slot, token=token)
         state.lru_slots[0] = [4, 0, 1, 3, 2]
 
         slots, misses = run_one_row(

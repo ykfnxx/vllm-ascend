@@ -19,11 +19,8 @@ DsaSparseLookupUpdateSimt(
     __gm__ int32_t* token_to_hot,
     __gm__ int32_t* hot_to_token,
     __gm__ int32_t* lru_slots,
-    __gm__ int32_t* state_seat_epoch,
-    __gm__ int32_t* row_to_cache_seat,
-    __gm__ int32_t* row_seat_epoch,
     __gm__ int32_t* query_positions,
-    __gm__ int32_t* query_to_row,
+    __gm__ int32_t* query_to_req_idx,
     __gm__ int32_t* query_to_lane,
     __gm__ uint8_t* query_valid_mask,
     __gm__ int32_t* valid_topk_counts,
@@ -32,8 +29,7 @@ DsaSparseLookupUpdateSimt(
     __gm__ int32_t* resolved_hot_indices,
     __gm__ uint8_t* miss_mask,
     __gm__ int32_t* op_workspace,
-    uint32_t request_row,
-    uint32_t seat_capacity,
+    uint32_t request_index,
     uint32_t token_position_capacity,
     uint32_t evictable_slot_count,
     uint32_t query_capacity,
@@ -45,10 +41,10 @@ DsaSparseLookupUpdateSimt(
     const uint32_t thread_count =
         static_cast<uint32_t>(blockDim.x);
 
-    __gm__ int32_t* row_workspace =
+    __gm__ int32_t* request_workspace =
         op_workspace +
-        static_cast<uint64_t>(request_row) * workspace_stride;
-    __gm__ int32_t* hit_flags = row_workspace;
+        static_cast<uint64_t>(request_index) * workspace_stride;
+    __gm__ int32_t* hit_flags = request_workspace;
     __gm__ int32_t* hit_slots =
         hit_flags + evictable_slot_count;
     __gm__ int32_t* evictable_slots =
@@ -62,10 +58,10 @@ DsaSparseLookupUpdateSimt(
     __gm__ int32_t* counters =
         thread_miss_counts + DSA_SPARSE_SIMT_THREADS;
 
-    // Build the fixed row/lane -> flat query inverse in the four scalar
+    // Build the fixed request-index/lane -> flat query inverse in the four scalar
     // workspace cells. This accepts a reordered flat query view without a
     // separate pack operator. The graph-input contract guarantees at most one
-    // query for each (row, lane).
+    // query for each (request index, lane).
     if (tid < DSA_SPARSE_MAX_QUERY_LANES) {
         counters[tid] = DSA_SPARSE_NOT_FOUND;
     }
@@ -73,8 +69,8 @@ DsaSparseLookupUpdateSimt(
     asc_syncthreads();
     if (tid == 0U) {
         for (uint32_t query = 0; query < query_capacity; ++query) {
-            if (query_to_row[query] !=
-                static_cast<int32_t>(request_row)) {
+            if (query_to_req_idx[query] !=
+                static_cast<int32_t>(request_index)) {
                 continue;
             }
             const int32_t lane = query_to_lane[query];
@@ -88,11 +84,11 @@ DsaSparseLookupUpdateSimt(
     asc_threadfence_block();
     asc_syncthreads();
 
-    int32_t row_queries[DSA_SPARSE_MAX_QUERY_LANES];
+    int32_t request_queries[DSA_SPARSE_MAX_QUERY_LANES];
     for (uint32_t lane = 0;
          lane < DSA_SPARSE_MAX_QUERY_LANES;
          ++lane) {
-        row_queries[lane] = counters[lane];
+        request_queries[lane] = counters[lane];
     }
     int32_t ordered_lanes[DSA_SPARSE_MAX_QUERY_LANES];
     for (uint32_t lane = 0;
@@ -107,10 +103,10 @@ DsaSparseLookupUpdateSimt(
              right < query_lane_capacity;
              ++right) {
             const int32_t left_query =
-                row_queries[
+                request_queries[
                     static_cast<uint32_t>(ordered_lanes[left])];
             const int32_t right_query =
-                row_queries[
+                request_queries[
                     static_cast<uint32_t>(ordered_lanes[right])];
             if ((left_query < 0 && right_query >= 0) ||
                 (right_query >= 0 && left_query >= 0 &&
@@ -122,14 +118,28 @@ DsaSparseLookupUpdateSimt(
         }
     }
 
-    const uint32_t row_entry_count =
+    bool has_active_query = false;
+    for (uint32_t lane = 0;
+         lane < query_lane_capacity;
+         ++lane) {
+        const int32_t query = request_queries[lane];
+        if (query >= 0 && query_valid_mask[query] != 0U) {
+            has_active_query = true;
+            break;
+        }
+    }
+    if (!has_active_query) {
+        return;
+    }
+
+    const uint32_t request_entry_count =
         query_lane_capacity * topk_count;
     for (uint32_t entry = tid;
-         entry < row_entry_count;
+         entry < request_entry_count;
          entry += thread_count) {
         const uint32_t lane = entry / topk_count;
         const uint32_t rank = entry - lane * topk_count;
-        const int32_t query = row_queries[lane];
+        const int32_t query = request_queries[lane];
         if (query < 0) {
             continue;
         }
@@ -142,78 +152,46 @@ DsaSparseLookupUpdateSimt(
     asc_threadfence_block();
     asc_syncthreads();
 
-    const int32_t seat_value =
-        row_to_cache_seat[request_row];
-    if (seat_value < 0 ||
-        seat_value >= static_cast<int32_t>(seat_capacity)) {
-        return;
-    }
-    const uint32_t seat = static_cast<uint32_t>(seat_value);
-    __gm__ int32_t* seat_token_to_hot =
+    __gm__ int32_t* request_token_to_hot =
         token_to_hot +
-        static_cast<uint64_t>(seat) * token_position_capacity;
-    __gm__ int32_t* seat_hot_to_token =
+        static_cast<uint64_t>(request_index) *
+            token_position_capacity;
+    __gm__ int32_t* request_hot_to_token =
         hot_to_token +
-        static_cast<uint64_t>(seat) * evictable_slot_count;
-    __gm__ int32_t* seat_lru =
+        static_cast<uint64_t>(request_index) *
+            evictable_slot_count;
+    __gm__ int32_t* request_lru =
         lru_slots +
-        static_cast<uint64_t>(seat) * evictable_slot_count;
+        static_cast<uint64_t>(request_index) *
+            evictable_slot_count;
 
-    // A cache seat is reset lazily on the first call made by its new owner.
-    // The lifecycle layer guarantees that active row_to_cache_seat values are
-    // injective, so no other AIV can reset or mutate this seat concurrently.
-    const int32_t expected_epoch =
-        row_seat_epoch[request_row];
-    const bool reset_state =
-        state_seat_epoch[seat] != expected_epoch;
-    if (reset_state) {
-        for (uint32_t token = tid;
-             token < token_position_capacity;
-             token += thread_count) {
-            seat_token_to_hot[token] = DSA_SPARSE_NOT_FOUND;
-        }
-        for (uint32_t slot = tid;
-             slot < evictable_slot_count;
-             slot += thread_count) {
-            seat_hot_to_token[slot] = DSA_SPARSE_NOT_FOUND;
-            seat_lru[slot] = static_cast<int32_t>(slot);
-        }
-        asc_threadfence_block();
-        asc_syncthreads();
-        if (tid == 0U) {
-            state_seat_epoch[seat] = expected_epoch;
-        }
-        asc_threadfence_block();
-        asc_syncthreads();
-    }
-
-    const int32_t row_seq_len = seq_lens[request_row];
+    const int32_t request_seq_len = seq_lens[request_index];
 
     // Current Main-KV positions live in reserved slots for this replay. Remove
     // an evictable mapping left by an earlier replay before ordinary lookup.
     for (uint32_t lane = tid;
          lane < query_lane_capacity;
          lane += thread_count) {
-        const int32_t query = row_queries[lane];
+        const int32_t query = request_queries[lane];
         if (query < 0 || query_valid_mask[query] == 0U) {
             continue;
         }
         const int32_t token = query_positions[query];
-        if (token < 0 || token >= row_seq_len ||
+        if (token < 0 || token >= request_seq_len ||
             token >= static_cast<int32_t>(
                          token_position_capacity)) {
             continue;
         }
         const int32_t stale_slot =
-            seat_token_to_hot[static_cast<uint32_t>(token)];
+            request_token_to_hot[static_cast<uint32_t>(token)];
         if (stale_slot >= 0 &&
             stale_slot <
                 static_cast<int32_t>(evictable_slot_count)) {
-            seat_token_to_hot[static_cast<uint32_t>(token)] =
+            request_token_to_hot[static_cast<uint32_t>(token)] =
                 DSA_SPARSE_NOT_FOUND;
-            if (seat_hot_to_token[
+            if (request_hot_to_token[
                     static_cast<uint32_t>(stale_slot)] == token) {
-                seat_hot_to_token[
+                request_hot_to_token[
                     static_cast<uint32_t>(stale_slot)] =
                     DSA_SPARSE_NOT_FOUND;
             }
@@ -238,11 +216,11 @@ DsaSparseLookupUpdateSimt(
     // monotonically raises the negative value, which deterministically chooses
     // the smallest q*K+k occurrence independently of SIMT scheduling.
     for (uint32_t entry = tid;
-         entry < row_entry_count;
+         entry < request_entry_count;
          entry += thread_count) {
         const uint32_t lane = entry / topk_count;
         const uint32_t rank = entry - lane * topk_count;
-        const int32_t query = row_queries[lane];
+        const int32_t query = request_queries[lane];
         const int32_t valid_topk_count =
             query < 0 ? 0 : valid_topk_counts[query];
         if (query < 0 || query_valid_mask[query] == 0U ||
@@ -255,7 +233,7 @@ DsaSparseLookupUpdateSimt(
         const uint64_t output_offset =
             static_cast<uint64_t>(query) * topk_count + rank;
         const int32_t token = topk_positions[output_offset];
-        if (token < 0 || token >= row_seq_len ||
+        if (token < 0 || token >= request_seq_len ||
             token >= static_cast<int32_t>(
                          token_position_capacity)) {
             continue;
@@ -267,7 +245,7 @@ DsaSparseLookupUpdateSimt(
              candidate_lane < query_lane_capacity;
              ++candidate_lane) {
             const int32_t candidate_query =
-                row_queries[candidate_lane];
+                request_queries[candidate_lane];
             if (candidate_query < 0 ||
                 query_valid_mask[candidate_query] == 0U) {
                 continue;
@@ -289,7 +267,7 @@ DsaSparseLookupUpdateSimt(
         }
 
         __gm__ int32_t* token_slot =
-            seat_token_to_hot + static_cast<uint32_t>(token);
+            request_token_to_hot + static_cast<uint32_t>(token);
         int32_t observed = *token_slot;
         if (observed >= 0 &&
             observed <
@@ -325,11 +303,11 @@ DsaSparseLookupUpdateSimt(
 
     // Only the deterministic minimum flat occurrence owns the payload miss.
     for (uint32_t entry = tid;
-         entry < row_entry_count;
+         entry < request_entry_count;
          entry += thread_count) {
         const uint32_t lane = entry / topk_count;
         const uint32_t rank = entry - lane * topk_count;
-        const int32_t query = row_queries[lane];
+        const int32_t query = request_queries[lane];
         const int32_t valid_topk_count =
             query < 0 ? 0 : valid_topk_counts[query];
         if (query < 0 || query_valid_mask[query] == 0U ||
@@ -341,7 +319,7 @@ DsaSparseLookupUpdateSimt(
         const uint64_t output_offset =
             static_cast<uint64_t>(query) * topk_count + rank;
         const int32_t token = topk_positions[output_offset];
-        if (token < 0 || token >= row_seq_len ||
+        if (token < 0 || token >= request_seq_len ||
             token >= static_cast<int32_t>(
                          token_position_capacity)) {
             continue;
@@ -349,7 +327,7 @@ DsaSparseLookupUpdateSimt(
         const int32_t claim =
             DSA_SPARSE_CLAIM_BASE -
             static_cast<int32_t>(output_offset);
-        if (seat_token_to_hot[
+        if (request_token_to_hot[
                 static_cast<uint32_t>(token)] == claim) {
             miss_mask[output_offset] = 1U;
         }
@@ -358,7 +336,7 @@ DsaSparseLookupUpdateSimt(
     asc_syncthreads();
 
     // Stable partition of the previous LRU order. All resident selections in
-    // this row-wide T*K union are protected from this call's victims. This
+    // this request-wide T*K union are protected from this call's victims. This
     // first list preserves old LRU order; victim selection applies the
     // independent free-before-occupied policy below.
     const uint32_t lru_chunk =
@@ -374,7 +352,7 @@ DsaSparseLookupUpdateSimt(
     int32_t local_evictables = 0;
     for (uint32_t pos = lru_begin; pos < lru_end; ++pos) {
         const uint32_t slot =
-            static_cast<uint32_t>(seat_lru[pos]);
+            static_cast<uint32_t>(request_lru[pos]);
         if (hit_flags[slot] != 0) {
             ++local_hits;
         } else {
@@ -395,7 +373,7 @@ DsaSparseLookupUpdateSimt(
     int32_t hit_offset = hit_prefix;
     int32_t evict_offset = evict_prefix;
     for (uint32_t pos = lru_begin; pos < lru_end; ++pos) {
-        const int32_t slot = seat_lru[pos];
+        const int32_t slot = request_lru[pos];
         if (hit_flags[static_cast<uint32_t>(slot)] != 0) {
             hit_slots[hit_offset++] = slot;
         } else {
@@ -433,7 +411,7 @@ DsaSparseLookupUpdateSimt(
          ++pos) {
         const uint32_t slot =
             static_cast<uint32_t>(evictable_slots[pos]);
-        if (seat_hot_to_token[slot] ==
+        if (request_hot_to_token[slot] ==
             DSA_SPARSE_NOT_FOUND) {
             ++local_free;
         } else {
@@ -464,7 +442,7 @@ DsaSparseLookupUpdateSimt(
          pos < candidate_end;
          ++pos) {
         const int32_t slot = evictable_slots[pos];
-        if (seat_hot_to_token[
+        if (request_hot_to_token[
                 static_cast<uint32_t>(slot)] ==
             DSA_SPARSE_NOT_FOUND) {
             hit_flags[free_offset++] = slot;
@@ -479,12 +457,12 @@ DsaSparseLookupUpdateSimt(
     // lanes are sorted by q while their reserved-slot lane identity remains
     // unchanged.
     const uint32_t query_chunk =
-        (row_entry_count + thread_count - 1U) /
+        (request_entry_count + thread_count - 1U) /
         thread_count;
     const uint32_t query_begin = tid * query_chunk;
     uint32_t query_end = query_begin + query_chunk;
-    if (query_end > row_entry_count) {
-        query_end = row_entry_count;
+    if (query_end > request_entry_count) {
+        query_end = request_entry_count;
     }
 
     int32_t local_misses = 0;
@@ -496,7 +474,7 @@ DsaSparseLookupUpdateSimt(
             ordered_lanes[order_index]);
         const uint32_t rank =
             entry - order_index * topk_count;
-        const int32_t query = row_queries[lane];
+        const int32_t query = request_queries[lane];
         if (query < 0) {
             continue;
         }
@@ -523,7 +501,7 @@ DsaSparseLookupUpdateSimt(
             ordered_lanes[order_index]);
         const uint32_t rank =
             entry - order_index * topk_count;
-        const int32_t query = row_queries[lane];
+        const int32_t query = request_queries[lane];
         if (query < 0) {
             continue;
         }
@@ -538,19 +516,19 @@ DsaSparseLookupUpdateSimt(
         const uint32_t victim_slot =
             static_cast<uint32_t>(hit_flags[miss_rank]);
         const int32_t victim_token =
-            seat_hot_to_token[victim_slot];
+            request_hot_to_token[victim_slot];
         if (victim_token >= 0 &&
             victim_token <
                 static_cast<int32_t>(
                     token_position_capacity)) {
-            seat_token_to_hot[
+            request_token_to_hot[
                 static_cast<uint32_t>(victim_token)] =
                 DSA_SPARSE_NOT_FOUND;
         }
 
         const int32_t token = topk_positions[output_offset];
-        seat_hot_to_token[victim_slot] = token;
-        seat_token_to_hot[static_cast<uint32_t>(token)] =
+        request_hot_to_token[victim_slot] = token;
+        request_token_to_hot[static_cast<uint32_t>(token)] =
             static_cast<int32_t>(victim_slot);
         resolved_hot_indices[output_offset] =
             static_cast<int32_t>(victim_slot);
@@ -620,7 +598,7 @@ DsaSparseLookupUpdateSimt(
          ++pos) {
         const int32_t slot = evictable_slots[pos];
         if (hit_flags[static_cast<uint32_t>(slot)] == 0) {
-            seat_lru[untouched_offset++] = slot;
+            request_lru[untouched_offset++] = slot;
         }
     }
     asc_threadfence_block();
@@ -631,13 +609,13 @@ DsaSparseLookupUpdateSimt(
     for (uint32_t rank = tid;
          rank < miss_count;
          rank += thread_count) {
-        seat_lru[stale_count + rank] =
+        request_lru[stale_count + rank] =
             hit_slots[hit_count + rank];
     }
     for (uint32_t rank = tid;
          rank < hit_count;
          rank += thread_count) {
-        seat_lru[stale_count + miss_count + rank] =
+        request_lru[stale_count + miss_count + rank] =
             hit_slots[rank];
     }
     asc_threadfence_block();
@@ -645,11 +623,11 @@ DsaSparseLookupUpdateSimt(
 
     // Duplicate followers reuse the canonical occurrence's installed slot.
     for (uint32_t entry = tid;
-         entry < row_entry_count;
+         entry < request_entry_count;
          entry += thread_count) {
         const uint32_t lane = entry / topk_count;
         const uint32_t rank = entry - lane * topk_count;
-        const int32_t query = row_queries[lane];
+        const int32_t query = request_queries[lane];
         if (query < 0) {
             continue;
         }
@@ -666,12 +644,12 @@ DsaSparseLookupUpdateSimt(
             valid_topk_count > 0 &&
             rank < static_cast<uint32_t>(
                        valid_topk_count) &&
-            token >= 0 && token < row_seq_len &&
+            token >= 0 && token < request_seq_len &&
             token <
                 static_cast<int32_t>(
                     token_position_capacity)) {
             resolved_hot_indices[output_offset] =
-                seat_token_to_hot[
+                request_token_to_hot[
                     static_cast<uint32_t>(token)];
         }
     }

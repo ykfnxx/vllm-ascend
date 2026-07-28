@@ -12,11 +12,8 @@ extern "C" __global__ __aicore__ void dsa_sparse_lookup_update(
     GM_ADDR token_to_hot,
     GM_ADDR hot_to_token,
     GM_ADDR lru_slots,
-    GM_ADDR state_seat_epoch,
-    GM_ADDR row_to_cache_seat,
-    GM_ADDR row_seat_epoch,
     GM_ADDR query_positions,
-    GM_ADDR query_to_row,
+    GM_ADDR query_to_req_idx,
     GM_ADDR query_to_lane,
     GM_ADDR query_valid_mask,
     GM_ADDR valid_topk_counts,
@@ -33,11 +30,8 @@ extern "C" __global__ __aicore__ void dsa_sparse_lookup_update(
     (void)token_to_hot;
     (void)hot_to_token;
     (void)lru_slots;
-    (void)state_seat_epoch;
-    (void)row_to_cache_seat;
-    (void)row_seat_epoch;
     (void)query_positions;
-    (void)query_to_row;
+    (void)query_to_req_idx;
     (void)query_to_lane;
     (void)query_valid_mask;
     (void)valid_topk_counts;
@@ -55,29 +49,26 @@ extern "C" __global__ __aicore__ void dsa_sparse_lookup_update(
         tiling_data,
         tiling);
 
-    const uint32_t first_request_row =
+    const uint32_t first_request_index =
         static_cast<uint32_t>(AscendC::GetBlockIdx());
     const uint32_t aiv_count =
         static_cast<uint32_t>(AscendC::GetBlockNum());
-    if (first_request_row >= tiling_data.requestCapacity ||
+    if (first_request_index >= tiling_data.requestCapacity ||
         aiv_count == 0U) {
         return;
     }
 
-    for (uint32_t request_row = first_request_row;
-         request_row < tiling_data.requestCapacity;
-         request_row += aiv_count) {
+    for (uint32_t request_index = first_request_index;
+         request_index < tiling_data.requestCapacity;
+         request_index += aiv_count) {
         asc_vf_call<
             DsaSparseLookupUpdate::DsaSparseLookupUpdateSimt>(
             dim3(DSA_SPARSE_SIMT_THREADS),
             reinterpret_cast<__gm__ int32_t*>(token_to_hot),
             reinterpret_cast<__gm__ int32_t*>(hot_to_token),
             reinterpret_cast<__gm__ int32_t*>(lru_slots),
-            reinterpret_cast<__gm__ int32_t*>(state_seat_epoch),
-            reinterpret_cast<__gm__ int32_t*>(row_to_cache_seat),
-            reinterpret_cast<__gm__ int32_t*>(row_seat_epoch),
             reinterpret_cast<__gm__ int32_t*>(query_positions),
-            reinterpret_cast<__gm__ int32_t*>(query_to_row),
+            reinterpret_cast<__gm__ int32_t*>(query_to_req_idx),
             reinterpret_cast<__gm__ int32_t*>(query_to_lane),
             reinterpret_cast<__gm__ uint8_t*>(
                 query_valid_mask),
@@ -89,8 +80,7 @@ extern "C" __global__ __aicore__ void dsa_sparse_lookup_update(
                 resolved_hot_indices),
             reinterpret_cast<__gm__ uint8_t*>(miss_mask),
             reinterpret_cast<__gm__ int32_t*>(op_workspace),
-            request_row,
-            tiling_data.seatCapacity,
+            request_index,
             tiling_data.tokenPositionCapacity,
             tiling_data.evictableSlotCount,
             tiling_data.queryCapacity,

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from vllm_ascend.attention.dsa_sparse import CacheSeatLease, CacheSeatManager
+from vllm_ascend.attention.dsa_sparse import RequestIndexManager
 from vllm_ascend.attention.dsa_sparse_pd import (
     DSASparsePDLifecycle,
     DSASparseTransferCompletion,
@@ -14,11 +14,11 @@ from vllm_ascend.attention.dsa_sparse_pd import (
 
 @dataclass
 class RecordingCoordinator:
-    seat_manager: CacheSeatManager
+    request_index_manager: RequestIndexManager
     busy_requests: set[str] = field(default_factory=set)
 
     def acquire_request(self, request_id):
-        return self.seat_manager.acquire(request_id)
+        return self.request_index_manager.acquire(request_id)
 
     def assert_request_idle(self, request_id):
         if request_id in self.busy_requests:
@@ -26,7 +26,7 @@ class RecordingCoordinator:
 
     def release_request(self, request_id):
         self.assert_request_idle(request_id)
-        return self.seat_manager.release(request_id)
+        return self.request_index_manager.release(request_id)
 
 
 @dataclass
@@ -38,7 +38,7 @@ class RecordingBackend:
 
 
 def make_lifecycle(max_num_seqs: int = 2):
-    coordinator = RecordingCoordinator(CacheSeatManager(max_num_seqs))
+    coordinator = RecordingCoordinator(RequestIndexManager(max_num_seqs))
     backend = RecordingBackend()
     lifecycle = DSASparsePDLifecycle(
         coordinator=coordinator,
@@ -65,10 +65,10 @@ def test_ready_fan_in_is_order_independent_and_notifies_once(main_first):
     assert notifications == {completion}
     assert lifecycle.ready_request_ids(notifications) == {"request-a"}
     assert lifecycle.take_ready_notifications() == set()
-    assert coordinator.seat_manager.active_request_ids == ()
+    assert coordinator.request_index_manager.active_request_ids == ()
 
 
-def test_admission_allocates_seat_only_after_dual_ready():
+def test_admission_allocates_request_index_only_after_dual_ready():
     lifecycle, coordinator, _backend = make_lifecycle()
     generation = lifecycle.begin_handoff("request-a", "transfer-a")
     completion = DSASparseTransferCompletion("request-a", generation)
@@ -78,14 +78,14 @@ def test_admission_allocates_seat_only_after_dual_ready():
         lifecycle.admit("request-a", generation)
 
     lifecycle.mark_indexer_ready(completion)
-    lease = lifecycle.admit("request-a", generation)
+    request_index = lifecycle.admit("request-a", generation)
 
-    assert isinstance(lease, CacheSeatLease)
-    assert coordinator.seat_manager.active_request_ids == ("request-a",)
-    assert lifecycle.admit("request-a", generation) is lease
+    assert request_index == 0
+    assert coordinator.request_index_manager.active_request_ids == ("request-a",)
+    assert lifecycle.admit("request-a", generation) == request_index
 
 
-def test_preempt_releases_region_and_reuses_seat_with_new_epoch():
+def test_preempt_releases_region_and_reuses_request_index():
     lifecycle, _coordinator, backend = make_lifecycle(max_num_seqs=1)
     first_generation = lifecycle.begin_handoff("request-a", "transfer-a")
     first_completion = DSASparseTransferCompletion(
@@ -94,7 +94,7 @@ def test_preempt_releases_region_and_reuses_seat_with_new_epoch():
     )
     lifecycle.mark_main_region_ready(first_completion, request_handle=17)
     lifecycle.mark_indexer_ready(first_completion)
-    first_lease = lifecycle.admit("request-a", first_generation)
+    first_request_index = lifecycle.admit("request-a", first_generation)
 
     lifecycle.preempt("request-a", first_generation)
     second_generation = lifecycle.begin_handoff("request-a", "transfer-b")
@@ -104,12 +104,11 @@ def test_preempt_releases_region_and_reuses_seat_with_new_epoch():
     )
     lifecycle.mark_main_region_ready(second_completion, request_handle=29)
     lifecycle.mark_indexer_ready(second_completion)
-    second_lease = lifecycle.admit("request-a", second_generation)
+    second_request_index = lifecycle.admit("request-a", second_generation)
 
     assert backend.released == [17]
     assert second_generation == first_generation + 1
-    assert second_lease.seat == first_lease.seat
-    assert second_lease.epoch == first_lease.epoch + 1
+    assert second_request_index == first_request_index
 
 
 def test_late_completion_from_retired_generation_is_ignored():
@@ -176,7 +175,7 @@ def test_stale_ready_notification_cannot_release_new_generation():
     assert lifecycle.ready_request_ids(old_notifications) == set()
 
 
-def test_active_layer_io_blocks_region_and_seat_release():
+def test_active_layer_io_blocks_region_and_request_index_release():
     lifecycle, coordinator, backend = make_lifecycle()
     generation = lifecycle.begin_handoff("request-a", "transfer-a")
     completion = DSASparseTransferCompletion("request-a", generation)
@@ -203,7 +202,7 @@ def test_finish_releases_region_and_removes_request():
     lifecycle.finish("request-a", generation)
 
     assert backend.released == [17]
-    assert coordinator.seat_manager.active_request_ids == ()
+    assert coordinator.request_index_manager.active_request_ids == ()
     with pytest.raises(KeyError, match="no active handoff"):
         lifecycle.snapshot("request-a")
 
@@ -230,5 +229,5 @@ def test_long_request_churn_keeps_only_active_lifecycle_state():
         lifecycle.finish(request_id, generation)
 
     assert lifecycle._requests == {}
-    assert coordinator.seat_manager.active_request_ids == ()
+    assert coordinator.request_index_manager.active_request_ids == ()
     assert len(backend.released) == 1_000

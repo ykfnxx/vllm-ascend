@@ -20,7 +20,7 @@ from vllm_ascend.ops.dsa_sparse import (
     "torch.ops._C_ascend.dsa_sparse_lookup_update",
     create=True,
 )
-def test_torch_wrapper_forwards_the_frozen_16_tensor_abi(mock_operator):
+def test_torch_wrapper_forwards_the_direct_request_index_abi(mock_operator):
     config = DSASparseCacheConfig(
         max_num_seqs=2,
         max_model_len=32,
@@ -58,11 +58,8 @@ def test_torch_wrapper_forwards_the_frozen_16_tensor_abi(mock_operator):
         state.token_to_hot,
         state.hot_to_token,
         state.lru_slots,
-        state.state_seat_epoch,
-        plan.row_mapping.row_to_cache_seat,
-        plan.row_mapping.row_seat_epoch,
         plan.query_positions,
-        plan.query_to_row,
+        plan.query_to_req_idx,
         plan.query_to_lane,
         plan.query_valid_mask,
         plan.valid_topk_counts,

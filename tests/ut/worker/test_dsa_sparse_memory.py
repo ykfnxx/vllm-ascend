@@ -63,27 +63,27 @@ def test_calculates_exact_fixed_tensor_bytes_without_tensor_allocation(
 
     # 24 hot rows * (6 BF16 + 5 UINT8 bytes per row).
     assert breakdown.hot_payload_bytes == 408
-    # Role-level row/query/block/newest descriptors are shared by both cohorts.
-    assert breakdown.batch_metadata_bytes == 160
-    # token_to_hot + hot_to_token + LRU + seat epoch.
-    assert breakdown.residency_state_bytes_per_cohort == 200
+    # Role-level request/query/block/newest descriptors are shared by cohorts.
+    assert breakdown.batch_metadata_bytes == 144
+    # token_to_hot + hot_to_token + LRU.
+    assert breakdown.residency_state_bytes_per_cohort == 192
     # Lookup input/output tensors plus the fused operator workspace.
     assert breakdown.lookup_plan_bytes_per_cohort == 6468
     # max(flat query initializer[Q=4], LRU initializer[S=7]).
     assert breakdown.initialization_scratch_bytes == 28
-    # Context: active indices + padded SFA slot/local-index buffers.
-    assert breakdown.eager_context_bytes_per_cohort == 160
+    # Context: active query/request indices + padded SFA buffers.
+    assert breakdown.eager_context_bytes_per_cohort == 176
     # One shared vectorized metadata-staging pass.
-    assert breakdown.eager_batch_staging_bytes == 332
+    assert breakdown.eager_batch_staging_bytes == 280
     # Lookup: fixed top-k/count plus the larger resolved-index gather.
     assert breakdown.eager_lookup_scratch_bytes_per_cohort == 112
-    assert breakdown.eager_execution_reserve_bytes_per_cohort == 272
-    assert breakdown.residency_state_bytes == 400
+    assert breakdown.eager_execution_reserve_bytes_per_cohort == 288
+    assert breakdown.residency_state_bytes == 384
     assert breakdown.lookup_plan_bytes == 12936
-    assert breakdown.core_fixed_tensor_bytes == 13904
-    assert breakdown.eager_execution_reserve_bytes == 876
-    assert breakdown.runtime_peak_reserve_bytes == 876
-    assert breakdown.fixed_hbm_bytes == 14791
+    assert breakdown.core_fixed_tensor_bytes == 13872
+    assert breakdown.eager_execution_reserve_bytes == 856
+    assert breakdown.runtime_peak_reserve_bytes == 856
+    assert breakdown.fixed_hbm_bytes == 14739
 
 
 def test_initialization_scratch_can_define_the_runtime_peak():

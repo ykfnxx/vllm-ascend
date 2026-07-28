@@ -317,10 +317,9 @@ def test_mock_factory_allocates_resources_and_runs_injected_lookup():
     with pytest.raises(KeyError, match="does not own"):
         runtime.begin_target_batch(**batch_arguments)
 
-    lease = runtime.admit_mock_request("request-a")
+    request_index = runtime.admit_mock_request("request-a")
     assert runtime.has_mock_request("request-a")
-    assert lease.seat == 0
-    assert lease.epoch == 1
+    assert request_index == 0
     with runtime.begin_target_batch(**batch_arguments) as router:
         for layer_name in ("layer.0", "layer.1"):
             router.main_write_target(layer_name)
@@ -363,16 +362,15 @@ def test_mock_admission_failure_rolls_back_generation_state():
         device="cpu",
         index_operator=RecordingIndexOperator([], has_misses=False),
     )
-    first_lease = runtime.admit_mock_request("request-a")
+    first_request_index = runtime.admit_mock_request("request-a")
 
     with pytest.raises(RuntimeError, match="No free"):
         runtime.admit_mock_request("request-b")
 
     runtime.retire_mock_request("request-a", preempted=False)
-    second_lease = runtime.admit_mock_request("request-b")
+    second_request_index = runtime.admit_mock_request("request-b")
 
-    assert first_lease.seat == second_lease.seat == 0
-    assert second_lease.epoch == first_lease.epoch + 1
+    assert first_request_index == second_request_index == 0
     runtime.retire_mock_request("request-b", preempted=False)
 
 

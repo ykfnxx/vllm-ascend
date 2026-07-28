@@ -5,15 +5,12 @@ from collections.abc import Hashable, Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
-from vllm_ascend.attention.dsa_sparse import CacheSeatLease
-
-
-class DSASparseSeatCoordinator(Protocol):
-    def acquire_request(self, request_id: Hashable) -> CacheSeatLease: ...
+class DSASparseRequestIndexCoordinator(Protocol):
+    def acquire_request(self, request_id: Hashable) -> int: ...
 
     def assert_request_idle(self, request_id: Hashable) -> None: ...
 
-    def release_request(self, request_id: Hashable) -> CacheSeatLease: ...
+    def release_request(self, request_id: Hashable) -> int: ...
 
 
 class DSASparseRequestRegionBackend(Protocol):
@@ -45,7 +42,7 @@ class DSASparseRequestSnapshot:
     admitted: bool
     failed_reason: str | None
     main_region_handle: int | None
-    seat_lease: CacheSeatLease | None
+    request_index: int | None
 
     @property
     def ready(self) -> bool:
@@ -63,7 +60,7 @@ class _DSASparseRequestState:
     admitted: bool = False
     failed_reason: str | None = None
     main_region_handle: int | None = None
-    seat_lease: CacheSeatLease | None = None
+    request_index: int | None = None
 
     @property
     def ready(self) -> bool:
@@ -80,17 +77,17 @@ class _DSASparseRequestState:
             admitted=self.admitted,
             failed_reason=self.failed_reason,
             main_region_handle=self.main_region_handle,
-            seat_lease=self.seat_lease,
+            request_index=self.request_index,
         )
 
 
 class DSASparsePDLifecycle:
-    """Decode-side Main/Indexer ready fan-in and stable-seat lifecycle."""
+    """Decode-side Main/Indexer ready fan-in and request-index lifecycle."""
 
     def __init__(
         self,
         *,
-        coordinator: DSASparseSeatCoordinator,
+        coordinator: DSASparseRequestIndexCoordinator,
         backend: DSASparseRequestRegionBackend,
     ) -> None:
         self._coordinator = coordinator
@@ -193,19 +190,19 @@ class DSASparsePDLifecycle:
         self,
         request_id: Hashable,
         generation: int,
-    ) -> CacheSeatLease:
+    ) -> int:
         state = self._require_generation(request_id, generation)
         if not state.ready:
             raise RuntimeError(
                 "DSA Sparse request cannot enter Decode running before Main region and Indexer KV are both ready."
             )
         if state.admitted:
-            assert state.seat_lease is not None
-            return state.seat_lease
-        lease = self._coordinator.acquire_request(request_id)
-        state.seat_lease = lease
+            assert state.request_index is not None
+            return state.request_index
+        request_index = self._coordinator.acquire_request(request_id)
+        state.request_index = request_index
         state.admitted = True
-        return lease
+        return request_index
 
     def preempt(
         self,

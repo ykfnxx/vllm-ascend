@@ -18,19 +18,16 @@ namespace {
 constexpr uint32_t kTokenToHot = 0;
 constexpr uint32_t kHotToToken = 1;
 constexpr uint32_t kLruSlots = 2;
-constexpr uint32_t kStateSeatEpoch = 3;
-constexpr uint32_t kRowToCacheSeat = 4;
-constexpr uint32_t kRowSeatEpoch = 5;
-constexpr uint32_t kQueryPositions = 6;
-constexpr uint32_t kQueryToRow = 7;
-constexpr uint32_t kQueryToLane = 8;
-constexpr uint32_t kQueryValidMask = 9;
-constexpr uint32_t kValidTopkCounts = 10;
-constexpr uint32_t kSeqLens = 11;
-constexpr uint32_t kTopkPositions = 12;
-constexpr uint32_t kResolvedHotIndices = 13;
-constexpr uint32_t kMissMask = 14;
-constexpr uint32_t kOpWorkspace = 15;
+constexpr uint32_t kQueryPositions = 3;
+constexpr uint32_t kQueryToReqIdx = 4;
+constexpr uint32_t kQueryToLane = 5;
+constexpr uint32_t kQueryValidMask = 6;
+constexpr uint32_t kValidTopkCounts = 7;
+constexpr uint32_t kSeqLens = 8;
+constexpr uint32_t kTopkPositions = 9;
+constexpr uint32_t kResolvedHotIndices = 10;
+constexpr uint32_t kMissMask = 11;
+constexpr uint32_t kOpWorkspace = 12;
 
 constexpr uint32_t kSimtThreads = 256;
 constexpr uint32_t kMaxQueryLanes = 4;
@@ -137,12 +134,11 @@ namespace optiling {
 static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
     gert::TilingContext* context)
 {
-    int64_t seat_capacity = 0;
+    int64_t request_capacity = 0;
     int64_t token_position_capacity = 0;
-    int64_t hot_seat_capacity = 0;
+    int64_t hot_request_capacity = 0;
     int64_t evictable_slot_count = 0;
     int64_t query_capacity = 0;
-    int64_t request_capacity = 0;
     int64_t topk_query_capacity = 0;
     int64_t topk_count = 0;
     int64_t workspace_request_capacity = 0;
@@ -152,24 +148,19 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
             context,
             kTokenToHot,
             "tokenToHot",
-            seat_capacity,
+            request_capacity,
             token_position_capacity) ||
         !GetTwoDims(
             context,
             kHotToToken,
             "hotToToken",
-            hot_seat_capacity,
+            hot_request_capacity,
             evictable_slot_count) ||
         !GetOneDim(
             context,
             kQueryPositions,
             "queryPositions",
             query_capacity) ||
-        !GetOneDim(
-            context,
-            kRowToCacheSeat,
-            "rowToCacheSeat",
-            request_capacity) ||
         !GetTwoDims(
             context,
             kTopkPositions,
@@ -185,10 +176,10 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
         return ge::GRAPH_FAILED;
     }
 
-    if (hot_seat_capacity != seat_capacity) {
+    if (hot_request_capacity != request_capacity) {
         OPS_LOG_E(
             context->GetNodeName(),
-            "tokenToHot and hotToToken seat capacities differ.");
+            "tokenToHot and hotToToken request capacities differ.");
         return ge::GRAPH_FAILED;
     }
     if (topk_query_capacity != query_capacity) {
@@ -253,13 +244,12 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
     }
     const uint64_t uint32_max =
         std::numeric_limits<uint32_t>::max();
-    if (static_cast<uint64_t>(seat_capacity) > uint32_max ||
+    if (static_cast<uint64_t>(request_capacity) > uint32_max ||
         static_cast<uint64_t>(token_position_capacity) >
             uint32_max ||
         static_cast<uint64_t>(evictable_slot_count) >
             uint32_max ||
         static_cast<uint64_t>(query_capacity) > uint32_max ||
-        static_cast<uint64_t>(request_capacity) > uint32_max ||
         static_cast<uint64_t>(topk_count) > uint32_max ||
         static_cast<uint64_t>(workspace_stride) > uint32_max) {
         OPS_LOG_E(
@@ -272,18 +262,8 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
             context,
             kLruSlots,
             "lruSlots",
-            seat_capacity,
+            request_capacity,
             evictable_slot_count) ||
-        !SameOneDim(
-            context,
-            kStateSeatEpoch,
-            "stateSeatEpoch",
-            seat_capacity) ||
-        !SameOneDim(
-            context,
-            kRowSeatEpoch,
-            "rowSeatEpoch",
-            request_capacity) ||
         !SameOneDim(
             context,
             kSeqLens,
@@ -291,8 +271,8 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
             request_capacity) ||
         !SameOneDim(
             context,
-            kQueryToRow,
-            "queryToRow",
+            kQueryToReqIdx,
+            "queryToReqIdx",
             query_capacity) ||
         !SameOneDim(
             context,
@@ -345,8 +325,6 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
         OPS_LOG_E(context->GetNodeName(), "tiling data is null.");
         return ge::GRAPH_FAILED;
     }
-    tiling_data->seatCapacity =
-        static_cast<uint32_t>(seat_capacity);
     tiling_data->tokenPositionCapacity =
         static_cast<uint32_t>(token_position_capacity);
     tiling_data->evictableSlotCount =

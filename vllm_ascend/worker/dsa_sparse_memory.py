@@ -22,8 +22,8 @@ class DSASparseFixedHBMBreakdown:
 
     ``hot_payload_bytes`` already covers every supplied local Main layer and
     is therefore independent of ``cohort_count``. Residency state and one
-    lookup plan are core fixed tensors private to each cohort. Role-level row
-    metadata is allocated once and shared by every target cohort.
+    lookup plan are core fixed tensors private to each cohort. Role-level
+    request-index metadata is allocated once and shared by every target cohort.
 
     ``initialization_scratch_bytes`` covers the largest explicit temporary
     tensor used while constructing the fixed state. The execution reserve
@@ -204,7 +204,6 @@ def _residency_state_bytes(config: DSASparseCacheConfig) -> int:
                 (config.max_num_seqs, config.device_buffer_size),
                 int32,
             ),
-            _tensor_bytes((config.max_num_seqs,), int32),
         )
     )
 
@@ -216,9 +215,6 @@ def _batch_metadata_bytes(config: DSASparseCacheConfig) -> int:
     write_shape = (request_capacity, query_lane_capacity)
 
     tensor_specs: tuple[tuple[Sequence[int], torch.dtype], ...] = (
-        # DSASparseRowMapping
-        ((request_capacity,), torch.int32),
-        ((request_capacity,), torch.int32),
         # DSASparseBatchMetadata
         ((token_capacity,), torch.int32),
         ((token_capacity,), torch.int32),
@@ -230,7 +226,7 @@ def _batch_metadata_bytes(config: DSASparseCacheConfig) -> int:
             torch.int32,
         ),
         (
-            (request_capacity, config.hot_blocks_per_seat),
+            (request_capacity, config.hot_blocks_per_request),
             torch.int32,
         ),
         (write_shape, torch.int32),
@@ -276,7 +272,7 @@ def _initialization_scratch_bytes(
         config.max_num_seqs * config.max_query_tokens_per_request
     )
     # DSASparseBatchMetadata.allocate keeps flat_query_indices[Q] alive while
-    # constructing query_to_row/query_to_lane. DSASparseResidencyState.allocate
+    # constructing query_to_req_idx/query_to_lane. DSASparseResidencyState.allocate
     # keeps arange(S) alive while cloning the expanded LRU initializer.
     return _tensor_bytes(
         (max(token_capacity, config.device_buffer_size),),
@@ -298,6 +294,7 @@ def _eager_execution_bytes(
     context_bytes = sum(
         (
             _tensor_bytes((active_query_capacity,), torch.long),
+            _tensor_bytes((request_capacity,), torch.long),
             _tensor_bytes((max_sfa_queries,), torch.int32),
             _tensor_bytes(
                 (max_sfa_queries, config.index_topk),
@@ -319,24 +316,11 @@ def _eager_execution_bytes(
                 ),
                 torch.int32,
             ),
-            # Synthetic Hot block table.
-            _tensor_bytes(
-                (
-                    request_capacity,
-                    config.hot_blocks_per_seat,
-                ),
-                torch.int32,
-            ),
-            # Per-seat block offsets used to form the synthetic table.
-            _tensor_bytes(
-                (config.hot_blocks_per_seat,),
-                torch.int32,
-            ),
-            # query row/lane long views used by vectorized addressing.
+            # query request-index/lane long views used by vectorized addressing.
             2 * _tensor_bytes((token_capacity,), torch.long),
-            # seats, seq lens, block indices, physical blocks,
+            # seq lens, block indices, physical blocks,
             # destinations, global slots, invalid values.
-            7 * _tensor_bytes((token_capacity,), torch.int32),
+            6 * _tensor_bytes((token_capacity,), torch.int32),
             # validity mask.
             _tensor_bytes((token_capacity,), torch.bool),
             # safe block and flattened write indices.
