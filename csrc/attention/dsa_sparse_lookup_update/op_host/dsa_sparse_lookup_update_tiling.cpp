@@ -366,7 +366,9 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
     if (system_workspace != nullptr) {
         system_workspace[0] = 0;
     }
-    context->SetTilingKey(1);
+    // The kernel has no template-specialized variants, so launch its
+    // default function entry.
+    context->SetTilingKey(0);
     const uint32_t request_count =
         static_cast<uint32_t>(request_capacity);
     context->SetBlockDim(
