@@ -9,6 +9,7 @@ from typing import Protocol, cast
 
 import torch
 
+from vllm_ascend import dsa_sparse_probe
 from vllm_ascend.attention.dsa_sparse import (
     CacheSeatLease,
     DSASparseBatchMetadata,
@@ -228,6 +229,20 @@ def create_dsa_sparse_eager_mock_runtime(
         )
 
     coordinator.freeze()
+    if dsa_sparse_probe.is_enabled():
+        dsa_sparse_probe.emit(
+            "runtime_ready",
+            cohort_count=len(descriptors),
+            layer_count=len(all_layer_names),
+            index_topk=config.index_topk,
+            cohorts=[
+                {
+                    "name": descriptor.cohort_key.name,
+                    "layers": list(descriptor.layer_names),
+                }
+                for descriptor in descriptors
+            ],
+        )
     mock_region_backend = _MockDSASparseRequestRegionBackend()
     return DSASparseEagerRuntime(
         coordinator,

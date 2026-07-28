@@ -3,6 +3,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, is_dataclass
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from tests.ut.attention.test_dsa_sparse_eager import (
     RecordingIndexOperator,
     build_coordinator,
 )
+from vllm_ascend import dsa_sparse_probe
 from vllm_ascend.attention.dsa_sparse import (
     DSASparseCacheConfig,
     DSASparseCohort,
@@ -221,21 +223,53 @@ def test_mock_factory_allocates_resources_and_runs_injected_lookup():
         ),
     )
     lookup_events = []
-    runtime = create_dsa_sparse_eager_mock_runtime(
-        config,
-        [
-            DSASparseEagerCohortLayout(
-                cohort_name="target-indexer-0",
-                layer_layouts=layer_layouts,
-            )
-        ],
-        device="cpu",
-        index_operator=RecordingIndexOperator(
-            lookup_events,
-            has_misses=False,
+    with (
+        patch.object(
+            dsa_sparse_probe,
+            "is_enabled",
+            return_value=True,
         ),
-    )
+        patch.object(
+            dsa_sparse_probe,
+            "emit",
+        ) as mock_probe_emit,
+    ):
+        runtime = create_dsa_sparse_eager_mock_runtime(
+            config,
+            [
+                DSASparseEagerCohortLayout(
+                    cohort_name="target-indexer-0",
+                    layer_layouts=layer_layouts,
+                )
+            ],
+            device="cpu",
+            index_operator=RecordingIndexOperator(
+                lookup_events,
+                has_misses=False,
+            ),
+        )
     assert runtime.uses_mock_lifecycle
+    probe_events = [
+        call.args[0]
+        for call in mock_probe_emit.call_args_list
+    ]
+    assert probe_events == [
+        "hot_cache_registered",
+        "hot_cache_registered",
+        "runtime_ready",
+    ]
+    runtime_ready = mock_probe_emit.call_args_list[-1]
+    assert runtime_ready.kwargs == {
+        "cohort_count": 1,
+        "layer_count": 2,
+        "index_topk": 4,
+        "cohorts": [
+            {
+                "name": "target-indexer-0",
+                "layers": ["layer.0", "layer.1"],
+            }
+        ],
+    }
 
     descriptor = runtime.cohort_descriptors[0]
     cohort = runtime.coordinator.get_cohort(descriptor.cohort_key)

@@ -115,6 +115,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE", "0"))
     ),
+    # Test-only: emit synchronized, machine-readable DSA Sparse eager-path
+    # events. Default 0; valid values are 0 and 1; contains no credentials.
+    "VLLM_ASCEND_DSA_SPARSE_RUNTIME_PROBE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_SPARSE_RUNTIME_PROBE", "0"))
+    ),
 }
 
 # end-env-vars-definition

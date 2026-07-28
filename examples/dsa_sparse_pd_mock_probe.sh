@@ -42,6 +42,7 @@ DEVICE_BUFFER_SIZE="2048"
 STARTUP_TIMEOUT="900"
 GPU_MEMORY_UTILIZATION="0.50"
 LOG_DIR=""
+VERIFY_PATH="0"
 
 usage() {
     cat <<'EOF'
@@ -71,10 +72,15 @@ Options:
   --gpu-memory-utilization F   Per-engine NPU memory fraction. Default: 0.50
   --startup-timeout SEC        Per-service startup timeout. Default: 900
   --log-dir DIR                Keep logs in DIR. Default: a new /tmp directory
+  --verify-path                Profile Decode and strictly verify the custom
+                               lookup op and per-layer Hot Cache SFA path.
   -h, --help                   Show this help.
 
 Success means that both engines started and one request completed through the
-P/D proxy. It does not mean that DSA payload transfer or model output is valid.
+P/D proxy. With --verify-path, success additionally proves that the Decode
+profile contains dsa_sparse_lookup_update and that every runtime-declared
+layer completed SFA with its registered Hot Cache address. It does not mean
+that DSA payload transfer or model output is valid.
 EOF
 }
 
@@ -183,6 +189,10 @@ while (($# > 0)); do
             LOG_DIR="$2"
             shift 2
             ;;
+        --verify-path)
+            VERIFY_PATH="1"
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -235,11 +245,28 @@ DECODE_LOG="$LOG_DIR/decode.log"
 PROXY_LOG="$LOG_DIR/proxy.log"
 REQUEST_JSON="$LOG_DIR/request.json"
 RESPONSE_JSON="$LOG_DIR/response.json"
+DECODE_PROFILE_DIR="$LOG_DIR/decode-profile"
+PROFILE_STARTED="0"
 
 declare -a CHILD_PIDS=()
 
+stop_decode_profile() {
+    if [[ "$PROFILE_STARTED" != "1" ]]; then
+        return 0
+    fi
+    if ! curl --fail --silent --show-error \
+        --request POST \
+        "http://127.0.0.1:$DECODE_HTTP_PORT/stop_profile" \
+        >/dev/null; then
+        echo "Failed to stop the Decode profiler." >&2
+        return 1
+    fi
+    PROFILE_STARTED="0"
+}
+
 cleanup() {
     local pid
+    stop_decode_profile || true
     for pid in "${CHILD_PIDS[@]:-}"; do
         if kill -0 "$pid" >/dev/null 2>&1; then
             kill "$pid" >/dev/null 2>&1 || true
@@ -287,7 +314,46 @@ COMMON_NETWORK_ENV=(
     "HCCL_SOCKET_IFNAME=$IFNAME"
     "OMP_PROC_BIND=false"
     "OMP_NUM_THREADS=1"
+    "VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE=1"
 )
+
+DECODE_PROBE_ENV=()
+DECODE_PROFILER_ARGS=()
+if [[ "$VERIFY_PATH" == "1" ]]; then
+    if [[ -d "$DECODE_PROFILE_DIR" ]] \
+        && find "$DECODE_PROFILE_DIR" \
+            -mindepth 1 \
+            -print \
+            -quit \
+            | grep --quiet .; then
+        echo "Decode profile directory is not empty: $DECODE_PROFILE_DIR" >&2
+        echo "Use a new --log-dir so stale profile data cannot satisfy verification." >&2
+        exit 2
+    fi
+    mkdir -p "$DECODE_PROFILE_DIR"
+    DECODE_PROBE_ENV+=(
+        "VLLM_ASCEND_DSA_SPARSE_RUNTIME_PROBE=1"
+    )
+    DECODE_PROFILER_CONFIG="$(
+        python3 - "$DECODE_PROFILE_DIR" <<'PY'
+import json
+import sys
+
+print(
+    json.dumps(
+        {
+            "profiler": "torch",
+            "torch_profiler_dir": sys.argv[1],
+            "torch_profiler_with_stack": False,
+        }
+    )
+)
+PY
+    )"
+    DECODE_PROFILER_ARGS+=(
+        --profiler-config "$DECODE_PROFILER_CONFIG"
+    )
+fi
 
 PREFILL_DSA_CONFIG='{"ascend_compilation_config":{"enable_npugraph_ex":false},"dsa_sparse_config":{"io_backend":"mock","io_backend_options":{"namespace":"tiny-glm-pd-probe"}}}'
 DECODE_DSA_CONFIG="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_sparse_config\":{\"io_backend\":\"mock\",\"io_backend_options\":{\"namespace\":\"tiny-glm-pd-probe\"},\"device_buffer_size\":$DEVICE_BUFFER_SIZE}}"
@@ -320,6 +386,7 @@ CHILD_PIDS+=("$PREFILL_PID")
 echo "Starting Decode on physical NPU $DECODE_DEVICE..."
 env \
     "${COMMON_NETWORK_ENV[@]}" \
+    "${DECODE_PROBE_ENV[@]}" \
     "ASCEND_RT_VISIBLE_DEVICES=$DECODE_DEVICE" \
     vllm serve "$MODEL" \
     --host 0.0.0.0 \
@@ -336,6 +403,7 @@ env \
     --compilation-config '{"cudagraph_mode":"NONE"}' \
     --additional-config "$DECODE_DSA_CONFIG" \
     --kv-transfer-config "$DECODE_KV_CONFIG" \
+    "${DECODE_PROFILER_ARGS[@]}" \
     >"$DECODE_LOG" 2>&1 &
 DECODE_PID=$!
 CHILD_PIDS+=("$DECODE_PID")
@@ -370,6 +438,15 @@ wait_for_health \
     "$PROXY_PID" \
     "$PROXY_LOG"
 
+if [[ "$VERIFY_PATH" == "1" ]]; then
+    echo "Starting Decode operator profiling..."
+    curl --fail --silent --show-error \
+        --request POST \
+        "http://127.0.0.1:$DECODE_HTTP_PORT/start_profile" \
+        >/dev/null
+    PROFILE_STARTED="1"
+fi
+
 python3 - \
     "$REQUEST_JSON" \
     "$SERVED_MODEL_NAME" \
@@ -402,6 +479,11 @@ HTTP_CODE="$(
         "http://127.0.0.1:$PROXY_HTTP_PORT/v1/completions"
 )"
 
+if [[ "$VERIFY_PATH" == "1" ]]; then
+    echo "Stopping Decode operator profiling..."
+    stop_decode_profile
+fi
+
 if [[ "$HTTP_CODE" != 2* ]]; then
     echo "P/D request failed with HTTP $HTTP_CODE." >&2
     python3 -m json.tool "$RESPONSE_JSON" >&2 2>/dev/null || cat "$RESPONSE_JSON" >&2
@@ -417,8 +499,48 @@ fi
 echo "P/D request completed with HTTP $HTTP_CODE."
 python3 -m json.tool "$RESPONSE_JSON" 2>/dev/null || cat "$RESPONSE_JSON"
 
+if [[ "$VERIFY_PATH" == "1" ]]; then
+    echo "Analyzing Decode operator profile..."
+    python3 - "$DECODE_PROFILE_DIR" <<'PY'
+import sys
+import time
+from pathlib import Path
+
+from torch_npu.profiler.profiler import analyse
+
+profile_root = Path(sys.argv[1])
+deadline = time.monotonic() + 60
+trace_directories = []
+while time.monotonic() < deadline:
+    trace_directories = sorted(
+        path
+        for path in profile_root.rglob("*_ascend_pt")
+        if path.is_dir()
+    )
+    if trace_directories:
+        break
+    time.sleep(1)
+if not trace_directories:
+    raise SystemExit(
+        f"No Ascend profiler trace found under {profile_root}"
+    )
+for trace_directory in trace_directories:
+    analyse(str(trace_directory))
+PY
+
+    python3 "$SCRIPT_DIR/dsa_sparse_probe_validate.py" \
+        --decode-log "$DECODE_LOG" \
+        --response-json "$RESPONSE_JSON" \
+        --profile-dir "$DECODE_PROFILE_DIR"
+fi
+
 echo
-echo "PASS: process isolation, P/D routing, and the current mock call path completed."
+if [[ "$VERIFY_PATH" == "1" ]]; then
+    echo "PASS: P/D routing, custom lookup op, and per-layer Hot Cache SFA path completed."
+else
+    echo "PASS: process isolation, P/D routing, and the current mock call path completed."
+    echo "Run again with --verify-path for strict custom-op and Hot Cache path validation."
+fi
 echo "NOT VALIDATED: Main/history/newest payload transfer, multi-step correctness, or model accuracy."
 echo "Inspect Decode events with:"
-echo "  grep -Ein 'dsa_sparse|lookup_update|mock|error|traceback' '$DECODE_LOG'"
+echo "  grep -Ein 'DSA_SPARSE_PROBE|dsa_sparse|lookup_update|mock|error|traceback' '$DECODE_LOG'"

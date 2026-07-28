@@ -20,6 +20,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.utils import select_common_block_size
 
+from vllm_ascend import dsa_sparse_probe
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
@@ -1541,17 +1542,44 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> torch.Tensor:
         """Call the existing SFA implementation with a resolved Hot Cache view."""
 
-        return DeviceOperator.execute_sparse_flash_attention_process(
+        local_sparse_indices = (
+            resolution.local_sparse_indices.unsqueeze(1)
+        )
+        output = DeviceOperator.execute_sparse_flash_attention_process(
             self,
             ql_nope,
             q_pe,
             resolution.hot_main_cache,
-            resolution.local_sparse_indices.unsqueeze(1),
+            local_sparse_indices,
             attn_metadata,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
             block_table=resolution.hot_block_table,
         )
+        if dsa_sparse_probe.is_enabled():
+            dsa_sparse_probe.synchronize_device()
+            dsa_sparse_probe.emit(
+                "hot_cache_sfa_done",
+                layer=self.layer_name or "",
+                hot_cache_ptrs=[
+                    plane.data_ptr()
+                    for plane in resolution.hot_main_cache
+                ],
+                hot_cache_shapes=[
+                    list(plane.shape)
+                    for plane in resolution.hot_main_cache
+                ],
+                sparse_indices_shape=list(
+                    local_sparse_indices.shape
+                ),
+                hot_block_table_ptr=(
+                    resolution.hot_block_table.data_ptr()
+                ),
+                hot_block_table_shape=list(
+                    resolution.hot_block_table.shape
+                ),
+            )
+        return output
 
     def _record_dcp_query_gather_context(
         self,

@@ -8,6 +8,7 @@ from vllm.distributed.parallel_state import GroupCoordinator
 
 from tests.ut.attention.utils import patch_distributed_groups
 from tests.ut.base import TestBase
+from vllm_ascend import dsa_sparse_probe
 from vllm_ascend.ascend_config import init_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_sparse import DSASparseResolution
@@ -188,6 +189,7 @@ class TestAscendSFAKVCacheComposition(TestBase):
 
     def test_hot_cache_adapter_only_replaces_sfa_cache_addressing(self):
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.layer_name = "model.layers.0.self_attn.attn"
         ql_nope = torch.empty(2, 4, 8)
         q_pe = torch.empty(2, 4, 2)
         hot_main_cache = (
@@ -207,11 +209,26 @@ class TestAscendSFAKVCacheComposition(TestBase):
         seq_lens = torch.tensor([1, 2], dtype=torch.int32)
         expected = torch.empty_like(ql_nope)
 
-        with patch.object(
-            DeviceOperator,
-            "execute_sparse_flash_attention_process",
-            return_value=expected,
-        ) as mock_sfa:
+        with (
+            patch.object(
+                DeviceOperator,
+                "execute_sparse_flash_attention_process",
+                return_value=expected,
+            ) as mock_sfa,
+            patch.object(
+                dsa_sparse_probe,
+                "is_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                dsa_sparse_probe,
+                "synchronize_device",
+            ) as mock_synchronize,
+            patch.object(
+                dsa_sparse_probe,
+                "emit",
+            ) as mock_probe_emit,
+        ):
             result = impl._execute_dsa_sparse_hot_cache_attention(
                 ql_nope,
                 q_pe,
@@ -235,6 +252,22 @@ class TestAscendSFAKVCacheComposition(TestBase):
             )
         )
         self.assertIs(call_args.kwargs["block_table"], hot_block_table)
+        mock_synchronize.assert_called_once_with()
+        mock_probe_emit.assert_called_once_with(
+            "hot_cache_sfa_done",
+            layer="model.layers.0.self_attn.attn",
+            hot_cache_ptrs=[
+                plane.data_ptr()
+                for plane in hot_main_cache
+            ],
+            hot_cache_shapes=[
+                list(plane.shape)
+                for plane in hot_main_cache
+            ],
+            sparse_indices_shape=[2, 1, 4],
+            hot_block_table_ptr=hot_block_table.data_ptr(),
+            hot_block_table_shape=[2, 4],
+        )
 
 
 class TestAscendSFADeviceOperator(TestBase):

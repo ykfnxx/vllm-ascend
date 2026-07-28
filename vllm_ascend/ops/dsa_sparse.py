@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm_ascend import dsa_sparse_probe
+
 if TYPE_CHECKING:
     from vllm_ascend.attention.dsa_sparse import (
         DSASparsePlan,
@@ -50,3 +52,11 @@ class DSASparseLookupUpdateTorchOperator:
             plan.miss_mask,
             plan.workspace,
         )
+        if dsa_sparse_probe.is_enabled():
+            dsa_sparse_probe.synchronize_device()
+            dsa_sparse_probe.emit(
+                "lookup_update_done",
+                cohort=state.cohort.name,
+                role=state.cohort.role,
+                topk_shape=list(plan.topk_positions.shape),
+            )

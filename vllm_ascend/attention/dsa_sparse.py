@@ -23,6 +23,7 @@ from typing import Literal, Protocol
 
 import torch
 
+from vllm_ascend import dsa_sparse_probe
 from vllm_ascend.attention.dsa_sparse_io import DSASparseIOOperator
 
 INVALID_INDEX = -1
@@ -780,6 +781,20 @@ class DSASparseEagerCoordinator:
         self._hot_plane_addresses.update(plane_addresses)
         self._region_identities.add(region_identity)
         self._completion_identities.add(completion_identity)
+        if dsa_sparse_probe.is_enabled():
+            dsa_sparse_probe.emit(
+                "hot_cache_registered",
+                cohort=binding.cohort.name,
+                layer=binding.layer_name,
+                hot_cache_ptrs=[
+                    plane.data_ptr()
+                    for plane in binding.hot_cache.planes
+                ],
+                hot_cache_shapes=[
+                    list(plane.shape)
+                    for plane in binding.hot_cache.planes
+                ],
+            )
 
     def freeze(self) -> None:
         frozen_cohorts: dict[DSASparseCohortKey, DSASparseCohort] = {}
