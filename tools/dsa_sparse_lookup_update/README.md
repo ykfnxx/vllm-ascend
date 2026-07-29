@@ -1,127 +1,48 @@
 # DSA sparse lookup/update standalone tools
 
-This directory builds, validates, and profiles
-`dsa_sparse_lookup_update` without starting a vLLM engine.
+This directory builds, checks, benchmarks, and profiles the fused
+`dsa_sparse_lookup_update` metadata operator without starting vLLM.
 
-The tools exercise only the metadata operator. They do not validate Main-KV
-payload I/O, SFA, scheduler admission, or the complete P/D lifecycle.
+The operator uses the ASU lookup-shaped interface:
 
-## Prerequisites
+```text
+(index, slot_to_index, free_slots, free_head,
+ req_pool_entries, query_index, lookup_mask, req_num)
+    -> (slot_out, miss_out)
+```
 
-- Ascend 950/A5 device
-- CANN toolchain capable of building AscendC SIMT kernels
-- The PyTorch and `torch_npu` versions required by this checkout
-- A built `vllm_ascend.vllm_ascend_C` extension from this checkout
+Lookup and metadata maintenance execute in one SIMT kernel. Payload I/O,
+Sparse Flash Attention, scheduler admission, and the complete P/D lifecycle
+are outside these standalone tools.
 
-Run all commands from the repository root.
+## Build and install
 
-## Build and install only this operator
+Run from the repository root:
 
 ```bash
 bash tools/dsa_sparse_lookup_update/build_and_install.sh
 ```
 
-The script invokes:
-
-```bash
-cd csrc
-bash build.sh --pkg --ops=dsa_sparse_lookup_update --soc=ascend950
-```
-
-It installs the resulting package under
-`tools/dsa_sparse_lookup_update/.install` so it does not replace the
-checkout-wide `vllm_ascend/_cann_ops_custom` directory.
-
-Use `--build-only` to leave the generated `.run` package uninstalled, or
-`--install-root PATH` to choose another install root.
+The script builds only this operator for `ascend950` and installs it under
+`tools/dsa_sparse_lookup_update/.install`. Because both the torch schema and
+the custom operator ABI changed, rebuild the vLLM-Ascend extension as well as
+the single-op package before running the scripts.
 
 ## Correctness
 
 ```bash
 python3 tools/dsa_sparse_lookup_update/test_correctness.py \
   --device npu:0 \
-  --random-cases 100
+  --requests 2 \
+  --random-cases 10
 ```
 
-The test calls `torch.ops._C_ascend.dsa_sparse_lookup_update` directly and
-compares all persistent state and result tensors with the repository's CPU
-oracle:
+The script checks `slot_out`, `miss_out`, and all four persistent state
+tensors against the CPU oracle. It covers hits, masked/invalid entries,
+duplicate misses, reordered pool rows, fused eviction, free-list refill,
+cursor movement, and the final `free_head[:, 0] == 0` invariant.
 
-- `token_to_hot`
-- `hot_to_token`
-- `lru_slots`
-- `resolved_hot_indices`
-- `miss_mask`
-
-The deterministic cases cover hits, duplicate misses, reserved newest slots,
-inactive request indices, and reordered query metadata. Random cases add
-different residency, LRU, validity, Top-K, and direct request-index mappings.
-
-To use a package installed somewhere else:
-
-```bash
-python3 tools/dsa_sparse_lookup_update/test_correctness.py \
-  --install-root /path/to/custom/op/install
-```
-
-## Latency and NPU profile
-
-Profile a steady-state lookup:
-
-```bash
-python3 tools/dsa_sparse_lookup_update/profile_operator.py \
-  --device npu:0
-```
-
-Warmup populates the metadata cache, then the same valid Top-K selection is
-measured as resident lookup/LRU maintenance. Request-index reuse and state
-reset belong to the lifecycle control plane and are outside this single-op
-profile.
-
-The default workload uses `T=1`, `K=2048`, and `S=4096`. Override dimensions
-with `--requests`, `--max-model-len`, `--slots`, `--lanes`, and
-`--topk`.
-
-Each run writes a JSON manifest and, unless `--no-trace` is passed, a parsed
-`torch_npu.profiler` trace under:
-
-```text
-tools/dsa_sparse_lookup_update/profiles/<timestamp>/
-```
-
-The event timing and profiler passes are separate. CPU copies, tensor
-allocation, and profiler parsing are outside the event-timed region. Confirm
-that the trace contains one of:
-
-- `DsaSparseLookupUpdate`
-- `dsa_sparse_lookup_update`
-- `aclnnDsaSparseLookupUpdate`
-
-## 8K resident-cache benchmark
-
-Benchmark one layer with 8192 resident slots per request and a configurable
-number of concurrent requests:
-
-```bash
-python3 tools/dsa_sparse_lookup_update/benchmark_operator.py \
-  --device npu:0 \
-  --concurrency 8
-```
-
-`--concurrency N` creates `N` active request indices in one batched operator
-invocation. Each index addresses an independent, fully populated 8192-slot
-cache directly. The default `Top-K` is 2048 and the default query-lane count is
-one.
-
-The benchmark supports:
-
-- `hit`: every Top-K entry is already resident. This measures lookup, result
-  production, and LRU hit maintenance against a full 8K cache.
-- `churn`: five disjoint 2K token groups rotate through the 8K cache. Every
-  measured invocation replaces 2K entries while the cache remains full.
-- `both`: run `hit` and `churn` independently. This is the default.
-
-Specify an arbitrary miss percentage:
+## Single-operator benchmark
 
 ```bash
 python3 tools/dsa_sparse_lookup_update/benchmark_operator.py \
@@ -130,37 +51,32 @@ python3 tools/dsa_sparse_lookup_update/benchmark_operator.py \
   --miss-rate 10
 ```
 
-For the default `Top-K=2048`, 10% is rounded to 205 misses per request. With
-eight concurrent requests this produces 1640 misses in each batched operator
-invocation. The manifest records the requested percentage, integer miss count,
-and effective percentage.
+The shape is fixed by the operator contract: 8K resident entries, 2K free
+entries, and 2K queries per request. `--concurrency N` controls the number of
+independent request rows handled by one operator invocation.
 
-To control the integer count directly, use `--miss-count`:
-
-```bash
-python3 tools/dsa_sparse_lookup_update/benchmark_operator.py \
-  --device npu:0 \
-  --concurrency 8 \
-  --miss-count 200
-```
-
-`--miss-rate` and `--miss-count` are mutually exclusive and override
-`--scenario`. Before timing, the script executes one validation invocation and
-checks that the operator's `miss_mask` contains exactly the requested number
-of misses.
-
-For example, run only the resident-hit workload for 32 concurrent requests:
+Choose either:
 
 ```bash
-python3 tools/dsa_sparse_lookup_update/benchmark_operator.py \
-  --device npu:0 \
-  --concurrency 32 \
-  --scenario hit \
-  --warmup 20 \
-  --iterations 200
+--miss-rate 10
+--miss-count 205
 ```
 
-The event-timed region contains one batched custom-operator invocation per
-sample. Tensor allocation, cache initialization, and host-side result
-serialization are excluded. Results are printed and saved under
-`tools/dsa_sparse_lookup_update/benchmarks/`.
+or use `--scenario hit`, `--scenario churn`, or the default `both`. The
+event-timed interval contains one batched custom-op invocation. Tensor
+creation, initial state construction, query-group updates, synchronization,
+and JSON serialization are excluded.
+
+## NPU profile
+
+```bash
+python3 tools/dsa_sparse_lookup_update/profile_operator.py \
+  --device npu:0 \
+  --requests 8
+```
+
+The profile workload is a steady all-hit lookup over the fixed 2K query
+width. It writes a manifest and, unless `--no-trace` is used, a parsed
+`torch_npu.profiler` trace under
+`tools/dsa_sparse_lookup_update/profiles/<timestamp>/`. The script fails if
+the parsed profile does not contain the custom operator name.

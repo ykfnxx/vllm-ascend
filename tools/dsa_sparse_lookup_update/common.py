@@ -11,14 +11,19 @@ from pathlib import Path
 from typing import Any
 
 INVALID_INDEX = -1
-SIMT_THREADS = 256
-MAX_QUERY_LANES = 4
-WORKSPACE_COUNTERS = 4
+INDEX_CAPACITY = 128 * 1024
+RESIDENT_SLOT_COUNT = 8 * 1024
+FREE_SLOT_COUNT = 2 * 1024
+SLOT_COUNT = 10 * 1024
+QUERY_COUNT = 2 * 1024
+FREE_HEAD_STRIDE = 16
 
 TOOL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOL_DIR.parents[1]
 DEFAULT_INSTALL_ROOT = TOOL_DIR / ".install"
-CHECKOUT_INSTALL_ROOT = REPO_ROOT / "vllm_ascend" / "_cann_ops_custom"
+CHECKOUT_INSTALL_ROOT = (
+    REPO_ROOT / "vllm_ascend" / "_cann_ops_custom"
+)
 CUSTOM_OP_VENDOR = "custom_transformer"
 
 
@@ -33,100 +38,88 @@ class Runtime:
 
 @dataclass
 class OperatorInputs:
-    token_to_hot: Any
-    hot_to_token: Any
-    lru_slots: Any
-    query_positions: Any
-    query_to_req_idx: Any
-    query_to_lane: Any
-    query_valid_mask: Any
-    valid_topk_counts: Any
-    seq_lens: Any
-    topk_positions: Any
-    resolved_hot_indices: Any
-    miss_mask: Any
-    workspace: Any
+    index: Any
+    slot_to_index: Any
+    free_slots: Any
+    free_head: Any
+    req_pool_entries: Any
+    query_index: Any
+    lookup_mask: Any
+
+    @property
+    def req_num(self) -> int:
+        return self.req_pool_entries.shape[0]
 
     def arguments(self) -> tuple[Any, ...]:
         return (
-            self.token_to_hot,
-            self.hot_to_token,
-            self.lru_slots,
-            self.query_positions,
-            self.query_to_req_idx,
-            self.query_to_lane,
-            self.query_valid_mask,
-            self.valid_topk_counts,
-            self.seq_lens,
-            self.topk_positions,
-            self.resolved_hot_indices,
-            self.miss_mask,
-            self.workspace,
+            self.index,
+            self.slot_to_index,
+            self.free_slots,
+            self.free_head,
+            self.req_pool_entries,
+            self.query_index,
+            self.lookup_mask,
+            self.req_num,
         )
 
 
-def workspace_stride(evictable_slots: int) -> int:
-    if evictable_slots <= 0:
-        raise ValueError(f"evictable_slots must be positive, got {evictable_slots}.")
-    return 3 * evictable_slots + 3 * SIMT_THREADS + WORKSPACE_COUNTERS
-
-
-def validate_dimensions(
-    *,
-    requests: int,
-    max_model_len: int,
-    slots: int,
-    lanes: int,
-    topk: int,
-) -> None:
-    dimensions = {
-        "requests": requests,
-        "max_model_len": max_model_len,
-        "slots": slots,
-        "lanes": lanes,
-        "topk": topk,
-    }
-    for name, value in dimensions.items():
-        if value <= 0:
-            raise ValueError(f"{name} must be positive, got {value}.")
-    if lanes > MAX_QUERY_LANES:
-        raise ValueError(f"lanes must be at most {MAX_QUERY_LANES}, got {lanes}.")
-    if slots < lanes * topk:
+def validate_requests(requests: int) -> None:
+    if requests <= 0:
         raise ValueError(
-            "slots must cover the complete per-request Top-K union, got "
-            f"slots={slots}, lanes={lanes}, topk={topk}."
+            f"requests must be positive, got {requests}."
         )
 
 
 def _prepend_env_path(name: str, path: Path) -> None:
     path_text = str(path)
-    current = [entry for entry in os.environ.get(name, "").split(":") if entry]
+    current = [
+        entry
+        for entry in os.environ.get(name, "").split(":")
+        if entry
+    ]
     if path_text not in current:
         current.insert(0, path_text)
         os.environ[name] = ":".join(current)
 
 
-def _resolve_install_root(install_root: str | Path | None) -> Path | None:
+def _resolve_install_root(
+    install_root: str | Path | None,
+) -> Path | None:
     if install_root is not None:
         resolved = Path(install_root).expanduser().resolve()
         vendor_root = resolved / "vendors" / CUSTOM_OP_VENDOR
         if not vendor_root.is_dir():
             raise RuntimeError(
-                f"{resolved} does not contain vendors/{CUSTOM_OP_VENDOR}. "
-                "Run build_and_install.sh first or pass the correct --install-root."
+                f"{resolved} does not contain "
+                f"vendors/{CUSTOM_OP_VENDOR}. Run "
+                "build_and_install.sh first or pass the correct "
+                "--install-root."
             )
         return resolved
 
-    for candidate in (DEFAULT_INSTALL_ROOT, CHECKOUT_INSTALL_ROOT):
-        if (candidate / "vendors" / CUSTOM_OP_VENDOR).is_dir():
+    for candidate in (
+        DEFAULT_INSTALL_ROOT,
+        CHECKOUT_INSTALL_ROOT,
+    ):
+        if (
+            candidate / "vendors" / CUSTOM_OP_VENDOR
+        ).is_dir():
             return candidate.resolve()
     return None
 
 
-def load_runtime(*, device: str, install_root: str | Path | None) -> Runtime:
+def load_runtime(
+    *,
+    device: str,
+    install_root: str | Path | None,
+) -> Runtime:
     resolved_install_root = _resolve_install_root(install_root)
     if resolved_install_root is not None:
-        vendor_root = resolved_install_root / "vendors" / CUSTOM_OP_VENDOR
+        vendor_root = (
+            resolved_install_root
+            / "vendors"
+            / CUSTOM_OP_VENDOR
+        )
         _prepend_env_path("ASCEND_CUSTOM_OPP_PATH", vendor_root)
         vendor_lib = vendor_root / "op_api" / "lib"
         if vendor_lib.is_dir():
@@ -140,25 +133,38 @@ def load_runtime(*, device: str, install_root: str | Path | None) -> Runtime:
         torch_npu = importlib.import_module("torch_npu")
     except ImportError as error:
         raise RuntimeError(
-            "PyTorch/torch_npu is unavailable. Run this tool in the Ascend 950 "
-            "vLLM-Ascend build environment."
+            "PyTorch/torch_npu is unavailable. Run this tool in "
+            "the Ascend 950 vLLM-Ascend build environment."
         ) from error
 
     try:
         torch.npu.set_device(device)
     except Exception as error:
-        raise RuntimeError(f"Unable to select {device}: {error}") from error
+        raise RuntimeError(
+            f"Unable to select {device}: {error}"
+        ) from error
 
     try:
         importlib.import_module("vllm_ascend.vllm_ascend_C")
-        operator = torch.ops._C_ascend.dsa_sparse_lookup_update
-    except (AttributeError, ImportError, OSError, RuntimeError) as error:
+        operator = (
+            torch.ops._C_ascend.dsa_sparse_lookup_update
+        )
+    except (
+        AttributeError,
+        ImportError,
+        OSError,
+        RuntimeError,
+    ) as error:
         install_hint = (
-            f" from {resolved_install_root}" if resolved_install_root is not None else ""
+            f" from {resolved_install_root}"
+            if resolved_install_root is not None
+            else ""
         )
         raise RuntimeError(
-            "Unable to load torch.ops._C_ascend.dsa_sparse_lookup_update"
-            f"{install_hint}. Build the extension and install the single-op package."
+            "Unable to load "
+            "torch.ops._C_ascend.dsa_sparse_lookup_update"
+            f"{install_hint}. Rebuild both the extension binding "
+            "and the single-op package."
         ) from error
 
     return Runtime(
@@ -170,119 +176,81 @@ def load_runtime(*, device: str, install_root: str | Path | None) -> Runtime:
     )
 
 
-def invoke(runtime: Runtime, inputs: OperatorInputs) -> None:
-    runtime.operator(*inputs.arguments())
+def invoke(
+    runtime: Runtime,
+    inputs: OperatorInputs,
+) -> tuple[Any, Any]:
+    return runtime.operator(*inputs.arguments())
 
 
 def make_profile_inputs(
     runtime: Runtime,
     *,
     requests: int,
-    max_model_len: int,
-    slots: int,
-    lanes: int,
-    topk: int,
 ) -> OperatorInputs:
-    validate_dimensions(
-        requests=requests,
-        max_model_len=max_model_len,
-        slots=slots,
-        lanes=lanes,
-        topk=topk,
-    )
-    required_valid_tokens = lanes * topk + lanes
-    if max_model_len < required_valid_tokens:
-        raise ValueError(
-            "max_model_len is too small for a unique valid Top-K union and "
-            f"reserved query positions; need at least {required_valid_tokens}, "
-            f"got {max_model_len}."
-        )
-
+    validate_requests(requests)
     torch = runtime.torch
     device = runtime.device
-    query_count = requests * lanes
 
-    token_to_hot = torch.full(
-        (requests, max_model_len),
+    index = torch.full(
+        (requests, INDEX_CAPACITY),
         INVALID_INDEX,
         dtype=torch.int32,
         device=device,
     )
-    hot_to_token = torch.full(
-        (requests, slots),
+    slot_to_index = torch.full(
+        (requests, SLOT_COUNT),
         INVALID_INDEX,
         dtype=torch.int32,
         device=device,
     )
-    lru_slots = (
-        torch.arange(slots, dtype=torch.int32, device=device)
+    resident = torch.arange(
+        RESIDENT_SLOT_COUNT,
+        dtype=torch.int32,
+        device=device,
+    ).expand(requests, -1)
+    index[:, :RESIDENT_SLOT_COUNT].copy_(resident)
+    slot_to_index[:, :RESIDENT_SLOT_COUNT].copy_(resident)
+    free_slots = (
+        torch.arange(
+            RESIDENT_SLOT_COUNT,
+            SLOT_COUNT,
+            dtype=torch.int32,
+            device=device,
+        )
         .expand(requests, -1)
         .clone()
     )
-    query_to_req_idx = torch.arange(
+    free_head = torch.zeros(
+        (requests, FREE_HEAD_STRIDE),
+        dtype=torch.int32,
+        device=device,
+    )
+    req_pool_entries = torch.arange(
         requests,
         dtype=torch.int32,
         device=device,
-    ).repeat_interleave(lanes)
-    query_to_lane = torch.arange(
-        lanes,
-        dtype=torch.int32,
-        device=device,
-    ).repeat(requests)
-    query_positions = (
-        torch.arange(lanes, dtype=torch.int32, device=device)
-        .repeat(requests)
-        .add(max_model_len - lanes)
     )
-    query_valid_mask = torch.ones(query_count, dtype=torch.bool, device=device)
-    valid_topk_counts = torch.full(
-        (query_count,),
-        topk,
+    query_index = (
+        torch.arange(
+            QUERY_COUNT,
+            dtype=torch.int32,
+            device=device,
+        )
+        .expand(requests, -1)
+        .clone()
+    )
+    lookup_mask = torch.ones(
+        (requests, QUERY_COUNT),
         dtype=torch.int32,
         device=device,
     )
-    seq_lens = torch.full(
-        (requests,),
-        max_model_len,
-        dtype=torch.int32,
-        device=device,
-    )
-
-    request_topk = torch.arange(
-        lanes * topk,
-        dtype=torch.int32,
-        device=device,
-    ).reshape(lanes, topk)
-    topk_positions = request_topk.repeat(requests, 1)
-    resolved_hot_indices = torch.full(
-        (query_count, topk),
-        INVALID_INDEX,
-        dtype=torch.int32,
-        device=device,
-    )
-    miss_mask = torch.zeros(
-        (query_count, topk),
-        dtype=torch.bool,
-        device=device,
-    )
-    workspace = torch.empty(
-        (requests, workspace_stride(slots)),
-        dtype=torch.int32,
-        device=device,
-    )
-
     return OperatorInputs(
-        token_to_hot=token_to_hot,
-        hot_to_token=hot_to_token,
-        lru_slots=lru_slots,
-        query_positions=query_positions,
-        query_to_req_idx=query_to_req_idx,
-        query_to_lane=query_to_lane,
-        query_valid_mask=query_valid_mask,
-        valid_topk_counts=valid_topk_counts,
-        seq_lens=seq_lens,
-        topk_positions=topk_positions,
-        resolved_hot_indices=resolved_hot_indices,
-        miss_mask=miss_mask,
-        workspace=workspace,
+        index=index,
+        slot_to_index=slot_to_index,
+        free_slots=free_slots,
+        free_head=free_head,
+        req_pool_entries=req_pool_entries,
+        query_index=query_index,
+        lookup_mask=lookup_mask,
     )

@@ -23,7 +23,6 @@ from vllm_ascend.attention.dsa_sparse import (
     DSASparseLookupOperator,
     DSASparseLookupState,
     DSASparseStepMetadata,
-    UnimplementedDSASparseLookupOperator,
 )
 from vllm_ascend.attention.dsa_sparse_io import (
     DSASparseIOOperator,
@@ -124,9 +123,8 @@ def create_dsa_sparse_eager_mock_runtime(
 ) -> DSASparseEagerRuntime:
     """Allocate the target-only eager runtime with a no-op I/O fixture.
 
-    Lookup is an injected protocol in this framework milestone. The default
-    implementation is explicitly unimplemented. The I/O fixture preserves one
-    call per layer but moves no payload.
+    Lookup defaults to the fused NPU implementation. The I/O fixture preserves
+    one call per layer but moves no payload.
     """
 
     cohort_layouts = tuple(cohort_layouts)
@@ -141,7 +139,11 @@ def create_dsa_sparse_eager_mock_runtime(
         raise ValueError("Each DSA Sparse Main layer must belong to exactly one eager cohort.")
 
     if lookup_operator is None:
-        lookup_operator = UnimplementedDSASparseLookupOperator()
+        from vllm_ascend.ops.dsa_sparse import (
+            TorchDSASparseLookupOperator,
+        )
+
+        lookup_operator = TorchDSASparseLookupOperator()
     if io_operator is None:
         io_operator = MockDSASparseIOOperator()
 

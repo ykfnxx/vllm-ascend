@@ -14,13 +14,15 @@ from pathlib import Path
 from typing import Any
 
 from common import (
+    QUERY_COUNT,
+    RESIDENT_SLOT_COUNT,
     TOOL_DIR,
     OperatorInputs,
     Runtime,
     invoke,
     load_runtime,
     make_profile_inputs,
-    validate_dimensions,
+    validate_requests,
 )
 
 CUSTOM_OP_NAMES = (
@@ -45,10 +47,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--install-root", type=Path)
     parser.add_argument("--requests", type=int, default=8)
-    parser.add_argument("--max-model-len", type=int, default=131072)
-    parser.add_argument("--slots", type=int, default=4096)
-    parser.add_argument("--lanes", type=int, default=1)
-    parser.add_argument("--topk", type=int, default=2048)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--profile-iters", type=int, default=20)
@@ -195,13 +193,7 @@ def _device_name(runtime: Runtime) -> str:
 
 def main() -> int:
     args = _parse_args()
-    validate_dimensions(
-        requests=args.requests,
-        max_model_len=args.max_model_len,
-        slots=args.slots,
-        lanes=args.lanes,
-        topk=args.topk,
-    )
+    validate_requests(args.requests)
     for name in ("warmup", "iterations", "profile_iters"):
         value = getattr(args, name)
         if value <= 0:
@@ -214,10 +206,6 @@ def main() -> int:
     inputs = make_profile_inputs(
         runtime,
         requests=args.requests,
-        max_model_len=args.max_model_len,
-        slots=args.slots,
-        lanes=args.lanes,
-        topk=args.topk,
     )
 
     timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
@@ -267,10 +255,11 @@ def main() -> int:
         ),
         "shape": {
             "requests": args.requests,
-            "max_model_len": args.max_model_len,
-            "slots": args.slots,
-            "lanes": args.lanes,
-            "topk": args.topk,
+            "resident_entries_per_request": (
+                RESIDENT_SLOT_COUNT
+            ),
+            "query_width": QUERY_COUNT,
+            "miss_count": 0,
         },
         "measurement": {
             "warmup": args.warmup,

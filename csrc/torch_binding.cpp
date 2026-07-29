@@ -2954,20 +2954,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def(
         "dsa_sparse_lookup_update("
-            "Tensor(a!) token_to_hot, "
-            "Tensor(b!) hot_to_token, "
-            "Tensor(c!) lru_slots, "
-            "Tensor query_positions, "
-            "Tensor query_to_req_idx, "
-            "Tensor query_to_lane, "
-            "Tensor query_valid_mask, "
-            "Tensor valid_topk_counts, "
-            "Tensor seq_lens, "
-            "Tensor topk_positions, "
-            "Tensor(d!) resolved_hot_indices, "
-            "Tensor(e!) miss_mask, "
-            "Tensor(f!) workspace"
-        ") -> ()"
+            "Tensor(a!) index, "
+            "Tensor(b!) slot_to_index, "
+            "Tensor(c!) free_slots, "
+            "Tensor(d!) free_head, "
+            "Tensor req_pool_entries, "
+            "Tensor query_index, "
+            "Tensor lookup_mask, "
+            "int req_num"
+        ") -> (Tensor, Tensor)"
     );
     ops.impl(
         "dsa_sparse_lookup_update",

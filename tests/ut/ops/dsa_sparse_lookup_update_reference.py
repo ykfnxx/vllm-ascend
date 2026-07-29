@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
-"""Deterministic CPU reference for the fused DSA sparse lookup/update ABI.
-
-Persistent metadata is indexed directly by stable request index. This oracle
-models only metadata semantics; payload I/O remains outside the operator.
-"""
+"""Deterministic CPU oracle for fused ASU-shaped lookup and maintain."""
 
 from __future__ import annotations
 
@@ -18,246 +14,198 @@ INVALID_INDEX = -1
 
 @dataclass
 class DSASparseLookupUpdateState:
-    """Persistent metadata indexed by stable request index.
+    """Persistent reciprocal maps, free list, and maintenance cursor."""
 
-    ``token_to_hot`` and ``hot_to_token`` are reciprocal maps.  ``lru_slots``
-    is ordered from least-recently-used to most-recently-used.
-    """
-
-    token_to_hot: list[list[int]]
-    hot_to_token: list[list[int]]
-    lru_slots: list[list[int]]
+    index: list[list[int]]
+    slot_to_index: list[list[int]]
+    free_slots: list[list[int]]
+    free_head: list[list[int]]
 
 
-def _rectangular_width(name: str, values: Sequence[Sequence[int]]) -> int:
-    if not values:
-        return 0
-    width = len(values[0])
-    if any(len(row) != width for row in values):
-        raise ValueError(f"{name} must be rectangular")
+def _width(name: str, rows: Sequence[Sequence[int]]) -> int:
+    if not rows:
+        raise ValueError(f"{name} must contain at least one row")
+    width = len(rows[0])
+    if width == 0 or any(len(row) != width for row in rows):
+        raise ValueError(f"{name} must be non-empty and rectangular")
     return width
 
 
-def _validate_state(state: DSASparseLookupUpdateState) -> tuple[int, int, int]:
-    num_requests = len(state.token_to_hot)
-    if len(state.hot_to_token) != num_requests:
-        raise ValueError("hot_to_token request count does not match token_to_hot")
-    if len(state.lru_slots) != num_requests:
-        raise ValueError("lru_slots request count does not match token_to_hot")
+def _validate_state(
+    state: DSASparseLookupUpdateState,
+) -> tuple[int, int, int, int]:
+    pool_capacity = len(state.index)
+    if (
+        len(state.slot_to_index) != pool_capacity
+        or len(state.free_slots) != pool_capacity
+        or len(state.free_head) != pool_capacity
+    ):
+        raise ValueError("all state tensors must have the same row count")
+    index_capacity = _width("index", state.index)
+    slot_count = _width("slot_to_index", state.slot_to_index)
+    free_count = _width("free_slots", state.free_slots)
+    head_stride = _width("free_head", state.free_head)
+    if head_stride < 2:
+        raise ValueError("free_head needs head and cursor cells")
+    if free_count > slot_count:
+        raise ValueError("free list cannot exceed slot count")
 
-    max_model_len = _rectangular_width("token_to_hot",
-                                       state.token_to_hot)
-    slot_count = _rectangular_width("hot_to_token", state.hot_to_token)
-    if _rectangular_width("lru_slots", state.lru_slots) != slot_count:
-        raise ValueError("lru_slots width does not match hot_to_token")
-
-    expected_slots = list(range(slot_count))
-    for request_index in range(num_requests):
-        if sorted(state.lru_slots[request_index]) != expected_slots:
+    for row in range(pool_capacity):
+        if state.free_head[row][0] != 0:
             raise ValueError(
-                f"lru_slots[{request_index}] must be a permutation of all slots")
-
-        for token, slot in enumerate(state.token_to_hot[request_index]):
+                "fused lookup/update requires free_head[row][0] == 0 "
+                "at call entry"
+            )
+        cursor = state.free_head[row][1]
+        if not 0 <= cursor < slot_count:
+            raise ValueError("maintenance cursor is outside slot range")
+        if len(set(state.free_slots[row])) != free_count:
+            raise ValueError("free_slots must not contain duplicates")
+        for slot in state.free_slots[row]:
+            if not 0 <= slot < slot_count:
+                raise ValueError("free_slots contains an invalid slot")
+            if state.slot_to_index[row][slot] != INVALID_INDEX:
+                raise ValueError("free_slots must name unoccupied slots")
+        for token, slot in enumerate(state.index[row]):
             if slot == INVALID_INDEX:
                 continue
             if not 0 <= slot < slot_count:
-                raise ValueError(
-                    f"token_to_hot[{request_index}][{token}] has invalid slot {slot}")
-            if state.hot_to_token[request_index][slot] != token:
-                raise ValueError("token_to_hot and hot_to_token disagree")
-
-        for slot, token in enumerate(state.hot_to_token[request_index]):
+                raise ValueError("index contains an invalid slot")
+            if state.slot_to_index[row][slot] != token:
+                raise ValueError("index and slot_to_index disagree")
+        for slot, token in enumerate(state.slot_to_index[row]):
             if token == INVALID_INDEX:
                 continue
-            if not 0 <= token < max_model_len:
-                raise ValueError(
-                    f"hot_to_token[{request_index}][{slot}] has invalid token {token}")
-            if state.token_to_hot[request_index][token] != slot:
-                raise ValueError("hot_to_token and token_to_hot disagree")
-
-    return num_requests, max_model_len, slot_count
+            if not 0 <= token < index_capacity:
+                raise ValueError("slot_to_index contains an invalid token")
+            if state.index[row][token] != slot:
+                raise ValueError("slot_to_index and index disagree")
+    return pool_capacity, index_capacity, slot_count, free_count
 
 
 def dsa_sparse_lookup_update_reference(
     state: DSASparseLookupUpdateState,
     *,
-    query_positions: Sequence[int],
-    query_to_req_idx: Sequence[int],
-    query_to_lane: Sequence[int],
-    query_valid_mask: Sequence[bool],
-    valid_topk_counts: Sequence[int],
-    seq_lens: Sequence[int],
-    topk_positions: Sequence[Sequence[int]],
-) -> tuple[list[list[int]], list[list[bool]]]:
-    """Apply one fused lookup/update step and mutate ``state`` in place.
+    req_pool_entries: Sequence[int],
+    query_index: Sequence[Sequence[int]],
+    lookup_mask: Sequence[Sequence[int]],
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Run lookup, allocate canonical misses, and maintain the free list.
 
-    The flattened ``(query, top-k entry)`` order is the canonical order for
-    duplicate misses and allocations.  Entries that point at a valid current
-    query position use the reserved index ``slot_count + query_lane`` and are
-    never installed in the evictable maps.
+    The first active flat query occurrence owns a duplicate miss. Every
+    returned slot is protected from this call's maintenance phase.
     """
 
-    num_requests, max_model_len, slot_count = _validate_state(state)
-    if len(seq_lens) != num_requests:
-        raise ValueError("seq_lens must contain one value per request index")
-
-    num_queries = len(topk_positions)
-    query_vectors = (
-        query_positions,
-        query_to_req_idx,
-        query_to_lane,
-        query_valid_mask,
-        valid_topk_counts,
+    pool_capacity, index_capacity, slot_count, free_count = (
+        _validate_state(state)
     )
-    if any(len(values) != num_queries for values in query_vectors):
-        raise ValueError("query metadata lengths must match topk_positions")
+    req_num = len(req_pool_entries)
+    if req_num == 0:
+        raise ValueError("req_pool_entries must not be empty")
+    query_width = _width("query_index", query_index)
+    if len(query_index) != req_num:
+        raise ValueError("query_index row count must equal req_num")
+    if (
+        len(lookup_mask) != req_num
+        or _width("lookup_mask", lookup_mask) != query_width
+    ):
+        raise ValueError("lookup_mask shape must equal query_index")
+    if len(set(req_pool_entries)) != req_num:
+        raise ValueError("req_pool_entries must be unique in one call")
+    for row in req_pool_entries:
+        if not 0 <= row < pool_capacity:
+            raise ValueError("req_pool_entries contains an invalid row")
 
-    topk_width = _rectangular_width("topk_positions", topk_positions)
-    for query, count in enumerate(valid_topk_counts):
-        if not 0 <= count <= topk_width:
-            raise ValueError(
-                f"valid_topk_counts[{query}] is outside [0, {topk_width}]")
-
-    for request_index, seq_len in enumerate(seq_lens):
-        if not 0 <= seq_len <= max_model_len:
-            raise ValueError(
-                f"seq_lens[{request_index}] is outside [0, {max_model_len}]")
-
-    request_lane_owners: set[tuple[int, int]] = set()
-    for query, request_index in enumerate(query_to_req_idx):
-        if not 0 <= request_index < num_requests:
-            raise ValueError(
-                f"query_to_req_idx[{query}] has invalid request index "
-                f"{request_index}")
-        lane = query_to_lane[query]
-        if lane < 0:
-            raise ValueError(f"query_to_lane[{query}] must be non-negative")
-        request_lane = (request_index, lane)
-        if request_lane in request_lane_owners:
-            raise ValueError(
-                "each (request index, query lane) may own at most one query"
-            )
-        request_lane_owners.add(request_lane)
-
-    slot_out = [[INVALID_INDEX] * topk_width
-                for _ in range(num_queries)]
-    miss_mask = [[False] * topk_width for _ in range(num_queries)]
-
-    queries_by_request: list[list[int]] = [
-        [] for _ in range(num_requests)
+    slot_out = [
+        [INVALID_INDEX] * query_width for _ in range(req_num)
     ]
-    for query, request_index in enumerate(query_to_req_idx):
-        queries_by_request[request_index].append(query)
+    miss_out = [[0] * query_width for _ in range(req_num)]
 
-    for request_index in range(num_requests):
-        request_queries = queries_by_request[request_index]
-        if not any(query_valid_mask[query] for query in request_queries):
+    for req_id, pool_row in enumerate(req_pool_entries):
+        row_index = state.index[pool_row]
+        row_slot_to_index = state.slot_to_index[pool_row]
+        row_free_slots = state.free_slots[pool_row]
+        cursor = state.free_head[pool_row][1]
+
+        canonical_misses: list[tuple[int, int]] = []
+        first_miss_entry: dict[int, int] = {}
+        for entry, token in enumerate(query_index[req_id]):
+            if lookup_mask[req_id][entry] == 0:
+                continue
+            if not 0 <= token < index_capacity:
+                continue
+            slot = row_index[token]
+            if slot != INVALID_INDEX:
+                slot_out[req_id][entry] = slot
+                continue
+            owner = first_miss_entry.get(token)
+            if owner is None:
+                first_miss_entry[token] = entry
+                canonical_misses.append((entry, token))
+
+        if len(canonical_misses) > free_count:
+            raise RuntimeError("miss count exceeds the free-list capacity")
+
+        for miss_rank, (entry, token) in enumerate(
+            canonical_misses
+        ):
+            slot = row_free_slots[miss_rank]
+            if row_slot_to_index[slot] != INVALID_INDEX:
+                raise ValueError("free list points to an occupied slot")
+            row_index[token] = slot
+            row_slot_to_index[slot] = token
+            slot_out[req_id][entry] = slot
+            miss_out[req_id][entry] = 1
+
+        for entry, token in enumerate(query_index[req_id]):
+            if (
+                lookup_mask[req_id][entry] != 0
+                and 0 <= token < index_capacity
+                and slot_out[req_id][entry] == INVALID_INDEX
+            ):
+                slot_out[req_id][entry] = row_index[token]
+
+        miss_count = len(canonical_misses)
+        state.free_head[pool_row][0] = miss_count
+        if miss_count == 0:
+            state.free_head[pool_row][0] = 0
             continue
 
-        seq_len = seq_lens[request_index]
-
-        # The first valid flat query occurrence defines the reserved lane if
-        # malformed/padded metadata repeats a current position.
-        newest_lane_by_token: dict[int, int] = {}
-        for query in request_queries:
-            token = query_positions[query]
-            if (query_valid_mask[query] and 0 <= token < seq_len
-                    and token < max_model_len):
-                newest_lane_by_token.setdefault(token,
-                                                query_to_lane[query])
-
-        # A position may have been evictable in the preceding step and become
-        # a current query position now.  Remove that stale long-term mapping
-        # before classifying this step's TopK entries.
-        for token in newest_lane_by_token:
-            old_slot = state.token_to_hot[request_index][token]
-            if old_slot == INVALID_INDEX:
-                continue
-            state.token_to_hot[request_index][token] = INVALID_INDEX
-            if state.hot_to_token[request_index][old_slot] == token:
-                state.hot_to_token[request_index][old_slot] = INVALID_INDEX
-
-        old_lru = list(state.lru_slots[request_index])
-        hit_slots: set[int] = set()
-        missing_occurrences: dict[int, list[tuple[int, int]]] = {}
-        missing_order: list[int] = []
-
-        for query in request_queries:
-            if not query_valid_mask[query]:
-                continue
-            valid_count = valid_topk_counts[query]
-            for topk_idx in range(valid_count):
-                token = topk_positions[query][topk_idx]
-                if not 0 <= token < seq_len or token >= max_model_len:
-                    continue
-
-                newest_lane = newest_lane_by_token.get(token)
-                if newest_lane is not None:
-                    slot_out[query][topk_idx] = slot_count + newest_lane
-                    continue
-
-                resident_slot = state.token_to_hot[request_index][token]
-                if resident_slot != INVALID_INDEX:
-                    slot_out[query][topk_idx] = resident_slot
-                    hit_slots.add(resident_slot)
-                    continue
-
-                if token not in missing_occurrences:
-                    missing_occurrences[token] = []
-                    missing_order.append(token)
-                missing_occurrences[token].append((query, topk_idx))
-
-        # All MTP queries belonging to the request are classified before choosing
-        # victims, so a hit in any query protects the slot from this step.
-        evictable_lru = [
-            slot for slot in old_lru if slot not in hit_slots
-        ]
-        free_slots = [
-            slot for slot in evictable_lru
-            if state.hot_to_token[request_index][slot] == INVALID_INDEX
-        ]
-        occupied_slots = [
-            slot for slot in evictable_lru
-            if state.hot_to_token[request_index][slot] != INVALID_INDEX
-        ]
-        allocation_candidates = free_slots + occupied_slots
-        if len(missing_order) > len(allocation_candidates):
+        protected = {
+            slot
+            for slot in slot_out[req_id]
+            if slot != INVALID_INDEX
+        }
+        victims: list[int] = []
+        for position in range(slot_count):
+            slot = (cursor + position) % slot_count
+            if (
+                slot not in protected
+                and row_slot_to_index[slot] != INVALID_INDEX
+            ):
+                victims.append(slot)
+                if len(victims) == miss_count:
+                    break
+        if len(victims) != miss_count:
             raise RuntimeError(
-                "not enough evictable slots for this request's canonical misses")
+                "not enough occupied non-protected slots to maintain "
+                "the resident count"
+            )
 
-        allocated_slots: list[int] = []
-        allocated_by_token: dict[int, int] = {}
-        for token, slot in zip(missing_order, allocation_candidates):
-            evicted_token = state.hot_to_token[request_index][slot]
-            if evicted_token != INVALID_INDEX:
-                state.token_to_hot[request_index][evicted_token] = INVALID_INDEX
+        for rank, slot in enumerate(victims):
+            old_token = row_slot_to_index[slot]
+            row_slot_to_index[slot] = INVALID_INDEX
+            if row_index[old_token] == slot:
+                row_index[old_token] = INVALID_INDEX
+            row_free_slots[miss_count - 1 - rank] = slot
 
-            state.hot_to_token[request_index][slot] = token
-            state.token_to_hot[request_index][token] = slot
-            allocated_slots.append(slot)
-            allocated_by_token[token] = slot
-
-        for token in missing_order:
-            slot = allocated_by_token[token]
-            occurrences = missing_occurrences[token]
-            for query, topk_idx in occurrences:
-                slot_out[query][topk_idx] = slot
-            canonical_query, canonical_topk_idx = occurrences[0]
-            miss_mask[canonical_query][canonical_topk_idx] = True
-
-        allocated_set = set(allocated_slots)
-        untouched_stale = [
-            slot for slot in old_lru
-            if slot not in hit_slots and slot not in allocated_set
-        ]
-        hits_in_lru_order = [
-            slot for slot in old_lru if slot in hit_slots
-        ]
-        state.lru_slots[request_index][:] = (
-            untouched_stale + allocated_slots + hits_in_lru_order)
+        state.free_head[pool_row][1] = (
+            victims[-1] + 1
+        ) % slot_count
+        state.free_head[pool_row][0] = 0
 
     _validate_state(state)
-    return slot_out, miss_mask
+    return slot_out, miss_out
 
 
 __all__ = [

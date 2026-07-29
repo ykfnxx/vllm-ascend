@@ -14,6 +14,7 @@ from vllm_ascend.attention.dsa_sparse import (
     DSASparseLayerLayout,
 )
 from vllm_ascend.dsa_sparse_constants import DSA_SPARSE_QUERY_WIDTH
+from vllm_ascend.ops.dsa_sparse import TorchDSASparseLookupOperator
 from vllm_ascend.worker.dsa_sparse_eager import (
     DSASparseEagerCohortLayout,
     create_dsa_sparse_eager_mock_runtime,
@@ -137,34 +138,14 @@ def test_runtime_requires_one_query_position_per_request():
         )
 
 
-def test_default_runtime_lookup_boundary_is_explicitly_unimplemented():
+def test_default_runtime_uses_fused_torch_lookup_operator():
     runtime = create_dsa_sparse_eager_mock_runtime(
         config(),
         (layout("cohort-0", "layer.0"),),
         device="cpu",
     )
-    runtime.admit_mock_request("request-a")
-    metadata = FakeMetadata(
-        num_input_tokens=1,
-        num_actual_tokens=1,
-        seq_lens=torch.tensor([131], dtype=torch.int32),
-        block_table=torch.tensor(
-            [[10, 11, 12, 13]],
-            dtype=torch.int32,
-        ),
-    )
 
-    execution = runtime.begin_target_batch(
-        request_ids=("request-a",),
-        query_positions=torch.tensor([130]),
-        layer_metadata={"layer.0": metadata},
+    assert isinstance(
+        runtime.coordinator.lookup_operator,
+        TorchDSASparseLookupOperator,
     )
-    with pytest.raises(NotImplementedError, match="not implemented"):
-        with execution as router:
-            router.main_write_target("layer.0")
-            router.submit_newest_write("layer.0")
-            router.run_layer_attention(
-                "layer.0",
-                topk()[:1],
-                lambda resolution: torch.empty(0),
-            )

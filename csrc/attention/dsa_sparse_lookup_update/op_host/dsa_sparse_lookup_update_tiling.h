@@ -9,12 +9,8 @@
 #include <cstdint>
 
 struct DsaSparseLookupUpdateTilingData {
-    uint32_t tokenPositionCapacity;
-    uint32_t evictableSlotCount;
-    uint32_t queryCapacity;
-    uint32_t requestCapacity;
-    uint32_t queryLaneCapacity;
-    uint32_t topkCount;
+    uint32_t reqNum;
+    uint32_t poolCapacity;
     uint32_t workspaceStride;
 };
 

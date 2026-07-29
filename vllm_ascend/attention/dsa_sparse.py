@@ -169,7 +169,7 @@ class DSASparseLayerKey:
 
 @dataclass(frozen=True)
 class DSASparseLookupState:
-    """Four persistent tensors consumed by ``asu_hbm_index_lookup``."""
+    """Four persistent tensors consumed by fused lookup/update."""
 
     cohort: DSASparseCohortKey
     index: torch.Tensor
@@ -328,21 +328,6 @@ class DSASparseLookupOperator(Protocol):
         state: DSASparseLookupState,
         batch: DSASparseLookupBatch,
     ) -> DSASparseLookupOutput: ...
-
-
-class UnimplementedDSASparseLookupOperator:
-    """Explicit boundary until the new fused SIMT operator is connected."""
-
-    def lookup(
-        self,
-        *,
-        state: DSASparseLookupState,
-        batch: DSASparseLookupBatch,
-    ) -> DSASparseLookupOutput:
-        del state, batch
-        raise NotImplementedError(
-            "DSA Sparse ASU-style lookup operator is not implemented."
-        )
 
 
 @dataclass(frozen=True)
