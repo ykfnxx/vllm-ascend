@@ -118,22 +118,11 @@ DsaSparseLookupUpdateSimt(
         }
     }
 
-    bool has_active_query = false;
-    for (uint32_t lane = 0;
-         lane < query_lane_capacity;
-         ++lane) {
-        const int32_t query = request_queries[lane];
-        if (query >= 0 && query_valid_mask[query] != 0U) {
-            has_active_query = true;
-            break;
-        }
-    }
-    if (!has_active_query) {
-        return;
-    }
-
     const uint32_t request_entry_count =
         query_lane_capacity * topk_count;
+    // Outputs belong to the per-call plan, not to persistent request state.
+    // Initialize every mapped query before the inactive-request fast path so
+    // padded queries never retain values from an earlier replay.
     for (uint32_t entry = tid;
          entry < request_entry_count;
          entry += thread_count) {
@@ -151,6 +140,20 @@ DsaSparseLookupUpdateSimt(
     }
     asc_threadfence_block();
     asc_syncthreads();
+
+    bool has_active_query = false;
+    for (uint32_t lane = 0;
+         lane < query_lane_capacity;
+         ++lane) {
+        const int32_t query = request_queries[lane];
+        if (query >= 0 && query_valid_mask[query] != 0U) {
+            has_active_query = true;
+            break;
+        }
+    }
+    if (!has_active_query) {
+        return;
+    }
 
     __gm__ int32_t* request_token_to_hot =
         token_to_hot +
