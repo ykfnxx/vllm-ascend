@@ -11,12 +11,14 @@ import statistics
 import subprocess
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from common import (
     INDEX_CAPACITY,
     QUERY_COUNT,
     RESIDENT_SLOT_COUNT,
     TOOL_DIR,
+    OperatorInputs,
     Runtime,
     invoke,
     load_runtime,
@@ -89,23 +91,15 @@ def _workloads(args: argparse.Namespace) -> list[tuple[str, int]]:
     return [("hit", 0), ("churn", QUERY_COUNT)]
 
 
-def _query_groups(
+def _miss_token_groups(
     runtime: Runtime,
     *,
-    concurrency: int,
     miss_count: int,
-) -> list:
+) -> tuple[int, Any | None]:
     torch = runtime.torch
     hit_count = QUERY_COUNT - miss_count
-    hit_tokens = torch.arange(
-        hit_count,
-        dtype=torch.int32,
-        device=runtime.device,
-    )
     if miss_count == 0:
-        return [
-            hit_tokens.expand(concurrency, -1).contiguous()
-        ]
+        return hit_count, None
 
     replaceable = RESIDENT_SLOT_COUNT - hit_count
     group_count = math.ceil(replaceable / miss_count) + 1
@@ -116,19 +110,29 @@ def _query_groups(
         raise ValueError(
             "controlled-miss token groups exceed index capacity"
         )
-    groups = []
-    for group in range(group_count):
-        misses = torch.arange(
-            RESIDENT_SLOT_COUNT + group * miss_count,
-            RESIDENT_SLOT_COUNT + (group + 1) * miss_count,
-            dtype=torch.int32,
-            device=runtime.device,
-        )
-        row = torch.cat((hit_tokens, misses))
-        groups.append(
-            row.expand(concurrency, -1).contiguous()
-        )
-    return groups
+    miss_groups = torch.arange(
+        RESIDENT_SLOT_COUNT,
+        last_token,
+        dtype=torch.int32,
+        device=runtime.device,
+    ).reshape(group_count, miss_count)
+    return hit_count, miss_groups
+
+
+def _load_query_group(
+    inputs: OperatorInputs,
+    *,
+    hit_count: int,
+    miss_groups: Any | None,
+    group_index: int,
+) -> None:
+    if miss_groups is None:
+        return
+    inputs.query_index[:, hit_count:].copy_(
+        miss_groups[group_index % miss_groups.shape[0]]
+        .unsqueeze(0)
+        .expand(inputs.req_num, -1)
+    )
 
 
 def _percentile(values: list[float], percentile: float) -> float:
@@ -150,13 +154,17 @@ def _run_benchmark(
     inputs = make_profile_inputs(
         runtime, requests=concurrency
     )
-    groups = _query_groups(
+    hit_count, miss_groups = _miss_token_groups(
         runtime,
-        concurrency=concurrency,
         miss_count=miss_count,
     )
 
-    inputs.query_index.copy_(groups[0])
+    _load_query_group(
+        inputs,
+        hit_count=hit_count,
+        miss_groups=miss_groups,
+        group_index=0,
+    )
     _, validation_misses = invoke(runtime, inputs)
     torch.npu.synchronize()
     actual_misses = int(validation_misses.sum().item())
@@ -169,8 +177,11 @@ def _run_benchmark(
 
     group_index = 1
     for _ in range(warmup):
-        inputs.query_index.copy_(
-            groups[group_index % len(groups)]
+        _load_query_group(
+            inputs,
+            hit_count=hit_count,
+            miss_groups=miss_groups,
+            group_index=group_index,
         )
         invoke(runtime, inputs)
         group_index += 1
@@ -184,15 +195,25 @@ def _run_benchmark(
         torch.npu.Event(enable_timing=True)
         for _ in range(iterations)
     ]
+    final_misses = validation_misses
     for iteration in range(iterations):
-        inputs.query_index.copy_(
-            groups[group_index % len(groups)]
+        _load_query_group(
+            inputs,
+            hit_count=hit_count,
+            miss_groups=miss_groups,
+            group_index=group_index,
         )
         group_index += 1
         starts[iteration].record()
-        invoke(runtime, inputs)
+        _, final_misses = invoke(runtime, inputs)
         ends[iteration].record()
     torch.npu.synchronize()
+    final_actual_misses = int(final_misses.sum().item())
+    if final_actual_misses != expected_misses:
+        raise AssertionError(
+            f"final timed invocation got {final_actual_misses} "
+            f"misses, expected {expected_misses}"
+        )
     samples_us = [
         start.elapsed_time(end) * 1000.0
         for start, end in zip(starts, ends)
@@ -202,6 +223,7 @@ def _run_benchmark(
         "effective_miss_rate_percent": (
             100.0 * miss_count / QUERY_COUNT
         ),
+        "validated_misses_per_invocation": expected_misses,
         "samples": len(samples_us),
         "min_us": min(samples_us),
         "median_us": statistics.median(samples_us),

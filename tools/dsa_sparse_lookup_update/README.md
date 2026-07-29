@@ -65,7 +65,9 @@ Choose either:
 or use `--scenario hit`, `--scenario churn`, or the default `both`. The
 event-timed interval contains one batched custom-op invocation. Tensor
 creation, initial state construction, query-group updates, synchronization,
-and JSON serialization are excluded.
+and JSON serialization are excluded. The script checks both the first and
+last measured invocation and fails if the requested miss count has degraded
+into hits as persistent metadata changes.
 
 ## NPU profile
 

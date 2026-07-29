@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 
+from vllm_ascend import dsa_sparse_probe
 from vllm_ascend.attention.dsa_sparse import (
     DSASparseLookupBatch,
     DSASparseLookupOutput,
@@ -40,6 +41,21 @@ class TorchDSASparseLookupOperator:
                 req_num,
             )
         )
+        if dsa_sparse_probe.is_enabled():
+            dsa_sparse_probe.synchronize_device()
+            dsa_sparse_probe.emit(
+                "lookup_update_done",
+                cohort=state.cohort.name,
+                role=state.cohort.role,
+                req_num=req_num,
+                req_pool_entries_shape=list(
+                    batch.req_pool_entries.shape
+                ),
+                query_index_shape=list(batch.query_index.shape),
+                lookup_mask_shape=list(batch.lookup_mask.shape),
+                slot_out_shape=list(slot_out.shape),
+                miss_out_shape=list(miss_out.shape),
+            )
         return DSASparseLookupOutput(
             slot_out=slot_out,
             miss_out=miss_out,

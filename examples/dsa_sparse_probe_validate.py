@@ -259,14 +259,53 @@ def validate(
             f"{expected_lookup_counts}, got {dict(lookup_counts)}"
         )
     for event in lookup_events:
-        topk_shape = _require_int_list(
-            event.get("topk_shape"),
-            "lookup_update_done.topk_shape",
+        cohort = _require_string(
+            event.get("cohort"),
+            "lookup_update_done.cohort",
         )
-        if len(topk_shape) != 2 or topk_shape[-1] != index_topk:
+        if cohort not in cohort_layers:
             _fail(
-                "lookup_update_done has an invalid Top-K shape: "
-                f"{topk_shape!r}"
+                "lookup_update_done names an undeclared cohort: "
+                f"{cohort!r}"
+            )
+        if event.get("role") != "target":
+            _fail(
+                "lookup_update_done.role must be 'target', got "
+                f"{event.get('role')!r}"
+            )
+        req_num = _require_positive_int(
+            event.get("req_num"),
+            "lookup_update_done.req_num",
+        )
+        expected_matrix_shape = (req_num, index_topk)
+        expected_vector_shape = (req_num,)
+        matrix_shapes = {
+            field: _require_int_list(
+                event.get(field),
+                f"lookup_update_done.{field}",
+            )
+            for field in (
+                "query_index_shape",
+                "lookup_mask_shape",
+                "slot_out_shape",
+                "miss_out_shape",
+            )
+        }
+        for field, shape in matrix_shapes.items():
+            if shape != expected_matrix_shape:
+                _fail(
+                    f"lookup_update_done.{field} must be "
+                    f"{expected_matrix_shape}, got {shape!r}"
+                )
+        req_pool_entries_shape = _require_int_list(
+            event.get("req_pool_entries_shape"),
+            "lookup_update_done.req_pool_entries_shape",
+        )
+        if req_pool_entries_shape != expected_vector_shape:
+            _fail(
+                "lookup_update_done.req_pool_entries_shape must be "
+                f"{expected_vector_shape}, got "
+                f"{req_pool_entries_shape!r}"
             )
 
     hot_sfa_events = _events_named(

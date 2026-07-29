@@ -52,13 +52,23 @@ def _write_fixture(
             "event": "lookup_update_done",
             "cohort": "cohort-0",
             "role": "target",
-            "topk_shape": [1, 4],
+            "req_num": 1,
+            "req_pool_entries_shape": [1],
+            "query_index_shape": [1, 4],
+            "lookup_mask_shape": [1, 4],
+            "slot_out_shape": [1, 4],
+            "miss_out_shape": [1, 4],
         },
         {
             "event": "lookup_update_done",
             "cohort": "cohort-1",
             "role": "target",
-            "topk_shape": [1, 4],
+            "req_num": 1,
+            "req_pool_entries_shape": [1],
+            "query_index_shape": [1, 4],
+            "lookup_mask_shape": [1, 4],
+            "slot_out_shape": [1, 4],
+            "miss_out_shape": [1, 4],
         },
         {
             "event": "hot_cache_sfa_done",
@@ -130,6 +140,31 @@ def test_validate_rejects_hot_cache_address_reuse(
     with pytest.raises(
         RuntimeError,
         match="Hot Cache addresses are shared across layers",
+    ):
+        validate(
+            decode_log=decode_log,
+            response_json=response_json,
+            profile_dir=profile_dir,
+        )
+
+
+def test_validate_rejects_old_lookup_event_shape(
+    tmp_path: Path,
+):
+    decode_log, response_json, profile_dir = _write_fixture(
+        tmp_path,
+    )
+    content = decode_log.read_text(encoding="utf-8")
+    content = content.replace(
+        '"query_index_shape": [1, 4]',
+        '"query_index_shape": [1, 3]',
+        1,
+    )
+    decode_log.write_text(content, encoding="utf-8")
+
+    with pytest.raises(
+        RuntimeError,
+        match="query_index_shape must be",
     ):
         validate(
             decode_log=decode_log,
