@@ -14,6 +14,22 @@ KERNEL_SOURCE = (
     / "arch35"
     / "dsa_sparse_lookup_update_simt.h"
 )
+KERNEL_ENTRY_SOURCE = (
+    ROOT
+    / "csrc"
+    / "attention"
+    / "dsa_sparse_lookup_update"
+    / "op_kernel"
+    / "dsa_sparse_lookup_update.cpp"
+)
+TILING_SOURCE = (
+    ROOT
+    / "csrc"
+    / "attention"
+    / "dsa_sparse_lookup_update"
+    / "op_host"
+    / "dsa_sparse_lookup_update_tiling.cpp"
+)
 BINDING_SOURCE = ROOT / "csrc" / "torch_binding.cpp"
 
 
@@ -42,6 +58,23 @@ def test_kernel_contains_fused_maintain_and_hidden_workspace() -> None:
     assert "request_free_head[1]" in source
     assert "request_free_slots" in source
     assert "lru_slots" not in source
+
+
+def test_hidden_workspace_uses_aclnn_user_workspace_region() -> None:
+    kernel_source = KERNEL_ENTRY_SOURCE.read_text(encoding="utf-8")
+    tiling_source = TILING_SOURCE.read_text(encoding="utf-8")
+
+    assert "GetUserWorkspace" not in kernel_source
+    assert (
+        "reinterpret_cast<__gm__ int32_t*>(\n"
+        "                user_workspace)"
+        in kernel_source
+    )
+    assert "platform.GetLibApiWorkSpaceSize()" in tiling_source
+    assert (
+        "system_workspace_bytes + user_workspace_bytes"
+        in tiling_source
+    )
 
 
 def test_torch_schema_matches_asu_lookup_shape() -> None:

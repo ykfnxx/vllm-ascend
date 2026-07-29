@@ -18,7 +18,7 @@ extern "C" __global__ __aicore__ void dsa_sparse_lookup_update(
     GM_ADDR lookup_mask,
     GM_ADDR slot_out,
     GM_ADDR miss_out,
-    GM_ADDR system_workspace,
+    GM_ADDR user_workspace,
     GM_ADDR tiling)
 {
 #ifdef ASCENDC_CPU_DEBUG
@@ -31,7 +31,7 @@ extern "C" __global__ __aicore__ void dsa_sparse_lookup_update(
     (void)lookup_mask;
     (void)slot_out;
     (void)miss_out;
-    (void)system_workspace;
+    (void)user_workspace;
     (void)tiling;
 #else
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
@@ -66,7 +66,7 @@ extern "C" __global__ __aicore__ void dsa_sparse_lookup_update(
             reinterpret_cast<__gm__ int32_t*>(slot_out),
             reinterpret_cast<__gm__ int32_t*>(miss_out),
             reinterpret_cast<__gm__ int32_t*>(
-                system_workspace),
+                user_workspace),
             req_id,
             tiling_data.poolCapacity,
             tiling_data.workspaceStride);

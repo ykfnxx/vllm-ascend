@@ -262,11 +262,19 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
         static_cast<uint32_t>(pool_capacity);
     tiling_data->workspaceStride = kWorkspaceStride;
 
-    const uint64_t workspace_bytes =
+    const uint64_t user_workspace_bytes =
         static_cast<uint64_t>(req_num) *
         static_cast<uint64_t>(kWorkspaceStride) *
         sizeof(int32_t);
-    if (workspace_bytes >
+    // The framework passes the kernel a pointer to the user region after
+    // reserving this Ascend C runtime prefix. The allocation reported by
+    // tiling must still contain both regions.
+    const uint64_t system_workspace_bytes =
+        static_cast<uint64_t>(platform.GetLibApiWorkSpaceSize());
+    const uint64_t workspace_bytes =
+        system_workspace_bytes + user_workspace_bytes;
+    if (workspace_bytes < user_workspace_bytes ||
+        workspace_bytes >
         static_cast<uint64_t>(
             std::numeric_limits<size_t>::max())) {
         OPS_LOG_E(context->GetNodeName(),
