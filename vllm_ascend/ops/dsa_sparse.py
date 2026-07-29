@@ -1,59 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
-from __future__ import annotations
+"""DSA Sparse operator integration boundary.
 
-from typing import TYPE_CHECKING
-
-import torch
-
-from vllm_ascend import dsa_sparse_probe
-
-if TYPE_CHECKING:
-    from vllm_ascend.attention.dsa_sparse import (
-        DSASparsePlan,
-        DSASparseResidencyState,
-    )
-
-
-class DSASparseLookupUpdateTorchOperator:
-    """Invoke the Ascend 950 fused lookup/update custom operator."""
-
-    def lookup_update(
-        self,
-        *,
-        state: "DSASparseResidencyState",
-        plan: "DSASparsePlan",
-    ) -> None:
-        try:
-            operator = torch.ops._C_ascend.dsa_sparse_lookup_update
-        except AttributeError as error:
-            raise RuntimeError(
-                "dsa_sparse_lookup_update is unavailable. Build and install "
-                "the Ascend 950 custom operator package before enabling DSA "
-                "Sparse eager Decode."
-            ) from error
-
-        operator(
-            state.token_to_hot,
-            state.hot_to_token,
-            state.lru_slots,
-            plan.query_positions,
-            plan.query_to_req_idx,
-            plan.query_to_lane,
-            plan.query_valid_mask,
-            plan.valid_topk_counts,
-            plan.seq_lens,
-            plan.topk_positions,
-            plan.resolved_hot_indices,
-            plan.miss_mask,
-            plan.workspace,
-        )
-        if dsa_sparse_probe.is_enabled():
-            dsa_sparse_probe.synchronize_device()
-            dsa_sparse_probe.emit(
-                "lookup_update_done",
-                cohort=state.cohort.name,
-                role=state.cohort.role,
-                topk_shape=list(plan.topk_positions.shape),
-            )
+The framework currently depends only on ``DSASparseLookupOperator``. The new
+fused SIMT implementation will be connected here in the operator milestone.
+No existing ``torch.ops`` lookup ABI is used by the framework adaptation.
+"""

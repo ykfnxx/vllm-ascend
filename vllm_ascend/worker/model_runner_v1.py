@@ -637,7 +637,7 @@ class NPUModelRunner(GPUModelRunner):
         self.dsa_sparse_eager_runtime = runtime
 
     def _initialize_dsa_sparse_eager_mock_runtime(self) -> None:
-        """Bind the formal lookup op and explicit no-op eager I/O fixture."""
+        """Bind the unimplemented Lookup boundary and mock I/O fixture."""
 
         config = self.ascend_config.dsa_sparse_config
         if config is None or not getattr(config, "is_consumer", False):
@@ -691,7 +691,6 @@ class NPUModelRunner(GPUModelRunner):
             cache_config,
             layer_layouts,
             cohort_count=cohort_count,
-            max_sfa_queries=self.max_num_tokens,
             backend_auxiliary_bytes=0,
         )
         self._dsa_sparse_fixed_hbm_breakdown = breakdown
@@ -703,23 +702,10 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError(
                 "DSA Sparse Decode cache config requires an enabled KV consumer."
             )
-        device_buffer_size = config.device_buffer_size
-        if (
-            isinstance(device_buffer_size, bool)
-            or not isinstance(device_buffer_size, int)
-            or device_buffer_size <= 0
-        ):
-            raise RuntimeError(
-                "DSA Sparse Decode device_buffer_size must be a positive integer."
-            )
         return DSASparseCacheConfig(
             max_num_seqs=self.max_num_reqs,
             max_model_len=self.model_config.max_model_len,
             block_size=self.block_size,
-            device_buffer_size=device_buffer_size,
-            max_query_tokens_per_request=(
-                config.max_query_tokens_per_request
-            ),
             index_topk=config.index_topk,
         )
 
@@ -912,13 +898,10 @@ class NPUModelRunner(GPUModelRunner):
                 "Bind the storage backend and eager I/O operator before "
                 "executing the model."
             )
-        if self.attn_state not in {
-            AscendAttentionState.DecodeOnly,
-            AscendAttentionState.SpecDecoding,
-        }:
+        if self.attn_state != AscendAttentionState.DecodeOnly:
             raise RuntimeError(
-                "DSA Sparse eager Decode accepts only DecodeOnly or "
-                f"SpecDecoding batches, got {self.attn_state!r}."
+                "DSA Sparse eager accepts only DecodeOnly batches, got "
+                f"{self.attn_state!r}."
             )
         if isinstance(attn_metadata, list):
             raise RuntimeError(
@@ -927,15 +910,15 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         request_ids = list(self.input_batch.req_ids[:num_reqs])
-        query_counts = [
-            int(query_count)
-            for query_count in num_scheduled_tokens[:num_reqs]
-        ]
-        num_active_queries = sum(query_counts)
+        scheduled = num_scheduled_tokens[:num_reqs]
+        if any(int(count) != 1 for count in scheduled):
+            raise RuntimeError(
+                "DSA Sparse currently requires exactly one decode token "
+                "per request per model forward."
+            )
         return self.dsa_sparse_eager_runtime.begin_target_batch(
             request_ids=request_ids,
-            query_positions=positions[:num_active_queries],
-            query_counts=query_counts,
+            query_positions=positions[:num_reqs],
             layer_metadata=attn_metadata,
         )
 

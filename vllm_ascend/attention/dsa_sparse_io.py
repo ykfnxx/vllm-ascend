@@ -110,11 +110,10 @@ class DSASparseIOBackend(Protocol):
 class DSASparseIOOperator(Protocol):
     """Unified Decode data-plane boundary.
 
-    A production implementation derives history read addresses from the
-    semantic Top-K positions and the current Decode block table, performs the
-    newest writes and miss reads, and establishes the completion dependency
-    before returning.  Eager and graph execution intentionally share this
-    single call shape.
+    A production implementation derives history read addresses from
+    ``query_index`` and the current Decode block table, loads ``miss_out`` rows
+    into ``slot_out``, performs live-tail writes, and establishes the completion
+    dependency before returning.
     """
 
     def dsa_sparse_io(
@@ -122,13 +121,13 @@ class DSASparseIOOperator(Protocol):
         *,
         context: object,
         region: object,
-        topk_positions: torch.Tensor,
-        resolved_hot_indices: torch.Tensor,
-        miss_mask: torch.Tensor,
-        query_to_req_idx: torch.Tensor,
+        query_index: torch.Tensor,
+        slot_out: torch.Tensor,
+        miss_out: torch.Tensor,
+        req_pool_entries: torch.Tensor,
         block_table: torch.Tensor,
         write_global_slots: torch.Tensor,
-        write_destination_hot_row_ids: torch.Tensor,
+        write_destination_slots: torch.Tensor,
         write_valid_mask: torch.Tensor,
         hot_planes: tuple[torch.Tensor, ...],
         completion: object,
@@ -146,10 +145,8 @@ class MockDSASparseIOOperator:
     """No-op implementation used only by the eager development runtime.
 
     The mock preserves the final, unconditional one-call-per-layer topology
-    and validates the static tensor contract.  It deliberately does not move
-    newest or history payload.  Consequently, a miss installed by
-    ``dsa_sparse_lookup_update`` does not contain valid payload and this mock
-    must not be used to claim model accuracy or multi-step miss correctness.
+    and validates the compact tensor contract. It deliberately does not move
+    live-tail or history payload.
     """
 
     def dsa_sparse_io(
@@ -157,77 +154,60 @@ class MockDSASparseIOOperator:
         *,
         context: object,
         region: object,
-        topk_positions: torch.Tensor,
-        resolved_hot_indices: torch.Tensor,
-        miss_mask: torch.Tensor,
-        query_to_req_idx: torch.Tensor,
+        query_index: torch.Tensor,
+        slot_out: torch.Tensor,
+        miss_out: torch.Tensor,
+        req_pool_entries: torch.Tensor,
         block_table: torch.Tensor,
         write_global_slots: torch.Tensor,
-        write_destination_hot_row_ids: torch.Tensor,
+        write_destination_slots: torch.Tensor,
         write_valid_mask: torch.Tensor,
         hot_planes: tuple[torch.Tensor, ...],
         completion: object,
     ) -> None:
         del context, region, completion
-        if topk_positions.ndim != 2:
-            raise ValueError("topk_positions must be two-dimensional.")
-        if topk_positions.shape != resolved_hot_indices.shape:
-            raise ValueError(
-                "topk_positions and resolved_hot_indices must have the same "
-                "shape."
-            )
-        if miss_mask.shape != topk_positions.shape:
-            raise ValueError("miss_mask must have the Top-K tensor shape.")
-        if query_to_req_idx.shape != (topk_positions.shape[0],):
-            raise ValueError(
-                "query_to_req_idx must contain one request index for each "
-                "query."
-            )
-        if block_table.ndim != 2:
-            raise ValueError("block_table must be two-dimensional.")
-        if write_global_slots.shape != write_destination_hot_row_ids.shape:
-            raise ValueError(
-                "Newest write source and destination descriptors must have "
-                "the same shape."
-            )
-        if write_valid_mask.shape != write_global_slots.shape:
-            raise ValueError("write_valid_mask must have the newest descriptor shape.")
-        if write_global_slots.ndim != 2:
-            raise ValueError("Newest write descriptors must be two-dimensional.")
-        if write_global_slots.shape[0] != block_table.shape[0]:
-            raise ValueError(
-                "Newest write descriptors and block_table must have the same "
-                "request-index capacity."
-            )
-        if not hot_planes:
-            raise ValueError("At least one Hot Cache plane is required.")
-        if any(plane.ndim < 2 for plane in hot_planes):
-            raise ValueError("Every Hot Cache plane must use a paged layout.")
-        hot_page_shape = hot_planes[0].shape[:2]
-        if any(
-            plane.shape[:2] != hot_page_shape
-            for plane in hot_planes[1:]
-        ):
-            raise ValueError(
-                "Every Hot Cache plane must have the same block and row "
-                "dimensions."
-            )
-        if topk_positions.dtype != torch.int32:
-            raise TypeError("topk_positions must use int32.")
-        if resolved_hot_indices.dtype != torch.int32:
-            raise TypeError("resolved_hot_indices must use int32.")
-        if miss_mask.dtype != torch.bool:
-            raise TypeError("miss_mask must use bool.")
-        if query_to_req_idx.dtype != torch.int32:
-            raise TypeError("query_to_req_idx must use int32.")
-        if block_table.dtype != torch.int32:
-            raise TypeError("block_table must use int32.")
-        if write_global_slots.dtype != torch.int32:
-            raise TypeError("write_global_slots must use int32.")
-        if write_destination_hot_row_ids.dtype != torch.int32:
-            raise TypeError("write_destination_hot_row_ids must use int32.")
-        if write_valid_mask.dtype != torch.bool:
-            raise TypeError("write_valid_mask must use bool.")
+        assert query_index.ndim == 2
+        assert slot_out.shape == query_index.shape
+        assert miss_out.shape == query_index.shape
+        assert req_pool_entries.shape == (query_index.shape[0],)
+        assert block_table.shape[0] == query_index.shape[0]
+        assert write_global_slots.shape == req_pool_entries.shape
+        assert write_destination_slots.shape == req_pool_entries.shape
+        assert write_valid_mask.shape == req_pool_entries.shape
+        assert query_index.dtype == torch.int32
+        assert slot_out.dtype == torch.int32
+        assert miss_out.dtype == torch.int32
+        assert req_pool_entries.dtype == torch.int32
+        assert block_table.dtype == torch.int32
+        assert write_global_slots.dtype == torch.int32
+        assert write_destination_slots.dtype == torch.int32
+        assert write_valid_mask.dtype == torch.bool
+        assert query_index.is_contiguous()
+        assert slot_out.is_contiguous()
+        assert miss_out.is_contiguous()
+        assert req_pool_entries.is_contiguous()
+        assert block_table.is_contiguous()
+        assert write_global_slots.is_contiguous()
+        assert write_destination_slots.is_contiguous()
+        assert write_valid_mask.is_contiguous()
+        tensors = (
+            slot_out,
+            miss_out,
+            req_pool_entries,
+            block_table,
+            write_global_slots,
+            write_destination_slots,
+            write_valid_mask,
+        )
+        assert all(
+            tensor.device == query_index.device
+            for tensor in tensors
+        )
+        assert hot_planes
+        assert all(
+            plane.device == query_index.device
+            for plane in hot_planes
+        )
 
 
 DSASparseIOBackendFactory = Callable[

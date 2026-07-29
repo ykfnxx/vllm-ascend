@@ -200,7 +200,7 @@ class TestAscendSFAKVCacheComposition(TestBase):
         hot_block_table = torch.arange(8, dtype=torch.int32).view(2, 4)
         resolution = DSASparseResolution(
             hot_main_cache=hot_main_cache,
-            local_sparse_indices=local_indices,
+            attention_indices=local_indices,
             hot_block_table=hot_block_table,
         )
         attn_metadata = SimpleNamespace(

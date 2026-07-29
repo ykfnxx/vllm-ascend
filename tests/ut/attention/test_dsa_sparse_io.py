@@ -71,17 +71,14 @@ def _mock_io_arguments():
     return {
         "context": object(),
         "region": object(),
-        "topk_positions": torch.zeros((2, 4), dtype=torch.int32),
-        "resolved_hot_indices": torch.zeros((2, 4), dtype=torch.int32),
-        "miss_mask": torch.zeros((2, 4), dtype=torch.bool),
-        "query_to_req_idx": torch.tensor([0, 1], dtype=torch.int32),
+        "query_index": torch.zeros((2, 2048), dtype=torch.int32),
+        "slot_out": torch.zeros((2, 2048), dtype=torch.int32),
+        "miss_out": torch.zeros((2, 2048), dtype=torch.int32),
+        "req_pool_entries": torch.tensor([0, 2], dtype=torch.int32),
         "block_table": torch.zeros((2, 8), dtype=torch.int32),
-        "write_global_slots": torch.zeros((2, 1), dtype=torch.int32),
-        "write_destination_hot_row_ids": torch.zeros(
-            (2, 1),
-            dtype=torch.int32,
-        ),
-        "write_valid_mask": torch.ones((2, 1), dtype=torch.bool),
+        "write_global_slots": torch.zeros((2,), dtype=torch.int32),
+        "write_destination_slots": torch.zeros((2,), dtype=torch.int32),
+        "write_valid_mask": torch.ones((2,), dtype=torch.bool),
         "hot_planes": (
             torch.empty((4, 4, 1, 8), dtype=torch.bfloat16),
         ),
@@ -95,8 +92,8 @@ def test_mock_io_accepts_the_single_final_decode_abi():
 
 def test_mock_io_leaves_miss_payload_and_descriptors_unchanged():
     arguments = _mock_io_arguments()
-    arguments["miss_mask"][0, 0] = True
-    arguments["resolved_hot_indices"][0, 0] = 3
+    arguments["miss_out"][0, 0] = 1
+    arguments["slot_out"][0, 0] = 3
     arguments["hot_planes"] = (
         torch.full(
             (4, 4, 1, 8),
@@ -105,12 +102,13 @@ def test_mock_io_leaves_miss_payload_and_descriptors_unchanged():
         ),
     )
     tensor_names = (
-        "topk_positions",
-        "resolved_hot_indices",
-        "miss_mask",
+        "query_index",
+        "slot_out",
+        "miss_out",
+        "req_pool_entries",
         "block_table",
         "write_global_slots",
-        "write_destination_hot_row_ids",
+        "write_destination_slots",
         "write_valid_mask",
     )
     before = {
@@ -130,20 +128,17 @@ def test_mock_io_leaves_miss_payload_and_descriptors_unchanged():
         assert torch.equal(plane, expected)
 
 
-def test_mock_io_validates_shapes_without_reading_tensor_values():
+def test_mock_io_requires_compact_output_shapes():
     arguments = _mock_io_arguments()
-    arguments["miss_mask"] = torch.zeros((1, 4), dtype=torch.bool)
+    arguments["miss_out"] = torch.zeros((1, 2048), dtype=torch.int32)
 
-    with pytest.raises(ValueError, match="Top-K tensor shape"):
+    with pytest.raises(AssertionError):
         MockDSASparseIOOperator().dsa_sparse_io(**arguments)
 
 
-def test_mock_io_rejects_non_int32_block_table():
+def test_mock_io_requires_int32_lookup_tensors():
     arguments = _mock_io_arguments()
-    arguments["block_table"] = torch.zeros(
-        (2, 8),
-        dtype=torch.int64,
-    )
+    arguments["slot_out"] = arguments["slot_out"].to(torch.int64)
 
-    with pytest.raises(TypeError, match="block_table must use int32"):
+    with pytest.raises(AssertionError):
         MockDSASparseIOOperator().dsa_sparse_io(**arguments)

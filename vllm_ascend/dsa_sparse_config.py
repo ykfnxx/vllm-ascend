@@ -6,6 +6,13 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Literal
 
+from vllm_ascend.dsa_sparse_constants import (
+    DSA_SPARSE_FREE_SLOT_COUNT,
+    DSA_SPARSE_INDEX_CAPACITY,
+    DSA_SPARSE_QUERY_WIDTH,
+    DSA_SPARSE_RESIDENT_SLOT_COUNT,
+)
+
 DSASparseKVRole = Literal["kv_producer", "kv_consumer"]
 DSA_SPARSE_MOCK_IO_BACKEND = "mock"
 
@@ -17,8 +24,6 @@ class DSASparseConfig:
     io_backend: str
     io_backend_options: Mapping[str, Any]
     kv_role: DSASparseKVRole
-    device_buffer_size: int | None
-    max_query_tokens_per_request: int
     index_topk: int
 
     @property
@@ -53,7 +58,6 @@ def load_dsa_sparse_config(vllm_config: object) -> DSASparseConfig | None:
     allowed_keys = {
         "io_backend",
         "io_backend_options",
-        "device_buffer_size",
     }
     unknown_keys = sorted(set(raw_config) - allowed_keys)
     if unknown_keys:
@@ -96,32 +100,37 @@ def load_dsa_sparse_config(vllm_config: object) -> DSASparseConfig | None:
     _require_parallel_size(parallel_config, "decode_context_parallel_size")
     _require_parallel_size(parallel_config, "prefill_context_parallel_size")
 
+    _require_no_speculative_tokens(vllm_config)
     index_topk = _get_index_topk(model_config)
-    device_buffer_size = raw_config.get("device_buffer_size")
-    if kv_role == "kv_producer":
-        max_query_tokens_per_request = 1
-        if device_buffer_size is not None:
-            raise ValueError("dsa_sparse_config.device_buffer_size is Decode-only and must not be set for kv_producer.")
-    else:
-        max_query_tokens_per_request = _get_max_query_tokens_per_request(vllm_config)
-        if isinstance(device_buffer_size, bool) or not isinstance(device_buffer_size, int):
-            raise ValueError("dsa_sparse_config.device_buffer_size must be a positive integer for kv_consumer.")
-        if device_buffer_size <= 0:
-            raise ValueError("dsa_sparse_config.device_buffer_size must be a positive integer for kv_consumer.")
-        minimum_size = max_query_tokens_per_request * index_topk
-        if device_buffer_size < minimum_size:
-            raise ValueError(
-                "dsa_sparse_config.device_buffer_size must hold the complete "
-                f"per-request Top-K union, expected at least {minimum_size}, "
-                f"got {device_buffer_size}."
-            )
+    if index_topk != DSA_SPARSE_QUERY_WIDTH:
+        raise ValueError(
+            f"DSA Sparse requires index_topk={DSA_SPARSE_QUERY_WIDTH}, "
+            f"got {index_topk}."
+        )
+    max_model_len = getattr(model_config, "max_model_len", None)
+    if (
+        not isinstance(max_model_len, int)
+        or not 0 < max_model_len <= DSA_SPARSE_INDEX_CAPACITY
+    ):
+        raise ValueError(
+            "DSA Sparse max_model_len must fit the 128K ASU index."
+        )
+    cache_config = getattr(vllm_config, "cache_config", None)
+    block_size = getattr(cache_config, "block_size", None)
+    if (
+        not isinstance(block_size, int)
+        or block_size <= 0
+        or DSA_SPARSE_RESIDENT_SLOT_COUNT % block_size
+        or DSA_SPARSE_FREE_SLOT_COUNT % block_size
+    ):
+        raise ValueError(
+            "DSA Sparse block_size must divide the 8K resident and 2K free regions."
+        )
 
     return DSASparseConfig(
         io_backend=io_backend,
         io_backend_options=MappingProxyType(dict(io_backend_options)),
         kv_role=kv_role,
-        device_buffer_size=device_buffer_size,
-        max_query_tokens_per_request=max_query_tokens_per_request,
         index_topk=index_topk,
     )
 
@@ -146,7 +155,7 @@ def _get_index_topk(model_config: object) -> int:
     raise ValueError("DSA Sparse requires a positive GLM-5 index_topk.")
 
 
-def _get_max_query_tokens_per_request(vllm_config: object) -> int:
+def _require_no_speculative_tokens(vllm_config: object) -> None:
     speculative_config = getattr(vllm_config, "speculative_config", None)
     num_speculative_tokens = (
         getattr(speculative_config, "num_speculative_tokens", 0) if speculative_config is not None else 0
@@ -161,7 +170,6 @@ def _get_max_query_tokens_per_request(vllm_config: object) -> int:
             "This DSA Sparse eager milestone supports target decode only; "
             "speculative tokens require a separate draft Hot Cache runtime."
         )
-    return 1
 
 
 def _require_parallel_size(parallel_config: object, field: str) -> None:

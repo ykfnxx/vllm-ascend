@@ -1542,15 +1542,15 @@ class AscendSFAImpl(MLAAttentionImpl):
     ) -> torch.Tensor:
         """Call the existing SFA implementation with a resolved Hot Cache view."""
 
-        local_sparse_indices = (
-            resolution.local_sparse_indices.unsqueeze(1)
+        attention_indices = (
+            resolution.attention_indices.unsqueeze(1)
         )
         output = DeviceOperator.execute_sparse_flash_attention_process(
             self,
             ql_nope,
             q_pe,
             resolution.hot_main_cache,
-            local_sparse_indices,
+            attention_indices,
             attn_metadata,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
@@ -1570,7 +1570,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     for plane in resolution.hot_main_cache
                 ],
                 sparse_indices_shape=list(
-                    local_sparse_indices.shape
+                    attention_indices.shape
                 ),
                 hot_block_table_ptr=(
                     resolution.hot_block_table.data_ptr()
@@ -1645,10 +1645,10 @@ class AscendSFAImpl(MLAAttentionImpl):
                 or attn_metadata.sfa_cp_metadata is not None
             ):
                 raise RuntimeError("DSA Sparse eager does not support context-parallel SFA.")
-            if attn_metadata.attn_state not in {
-                AscendAttentionState.DecodeOnly,
-                AscendAttentionState.SpecDecoding,
-            }:
+            if (
+                attn_metadata.attn_state
+                != AscendAttentionState.DecodeOnly
+            ):
                 raise RuntimeError("DSA Sparse eager does not support D-side prefill or mixed batches.")
             if dsa_sparse_context.num_sfa_queries != attn_metadata.num_input_tokens:
                 raise RuntimeError("DSA Sparse eager query view does not match the SFA token batch.")
@@ -1678,8 +1678,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             else attn_metadata.slot_mapping
         )
         if dsa_sparse_write_target is not None:
-            slot_mapping_sfa = dsa_sparse_write_target.reserved_slot_mapping
-            main_slot_mapping = dsa_sparse_write_target.reserved_slot_mapping
+            slot_mapping_sfa = dsa_sparse_write_target.slot_mapping
+            main_slot_mapping = dsa_sparse_write_target.slot_mapping
 
         # Inputs and outputs may be padded for CUDA graphs
         num_input_tokens = attn_metadata.num_input_tokens

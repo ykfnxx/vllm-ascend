@@ -320,14 +320,12 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner.use_sparse = True
         runner.max_num_reqs = 2
         runner.max_num_tokens = 8
-        runner.block_size = 4
+        runner.block_size = 128
         runner.kv_cache_dtype = torch.bfloat16
-        runner.model_config.max_model_len = 10
+        runner.model_config.max_model_len = 512
         runner.ascend_config.dsa_sparse_config = SimpleNamespace(
             kv_role="kv_consumer",
-            device_buffer_size=7,
-            max_query_tokens_per_request=2,
-            index_topk=3,
+            index_topk=2048,
         )
         runner._dsa_sparse_fixed_hbm_breakdown = None
 
@@ -357,10 +355,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         breakdown = runner._dsa_sparse_fixed_hbm_breakdown
         self.assertIsNotNone(breakdown)
         self.assertEqual(breakdown.cohort_count, 2)
-        self.assertEqual(
-            breakdown.eager_execution_reserve_bytes_per_cohort,
-            272,
-        )
+        self.assertGreater(breakdown.lookup_state_bytes_per_cohort, 0)
         self.assertEqual(
             fixed_hbm_bytes,
             breakdown.fixed_hbm_bytes,
@@ -1009,7 +1004,7 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
 
         result = runner._begin_dsa_sparse_eager_execution(
             num_reqs=2,
-            num_scheduled_tokens=np.array([1, 2], dtype=np.int32),
+            num_scheduled_tokens=np.array([1, 1], dtype=np.int32),
             positions=positions,
             attn_metadata=metadata,
         )
@@ -1017,14 +1012,25 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
         self.assertIs(result, execution)
         call = runtime.begin_target_batch.call_args
         self.assertEqual(call.kwargs["request_ids"], ["request-a", "request-b"])
-        self.assertEqual(call.kwargs["query_counts"], [1, 2])
         self.assertTrue(
             torch.equal(
                 call.kwargs["query_positions"],
-                torch.tensor([5, 9, 10], dtype=torch.int64),
+                torch.tensor([5, 9], dtype=torch.int64),
             )
         )
         self.assertIs(call.kwargs["layer_metadata"], metadata)
+
+    def test_rejects_more_than_one_decode_token_per_request(self):
+        runner = self._build_runner()
+        runner.bind_dsa_sparse_eager_runtime(MagicMock())
+
+        with self.assertRaisesRegex(RuntimeError, "exactly one"):
+            runner._begin_dsa_sparse_eager_execution(
+                num_reqs=2,
+                num_scheduled_tokens=np.array([1, 2], dtype=np.int32),
+                positions=torch.tensor([5, 9, 10]),
+                attn_metadata={},
+            )
 
     def test_consumer_without_runtime_fails_instead_of_falling_back(self):
         runner = self._build_runner()
@@ -1042,6 +1048,15 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
         runner.bind_dsa_sparse_eager_runtime(MagicMock())
         runner.attn_state = AscendAttentionState.PrefillNoCache
 
+        with self.assertRaisesRegex(RuntimeError, "DecodeOnly"):
+            runner._begin_dsa_sparse_eager_execution(
+                num_reqs=1,
+                num_scheduled_tokens=np.array([1], dtype=np.int32),
+                positions=torch.tensor([5]),
+                attn_metadata={},
+            )
+
+        runner.attn_state = AscendAttentionState.SpecDecoding
         with self.assertRaisesRegex(RuntimeError, "DecodeOnly"):
             runner._begin_dsa_sparse_eager_execution(
                 num_reqs=1,

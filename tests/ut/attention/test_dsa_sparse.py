@@ -5,228 +5,104 @@ import pytest
 import torch
 
 from vllm_ascend.attention.dsa_sparse import (
-    INVALID_INDEX,
     DSASparseCacheConfig,
     DSASparseCohortKey,
-    DSASparseLayerHotCache,
-    DSASparseLayerLayout,
-    DSASparseBatchMetadata,
-    DSASparsePlan,
-    DSASparsePlanKey,
-    DSASparseResidencyState,
+    DSASparseLookupState,
     RequestIndexManager,
-    UnimplementedDSASparseLookupUpdateOperator,
-    dsa_sparse_lookup_workspace_stride,
+)
+from vllm_ascend.dsa_sparse_constants import (
+    DSA_SPARSE_FREE_HEAD_STRIDE,
+    DSA_SPARSE_FREE_SLOT_COUNT,
+    DSA_SPARSE_INDEX_CAPACITY,
+    DSA_SPARSE_LOOKUP_SLOT_COUNT,
+    DSA_SPARSE_QUERY_WIDTH,
+    DSA_SPARSE_RESIDENT_SLOT_COUNT,
 )
 
 
-def make_cache_config() -> DSASparseCacheConfig:
-    return DSASparseCacheConfig(
+def test_cache_config_freezes_asu_dimensions_and_live_tail_layout():
+    config = DSASparseCacheConfig(
         max_num_seqs=3,
-        max_model_len=128,
-        block_size=16,
-        device_buffer_size=32,
-        max_query_tokens_per_request=4,
-        index_topk=8,
+        max_model_len=4096,
+        block_size=128,
+        index_topk=DSA_SPARSE_QUERY_WIDTH,
     )
 
-
-def test_cache_config_accounts_for_reserved_and_aligned_slots():
-    config = make_cache_config()
-
-    assert config.max_topk_union_width == 32
-    assert config.evictable_hot_slots == range(0, 32)
-    assert config.reserved_newest_slots == range(32, 36)
-    assert config.alignment_padding_slots == range(36, 48)
-    assert config.managed_hot_width == 36
-    assert config.hot_stride == 48
-    assert config.hot_blocks_per_request == 3
-    assert config.total_hot_blocks == 9
+    assert config.index_capacity == DSA_SPARSE_INDEX_CAPACITY
+    assert config.resident_slot_count == DSA_SPARSE_RESIDENT_SLOT_COUNT
+    assert config.free_slot_count == DSA_SPARSE_FREE_SLOT_COUNT
+    assert config.lookup_slot_count == DSA_SPARSE_LOOKUP_SLOT_COUNT
+    assert config.live_tail_start == DSA_SPARSE_LOOKUP_SLOT_COUNT
+    assert config.hot_stride == DSA_SPARSE_LOOKUP_SLOT_COUNT + 128
+    assert config.hot_blocks_per_request == 81
+    assert config.total_hot_blocks == 243
 
 
-def test_cache_config_rejects_topk_union_larger_than_evictable_cache():
-    with pytest.raises(ValueError, match="complete per-request Top-K union"):
+def test_cache_config_rejects_non_asu_topk_and_incompatible_block_size():
+    with pytest.raises(ValueError, match="index_topk"):
         DSASparseCacheConfig(
-            max_num_seqs=3,
-            max_model_len=128,
-            block_size=16,
-            device_buffer_size=31,
-            max_query_tokens_per_request=4,
-            index_topk=8,
+            max_num_seqs=1,
+            max_model_len=4096,
+            block_size=128,
+            index_topk=1024,
+        )
+    with pytest.raises(ValueError, match="block_size"):
+        DSASparseCacheConfig(
+            max_num_seqs=1,
+            max_model_len=4096,
+            block_size=192,
+            index_topk=DSA_SPARSE_QUERY_WIDTH,
         )
 
 
-def test_cache_config_rejects_more_than_four_query_lanes():
-    with pytest.raises(ValueError, match="operator limit of 4"):
-        DSASparseCacheConfig(
-            max_num_seqs=3,
-            max_model_len=128,
-            block_size=16,
-            device_buffer_size=40,
-            max_query_tokens_per_request=5,
-            index_topk=8,
-        )
-
-
-def test_request_index_manager_keeps_index_stable_across_batch_reorder():
-    manager = RequestIndexManager(max_num_seqs=3)
-    first = manager.acquire("request-a")
-    second = manager.acquire("request-b")
-
-    assert manager.get_index("request-b") == second
-    assert manager.get_index("request-a") == first
-
-
-def test_request_index_reuse_returns_the_released_index():
-    manager = RequestIndexManager(max_num_seqs=1)
-    previous = manager.acquire("request-a")
-    manager.release("request-a")
-    current = manager.acquire("request-b")
-
-    assert current == previous
-
-
-def test_request_index_manager_rejects_duplicate_request():
-    manager = RequestIndexManager(max_num_seqs=2)
-    manager.acquire("request-a")
-
-    with pytest.raises(ValueError, match="already owns"):
-        manager.acquire("request-a")
-
-
-def test_residency_state_excludes_reserved_slots_from_lru():
-    config = make_cache_config()
-    cohort = DSASparseCohortKey(name="layers.0-3", role="target")
-    state = DSASparseResidencyState.allocate(
+def test_lookup_state_uses_four_asu_tensors_and_resets_released_row():
+    config = DSASparseCacheConfig(
+        max_num_seqs=2,
+        max_model_len=4096,
+        block_size=128,
+        index_topk=DSA_SPARSE_QUERY_WIDTH,
+    )
+    state = DSASparseLookupState.allocate(
         config,
-        cohort,
+        DSASparseCohortKey("cohort", "target"),
         device="cpu",
     )
 
-    assert state.cohort is cohort
-    assert state.token_to_hot.shape == (3, 128)
-    assert state.hot_to_token.shape == (3, 32)
-    assert state.lru_slots.shape == (3, 32)
-    assert state.lru_slots[0].tolist() == list(range(32))
-    assert torch.all(state.token_to_hot == INVALID_INDEX)
-    assert torch.all(state.hot_to_token == INVALID_INDEX)
-
-
-def test_plan_uses_fixed_shapes_and_hot_block_stride():
-    config = make_cache_config()
-    key = DSASparsePlanKey(
-        token_capacity=8,
-        request_capacity=2,
-        query_lane_capacity=4,
-        role="target",
-    )
-    plan = DSASparsePlan.allocate(config, key, device="cpu")
-
-    assert plan.resolved_hot_indices.shape == (8, 8)
-    assert plan.miss_mask.shape == (8, 8)
-    assert plan.workspace.shape == (
+    assert state.index.shape == (2, DSA_SPARSE_INDEX_CAPACITY)
+    assert state.slot_to_index.shape == (
         2,
-        dsa_sparse_lookup_workspace_stride(32),
+        DSA_SPARSE_LOOKUP_SLOT_COUNT,
     )
-    assert plan.hot_block_table.shape == (2, 3)
-    assert plan.query_positions.shape == (8,)
-    assert plan.query_to_req_idx.tolist() == [0, 0, 0, 0, 1, 1, 1, 1]
-    assert plan.query_to_lane.tolist() == [0, 1, 2, 3, 0, 1, 2, 3]
-    assert plan.query_valid_mask.shape == (8,)
-    assert plan.valid_topk_counts.shape == (8,)
-    assert plan.topk_positions.shape == (8, 8)
-    assert plan.seq_lens.shape == (2,)
-    assert plan.block_table.shape == (2, 8)
-    assert plan.write_global_slots.shape == (2, 4)
-    assert plan.write_destination_hot_row_ids.shape == (2, 4)
-    assert plan.write_valid_mask.shape == (2, 4)
+    assert state.free_slots.shape == (2, DSA_SPARSE_FREE_SLOT_COUNT)
+    assert state.free_head.shape == (2, DSA_SPARSE_FREE_HEAD_STRIDE)
+    assert state.free_slots[0, 0].item() == DSA_SPARSE_RESIDENT_SLOT_COUNT
+    assert state.free_slots[0, -1].item() == DSA_SPARSE_LOOKUP_SLOT_COUNT - 1
+
+    state.initialize_resident(0)
+    assert state.index[0, 0].item() == 0
+    assert state.index[0, 8191].item() == 8191
+    assert state.slot_to_index[0, 0].item() == 0
+    assert state.slot_to_index[0, 8191].item() == 8191
+
+    state.index[1, 7] = 9
+    state.slot_to_index[1, 3] = 7
+    state.free_slots[1].fill_(-1)
+    state.free_head[1].fill_(6)
+    state.reset_request(1)
+
+    assert state.index[1].eq(-1).all()
+    assert state.slot_to_index[1].eq(-1).all()
+    assert state.free_slots[1, 0].item() == DSA_SPARSE_RESIDENT_SLOT_COUNT
+    assert state.free_slots[1, -1].item() == DSA_SPARSE_LOOKUP_SLOT_COUNT - 1
+    assert state.free_head[1].eq(0).all()
 
 
-@pytest.mark.parametrize(
-    ("plane_dtypes", "plane_row_shapes", "expected_shapes"),
-    [
-        (
-            (torch.bfloat16, torch.bfloat16),
-            ((1, 512), (1, 64)),
-            ((9, 16, 1, 512), (9, 16, 1, 64)),
-        ),
-        (
-            (torch.int8,),
-            ((1, 704),),
-            ((9, 16, 1, 704),),
-        ),
-    ],
-)
-def test_layer_hot_cache_preserves_existing_sfa_plane_layout(
-    plane_dtypes,
-    plane_row_shapes,
-    expected_shapes,
-):
-    config = make_cache_config()
-    layout = DSASparseLayerLayout(
-        layer_name="model.layers.0.self_attn",
-        plane_dtypes=plane_dtypes,
-        plane_row_shapes=plane_row_shapes,
-    )
+def test_request_index_is_stable_and_can_be_non_contiguous():
+    manager = RequestIndexManager(3)
+    assert manager.acquire("a") == 0
+    assert manager.acquire("b") == 1
+    assert manager.acquire("c") == 2
+    assert manager.release("b") == 1
 
-    hot_cache = DSASparseLayerHotCache.allocate(
-        layout,
-        config,
-        device="cpu",
-    )
-
-    assert tuple(plane.shape for plane in hot_cache.planes) == expected_shapes
-    assert tuple(plane.dtype for plane in hot_cache.planes) == plane_dtypes
-
-
-def test_unimplemented_lookup_update_operator_is_an_explicit_stub():
-    operator = UnimplementedDSASparseLookupUpdateOperator()
-
-    with pytest.raises(NotImplementedError, match="lookup/update"):
-        operator.lookup_update()
-
-
-def test_plans_can_share_role_level_batch_metadata():
-    config = make_cache_config()
-    key = DSASparsePlanKey(
-        token_capacity=8,
-        request_capacity=2,
-        query_lane_capacity=4,
-        role="target",
-    )
-    metadata = DSASparseBatchMetadata.allocate(
-        config,
-        key,
-        device="cpu",
-    )
-    first = DSASparsePlan.allocate(
-        config,
-        key,
-        device="cpu",
-        batch_metadata=metadata,
-    )
-    second = DSASparsePlan.allocate(
-        config,
-        key,
-        device="cpu",
-        batch_metadata=metadata,
-    )
-
-    assert first.batch_metadata is second.batch_metadata
-    assert first.topk_positions.data_ptr() != second.topk_positions.data_ptr()
-    assert first.workspace.data_ptr() != second.workspace.data_ptr()
-
-
-def test_plan_key_rejects_non_rectangular_query_mapping():
-    with pytest.raises(ValueError, match="token_capacity must equal"):
-        DSASparsePlanKey(
-            token_capacity=7,
-            request_capacity=2,
-            query_lane_capacity=4,
-            role="target",
-        )
-
-
-def test_cohort_role_is_limited_to_target_and_draft():
-    with pytest.raises(ValueError, match="target.*draft"):
-        DSASparseCohortKey(name="layers.0-3", role="invalid")
+    assert manager.get_index("a") == 0
+    assert manager.get_index("c") == 2

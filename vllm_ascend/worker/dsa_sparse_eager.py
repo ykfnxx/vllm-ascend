@@ -11,7 +11,6 @@ import torch
 
 from vllm_ascend import dsa_sparse_probe
 from vllm_ascend.attention.dsa_sparse import (
-    DSASparseBatchMetadata,
     DSASparseCacheConfig,
     DSASparseCohort,
     DSASparseCohortKey,
@@ -21,10 +20,10 @@ from vllm_ascend.attention.dsa_sparse import (
     DSASparseLayerBinding,
     DSASparseLayerHotCache,
     DSASparseLayerLayout,
-    DSASparseLookupUpdateOperator,
-    DSASparsePlan,
-    DSASparsePlanKey,
-    DSASparseResidencyState,
+    DSASparseLookupOperator,
+    DSASparseLookupState,
+    DSASparseStepMetadata,
+    UnimplementedDSASparseLookupOperator,
 )
 from vllm_ascend.attention.dsa_sparse_io import (
     DSASparseIOOperator,
@@ -51,7 +50,6 @@ class DSASparseEagerCohortDescriptor:
     """Runner-visible routing information for one IndexCache cohort."""
 
     cohort_key: DSASparseCohortKey
-    plan_key: DSASparsePlanKey
     layer_names: tuple[str, ...]
     leader_layer: str
 
@@ -66,7 +64,7 @@ class DSASparseEagerCohortDescriptor:
             raise ValueError("DSA Sparse eager layer names must not be empty.")
         if self.leader_layer not in self.layer_names:
             raise ValueError("The DSA Sparse eager cohort leader must be one of its layers.")
-        if self.cohort_key.role != "target" or self.plan_key.role != "target":
+        if self.cohort_key.role != "target":
             raise ValueError("begin_target_batch only accepts target DSA Sparse cohorts.")
 
 
@@ -121,15 +119,14 @@ def create_dsa_sparse_eager_mock_runtime(
     cohort_layouts: Iterable[DSASparseEagerCohortLayout],
     *,
     device: torch.device | str,
-    index_operator: DSASparseLookupUpdateOperator | None = None,
+    lookup_operator: DSASparseLookupOperator | None = None,
     io_operator: DSASparseIOOperator | None = None,
 ) -> DSASparseEagerRuntime:
     """Allocate the target-only eager runtime with a no-op I/O fixture.
 
-    The lookup/update path uses the formal Ascend 950 custom operator unless a
-    test explicitly injects another implementation.  The I/O fixture preserves
-    the final one-call-per-layer ABI but moves no payload; it is not a storage
-    backend and cannot establish model accuracy when a history miss occurs.
+    Lookup is an injected protocol in this framework milestone. The default
+    implementation is explicitly unimplemented. The I/O fixture preserves one
+    call per layer but moves no payload.
     """
 
     cohort_layouts = tuple(cohort_layouts)
@@ -143,30 +140,15 @@ def create_dsa_sparse_eager_mock_runtime(
     if len(set(all_layer_names)) != len(all_layer_names):
         raise ValueError("Each DSA Sparse Main layer must belong to exactly one eager cohort.")
 
-    if index_operator is None:
-        from vllm_ascend.ops.dsa_sparse import (
-            DSASparseLookupUpdateTorchOperator,
-        )
-
-        index_operator = DSASparseLookupUpdateTorchOperator()
+    if lookup_operator is None:
+        lookup_operator = UnimplementedDSASparseLookupOperator()
     if io_operator is None:
         io_operator = MockDSASparseIOOperator()
 
     coordinator = DSASparseEagerCoordinator(
         config,
-        index_operator=index_operator,
+        lookup_operator=lookup_operator,
         io_operator=io_operator,
-    )
-    plan_key = DSASparsePlanKey(
-        token_capacity=(config.max_num_seqs * config.max_query_tokens_per_request),
-        request_capacity=config.max_num_seqs,
-        query_lane_capacity=config.max_query_tokens_per_request,
-        role="target",
-    )
-    batch_metadata = DSASparseBatchMetadata.allocate(
-        config,
-        plan_key,
-        device=device,
     )
     descriptors: list[DSASparseEagerCohortDescriptor] = []
     for cohort_layout in cohort_layouts:
@@ -178,19 +160,11 @@ def create_dsa_sparse_eager_mock_runtime(
             DSASparseCohort(
                 key=cohort_key,
                 leader_layer=cohort_layout.leader_layer,
-                state=DSASparseResidencyState.allocate(
+                state=DSASparseLookupState.allocate(
                     config,
                     cohort_key,
                     device=device,
                 ),
-                plans={
-                    plan_key: DSASparsePlan.allocate(
-                        config,
-                        plan_key,
-                        device=device,
-                        batch_metadata=batch_metadata,
-                    )
-                },
             )
         )
         for layer_layout in cohort_layout.layer_layouts:
@@ -221,7 +195,6 @@ def create_dsa_sparse_eager_mock_runtime(
         descriptors.append(
             DSASparseEagerCohortDescriptor(
                 cohort_key=cohort_key,
-                plan_key=plan_key,
                 layer_names=cohort_layout.layer_names,
                 leader_layer=cohort_layout.leader_layer,
             )
@@ -457,36 +430,31 @@ class DSASparseEagerRuntime:
         *,
         request_ids: Sequence[Hashable],
         query_positions: torch.Tensor,
-        query_counts: Sequence[int],
         layer_metadata: Mapping[str, object],
     ) -> DSASparseEagerExecution:
         """Begin every cohort and attach one shared router to layer metadata."""
 
         request_ids = list(request_ids)
-        query_counts = list(query_counts)
-        request_indices = [
-            self.coordinator.request_index(request_id)
-            for request_id in request_ids
-        ]
         metadata_by_layer = self._resolve_layer_metadata(layer_metadata)
         unique_metadata = _unique_by_identity(metadata_by_layer.values())
         self._reject_existing_contexts(unique_metadata)
+        first_descriptor = self.cohort_descriptors[0]
+        first_metadata = metadata_by_layer[first_descriptor.leader_layer]
+        step_metadata = self._build_step_metadata(
+            first_metadata,
+            request_ids=request_ids,
+            query_positions=query_positions,
+        )
 
         contexts: list[DSASparseEagerBatchContext] = []
         layer_contexts: dict[str, DSASparseEagerBatchContext] = {}
         try:
-            for cohort_index, descriptor in enumerate(
-                self.cohort_descriptors
-            ):
+            for descriptor in self.cohort_descriptors:
                 leader_metadata = metadata_by_layer[descriptor.leader_layer]
                 context = self._begin_cohort(
                     descriptor,
                     leader_metadata=leader_metadata,
-                    request_ids=request_ids,
-                    request_indices=request_indices,
-                    query_positions=query_positions,
-                    query_counts=query_counts,
-                    stage_batch_metadata=cohort_index == 0,
+                    metadata=step_metadata,
                 )
                 contexts.append(context)
                 layer_contexts.update(dict.fromkeys(descriptor.layer_names, context))
@@ -528,7 +496,6 @@ class DSASparseEagerRuntime:
     def _validate_descriptors(self) -> None:
         cohort_keys: set[DSASparseCohortKey] = set()
         layer_names: set[str] = set()
-        shared_batch_metadata: object | None = None
         for descriptor in self.cohort_descriptors:
             if descriptor.cohort_key in cohort_keys:
                 raise ValueError("Each DSA Sparse eager cohort may be described only once.")
@@ -542,18 +509,6 @@ class DSASparseEagerRuntime:
                 raise ValueError(
                     "DSA Sparse runtime leader does not match the registered "
                     f"cohort leader for {descriptor.cohort_key!r}."
-                )
-            if descriptor.plan_key not in cohort.plans:
-                raise ValueError(
-                    f"DSA Sparse plan {descriptor.plan_key!r} is not registered for cohort {descriptor.cohort_key!r}."
-                )
-            plan = cohort.plans[descriptor.plan_key]
-            if shared_batch_metadata is None:
-                shared_batch_metadata = plan.batch_metadata
-            elif plan.batch_metadata is not shared_batch_metadata:
-                raise ValueError(
-                    "All target DSA Sparse cohorts must share one role-level "
-                    "batch metadata allocation."
                 )
             for layer_name in descriptor.layer_names:
                 self.coordinator.get_layer_binding(
@@ -603,11 +558,7 @@ class DSASparseEagerRuntime:
         descriptor: DSASparseEagerCohortDescriptor,
         *,
         leader_metadata: DSASparseEagerLayerMetadata,
-        request_ids: list[Hashable],
-        request_indices: list[int],
-        query_positions: torch.Tensor,
-        query_counts: list[int],
-        stage_batch_metadata: bool,
+        metadata: DSASparseStepMetadata,
     ) -> DSASparseEagerBatchContext:
         num_input_tokens = _metadata_integer(
             leader_metadata,
@@ -617,31 +568,46 @@ class DSASparseEagerRuntime:
             leader_metadata,
             "num_actual_tokens",
         )
-        num_active_queries = sum(query_counts)
-        if num_actual_tokens != num_active_queries:
+        num_requests = len(metadata.request_ids)
+        if num_actual_tokens != num_requests:
             raise ValueError(
                 "DSA Sparse leader num_actual_tokens must equal the active "
                 f"query count, got {num_actual_tokens} and "
-                f"{num_active_queries}."
+                f"{num_requests}."
             )
-        if num_input_tokens < num_actual_tokens:
-            raise ValueError("DSA Sparse leader num_input_tokens must cover all actual tokens.")
-
-        seq_lens = _metadata_tensor(leader_metadata, "seq_lens")
-        block_table = _metadata_tensor(leader_metadata, "block_table")
-        num_requests = len(request_ids)
+        if num_input_tokens != num_actual_tokens:
+            raise ValueError(
+                "DSA Sparse eager requires an unpadded single-token Decode batch."
+            )
         return DSASparseEagerBatchContext.begin(
             self.coordinator,
             descriptor.cohort_key,
-            descriptor.plan_key,
+            metadata=metadata,
+        )
+
+    def _build_step_metadata(
+        self,
+        leader_metadata: DSASparseEagerLayerMetadata,
+        *,
+        request_ids: list[Hashable],
+        query_positions: torch.Tensor,
+    ) -> DSASparseStepMetadata:
+        num_requests = len(request_ids)
+        if query_positions.shape != (num_requests,):
+            raise ValueError(
+                "query_positions must contain one token per request."
+            )
+        return self.coordinator.build_step_metadata(
             request_ids=request_ids,
-            request_indices=request_indices,
             query_positions=query_positions,
-            query_counts=query_counts,
-            seq_lens=seq_lens[:num_requests],
-            block_table=block_table[:num_requests],
-            num_sfa_queries=num_input_tokens,
-            stage_batch_metadata=stage_batch_metadata,
+            seq_lens=_metadata_tensor(
+                leader_metadata,
+                "seq_lens",
+            )[:num_requests],
+            block_table=_metadata_tensor(
+                leader_metadata,
+                "block_table",
+            )[:num_requests],
         )
 
 
