@@ -15,12 +15,15 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.dsa_sparse_io import MockDSASparseIOOperator
+from vllm_ascend.attention.dsa_sparse_pd import DSASparsePDHandoff
 from vllm_ascend.attention.indexer import (
     AscendSFAIndexerBackend,
     AscendSFAIndexerMetadataBuilder,
 )
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
+from vllm_ascend.dsa_sparse_constants import DSA_SPARSE_QUERY_WIDTH
 from vllm_ascend.worker.dsa_sparse_external_main import (
     DSASparseExternalMainSpecs,
 )
@@ -944,8 +947,23 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
             )
         )
         runner.dsa_sparse_eager_runtime = None
+        runner.dsa_sparse_mock_io_operator = (
+            MockDSASparseIOOperator()
+        )
+        runner._dsa_sparse_pd_handoffs = {}
         runner.attn_state = AscendAttentionState.DecodeOnly
         runner.input_batch = SimpleNamespace(req_ids=["request-a", "request-b", None])
+        runner.requests = {
+            "request-a": SimpleNamespace(
+                num_prompt_tokens=1,
+                num_computed_tokens=0,
+            ),
+            "request-b": SimpleNamespace(
+                num_prompt_tokens=1,
+                num_computed_tokens=0,
+            ),
+        }
+        runner.block_size = 128
         return runner
 
     @patch("vllm_ascend.worker.model_runner_v1.create_dsa_sparse_eager_mock_runtime")
@@ -973,6 +991,7 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
             cache_config,
             cohort_layouts,
             device=torch.device("cpu"),
+            io_operator=runner.dsa_sparse_mock_io_operator,
         )
         self.assertIs(runner.dsa_sparse_eager_runtime, runtime)
 
@@ -1074,20 +1093,28 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
                 attn_metadata=[{}],
             )
 
-    def test_producer_keeps_baseline_and_cannot_bind_decode_runtime(self):
+    def test_producer_attaches_publication_context_and_cannot_bind_decode_runtime(self):
         runner = self._build_runner(consumer=False)
 
         with self.assertRaisesRegex(RuntimeError, "Decode KV consumer"):
             runner.bind_dsa_sparse_eager_runtime(MagicMock())
 
+        metadata = SimpleNamespace(
+            block_table=torch.tensor([[1]], dtype=torch.int32),
+            dsa_sparse_producer_context=None,
+        )
         execution = runner._begin_dsa_sparse_eager_execution(
             num_reqs=1,
             num_scheduled_tokens=np.array([1], dtype=np.int32),
             positions=torch.tensor([5]),
-            attn_metadata={},
+            attn_metadata={"model.layers.0.self_attn.attn": metadata},
         )
-        with execution:
-            pass
+        with execution as context:
+            self.assertIs(
+                metadata.dsa_sparse_producer_context,
+                context,
+            )
+        self.assertIsNone(metadata.dsa_sparse_producer_context)
 
     @patch(
         "vllm_ascend.worker.model_runner_v1.GPUModelRunner._update_states",
@@ -1138,6 +1165,64 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
                 call("new"),
                 call("resumed"),
             ],
+        )
+
+    @patch(
+        "vllm_ascend.worker.model_runner_v1.get_tp_group",
+        return_value=SimpleNamespace(rank_in_group=0),
+    )
+    @patch(
+        "vllm_ascend.worker.model_runner_v1.GPUModelRunner._update_states",
+        return_value=None,
+    )
+    def test_update_states_initializes_new_request_from_pd_handoff(
+        self,
+        _mock_upstream_update,
+        _mock_tp_group,
+    ):
+        runner = self._build_runner()
+        runner.use_async_scheduling = False
+        runtime = MagicMock()
+        runtime.uses_mock_lifecycle = True
+        runner.dsa_sparse_eager_runtime = runtime
+        handoff = DSASparsePDHandoff(
+            remote_request_id="prefill-request",
+            stored_token_count=128,
+            block_size=128,
+            layer_topk_by_rank={
+                0: {
+                    "model.layers.0.self_attn.attn": list(
+                        range(DSA_SPARSE_QUERY_WIDTH)
+                    ),
+                },
+            },
+        )
+        scheduler_output = SimpleNamespace(
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=[],
+                num_computed_tokens=[],
+                resumed_req_ids=[],
+            ),
+            finished_req_ids=set(),
+            preempted_req_ids=set(),
+            scheduled_new_reqs=[
+                SimpleNamespace(req_id="new"),
+            ],
+            kv_connector_metadata=SimpleNamespace(
+                requests={
+                    "new": SimpleNamespace(
+                        dsa_sparse_handoff=handoff
+                    ),
+                }
+            ),
+        )
+
+        runner._update_states(scheduler_output)
+
+        runtime.initialize_mock_request_from_handoff.assert_called_once_with(
+            "new",
+            handoff,
+            rank=0,
         )
 
     @patch(

@@ -108,13 +108,39 @@ class DSASparseIOBackend(Protocol):
 
 
 class DSASparseIOOperator(Protocol):
-    """Unified Decode data-plane boundary.
+    """P publication, D initialization, and Decode data-plane boundary.
 
     A production implementation derives history read addresses from
     ``query_index`` and the current Decode block table, loads ``miss_out`` rows
     into ``slot_out``, performs live-tail writes, and establishes the completion
     dependency before returning.
     """
+
+    def publish_main(
+        self,
+        *,
+        context: object,
+        region: object,
+        request_transfer_id: str,
+        block_table: torch.Tensor,
+        stored_token_count: int,
+        block_size: int,
+        main_planes: tuple[torch.Tensor, ...],
+        completion: object,
+    ) -> None: ...
+
+    def initialize_hot_cache(
+        self,
+        *,
+        context: object,
+        region: object,
+        request_transfer_id: str,
+        request_index: int,
+        source_token_positions: torch.Tensor,
+        destination_slots: torch.Tensor,
+        hot_planes: tuple[torch.Tensor, ...],
+        completion: object,
+    ) -> None: ...
 
     def dsa_sparse_io(
         self,
@@ -126,6 +152,7 @@ class DSASparseIOOperator(Protocol):
         miss_out: torch.Tensor,
         req_pool_entries: torch.Tensor,
         block_table: torch.Tensor,
+        write_token_positions: torch.Tensor,
         write_global_slots: torch.Tensor,
         write_destination_slots: torch.Tensor,
         write_valid_mask: torch.Tensor,
@@ -136,6 +163,16 @@ class DSASparseIOOperator(Protocol):
 
 class UnimplementedDSASparseIOOperator:
     """Explicit eager stub until the backend bridge is implemented."""
+
+    def publish_main(self, **_: object) -> None:
+        raise NotImplementedError(
+            "DSA Sparse Main publication operator is not implemented."
+        )
+
+    def initialize_hot_cache(self, **_: object) -> None:
+        raise NotImplementedError(
+            "DSA Sparse Hot Cache initialization operator is not implemented."
+        )
 
     def dsa_sparse_io(self, **_: object) -> None:
         raise NotImplementedError("DSA Sparse unified I/O operator is not implemented.")
@@ -149,6 +186,59 @@ class MockDSASparseIOOperator:
     live-tail or history payload.
     """
 
+    def publish_main(
+        self,
+        *,
+        context: object,
+        region: object,
+        request_transfer_id: str,
+        block_table: torch.Tensor,
+        stored_token_count: int,
+        block_size: int,
+        main_planes: tuple[torch.Tensor, ...],
+        completion: object,
+    ) -> None:
+        del context, region, completion
+        assert request_transfer_id
+        assert stored_token_count > 0
+        assert block_size > 0
+        assert block_table.ndim == 1
+        assert block_table.dtype == torch.int32
+        assert block_table.is_contiguous()
+        assert main_planes
+        assert all(
+            plane.device == block_table.device
+            for plane in main_planes
+        )
+
+    def initialize_hot_cache(
+        self,
+        *,
+        context: object,
+        region: object,
+        request_transfer_id: str,
+        request_index: int,
+        source_token_positions: torch.Tensor,
+        destination_slots: torch.Tensor,
+        hot_planes: tuple[torch.Tensor, ...],
+        completion: object,
+    ) -> None:
+        del context, region, completion
+        assert request_transfer_id
+        assert request_index >= 0
+        assert source_token_positions.ndim == 1
+        assert destination_slots.shape == source_token_positions.shape
+        assert source_token_positions.dtype == torch.int32
+        assert destination_slots.dtype == torch.int32
+        assert source_token_positions.is_contiguous()
+        assert destination_slots.is_contiguous()
+        assert source_token_positions.device == destination_slots.device
+        assert hot_planes
+        assert all(
+            plane.device == source_token_positions.device
+            for plane in hot_planes
+        )
+
     def dsa_sparse_io(
         self,
         *,
@@ -159,6 +249,7 @@ class MockDSASparseIOOperator:
         miss_out: torch.Tensor,
         req_pool_entries: torch.Tensor,
         block_table: torch.Tensor,
+        write_token_positions: torch.Tensor,
         write_global_slots: torch.Tensor,
         write_destination_slots: torch.Tensor,
         write_valid_mask: torch.Tensor,
@@ -171,6 +262,7 @@ class MockDSASparseIOOperator:
         assert miss_out.shape == query_index.shape
         assert req_pool_entries.shape == (query_index.shape[0],)
         assert block_table.shape[0] == query_index.shape[0]
+        assert write_token_positions.shape == req_pool_entries.shape
         assert write_global_slots.shape == req_pool_entries.shape
         assert write_destination_slots.shape == req_pool_entries.shape
         assert write_valid_mask.shape == req_pool_entries.shape
@@ -179,6 +271,7 @@ class MockDSASparseIOOperator:
         assert miss_out.dtype == torch.int32
         assert req_pool_entries.dtype == torch.int32
         assert block_table.dtype == torch.int32
+        assert write_token_positions.dtype == torch.int32
         assert write_global_slots.dtype == torch.int32
         assert write_destination_slots.dtype == torch.int32
         assert write_valid_mask.dtype == torch.bool
@@ -187,6 +280,7 @@ class MockDSASparseIOOperator:
         assert miss_out.is_contiguous()
         assert req_pool_entries.is_contiguous()
         assert block_table.is_contiguous()
+        assert write_token_positions.is_contiguous()
         assert write_global_slots.is_contiguous()
         assert write_destination_slots.is_contiguous()
         assert write_valid_mask.is_contiguous()
@@ -195,6 +289,7 @@ class MockDSASparseIOOperator:
             miss_out,
             req_pool_entries,
             block_table,
+            write_token_positions,
             write_global_slots,
             write_destination_slots,
             write_valid_mask,

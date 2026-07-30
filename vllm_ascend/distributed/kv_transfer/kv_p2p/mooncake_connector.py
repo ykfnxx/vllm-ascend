@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorRole,
+    KVConnectorWorkerMetadata,
     SupportsHMA,
 )
 from vllm.distributed.parallel_state import (
@@ -57,6 +58,11 @@ from vllm.v1.request import RequestStatus
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.attention.dsa_sparse_pd import (
+    DSA_SPARSE_PD_HANDOFF_KEY,
+    DSASparsePDHandoff,
+    get_dsa_sparse_pd_handoff,
+)
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     RegisterRegions,
@@ -75,6 +81,7 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 # isort: on
 
@@ -125,6 +132,51 @@ class ReqMeta:
     num_prompt_blocks: int
     remote_block_size: int
     local_full_block_ids: BlockIds = tuple()
+    dsa_sparse_handoff: DSASparsePDHandoff | None = None
+
+
+@dataclass
+class DSASparsePDWorkerMetadata(KVConnectorWorkerMetadata):
+    """Final-Prefill TopK aggregated from P workers."""
+
+    request_layer_topk_by_rank: dict[
+        str,
+        dict[int, dict[str, list[int]]],
+    ]
+
+    def aggregate(
+        self,
+        other: KVConnectorWorkerMetadata,
+    ) -> "DSASparsePDWorkerMetadata":
+        if not isinstance(other, DSASparsePDWorkerMetadata):
+            raise TypeError(
+                "Cannot aggregate DSA Sparse P/D metadata with "
+                f"{type(other).__name__}."
+            )
+        for request_id, incoming_by_rank in (
+            other.request_layer_topk_by_rank.items()
+        ):
+            by_rank = self.request_layer_topk_by_rank.setdefault(
+                request_id,
+                {},
+            )
+            for rank, incoming_layers in incoming_by_rank.items():
+                layers = by_rank.setdefault(int(rank), {})
+                for layer_name, incoming_topk in incoming_layers.items():
+                    normalized = [
+                        int(token_id)
+                        for token_id in incoming_topk
+                    ]
+                    current = layers.get(layer_name)
+                    if current is not None and current != normalized:
+                        raise RuntimeError(
+                            "DSA Sparse P workers produced conflicting "
+                            "TopK metadata: "
+                            f"request={request_id!r}, rank={rank}, "
+                            f"layer={layer_name!r}."
+                        )
+                    layers[layer_name] = normalized
+        return self
 
 
 @dataclass(frozen=True)
@@ -1435,6 +1487,18 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
         kv_transfer_params: dict[str, Any],
         local_full_block_ids: BlockIds | None = None,
     ):
+        dsa_sparse_handoff = get_dsa_sparse_pd_handoff(
+            kv_transfer_params
+        )
+        if (
+            dsa_sparse_handoff is not None
+            and dsa_sparse_handoff.remote_request_id
+            != kv_transfer_params["remote_request_id"]
+        ):
+            raise ValueError(
+                "DSA Sparse P/D handoff request identity does not match "
+                "Mooncake remote_request_id."
+            )
         self.requests[request_id] = ReqMeta(
             local_block_ids=local_block_ids,
             num_external_tokens=num_external_tokens,
@@ -1451,6 +1515,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             num_prompt_blocks=kv_transfer_params.get("num_prompt_blocks", 0),
             remote_block_size=kv_transfer_params.get("remote_block_size", 0),
             local_full_block_ids=local_full_block_ids or tuple(),
+            dsa_sparse_handoff=dsa_sparse_handoff,
         )
 
 
@@ -1504,6 +1569,26 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
+    def update_connector_output(
+        self,
+        connector_output: "KVConnectorOutput",
+    ) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.update_connector_output(
+            connector_output
+        )
+
+    def update_dsa_sparse_before_request_finish(
+        self,
+        connector_output: "KVConnectorOutput",
+    ) -> None:
+        """Consume final-Prefill TopK before Scheduler frees P requests."""
+
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.update_dsa_sparse_before_request_finish(
+            connector_output
+        )
+
     ############################################################
     # Worker Side Methods
     ############################################################
@@ -1533,8 +1618,19 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
     ) -> None:
-        """MooncakeConnector does not save explicitly."""
-        pass
+        """Capture DSA control metadata; payload remains connector-owned."""
+
+        assert self.connector_worker is not None
+        self.connector_worker.capture_dsa_sparse_layer_topk(
+            layer_name,
+            attn_metadata,
+        )
+
+    def build_connector_worker_meta(
+        self,
+    ) -> KVConnectorWorkerMetadata | None:
+        assert self.connector_worker is not None
+        return self.connector_worker.build_connector_worker_meta()
 
     def wait_for_save(self):
         """MooncakeConnector does not save explicitly."""
@@ -1610,6 +1706,11 @@ class MooncakeConnectorScheduler:
         self._reqs_need_recv: dict[str, tuple[Request, BlockIds, BlockIds, int]] = {}
         self._reqs_need_send: dict[str, float] = {}
         self._reqs_in_batch: set[str] = set()
+        self.dsa_sparse_config = self.ascend_config.dsa_sparse_config
+        self._dsa_sparse_topk_by_request: dict[
+            str,
+            dict[int, dict[str, list[int]]],
+        ] = {}
 
         # master-slave meta information for cross-nodes
         self.multi_nodes_meta_mapping: dict[str, dict[str, Any]] = {}
@@ -1848,10 +1949,30 @@ class MooncakeConnectorScheduler:
             or not params.get("do_remote_decode")
             or request.status != RequestStatus.FINISHED_LENGTH_CAPPED
         ):
+            if (
+                getattr(
+                    self.dsa_sparse_config,
+                    "kv_role",
+                    None,
+                )
+                == "kv_producer"
+                and isinstance(request.status, RequestStatus)
+                and RequestStatus.is_finished(request.status)
+            ):
+                self._dsa_sparse_topk_by_request.pop(
+                    request.request_id,
+                    None,
+                )
             return False, None
 
-        num_prompt_blocks = math.ceil(len(request.prompt_token_ids) / self.block_size)
-        computed_block_ids = self._get_transfer_block_ids(block_ids, len(request.prompt_token_ids))
+        prompt_token_count = len(request.prompt_token_ids)
+        num_prompt_blocks = math.ceil(
+            prompt_token_count / self.block_size
+        )
+        computed_block_ids = self._get_transfer_block_ids(
+            block_ids,
+            prompt_token_count,
+        )
         computed_block_ids = self._get_swa_transfer_block_ids(computed_block_ids)
         computed_block_lens = [len(block_id_list) for block_id_list in computed_block_ids]
         delay_free_blocks = sum(computed_block_lens) > 0
@@ -1859,7 +1980,7 @@ class MooncakeConnectorScheduler:
             logger.info("Delaying free of %d blocks for request %s", sum(computed_block_lens), request.request_id)
             self._reqs_need_send[request.request_id] = time.time()
 
-        return delay_free_blocks, dict(
+        transfer_params = dict(
             do_remote_prefill=True,
             do_remote_decode=False,
             remote_block_ids=computed_block_ids,
@@ -1874,6 +1995,90 @@ class MooncakeConnectorScheduler:
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
             remote_block_size=self.block_size,
+        )
+        handoff = self._build_dsa_sparse_handoff(request)
+        if handoff is not None:
+            transfer_params[
+                DSA_SPARSE_PD_HANDOFF_KEY
+            ] = handoff.to_dict()
+        return delay_free_blocks, transfer_params
+
+    def update_connector_output(
+        self,
+        connector_output: "KVConnectorOutput",
+    ) -> None:
+        self._consume_dsa_sparse_worker_metadata(
+            connector_output.kv_connector_worker_meta
+        )
+
+    def update_dsa_sparse_before_request_finish(
+        self,
+        connector_output: "KVConnectorOutput",
+    ) -> None:
+        """Pre-consume metadata needed by request_finished in this step."""
+
+        metadata = connector_output.kv_connector_worker_meta
+        if not isinstance(metadata, DSASparsePDWorkerMetadata):
+            return
+        self._consume_dsa_sparse_worker_metadata(metadata)
+        connector_output.kv_connector_worker_meta = None
+
+    def _consume_dsa_sparse_worker_metadata(
+        self,
+        metadata: KVConnectorWorkerMetadata | None,
+    ) -> None:
+        if not isinstance(metadata, DSASparsePDWorkerMetadata):
+            return
+        accumulator = DSASparsePDWorkerMetadata(
+            self._dsa_sparse_topk_by_request
+        )
+        accumulator.aggregate(metadata)
+
+    def _build_dsa_sparse_handoff(
+        self,
+        request: "Request",
+    ) -> DSASparsePDHandoff | None:
+        config = self.dsa_sparse_config
+        if getattr(config, "kv_role", None) != "kv_producer":
+            self._dsa_sparse_topk_by_request.pop(
+                request.request_id,
+                None,
+            )
+            return None
+        try:
+            layer_topk_by_rank = (
+                self._dsa_sparse_topk_by_request.pop(
+                    request.request_id
+                )
+            )
+        except KeyError as error:
+            raise RuntimeError(
+                "DSA Sparse P request finished without final-Prefill "
+                f"TopK metadata: request={request.request_id!r}."
+            ) from error
+        expected_ranks = set(range(self.tp_size))
+        actual_ranks = set(layer_topk_by_rank)
+        if actual_ranks != expected_ranks:
+            raise RuntimeError(
+                "DSA Sparse P/D TopK ranks are incomplete: "
+                f"request={request.request_id!r}, "
+                f"expected={sorted(expected_ranks)}, "
+                f"actual={sorted(actual_ranks)}."
+            )
+        layer_sets = {
+            frozenset(layer_topk)
+            for layer_topk in layer_topk_by_rank.values()
+        }
+        if len(layer_sets) != 1:
+            raise RuntimeError(
+                "DSA Sparse P/D ranks captured different layer sets: "
+                f"request={request.request_id!r}."
+            )
+        return DSASparsePDHandoff(
+            remote_request_id=request.request_id,
+            stored_token_count=request.num_prompt_tokens,
+            block_size=self.block_size,
+            layer_topk_by_rank=layer_topk_by_rank,
         )
 
     def _port_offset_from_handshake_metadata(
@@ -1937,6 +2142,7 @@ class MooncakeConnectorWorker:
         # Metadata.
         self.vllm_config = vllm_config
         self.ascend_config = get_ascend_config()
+        self.dsa_sparse_config = self.ascend_config.dsa_sparse_config
         self.engine_id = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -2011,6 +2217,69 @@ class MooncakeConnectorWorker:
             self.tp_num_need_pulls = num_d_block_heads // num_p_block_heads
         self.local_remote_block_port_mapping: dict[str, list[list[int]] | None] = {}
         self.remote_port_send_num: dict[str, dict[int, RemotePortInfo]] = {}
+        self._dsa_sparse_layer_topk_by_request: dict[
+            str,
+            dict[str, list[int]],
+        ] = {}
+
+    def capture_dsa_sparse_layer_topk(
+        self,
+        layer_name: str,
+        attn_metadata: "AttentionMetadata",
+    ) -> None:
+        config = self.dsa_sparse_config
+        if getattr(config, "kv_role", None) != "kv_producer":
+            return
+        layer_metadata = (
+            attn_metadata.get(layer_name)
+            if isinstance(attn_metadata, Mapping)
+            else attn_metadata
+        )
+        producer_context = getattr(
+            layer_metadata,
+            "dsa_sparse_producer_context",
+            None,
+        )
+        if producer_context is None:
+            return
+        request_topk = producer_context.layer_topk(layer_name)
+        for request_id, token_ids in request_topk.items():
+            layers = (
+                self._dsa_sparse_layer_topk_by_request.setdefault(
+                    request_id,
+                    {},
+                )
+            )
+            normalized = [int(token_id) for token_id in token_ids]
+            current = layers.get(layer_name)
+            if current is not None and current != normalized:
+                raise RuntimeError(
+                    "DSA Sparse P worker captured conflicting TopK: "
+                    f"request={request_id!r}, layer={layer_name!r}."
+                )
+            layers[layer_name] = normalized
+
+    def build_connector_worker_meta(
+        self,
+    ) -> KVConnectorWorkerMetadata | None:
+        if not self._dsa_sparse_layer_topk_by_request:
+            return None
+        request_layer_topk = (
+            self._dsa_sparse_layer_topk_by_request
+        )
+        self._dsa_sparse_layer_topk_by_request = {}
+        return DSASparsePDWorkerMetadata(
+            {
+                request_id: {
+                    self.tp_rank: {
+                        layer_name: list(token_ids)
+                        for layer_name, token_ids in layers.items()
+                    }
+                }
+                for request_id, layers
+                in request_layer_topk.items()
+            }
+        )
 
     def _get_prefill_decode_size(self, vllm_config: VllmConfig):
         # get prefill tp and dp size from extra config

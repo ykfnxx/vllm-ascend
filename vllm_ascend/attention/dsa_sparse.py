@@ -239,13 +239,60 @@ class DSASparseLookupState:
             dtype=torch.int32,
             device=self.index.device,
         )
+        self.initialize_resident_tokens(
+            request_index,
+            resident_tokens,
+        )
+
+    def initialize_resident_tokens(
+        self,
+        request_index: int,
+        resident_tokens: torch.Tensor,
+    ) -> None:
+        """Bind selected history tokens to the leading resident slots."""
+
+        resident_tokens = resident_tokens.to(
+            device=self.index.device,
+            dtype=torch.int32,
+        ).reshape(-1)
+        if resident_tokens.numel() > DSA_SPARSE_RESIDENT_SLOT_COUNT:
+            raise ValueError(
+                "DSA Sparse resident initialization exceeds the 8K "
+                "resident region."
+            )
+        if resident_tokens.numel() and (
+            bool((resident_tokens < 0).any().item())
+            or bool(
+                (
+                    resident_tokens
+                    >= DSA_SPARSE_INDEX_CAPACITY
+                ).any().item()
+            )
+        ):
+            raise ValueError(
+                "DSA Sparse resident tokens must fit the 128K index."
+            )
+        if resident_tokens.unique().numel() != resident_tokens.numel():
+            raise ValueError(
+                "DSA Sparse resident initialization contains duplicates."
+            )
+
+        self.reset_request(request_index)
+        resident_count = resident_tokens.numel()
+        if resident_count == 0:
+            return
+        resident_slots = torch.arange(
+            resident_count,
+            dtype=torch.int32,
+            device=self.index.device,
+        )
         self.index[
             request_index,
-            :DSA_SPARSE_RESIDENT_SLOT_COUNT,
-        ].copy_(resident_tokens)
+            resident_tokens.to(torch.long),
+        ].copy_(resident_slots)
         self.slot_to_index[
             request_index,
-            :DSA_SPARSE_RESIDENT_SLOT_COUNT,
+            :resident_count,
         ].copy_(resident_tokens)
 
 
@@ -743,6 +790,9 @@ class DSASparseEagerCoordinator:
                     step.lookup_batch.req_pool_entries
                 ),
                 block_table=step.metadata.block_table,
+                write_token_positions=(
+                    step.metadata.query_positions
+                ),
                 write_global_slots=(
                     step.metadata.write_global_slots
                 ),
@@ -824,6 +874,22 @@ class DSASparseEagerAttentionContext(Protocol):
         semantic_topk_positions: torch.Tensor,
         attention: Callable[[DSASparseResolution], torch.Tensor],
     ) -> torch.Tensor: ...
+
+
+class DSASparseProducerAttentionContext(Protocol):
+    """P-side final-Prefill publication and TopK capture boundary."""
+
+    def publish_layer(
+        self,
+        layer_name: str,
+        main_kv_cache: tuple[torch.Tensor, ...],
+        semantic_topk_positions: torch.Tensor,
+    ) -> None: ...
+
+    def layer_topk(
+        self,
+        layer_name: str,
+    ) -> dict[str, list[int]]: ...
 
 
 class DSASparseEagerBatchContext:

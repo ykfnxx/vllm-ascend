@@ -3,7 +3,259 @@
 
 from collections.abc import Hashable, Iterable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
+
+from vllm_ascend.dsa_sparse_constants import (
+    DSA_SPARSE_QUERY_WIDTH,
+    DSA_SPARSE_RESIDENT_SLOT_COUNT,
+)
+
+DSA_SPARSE_PD_HANDOFF_KEY = "dsa_sparse_pd_handoff"
+DSA_SPARSE_PD_PROTOCOL_VERSION = 1
+
+
+def build_dsa_sparse_resident_token_ids(
+    *,
+    topk_token_ids: Iterable[int],
+    stored_token_count: int,
+    block_size: int,
+    resident_token_count: int = DSA_SPARSE_RESIDENT_SLOT_COUNT,
+) -> list[int]:
+    """Build a TopK-first resident set while preserving score order.
+
+    The last partial block lives in the independent dense-tail region. Valid
+    TopK positions are selected first, then the remaining capacity is filled
+    in historical token order without re-sorting the TopK prefix.
+    """
+
+    stored_token_count = int(stored_token_count)
+    block_size = int(block_size)
+    resident_token_count = int(resident_token_count)
+    if stored_token_count <= 0:
+        raise ValueError(
+            "DSA Sparse resident initialization requires stored tokens."
+        )
+    if block_size <= 0:
+        raise ValueError(
+            "DSA Sparse resident initialization requires block_size > 0."
+        )
+    if not 0 < resident_token_count <= DSA_SPARSE_RESIDENT_SLOT_COUNT:
+        raise ValueError(
+            "DSA Sparse resident_token_count must fit the 8K region."
+        )
+
+    dense_tail_start = (
+        stored_token_count // block_size
+    ) * block_size
+    target_count = min(resident_token_count, dense_tail_start)
+    selected: list[int] = []
+    selected_set: set[int] = set()
+    for raw_token_id in topk_token_ids:
+        token_id = int(raw_token_id)
+        if (
+            token_id < 0
+            or token_id >= dense_tail_start
+            or token_id in selected_set
+        ):
+            continue
+        selected.append(token_id)
+        selected_set.add(token_id)
+        if len(selected) == target_count:
+            return selected
+
+    for token_id in range(dense_tail_start):
+        if token_id in selected_set:
+            continue
+        selected.append(token_id)
+        if len(selected) == target_count:
+            break
+    return selected
+
+
+@dataclass(frozen=True)
+class DSASparsePDHandoff:
+    """Serializable P-to-D control metadata.
+
+    Main payload remains in the configured backend. The connector transports
+    only request identity, layout bounds, and final-Prefill per-layer TopK.
+    """
+
+    remote_request_id: str
+    stored_token_count: int
+    block_size: int
+    layer_topk_by_rank: dict[int, dict[str, list[int]]]
+    protocol_version: int = DSA_SPARSE_PD_PROTOCOL_VERSION
+
+    def __post_init__(self) -> None:
+        if self.protocol_version != DSA_SPARSE_PD_PROTOCOL_VERSION:
+            raise ValueError(
+                "Unsupported DSA Sparse P/D handoff protocol version "
+                f"{self.protocol_version}."
+            )
+        if not self.remote_request_id:
+            raise ValueError(
+                "DSA Sparse P/D remote_request_id must not be empty."
+            )
+        if self.stored_token_count <= 0:
+            raise ValueError(
+                "DSA Sparse P/D stored_token_count must be positive."
+            )
+        if self.block_size <= 0:
+            raise ValueError(
+                "DSA Sparse P/D block_size must be positive."
+            )
+        if not self.layer_topk_by_rank:
+            raise ValueError(
+                "DSA Sparse P/D handoff requires per-rank layer TopK."
+            )
+        for rank, layer_topk in self.layer_topk_by_rank.items():
+            if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+                raise ValueError(
+                    "DSA Sparse P/D ranks must be non-negative integers."
+                )
+            if not layer_topk:
+                raise ValueError(
+                    f"DSA Sparse P/D rank {rank} has no layer TopK."
+                )
+            for layer_name, token_ids in layer_topk.items():
+                if not layer_name:
+                    raise ValueError(
+                        "DSA Sparse P/D layer names must not be empty."
+                    )
+                if len(token_ids) != DSA_SPARSE_QUERY_WIDTH:
+                    raise ValueError(
+                        "DSA Sparse P/D layer TopK width must be "
+                        f"{DSA_SPARSE_QUERY_WIDTH}, got "
+                        f"{len(token_ids)} for {layer_name!r}."
+                    )
+                if any(
+                    isinstance(token_id, bool)
+                    or not isinstance(token_id, int)
+                    for token_id in token_ids
+                ):
+                    raise TypeError(
+                        "DSA Sparse P/D TopK token IDs must be integers."
+                    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "protocol_version": self.protocol_version,
+            "remote_request_id": self.remote_request_id,
+            "stored_token_count": self.stored_token_count,
+            "block_size": self.block_size,
+            "layer_topk_by_rank": {
+                str(rank): {
+                    layer_name: list(token_ids)
+                    for layer_name, token_ids in layer_topk.items()
+                }
+                for rank, layer_topk in self.layer_topk_by_rank.items()
+            },
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        raw_handoff: object,
+    ) -> "DSASparsePDHandoff":
+        if not isinstance(raw_handoff, dict):
+            raise TypeError(
+                "DSA Sparse P/D handoff must be a dictionary."
+            )
+        raw_topk = raw_handoff.get("layer_topk_by_rank")
+        if not isinstance(raw_topk, dict):
+            raise TypeError(
+                "DSA Sparse P/D layer_topk_by_rank must be a dictionary."
+            )
+        layer_topk_by_rank: dict[int, dict[str, list[int]]] = {}
+        for raw_rank, raw_layers in raw_topk.items():
+            if not isinstance(raw_layers, dict):
+                raise TypeError(
+                    "DSA Sparse P/D rank TopK must be a dictionary."
+                )
+            if isinstance(raw_rank, bool):
+                raise TypeError(
+                    "DSA Sparse P/D rank keys must be integers."
+                )
+            try:
+                rank = int(raw_rank)
+            except (TypeError, ValueError) as error:
+                raise TypeError(
+                    "DSA Sparse P/D rank keys must be integers."
+                ) from error
+            if str(rank) != str(raw_rank):
+                raise TypeError(
+                    "DSA Sparse P/D rank keys must use canonical integers."
+                )
+            layers: dict[str, list[int]] = {}
+            for layer_name, token_ids in raw_layers.items():
+                if not isinstance(layer_name, str):
+                    raise TypeError(
+                        "DSA Sparse P/D layer names must be strings."
+                    )
+                if not isinstance(token_ids, (list, tuple)):
+                    raise TypeError(
+                        "DSA Sparse P/D layer TopK must be a sequence."
+                    )
+                if any(
+                    isinstance(token_id, bool)
+                    or not isinstance(token_id, int)
+                    for token_id in token_ids
+                ):
+                    raise TypeError(
+                        "DSA Sparse P/D TopK token IDs must be integers."
+                    )
+                layers[layer_name] = list(token_ids)
+            layer_topk_by_rank[rank] = layers
+        protocol_version = raw_handoff.get(
+            "protocol_version",
+            DSA_SPARSE_PD_PROTOCOL_VERSION,
+        )
+        stored_token_count = raw_handoff.get(
+            "stored_token_count",
+            0,
+        )
+        block_size = raw_handoff.get("block_size", 0)
+        for field_name, field_value in (
+            ("protocol_version", protocol_version),
+            ("stored_token_count", stored_token_count),
+            ("block_size", block_size),
+        ):
+            if isinstance(field_value, bool) or not isinstance(
+                field_value,
+                int,
+            ):
+                raise TypeError(
+                    f"DSA Sparse P/D {field_name} must be an integer."
+                )
+        remote_request_id = raw_handoff.get(
+            "remote_request_id",
+            "",
+        )
+        if not isinstance(remote_request_id, str):
+            raise TypeError(
+                "DSA Sparse P/D remote_request_id must be a string."
+            )
+        return cls(
+            protocol_version=protocol_version,
+            remote_request_id=remote_request_id,
+            stored_token_count=stored_token_count,
+            block_size=block_size,
+            layer_topk_by_rank=layer_topk_by_rank,
+        )
+
+
+def get_dsa_sparse_pd_handoff(
+    kv_transfer_params: object,
+) -> DSASparsePDHandoff | None:
+    if not isinstance(kv_transfer_params, dict):
+        return None
+    raw_handoff = kv_transfer_params.get(
+        DSA_SPARSE_PD_HANDOFF_KEY
+    )
+    if raw_handoff is None:
+        return None
+    return DSASparsePDHandoff.from_dict(raw_handoff)
+
 
 class DSASparseRequestIndexCoordinator(Protocol):
     def acquire_request(self, request_id: Hashable) -> int: ...

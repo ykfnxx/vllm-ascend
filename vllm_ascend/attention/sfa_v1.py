@@ -28,6 +28,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.dsa_sparse import (
     DSASparseEagerAttentionContext,
+    DSASparseProducerAttentionContext,
     DSASparseResolution,
 )
 from vllm_ascend.attention.mla_v1 import MAX_O_PROJ_PREFETCH_SIZE, MLAPO_MAX_SUPPORTED_TOKENS
@@ -251,6 +252,9 @@ class AscendSFAMetadata:
     group_key_idx: torch.Tensor | None = None
     group_key_cache_idx: torch.Tensor | None = None
     dsa_sparse_context: DSASparseEagerAttentionContext | None = None
+    dsa_sparse_producer_context: (
+        DSASparseProducerAttentionContext | None
+    ) = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -1632,6 +1636,34 @@ class AscendSFAImpl(MLAAttentionImpl):
             "dsa_sparse_context",
             None,
         )
+        dsa_sparse_producer_context = getattr(
+            attn_metadata,
+            "dsa_sparse_producer_context",
+            None,
+        )
+        if (
+            dsa_sparse_context is not None
+            and dsa_sparse_producer_context is not None
+        ):
+            raise RuntimeError(
+                "DSA Sparse metadata cannot own P and D contexts together."
+            )
+        main_kv_cache = kv_cache
+        if dsa_sparse_producer_context is not None:
+            if not self.is_kv_producer:
+                raise RuntimeError(
+                    "DSA Sparse Main publication is Prefill-producer only."
+                )
+            if (
+                attn_metadata.attn_state
+                in {
+                    AscendAttentionState.DecodeOnly,
+                    AscendAttentionState.SpecDecoding,
+                }
+            ):
+                raise RuntimeError(
+                    "DSA Sparse Main publication requires a Prefill batch."
+                )
         dsa_sparse_write_target = None
         if dsa_sparse_context is not None:
             if not self.is_kv_consumer:
@@ -2012,6 +2044,13 @@ class AscendSFAImpl(MLAAttentionImpl):
             )
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
+
+        if dsa_sparse_producer_context is not None:
+            dsa_sparse_producer_context.publish_layer(
+                layer_name,
+                main_kv_cache,
+                topk_indices,
+            )
 
         if dsa_sparse_context is None:
             attn_output = self._execute_sparse_flash_attention_process(

@@ -58,6 +58,8 @@ patch(
 patch("vllm.distributed.parallel_state._DCP", _mock_dcp_group).start()
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
+    DSA_SPARSE_PD_HANDOFF_KEY,
+    DSASparsePDWorkerMetadata,
     MAX_REQUESTS_PER_PEER_HANDLER,
     GroupPull,
     KVCacheRecvingThread,
@@ -76,6 +78,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
     split_if_not_byte_contiguous,
     string_to_int64_hash,
     zmq_ctx,
+)
+from vllm_ascend.dsa_sparse_constants import (  # noqa: E402
+    DSA_SPARSE_QUERY_WIDTH,
 )
 
 for _k, _v in _saved_modules.items():
@@ -1241,6 +1246,7 @@ class MockRequest:
         self.kv_transfer_params = kv_transfer_params or {}
         self.status = status or "running"
         self.output_token_ids = [101, 102]
+        self.num_prompt_tokens = len(self.prompt_token_ids)
 
 
 class MockKVCacheGroup:
@@ -1650,6 +1656,45 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         delay_free, params = self.scheduler.request_finished(request, [1, 2, 3])
         self.assertFalse(delay_free)
         self.assertIsNone(params)
+
+    def test_dsa_topk_is_consumed_before_finish_and_added_to_handoff(self):
+        self.scheduler.dsa_sparse_config = types.SimpleNamespace(
+            kv_role="kv_producer"
+        )
+        self.scheduler.tp_size = 1
+        topk = list(range(DSA_SPARSE_QUERY_WIDTH))
+        output = types.SimpleNamespace(
+            kv_connector_worker_meta=DSASparsePDWorkerMetadata(
+                {
+                    "req1": {
+                        0: {
+                            "model.layers.0.self_attn": topk,
+                        },
+                    },
+                }
+            )
+        )
+
+        self.scheduler.update_dsa_sparse_before_request_finish(
+            output
+        )
+        request = self._make_remote_decode_request(128)
+        _delay_free, params = self.scheduler.request_finished(
+            request,
+            ([1, 2, 3, 4, 5, 6, 7, 8],),
+        )
+
+        self.assertIsNone(output.kv_connector_worker_meta)
+        self.assertIsNotNone(params)
+        handoff = params[DSA_SPARSE_PD_HANDOFF_KEY]
+        self.assertEqual(handoff["remote_request_id"], "req1")
+        self.assertEqual(handoff["stored_token_count"], 128)
+        self.assertEqual(
+            handoff["layer_topk_by_rank"]["0"][
+                "model.layers.0.self_attn"
+            ],
+            topk,
+        )
 
     def test_get_transfer_block_ids_trims_attention_mtp_blocks(self):
         self.scheduler.group_transfer_info = [
@@ -3177,6 +3222,44 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
 
         with self.assertRaises(AssertionError):
             worker._get_sfa_replicate_k_block_ids(cast(ReqMeta, meta))
+
+    def test_dsa_worker_captures_layer_topk_as_control_metadata(self):
+        worker = MooncakeConnectorWorker.__new__(
+            MooncakeConnectorWorker
+        )
+        worker.dsa_sparse_config = types.SimpleNamespace(
+            kv_role="kv_producer"
+        )
+        worker.tp_rank = 2
+        worker._dsa_sparse_layer_topk_by_request = {}
+        topk = list(range(DSA_SPARSE_QUERY_WIDTH))
+        producer_context = MagicMock()
+        producer_context.layer_topk.return_value = {
+            "request-a": topk,
+        }
+        metadata = {
+            "layer.0": types.SimpleNamespace(
+                dsa_sparse_producer_context=producer_context
+            )
+        }
+
+        worker.capture_dsa_sparse_layer_topk(
+            "layer.0",
+            metadata,
+        )
+        worker_metadata = worker.build_connector_worker_meta()
+
+        self.assertIsInstance(
+            worker_metadata,
+            DSASparsePDWorkerMetadata,
+        )
+        self.assertEqual(
+            worker_metadata.request_layer_topk_by_rank[
+                "request-a"
+            ][2]["layer.0"],
+            topk,
+        )
+        self.assertIsNone(worker.build_connector_worker_meta())
 
 
 if __name__ == "__main__":

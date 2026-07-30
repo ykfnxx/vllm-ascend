@@ -29,8 +29,10 @@ from vllm_ascend.attention.dsa_sparse_io import (
     MockDSASparseIOOperator,
 )
 from vllm_ascend.attention.dsa_sparse_pd import (
+    DSASparsePDHandoff,
     DSASparsePDLifecycle,
     DSASparseTransferCompletion,
+    build_dsa_sparse_resident_token_ids,
 )
 
 
@@ -42,6 +44,15 @@ class DSASparseEagerLayerMetadata(Protocol):
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     dsa_sparse_context: DSASparseEagerContextRouter | None
+
+
+class DSASparseProducerLayerMetadata(Protocol):
+    """Metadata fields used by P-side Main publication."""
+
+    block_table: torch.Tensor
+    dsa_sparse_producer_context: (
+        DSASparseProducerBatchContext | None
+    )
 
 
 @dataclass(frozen=True)
@@ -111,6 +122,282 @@ class _MockDSASparseRequestRegionBackend:
 
     def release_request(self, request_handle: int) -> None:
         del request_handle
+
+
+class DSASparseProducerBatchContext:
+    """Publish final-Prefill Main through the I/O abstraction and capture TopK."""
+
+    def __init__(
+        self,
+        *,
+        io_operator: DSASparseIOOperator,
+        request_ids: Sequence[str],
+        scheduled_token_counts: Sequence[int],
+        stored_token_counts: Sequence[int],
+        publish_requests: Sequence[bool],
+        layer_metadata: Mapping[str, object],
+        block_size: int,
+    ) -> None:
+        self.io_operator = io_operator
+        self.request_ids = tuple(str(request_id) for request_id in request_ids)
+        self.scheduled_token_counts = tuple(
+            int(count) for count in scheduled_token_counts
+        )
+        self.stored_token_counts = tuple(
+            int(count) for count in stored_token_counts
+        )
+        self.publish_requests = tuple(
+            bool(value) for value in publish_requests
+        )
+        self.layer_metadata = dict(layer_metadata)
+        self.block_size = int(block_size)
+        self._published_layers: set[str] = set()
+        self._layer_topk: dict[
+            str,
+            dict[str, list[int]],
+        ] = {}
+
+        request_count = len(self.request_ids)
+        if not (
+            len(self.scheduled_token_counts)
+            == len(self.stored_token_counts)
+            == len(self.publish_requests)
+            == request_count
+        ):
+            raise ValueError(
+                "DSA Sparse P publication vectors must have equal lengths."
+            )
+        if self.block_size <= 0:
+            raise ValueError(
+                "DSA Sparse P publication requires block_size > 0."
+            )
+        if any(count <= 0 for count in self.scheduled_token_counts):
+            raise ValueError(
+                "DSA Sparse P publication requires scheduled tokens."
+            )
+        if any(count <= 0 for count in self.stored_token_counts):
+            raise ValueError(
+                "DSA Sparse P publication requires stored prompt tokens."
+            )
+        if not any(self.publish_requests):
+            raise ValueError(
+                "DSA Sparse P publication requires a final Prefill request."
+            )
+
+    def publish_layer(
+        self,
+        layer_name: str,
+        main_kv_cache: tuple[torch.Tensor, ...],
+        semantic_topk_positions: torch.Tensor,
+    ) -> None:
+        if layer_name in self._published_layers:
+            raise RuntimeError(
+                f"DSA Sparse layer {layer_name!r} was published twice."
+            )
+        try:
+            raw_metadata = self.layer_metadata[layer_name]
+        except KeyError as error:
+            raise KeyError(
+                f"Missing DSA Sparse P metadata for layer {layer_name!r}."
+            ) from error
+        block_table = getattr(raw_metadata, "block_table", None)
+        if not isinstance(block_table, torch.Tensor):
+            raise TypeError(
+                "DSA Sparse P metadata must expose a block_table tensor."
+            )
+        if not main_kv_cache:
+            raise RuntimeError(
+                "DSA Sparse P publication requires Main KV cache planes."
+            )
+
+        total_scheduled_tokens = sum(self.scheduled_token_counts)
+        if semantic_topk_positions.shape[0] < total_scheduled_tokens:
+            raise ValueError(
+                "DSA Sparse TopK rows do not cover the Prefill batch."
+            )
+        layer_topk: dict[str, list[int]] = {}
+        token_row_start = 0
+        for request_row, (
+            request_id,
+            scheduled_token_count,
+            stored_token_count,
+            should_publish,
+        ) in enumerate(
+            zip(
+                self.request_ids,
+                self.scheduled_token_counts,
+                self.stored_token_counts,
+                self.publish_requests,
+            )
+        ):
+            token_row_end = token_row_start + scheduled_token_count
+            if should_publish:
+                # This D2H copy is restricted to the one-time final-Prefill
+                # control handoff; it is never part of the Decode hot path.
+                request_topk = (
+                    semantic_topk_positions[token_row_end - 1]
+                    .detach()
+                    .reshape(-1)
+                    .to(device="cpu", dtype=torch.int32)
+                    .tolist()
+                )
+                layer_topk[request_id] = [
+                    int(token_id)
+                    for token_id in request_topk
+                ]
+                self.io_operator.publish_main(
+                    context=_MockDSASparseIOResource(
+                        layer_name,
+                        "publication_context",
+                    ),
+                    region=_MockDSASparseIOResource(
+                        layer_name,
+                        "publication_region",
+                    ),
+                    request_transfer_id=request_id,
+                    block_table=block_table[
+                        request_row
+                    ].to(dtype=torch.int32).contiguous(),
+                    stored_token_count=stored_token_count,
+                    block_size=self.block_size,
+                    main_planes=main_kv_cache,
+                    completion=getattr(
+                        raw_metadata,
+                        "reshape_cache_event",
+                        _MockDSASparseIOResource(
+                            layer_name,
+                            "publication_completion",
+                        ),
+                    ),
+                )
+            token_row_start = token_row_end
+        self._layer_topk[layer_name] = layer_topk
+        self._published_layers.add(layer_name)
+
+    def layer_topk(
+        self,
+        layer_name: str,
+    ) -> dict[str, list[int]]:
+        if layer_name not in self._published_layers:
+            raise RuntimeError(
+                f"DSA Sparse layer {layer_name!r} has not been published."
+            )
+        return {
+            request_id: list(token_ids)
+            for request_id, token_ids
+            in self._layer_topk[layer_name].items()
+        }
+
+
+class DSASparseProducerExecution:
+    """Attach one P publication context to participating SFA metadata."""
+
+    def __init__(
+        self,
+        context: DSASparseProducerBatchContext,
+        metadata_objects: Sequence[DSASparseProducerLayerMetadata],
+    ) -> None:
+        self.context = context
+        self._metadata_objects = tuple(metadata_objects)
+        self._closed = False
+
+    def __enter__(self) -> DSASparseProducerBatchContext:
+        if self._closed:
+            raise RuntimeError(
+                "DSA Sparse P publication execution is already closed."
+            )
+        return self.context
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: object,
+    ) -> bool:
+        del exc_type, traceback
+        if self._closed:
+            raise RuntimeError(
+                "DSA Sparse P publication execution is already closed."
+            )
+        first_error: BaseException | None = None
+        for metadata in reversed(self._metadata_objects):
+            try:
+                if (
+                    metadata.dsa_sparse_producer_context
+                    is self.context
+                ):
+                    metadata.dsa_sparse_producer_context = None
+                elif metadata.dsa_sparse_producer_context is not None:
+                    raise RuntimeError(
+                        "DSA Sparse P metadata context ownership changed "
+                        "before detach."
+                    )
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        self._closed = True
+        if first_error is not None:
+            if exc_value is not None:
+                _add_cleanup_note(
+                    exc_value,
+                    "DSA Sparse P metadata detach also failed: "
+                    f"{first_error!r}",
+                )
+                return False
+            raise RuntimeError(
+                "Failed to detach DSA Sparse P metadata."
+            ) from first_error
+        return False
+
+
+def begin_dsa_sparse_producer_execution(
+    *,
+    io_operator: DSASparseIOOperator,
+    request_ids: Sequence[str],
+    scheduled_token_counts: Sequence[int],
+    stored_token_counts: Sequence[int],
+    publish_requests: Sequence[bool],
+    layer_metadata: Mapping[str, object],
+    block_size: int,
+) -> DSASparseProducerExecution:
+    context = DSASparseProducerBatchContext(
+        io_operator=io_operator,
+        request_ids=request_ids,
+        scheduled_token_counts=scheduled_token_counts,
+        stored_token_counts=stored_token_counts,
+        publish_requests=publish_requests,
+        layer_metadata=layer_metadata,
+        block_size=block_size,
+    )
+    metadata_objects = _unique_producer_metadata(
+        layer_metadata.values()
+    )
+    attached: list[DSASparseProducerLayerMetadata] = []
+    try:
+        for metadata in metadata_objects:
+            if not hasattr(
+                metadata,
+                "dsa_sparse_producer_context",
+            ):
+                raise TypeError(
+                    "DSA Sparse P metadata does not expose "
+                    "dsa_sparse_producer_context."
+                )
+            if metadata.dsa_sparse_producer_context is not None:
+                raise RuntimeError(
+                    "DSA Sparse P metadata already owns a context."
+                )
+            metadata.dsa_sparse_producer_context = context
+            attached.append(metadata)
+    except BaseException:
+        for metadata in reversed(attached):
+            if metadata.dsa_sparse_producer_context is context:
+                metadata.dsa_sparse_producer_context = None
+        raise
+    return DSASparseProducerExecution(
+        context,
+        metadata_objects,
+    )
 
 
 def create_dsa_sparse_eager_mock_runtime(
@@ -326,6 +613,7 @@ class DSASparseEagerRuntime:
             raise ValueError("DSA Sparse eager runtime requires at least one cohort.")
         self._mock_pd_lifecycle = mock_pd_lifecycle
         self._mock_request_generations: dict[Hashable, int] = {}
+        self._mock_initialized_requests: dict[Hashable, str] = {}
         self._next_mock_region_handle = 1
         self._validate_descriptors()
 
@@ -341,6 +629,12 @@ class DSASparseEagerRuntime:
 
     def has_mock_request(self, request_id: Hashable) -> bool:
         return request_id in self._mock_request_generations
+
+    def is_mock_request_initialized(
+        self,
+        request_id: Hashable,
+    ) -> bool:
+        return request_id in self._mock_initialized_requests
 
     def preflight_mock_retire(
         self,
@@ -406,6 +700,144 @@ class DSASparseEagerRuntime:
         self._mock_request_generations[request_id] = generation
         return request_index
 
+    def initialize_mock_request_from_handoff(
+        self,
+        request_id: Hashable,
+        handoff: DSASparsePDHandoff,
+        *,
+        rank: int,
+    ) -> int:
+        """Initialize D lookup mappings and submit Hot Cache loads."""
+
+        if request_id not in self._mock_request_generations:
+            raise RuntimeError(
+                "DSA Sparse mock request must be admitted before Hot Cache "
+                "initialization."
+            )
+        current_transfer_id = self._mock_initialized_requests.get(
+            request_id
+        )
+        if current_transfer_id is not None:
+            if current_transfer_id != handoff.remote_request_id:
+                raise RuntimeError(
+                    "DSA Sparse request is already initialized from another "
+                    "P request."
+                )
+            return self.coordinator.request_index(request_id)
+        if handoff.block_size != self.coordinator.config.block_size:
+            raise ValueError(
+                "DSA Sparse P/D block_size mismatch: "
+                f"P={handoff.block_size}, "
+                f"D={self.coordinator.config.block_size}."
+            )
+        try:
+            layer_topk = handoff.layer_topk_by_rank[rank]
+        except KeyError as error:
+            raise ValueError(
+                f"DSA Sparse P/D handoff has no TopK for rank {rank}."
+            ) from error
+
+        request_index = self.coordinator.request_index(request_id)
+        for descriptor in self.cohort_descriptors:
+            try:
+                leader_topk = layer_topk[descriptor.leader_layer]
+            except KeyError as error:
+                raise ValueError(
+                    "DSA Sparse P/D handoff is missing cohort leader TopK "
+                    f"for {descriptor.leader_layer!r}."
+                ) from error
+            resident_token_ids = (
+                build_dsa_sparse_resident_token_ids(
+                    topk_token_ids=leader_topk,
+                    stored_token_count=handoff.stored_token_count,
+                    block_size=handoff.block_size,
+                )
+            )
+            cohort = self.coordinator.get_cohort(
+                descriptor.cohort_key
+            )
+            resident_tensor = torch.tensor(
+                resident_token_ids,
+                dtype=torch.int32,
+                device=cohort.state.index.device,
+            )
+            cohort.state.initialize_resident_tokens(
+                request_index,
+                resident_tensor,
+            )
+
+            dense_tail_start = (
+                handoff.stored_token_count
+                // handoff.block_size
+            ) * handoff.block_size
+            tail_token_ids = list(
+                range(
+                    dense_tail_start,
+                    handoff.stored_token_count,
+                )
+            )
+            source_token_ids = (
+                resident_token_ids + tail_token_ids
+            )
+            destination_slots = list(
+                range(len(resident_token_ids))
+            )
+            destination_slots.extend(
+                self.coordinator.config.live_tail_start
+                + token_id
+                - dense_tail_start
+                for token_id in tail_token_ids
+            )
+
+            for layer_name in descriptor.layer_names:
+                if layer_name not in layer_topk:
+                    raise ValueError(
+                        "DSA Sparse P/D handoff is missing layer TopK for "
+                        f"{layer_name!r}."
+                    )
+                binding = self.coordinator.get_layer_binding(
+                    descriptor.cohort_key,
+                    layer_name,
+                )
+                source_tensor = torch.tensor(
+                    source_token_ids,
+                    dtype=torch.int32,
+                    device=binding.hot_cache.planes[0].device,
+                )
+                destination_tensor = torch.tensor(
+                    [
+                        request_index
+                        * self.coordinator.config.hot_stride
+                        + local_slot
+                        for local_slot in destination_slots
+                    ],
+                    dtype=torch.int32,
+                    device=binding.hot_cache.planes[0].device,
+                )
+                self.coordinator.io_operator.initialize_hot_cache(
+                    context=binding.io_context,
+                    region=binding.io_region,
+                    request_transfer_id=handoff.remote_request_id,
+                    request_index=request_index,
+                    source_token_positions=source_tensor,
+                    destination_slots=destination_tensor,
+                    hot_planes=binding.hot_cache.planes,
+                    completion=binding.io_completion,
+                )
+
+        self._mock_initialized_requests[request_id] = (
+            handoff.remote_request_id
+        )
+        if dsa_sparse_probe.is_enabled():
+            dsa_sparse_probe.emit(
+                "pd_hot_cache_initialized",
+                request_id=str(request_id),
+                remote_request_id=handoff.remote_request_id,
+                request_index=request_index,
+                stored_token_count=handoff.stored_token_count,
+            )
+        return request_index
+
     def retire_mock_request(
         self,
         request_id: Hashable,
@@ -426,6 +858,7 @@ class DSASparseEagerRuntime:
         else:
             lifecycle.finish(request_id, generation)
         del self._mock_request_generations[request_id]
+        self._mock_initialized_requests.pop(request_id, None)
 
     def begin_target_batch(
         self,
@@ -648,6 +1081,22 @@ def _unique_by_identity(
         if identity not in identities:
             identities.add(identity)
             unique.append(value)
+    return tuple(unique)
+
+
+def _unique_producer_metadata(
+    values: Iterable[object],
+) -> tuple[DSASparseProducerLayerMetadata, ...]:
+    unique: list[DSASparseProducerLayerMetadata] = []
+    identities: set[int] = set()
+    for value in values:
+        identity = id(value)
+        if identity in identities:
+            continue
+        identities.add(identity)
+        unique.append(
+            cast(DSASparseProducerLayerMetadata, value)
+        )
     return tuple(unique)
 
 

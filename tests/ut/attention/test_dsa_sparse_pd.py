@@ -7,9 +7,12 @@ import pytest
 
 from vllm_ascend.attention.dsa_sparse import RequestIndexManager
 from vllm_ascend.attention.dsa_sparse_pd import (
+    DSASparsePDHandoff,
     DSASparsePDLifecycle,
     DSASparseTransferCompletion,
+    build_dsa_sparse_resident_token_ids,
 )
+from vllm_ascend.dsa_sparse_constants import DSA_SPARSE_QUERY_WIDTH
 
 
 @dataclass
@@ -231,3 +234,53 @@ def test_long_request_churn_keeps_only_active_lifecycle_state():
     assert lifecycle._requests == {}
     assert coordinator.request_index_manager.active_request_ids == ()
     assert len(backend.released) == 1_000
+
+
+def test_resident_selection_preserves_topk_order_and_dense_tail():
+    resident = build_dsa_sparse_resident_token_ids(
+        topk_token_ids=[255, 7, 3, 7, -1, 128, 200],
+        stored_token_count=259,
+        block_size=128,
+        resident_token_count=6,
+    )
+
+    # [256, 259) is the independent dense tail. Invalid and duplicate
+    # positions are ignored before historical-order fill.
+    assert resident == [255, 7, 3, 128, 200, 0]
+
+
+def test_pd_handoff_round_trips_without_backend_payload():
+    topk = list(range(DSA_SPARSE_QUERY_WIDTH))
+    handoff = DSASparsePDHandoff(
+        remote_request_id="prefill-request",
+        stored_token_count=4097,
+        block_size=128,
+        layer_topk_by_rank={
+            0: {
+                "model.layers.0.self_attn": topk,
+            },
+        },
+    )
+
+    assert DSASparsePDHandoff.from_dict(
+        handoff.to_dict()
+    ) == handoff
+
+
+def test_pd_handoff_rejects_non_integer_topk_ids():
+    raw_handoff = {
+        "remote_request_id": "prefill-request",
+        "stored_token_count": 4097,
+        "block_size": 128,
+        "layer_topk_by_rank": {
+            "0": {
+                "model.layers.0.self_attn": [
+                    True
+                ]
+                * DSA_SPARSE_QUERY_WIDTH,
+            },
+        },
+    }
+
+    with pytest.raises(TypeError, match="token IDs"):
+        DSASparsePDHandoff.from_dict(raw_handoff)

@@ -111,6 +111,10 @@ from vllm_ascend.attention.dsa_sparse import (
     DSASparseCacheConfig,
     DSASparseLayerLayout,
 )
+from vllm_ascend.attention.dsa_sparse_io import (
+    MockDSASparseIOOperator,
+)
+from vllm_ascend.attention.dsa_sparse_pd import DSASparsePDHandoff
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import (
@@ -176,6 +180,8 @@ from vllm_ascend.worker.dsa_sparse_eager import (
     DSASparseEagerCohortLayout,
     DSASparseEagerExecution,
     DSASparseEagerRuntime,
+    DSASparseProducerExecution,
+    begin_dsa_sparse_producer_execution,
     create_dsa_sparse_eager_mock_runtime,
 )
 from vllm_ascend.worker.dsa_sparse_external_main import (
@@ -357,6 +363,15 @@ class NPUModelRunner(GPUModelRunner):
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
         self.dsa_sparse_eager_runtime: DSASparseEagerRuntime | None = None
+        self.dsa_sparse_mock_io_operator = (
+            MockDSASparseIOOperator()
+            if self.ascend_config.dsa_sparse_config is not None
+            else None
+        )
+        self._dsa_sparse_pd_handoffs: dict[
+            str,
+            DSASparsePDHandoff,
+        ] = {}
         self._dsa_sparse_external_main_specs = (
             DSASparseExternalMainSpecs.empty()
         )
@@ -660,6 +675,7 @@ class NPUModelRunner(GPUModelRunner):
             self._get_dsa_sparse_cache_config(),
             self._get_dsa_sparse_eager_cohort_layouts(),
             device=self.device,
+            io_operator=self.dsa_sparse_mock_io_operator,
         )
         self.bind_dsa_sparse_eager_runtime(runtime)
 
@@ -888,15 +904,74 @@ class NPUModelRunner(GPUModelRunner):
         num_scheduled_tokens: np.ndarray,
         positions: torch.Tensor,
         attn_metadata: PerLayerAttnMetadata,
-    ) -> DSASparseEagerExecution | nullcontext[None]:
+    ) -> (
+        DSASparseEagerExecution
+        | DSASparseProducerExecution
+        | nullcontext[None]
+    ):
         config = self.ascend_config.dsa_sparse_config
-        if config is None or config.is_producer:
+        if config is None:
             return nullcontext()
+        if config.is_producer:
+            if isinstance(attn_metadata, list):
+                raise RuntimeError(
+                    "DSA Sparse P publication does not support attention "
+                    "microbatch metadata."
+                )
+            io_operator = self.dsa_sparse_mock_io_operator
+            if io_operator is None:
+                raise RuntimeError(
+                    "DSA Sparse P publication has no I/O operator."
+                )
+            request_ids = list(self.input_batch.req_ids[:num_reqs])
+            scheduled_counts = [
+                int(count)
+                for count in num_scheduled_tokens[:num_reqs]
+            ]
+            stored_counts: list[int] = []
+            publish_requests: list[bool] = []
+            for request_id, scheduled_count in zip(
+                request_ids,
+                scheduled_counts,
+            ):
+                request_state = self.requests[request_id]
+                stored_token_count = (
+                    request_state.num_prompt_tokens
+                )
+                stored_counts.append(stored_token_count)
+                prefill_start = request_state.num_computed_tokens
+                publish_requests.append(
+                    prefill_start < stored_token_count
+                    <= prefill_start + scheduled_count
+                )
+            if not any(publish_requests):
+                return nullcontext()
+            layer_metadata = {
+                layer_name: metadata
+                for layer_name, metadata in attn_metadata.items()
+                if hasattr(
+                    metadata,
+                    "dsa_sparse_producer_context",
+                )
+            }
+            if not layer_metadata:
+                raise RuntimeError(
+                    "DSA Sparse P publication found no SFA layer metadata."
+                )
+            return begin_dsa_sparse_producer_execution(
+                io_operator=io_operator,
+                request_ids=request_ids,
+                scheduled_token_counts=scheduled_counts,
+                stored_token_counts=stored_counts,
+                publish_requests=publish_requests,
+                layer_metadata=layer_metadata,
+                block_size=self.block_size,
+            )
         if self.dsa_sparse_eager_runtime is None:
             raise RuntimeError(
                 "DSA Sparse eager Decode is enabled, but no runtime is bound. "
-                "Bind the storage backend and eager I/O operator before "
-                "executing the model."
+                "Initialize the eager mock runtime before executing the "
+                "model."
             )
         if self.attn_state != AscendAttentionState.DecodeOnly:
             raise RuntimeError(
@@ -1043,6 +1118,7 @@ class NPUModelRunner(GPUModelRunner):
         # Temporary rewind guard for KV-load-failure recompute.
         # This can be removed after the upstream fix is merged.
         req_data = scheduler_output.scheduled_cached_reqs
+        self._record_dsa_sparse_pd_handoffs(scheduler_output)
 
         if self.use_async_scheduling:
             for i, req_id in enumerate(req_data.req_ids):
@@ -1096,6 +1172,15 @@ class NPUModelRunner(GPUModelRunner):
                 for request_id in dict.fromkeys(admission_order):
                     mock_runtime.admit_mock_request(request_id)
                     admitted_request_ids.append(request_id)
+                    handoff = self._dsa_sparse_pd_handoffs.get(
+                        request_id
+                    )
+                    if handoff is not None:
+                        mock_runtime.initialize_mock_request_from_handoff(
+                            request_id,
+                            handoff,
+                            rank=get_tp_group().rank_in_group,
+                        )
             except BaseException as admission_error:
                 for request_id in reversed(admitted_request_ids):
                     try:
@@ -1116,8 +1201,68 @@ class NPUModelRunner(GPUModelRunner):
                                 f"{cleanup_error!r}"
                             )
                 raise
+            new_request_ids = {
+                request.req_id
+                for request
+                in scheduler_output.scheduled_new_reqs
+            }
+            for request_id in finished_req_ids - new_request_ids:
+                self._dsa_sparse_pd_handoffs.pop(
+                    request_id,
+                    None,
+                )
 
         return deferred_correction
+
+    def _record_dsa_sparse_pd_handoffs(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        config = self.ascend_config.dsa_sparse_config
+        if config is None or not config.is_consumer:
+            return
+        handoffs = getattr(
+            self,
+            "_dsa_sparse_pd_handoffs",
+            None,
+        )
+        if handoffs is None:
+            handoffs = {}
+            self._dsa_sparse_pd_handoffs = handoffs
+        connector_metadata = getattr(
+            scheduler_output,
+            "kv_connector_metadata",
+            None,
+        )
+        requests = getattr(
+            connector_metadata,
+            "requests",
+            None,
+        )
+        if not isinstance(requests, dict):
+            return
+        for request_id, request_metadata in requests.items():
+            handoff = getattr(
+                request_metadata,
+                "dsa_sparse_handoff",
+                None,
+            )
+            if handoff is None:
+                continue
+            if not isinstance(handoff, DSASparsePDHandoff):
+                raise TypeError(
+                    "DSA Sparse connector metadata contains an invalid "
+                    f"handoff for request {request_id!r}."
+                )
+            current = handoffs.get(
+                request_id
+            )
+            if current is not None and current != handoff:
+                raise RuntimeError(
+                    "DSA Sparse D received conflicting P/D handoffs for "
+                    f"request {request_id!r}."
+                )
+            handoffs[request_id] = handoff
 
     def _pad_query_start_loc_for_fia(
         self,

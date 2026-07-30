@@ -1067,3 +1067,20 @@
 #       runner and can rely on upstream's default enablement heuristics
 #       (model architecture, Triton, feature checks) without crashes or
 #       degraded functionality.
+#
+# ** 31. File: platform/patch_dsa_sparse_pd.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.sched.scheduler.Scheduler.update_from_output`
+#    Why:
+#       vLLM invokes connector request teardown before it delivers worker
+#       metadata. DSA Sparse needs final-Prefill TopK metadata while building
+#       the P-to-D handoff during that teardown.
+#    How:
+#       Let connectors pre-consume DSA Sparse worker metadata before the
+#       original scheduler output loop. Mooncake removes only the consumed DSA
+#       metadata so the normal later connector update remains a no-op for it.
+#    Related PR (if no, explain why):
+#       No, this is an eager DSA Sparse development path.
+#    Future Plan:
+#       Remove this patch once upstream exposes a connector metadata hook before
+#       `request_finished`.
