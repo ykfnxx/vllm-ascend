@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import torch
 
@@ -70,10 +70,20 @@ def test_torch_operator_can_select_asu_hbm_index_lookup() -> None:
         "torch.ops._C_ascend.asu_hbm_index_lookup",
         create=True,
         return_value=(expected_slots, expected_misses),
-    ) as custom_op, patch(
+    ) as lookup_op, patch(
+        "torch.ops._C_ascend.asu_hbm_index_maintain_aicpu",
+        create=True,
+    ) as maintain_op, patch(
+        "torch.npu.synchronize",
+        create=True,
+    ) as synchronize, patch(
         "vllm_ascend.ops.dsa_sparse.dsa_sparse_probe.is_enabled",
         return_value=False,
     ):
+        calls = Mock()
+        calls.attach_mock(lookup_op, "lookup")
+        calls.attach_mock(maintain_op, "maintain")
+        calls.attach_mock(synchronize, "synchronize")
         output = TorchDSASparseLookupOperator(
             lookup_backend="asu_hbm_index_lookup"
         ).lookup(
@@ -81,16 +91,29 @@ def test_torch_operator_can_select_asu_hbm_index_lookup() -> None:
             batch=batch,
         )
 
-    custom_op.assert_called_once_with(
-        state.index,
-        state.slot_to_index,
-        state.free_slots,
-        state.free_head,
-        batch.req_pool_entries,
-        batch.query_index,
-        batch.lookup_mask,
-        2,
-    )
+    assert calls.mock_calls == [
+        call.lookup(
+            state.index,
+            state.slot_to_index,
+            state.free_slots,
+            state.free_head,
+            batch.req_pool_entries,
+            batch.query_index,
+            batch.lookup_mask,
+            2,
+        ),
+        call.maintain(
+            state.index,
+            state.slot_to_index,
+            state.free_slots,
+            state.free_head,
+            batch.req_pool_entries,
+            expected_slots,
+            2,
+            0,
+        ),
+        call.synchronize(),
+    ]
     assert output.slot_out is expected_slots
     assert output.miss_out is expected_misses
 

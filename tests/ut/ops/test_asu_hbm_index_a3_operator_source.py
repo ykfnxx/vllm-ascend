@@ -30,7 +30,7 @@ def _soc_branch(source: str, name: str, next_name: str) -> str:
     return source[start:end]
 
 
-def test_a3_package_selects_both_legacy_index_operators() -> None:
+def test_a3_and_a5_packages_select_both_legacy_index_operators() -> None:
     source = BUILD_SCRIPT.read_text(encoding="utf-8")
     a2_branch = _soc_branch(source, "ascend910b", "ascend910_93")
     a3_branch = _soc_branch(source, "ascend910_93", "ascend950")
@@ -43,14 +43,14 @@ def test_a3_package_selects_both_legacy_index_operators() -> None:
         "asu_hbm_index_maintain_aicpu",
     ):
         assert f'"{op_name}"' in a3_branch
+        assert f'"{op_name}"' in a5_branch
         assert f'"{op_name}"' not in a2_branch
-        assert f'"{op_name}"' not in a5_branch
 
     assert '"dsa_sparse_lookup_update"' in a5_branch
     assert '"dsa_sparse_lookup_update"' not in a3_branch
 
 
-def test_lookup_is_registered_only_for_ascend910_93() -> None:
+def test_lookup_is_registered_for_a3_and_a5() -> None:
     source = (
         LOOKUP_ROOT
         / "op_host"
@@ -58,8 +58,8 @@ def test_lookup_is_registered_only_for_ascend910_93() -> None:
     ).read_text(encoding="utf-8")
 
     assert 'AddConfig("ascend910_93"' in source
+    assert 'AddConfig("ascend950"' in source
     assert 'AddConfig("ascend910b"' not in source
-    assert 'AddConfig("ascend950"' not in source
 
 
 def test_lookup_exposes_v023_public_aclnn_wrapper() -> None:
@@ -94,6 +94,25 @@ def test_lookup_preserves_a3_kernel_compile_mode() -> None:
 
     assert "--cce-auto-sync=off" in source
     assert "--op_relocatable_kernel_binary=true" in source
+
+
+def test_lookup_uses_default_aiv_kernel_entry() -> None:
+    kernel_source = (
+        LOOKUP_ROOT
+        / "op_kernel"
+        / "asu_hbm_index_lookup.cpp"
+    ).read_text(encoding="utf-8")
+    tiling_source = (
+        LOOKUP_ROOT
+        / "op_host"
+        / "asu_hbm_index_lookup_tiling.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert (
+        "KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY)"
+        in kernel_source
+    )
+    assert "context->SetTilingKey(0)" in tiling_source
 
 
 def test_maintain_uses_v023_unified_aicpu_package_layout() -> None:

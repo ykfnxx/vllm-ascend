@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
-"""Torch binding for the fused DSA Sparse lookup/update operator."""
+"""Torch bindings for the selectable DSA Sparse lookup backends."""
 
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ class TorchDSASparseLookupOperator:
         self.lookup_backend = lookup_backend
         if lookup_backend == DSA_SPARSE_ASU_LOOKUP_BACKEND:
             self._lookup = self._asu_hbm_index_lookup
+            self._maintain_seed = 0
         else:
             self._lookup = self._dsa_sparse_lookup_update
 
@@ -46,6 +47,12 @@ class TorchDSASparseLookupOperator:
         *args: object,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return torch.ops._C_ascend.dsa_sparse_lookup_update(*args)
+
+    @staticmethod
+    def _asu_hbm_index_maintain(
+        *args: object,
+    ) -> None:
+        torch.ops._C_ascend.asu_hbm_index_maintain_aicpu(*args)
 
     def lookup(
         self,
@@ -68,8 +75,26 @@ class TorchDSASparseLookupOperator:
             batch.lookup_mask,
             req_num,
         )
+        synchronized = False
+        if self.lookup_backend == DSA_SPARSE_ASU_LOOKUP_BACKEND:
+            self._asu_hbm_index_maintain(
+                state.index,
+                state.slot_to_index,
+                state.free_slots,
+                state.free_head,
+                batch.req_pool_entries,
+                slot_out,
+                req_num,
+                self._maintain_seed,
+            )
+            self._maintain_seed = (
+                self._maintain_seed + 1
+            ) & 0x7FFFFFFF
+            torch.npu.synchronize()
+            synchronized = True
         if dsa_sparse_probe.is_enabled():
-            dsa_sparse_probe.synchronize_device()
+            if not synchronized:
+                dsa_sparse_probe.synchronize_device()
             dsa_sparse_probe.emit(
                 "lookup_update_done",
                 cohort=state.cohort.name,

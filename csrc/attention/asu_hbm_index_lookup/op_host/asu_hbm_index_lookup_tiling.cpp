@@ -49,6 +49,7 @@ static ge::graphStatus AsuHbmIndexLookupTilingFunc(
     uint32_t req_num = static_cast<uint32_t>(*req_num_attr);
     tiling.set_reqNum(req_num);
     context->SetBlockDim(std::min(req_num, aiv_num));
+    context->SetTilingKey(0);
 
     tiling.SaveToBuffer(
         context->GetRawTilingData()->GetData(),
