@@ -5,7 +5,7 @@
 # This script exercises:
 #   - two isolated vLLM engines (Prefill TP1 + Decode TP1);
 #   - the standard P/D proxy and kv_transfer_params handoff;
-#   - the fused ASU-shaped Lookup/Maintain custom operator;
+#   - the selected ASU-shaped lookup custom operator;
 #   - per-layer Hot Cache Sparse Flash Attention.
 #
 # Payload movement remains mocked. This script validates control flow and
@@ -41,6 +41,7 @@ MAX_TOKENS="1"
 MAX_MODEL_LEN="4096"
 STARTUP_TIMEOUT="900"
 GPU_MEMORY_UTILIZATION="0.50"
+LOOKUP_BACKEND="dsa_sparse_lookup_update"
 LOG_DIR=""
 VERIFY_PATH="0"
 
@@ -69,16 +70,19 @@ Options:
   --max-tokens N               Decode token count. Default: 1
   --max-model-len N            Model context limit. Default: 4096
   --gpu-memory-utilization F   Per-engine NPU memory fraction. Default: 0.50
+  --lookup-backend NAME        Lookup operator: dsa_sparse_lookup_update
+                               or asu_hbm_index_lookup.
+                               Default: dsa_sparse_lookup_update
   --startup-timeout SEC        Per-service startup timeout. Default: 900
   --log-dir DIR                Keep logs in DIR. Default: a new /tmp directory
-  --verify-path                Profile Decode and verify the fused lookup op
+  --verify-path                Profile Decode and verify the selected lookup op
                                plus every per-layer Hot Cache SFA call.
   -h, --help                   Show this help.
 
 Without --verify-path, success only proves process isolation and P/D routing.
-With --verify-path, success also proves that each Decode step called the fused
-Lookup/Maintain operator once per cohort and that the Decode profile contains
-the custom operator. Payload movement remains mocked.
+With --verify-path, success also proves that each Decode step called the
+selected lookup operator once per cohort and that the Decode profile contains
+that operator. Payload movement remains mocked.
 EOF
 }
 
@@ -172,6 +176,11 @@ while (($# > 0)); do
             GPU_MEMORY_UTILIZATION="$2"
             shift 2
             ;;
+        --lookup-backend)
+            require_value "$@"
+            LOOKUP_BACKEND="$2"
+            shift 2
+            ;;
         --startup-timeout)
             require_value "$@"
             STARTUP_TIMEOUT="$2"
@@ -213,6 +222,12 @@ done
 
 if [[ "$PREFILL_DEVICE" == "$DECODE_DEVICE" ]]; then
     echo "Prefill and Decode must use different physical NPU IDs." >&2
+    exit 2
+fi
+
+if [[ "$LOOKUP_BACKEND" != "dsa_sparse_lookup_update" \
+    && "$LOOKUP_BACKEND" != "asu_hbm_index_lookup" ]]; then
+    echo "Unsupported lookup backend: $LOOKUP_BACKEND" >&2
     exit 2
 fi
 
@@ -343,8 +358,8 @@ PY
     )
 fi
 
-PREFILL_DSA_CONFIG='{"ascend_compilation_config":{"enable_npugraph_ex":false},"dsa_sparse_config":{"io_backend":"mock","io_backend_options":{"namespace":"tiny-glm-pd-probe"}}}'
-DECODE_DSA_CONFIG="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_sparse_config\":{\"io_backend\":\"mock\",\"io_backend_options\":{\"namespace\":\"tiny-glm-pd-probe\"}}}"
+PREFILL_DSA_CONFIG="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_sparse_config\":{\"io_backend\":\"mock\",\"io_backend_options\":{\"namespace\":\"tiny-glm-pd-probe\"},\"lookup_backend\":\"$LOOKUP_BACKEND\"}}"
+DECODE_DSA_CONFIG="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_sparse_config\":{\"io_backend\":\"mock\",\"io_backend_options\":{\"namespace\":\"tiny-glm-pd-probe\"},\"lookup_backend\":\"$LOOKUP_BACKEND\"}}"
 PREFILL_KV_CONFIG="{\"kv_connector\":\"MooncakeConnectorV1\",\"kv_role\":\"kv_producer\",\"kv_port\":$PREFILL_KV_PORT,\"engine_id\":\"0\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"prefill\":{\"dp_size\":1,\"tp_size\":1},\"decode\":{\"dp_size\":1,\"tp_size\":1}}}"
 DECODE_KV_CONFIG="{\"kv_connector\":\"MooncakeConnectorV1\",\"kv_role\":\"kv_consumer\",\"kv_port\":$DECODE_KV_PORT,\"engine_id\":\"1\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"prefill\":{\"dp_size\":1,\"tp_size\":1},\"decode\":{\"dp_size\":1,\"tp_size\":1}}}"
 
@@ -519,12 +534,13 @@ PY
     python3 "$SCRIPT_DIR/dsa_sparse_probe_validate.py" \
         --decode-log "$DECODE_LOG" \
         --response-json "$RESPONSE_JSON" \
-        --profile-dir "$DECODE_PROFILE_DIR"
+        --profile-dir "$DECODE_PROFILE_DIR" \
+        --lookup-backend "$LOOKUP_BACKEND"
 fi
 
 echo
 if [[ "$VERIFY_PATH" == "1" ]]; then
-    echo "PASS: P/D routing, fused Lookup/Maintain, and per-layer Hot Cache SFA completed."
+    echo "PASS: P/D routing, $LOOKUP_BACKEND, and per-layer Hot Cache SFA completed."
 else
     echo "PASS: process isolation and P/D routing completed."
     echo "Run again with --verify-path to verify the custom-op and Hot Cache path."

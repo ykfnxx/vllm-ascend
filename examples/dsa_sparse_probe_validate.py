@@ -10,11 +10,18 @@ from pathlib import Path
 from typing import Any
 
 PROBE_LOG_PREFIX = "DSA_SPARSE_PROBE "
-CUSTOM_OP_NAMES = (
-    "dsasparselookupupdate",
-    "dsa_sparse_lookup_update",
-    "aclnndsasparselookupupdate",
-)
+CUSTOM_OP_NAMES = {
+    "dsa_sparse_lookup_update": (
+        "dsasparselookupupdate",
+        "dsa_sparse_lookup_update",
+        "aclnndsasparselookupupdate",
+    ),
+    "asu_hbm_index_lookup": (
+        "asuhbmindexlookup",
+        "asu_hbm_index_lookup",
+        "aclnnasuhbmindexlookup",
+    ),
+}
 PROFILE_FILENAMES = {
     "kernel_details.csv",
     "operator_details.csv",
@@ -101,7 +108,11 @@ def _read_completion_tokens(response_json: Path) -> int:
     )
 
 
-def _profile_contains_custom_op(profile_dir: Path) -> bool:
+def _profile_contains_custom_op(
+    profile_dir: Path,
+    lookup_backend: str,
+) -> bool:
+    expected_names = CUSTOM_OP_NAMES[lookup_backend]
     profile_files = [
         path
         for path in profile_dir.rglob("*")
@@ -121,7 +132,7 @@ def _profile_contains_custom_op(profile_dir: Path) -> bool:
                 lowered = line.lower()
                 if any(
                     op_name in lowered
-                    for op_name in CUSTOM_OP_NAMES
+                    for op_name in expected_names
                 ):
                     return True
     return False
@@ -132,6 +143,7 @@ def validate(
     decode_log: Path,
     response_json: Path,
     profile_dir: Path,
+    lookup_backend: str = "dsa_sparse_lookup_update",
 ) -> dict[str, int]:
     events = _read_probe_events(decode_log)
     runtime_events = _events_named(events, "runtime_ready")
@@ -377,10 +389,13 @@ def validate(
             f"{expected_hot_sfa_counts}, got {dict(hot_sfa_counts)}"
         )
 
-    if not _profile_contains_custom_op(profile_dir):
+    if not _profile_contains_custom_op(
+        profile_dir,
+        lookup_backend,
+    ):
         _fail(
-            "Decode profile does not contain DsaSparseLookupUpdate, "
-            "dsa_sparse_lookup_update, or aclnnDsaSparseLookupUpdate."
+            "Decode profile does not contain selected lookup backend "
+            f"{lookup_backend!r}."
         )
 
     return {
@@ -414,11 +429,17 @@ def main() -> None:
         type=Path,
         required=True,
     )
+    parser.add_argument(
+        "--lookup-backend",
+        choices=tuple(CUSTOM_OP_NAMES),
+        default="dsa_sparse_lookup_update",
+    )
     args = parser.parse_args()
     summary = validate(
         decode_log=args.decode_log,
         response_json=args.response_json,
         profile_dir=args.profile_dir,
+        lookup_backend=args.lookup_backend,
     )
     print(
         "PASS: DSA Sparse custom operator and Hot Cache path verified: "

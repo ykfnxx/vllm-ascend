@@ -13,10 +13,39 @@ from vllm_ascend.attention.dsa_sparse import (
     DSASparseLookupOutput,
     DSASparseLookupState,
 )
+from vllm_ascend.dsa_sparse_config import (
+    DSA_SPARSE_ASU_LOOKUP_BACKEND,
+    DSA_SPARSE_FUSED_LOOKUP_BACKEND,
+    DSASparseLookupBackend,
+)
 
 
 class TorchDSASparseLookupOperator:
-    """Invoke the ASU-shaped lookup ABI with maintain fused in the kernel."""
+    """Invoke the selected implementation of the common lookup ABI."""
+
+    def __init__(
+        self,
+        lookup_backend: DSASparseLookupBackend = (
+            DSA_SPARSE_FUSED_LOOKUP_BACKEND
+        ),
+    ) -> None:
+        self.lookup_backend = lookup_backend
+        if lookup_backend == DSA_SPARSE_ASU_LOOKUP_BACKEND:
+            self._lookup = self._asu_hbm_index_lookup
+        else:
+            self._lookup = self._dsa_sparse_lookup_update
+
+    @staticmethod
+    def _asu_hbm_index_lookup(
+        *args: object,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops._C_ascend.asu_hbm_index_lookup(*args)
+
+    @staticmethod
+    def _dsa_sparse_lookup_update(
+        *args: object,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops._C_ascend.dsa_sparse_lookup_update(*args)
 
     def lookup(
         self,
@@ -29,17 +58,15 @@ class TorchDSASparseLookupOperator:
             raise ValueError(
                 "DSA Sparse lookup requires at least one request."
             )
-        slot_out, miss_out = (
-            torch.ops._C_ascend.dsa_sparse_lookup_update(
-                state.index,
-                state.slot_to_index,
-                state.free_slots,
-                state.free_head,
-                batch.req_pool_entries,
-                batch.query_index,
-                batch.lookup_mask,
-                req_num,
-            )
+        slot_out, miss_out = self._lookup(
+            state.index,
+            state.slot_to_index,
+            state.free_slots,
+            state.free_head,
+            batch.req_pool_entries,
+            batch.query_index,
+            batch.lookup_mask,
+            req_num,
         )
         if dsa_sparse_probe.is_enabled():
             dsa_sparse_probe.synchronize_device()

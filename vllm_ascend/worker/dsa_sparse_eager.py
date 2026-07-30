@@ -32,6 +32,10 @@ from vllm_ascend.attention.dsa_sparse_pd import (
     DSASparsePDLifecycle,
     DSASparseTransferCompletion,
 )
+from vllm_ascend.dsa_sparse_config import (
+    DSA_SPARSE_FUSED_LOOKUP_BACKEND,
+    DSASparseLookupBackend,
+)
 
 
 class DSASparseEagerLayerMetadata(Protocol):
@@ -118,6 +122,9 @@ def create_dsa_sparse_eager_mock_runtime(
     cohort_layouts: Iterable[DSASparseEagerCohortLayout],
     *,
     device: torch.device | str,
+    lookup_backend: DSASparseLookupBackend = (
+        DSA_SPARSE_FUSED_LOOKUP_BACKEND
+    ),
     lookup_operator: DSASparseLookupOperator | None = None,
     io_operator: DSASparseIOOperator | None = None,
 ) -> DSASparseEagerRuntime:
@@ -143,7 +150,9 @@ def create_dsa_sparse_eager_mock_runtime(
             TorchDSASparseLookupOperator,
         )
 
-        lookup_operator = TorchDSASparseLookupOperator()
+        lookup_operator = TorchDSASparseLookupOperator(
+            lookup_backend=lookup_backend,
+        )
     if io_operator is None:
         io_operator = MockDSASparseIOOperator()
 

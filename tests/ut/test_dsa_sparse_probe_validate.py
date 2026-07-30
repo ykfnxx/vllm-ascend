@@ -18,6 +18,7 @@ def _write_fixture(
     root: Path,
     *,
     second_layer_ptr: int = 201,
+    operator_name: str = "DsaSparseLookupUpdate",
 ) -> tuple[Path, Path, Path]:
     decode_log = root / "decode.log"
     response_json = root / "response.json"
@@ -101,7 +102,7 @@ def _write_fixture(
         encoding="utf-8",
     )
     (profile_dir / "operator_details.csv").write_text(
-        "Name,Duration\nDsaSparseLookupUpdate,1\n",
+        f"Name,Duration\n{operator_name},1\n",
         encoding="utf-8",
     )
     return decode_log, response_json, profile_dir
@@ -141,6 +142,40 @@ def test_validate_rejects_hot_cache_address_reuse(
         RuntimeError,
         match="Hot Cache addresses are shared across layers",
     ):
+        validate(
+            decode_log=decode_log,
+            response_json=response_json,
+            profile_dir=profile_dir,
+        )
+
+
+def test_validate_accepts_selected_asu_lookup_backend(
+    tmp_path: Path,
+):
+    decode_log, response_json, profile_dir = _write_fixture(
+        tmp_path,
+        operator_name="AsuHbmIndexLookup",
+    )
+
+    summary = validate(
+        decode_log=decode_log,
+        response_json=response_json,
+        profile_dir=profile_dir,
+        lookup_backend="asu_hbm_index_lookup",
+    )
+
+    assert summary["lookup_update_done"] == 2
+
+
+def test_validate_rejects_unselected_lookup_backend(
+    tmp_path: Path,
+):
+    decode_log, response_json, profile_dir = _write_fixture(
+        tmp_path,
+        operator_name="AsuHbmIndexLookup",
+    )
+
+    with pytest.raises(RuntimeError, match="selected lookup backend"):
         validate(
             decode_log=decode_log,
             response_json=response_json,

@@ -660,6 +660,7 @@ class NPUModelRunner(GPUModelRunner):
             self._get_dsa_sparse_cache_config(),
             self._get_dsa_sparse_eager_cohort_layouts(),
             device=self.device,
+            lookup_backend=config.lookup_backend,
         )
         self.bind_dsa_sparse_eager_runtime(runtime)
 

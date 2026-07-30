@@ -941,6 +941,7 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
                 is_consumer=consumer,
                 is_producer=not consumer,
                 io_backend="mock",
+                lookup_backend="dsa_sparse_lookup_update",
             )
         )
         runner.dsa_sparse_eager_runtime = None
@@ -973,6 +974,7 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
             cache_config,
             cohort_layouts,
             device=torch.device("cpu"),
+            lookup_backend="dsa_sparse_lookup_update",
         )
         self.assertIs(runner.dsa_sparse_eager_runtime, runtime)
 

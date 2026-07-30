@@ -11,6 +11,7 @@ from vllm_ascend.dsa_sparse_config import load_dsa_sparse_config
 def make_vllm_config(
     *,
     io_backend: str = "mock",
+    lookup_backend: str | None = None,
     role: str = "kv_consumer",
     enforce_eager: bool = True,
     pp: int = 1,
@@ -28,6 +29,8 @@ def make_vllm_config(
         "io_backend_options": {"namespace": "test"},
         **(extra_dsa_fields or {}),
     }
+    if lookup_backend is not None:
+        dsa_config["lookup_backend"] = lookup_backend
     return SimpleNamespace(
         additional_config={"dsa_sparse_config": dsa_config},
         model_config=SimpleNamespace(
@@ -63,6 +66,7 @@ def test_config_exposes_only_fixed_lookup_contract_inputs():
     assert config is not None
     assert config.is_consumer
     assert config.index_topk == 2048
+    assert config.lookup_backend == "dsa_sparse_lookup_update"
     assert not hasattr(config, "device_buffer_size")
     assert not hasattr(config, "max_query_tokens_per_request")
     with pytest.raises(TypeError):
@@ -92,6 +96,22 @@ def test_graph_execution_is_rejected():
 def test_only_mock_io_is_supported():
     with pytest.raises(ValueError, match="only io_backend='mock'"):
         load_dsa_sparse_config(make_vllm_config(io_backend="vendor"))
+
+
+def test_asu_lookup_backend_is_supported():
+    config = load_dsa_sparse_config(
+        make_vllm_config(lookup_backend="asu_hbm_index_lookup")
+    )
+
+    assert config is not None
+    assert config.lookup_backend == "asu_hbm_index_lookup"
+
+
+def test_unknown_lookup_backend_is_rejected():
+    with pytest.raises(ValueError, match="lookup_backend"):
+        load_dsa_sparse_config(
+            make_vllm_config(lookup_backend="unknown")
+        )
 
 
 @pytest.mark.parametrize(
