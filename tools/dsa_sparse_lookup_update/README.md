@@ -139,3 +139,56 @@ writes a manifest and, unless `--no-trace` is used, a parsed
 `torch_npu.profiler` trace under
 `tools/dsa_sparse_lookup_update/profiles/<timestamp>/`. The script fails if
 the parsed profile does not contain the custom operator name.
+
+## Multi-profile optimization matrix
+
+Run the optimization workload matrix and collect independent hardware metric
+profiles with one command:
+
+```bash
+python3 tools/dsa_sparse_lookup_update/profile_operator_matrix.py \
+  --device npu:0 \
+  --install-root tools/dsa_sparse_lookup_update/.install
+```
+
+The default matrix uses 32 requests and `0`, `1`, `205`, and `2048` misses per
+request. For every workload it records one NPU Event latency distribution and
+then creates four separately parsed profiler traces:
+
+- `pipe-utilization`;
+- `memory`;
+- `resource-conflict`;
+- `l2-cache`.
+
+The metric groups are collected in separate profiler sessions because they
+use different hardware counters. State restoration is outside each Event
+interval and appears in every nonzero-miss trace.
+
+Specify a smaller or larger matrix as needed:
+
+```bash
+python3 tools/dsa_sparse_lookup_update/profile_operator_matrix.py \
+  --device npu:2 \
+  --requests 1 8 32 \
+  --miss-rates 0 10 100 \
+  --metrics pipe-utilization memory resource-conflict \
+  --profile-iters 10
+```
+
+Use either `--miss-counts` or `--miss-rates`. Repeated request counts, miss
+counts, and metric names are deduplicated. The output layout is:
+
+```text
+profiles/matrix-<timestamp>/
+  manifest.json
+  req-0032_miss-0000/
+    manifest.json
+    pipe-utilization/
+    memory/
+    resource-conflict/
+    l2-cache/
+```
+
+Each workload manifest records its exact miss count, effective miss rate,
+Event timing, trace directories, parsed CSV files, and whether state restore
+operations are present in the trace.
