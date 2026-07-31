@@ -40,41 +40,49 @@ def test_outputs_are_initialized_before_invalid_pool_row_return() -> None:
         "if (pool_entry_value < 0"
     )
     slot_initialization = source.index(
-        "slot_out[query_base + entry] = DSA_SPARSE_NOT_FOUND"
+        "local_slots[local_entry] = DSA_SPARSE_NOT_FOUND"
     )
     miss_initialization = source.index(
-        "miss_out[query_base + entry] = 0"
+        "local_misses[local_entry] = 0"
+    )
+    output_store = source.index(
+        "slot_out[offset] = local_slots[local_entry]",
+        invalid_pool_return,
     )
 
     assert slot_initialization < invalid_pool_return
     assert miss_initialization < invalid_pool_return
+    assert invalid_pool_return < output_store
 
 
-def test_kernel_contains_fused_maintain_and_hidden_workspace() -> None:
+def test_kernel_contains_fused_maintain_and_ub_scratch() -> None:
     source = KERNEL_SOURCE.read_text(encoding="utf-8")
 
-    assert "protected_slots" in source
+    assert "__ubuf__ uint32_t* protected_bits" in source
+    assert "__simt_callee__ inline int32_t BlockExclusiveScan" in source
+    assert "asc_atomic_or(protected_bits + word, bit)" in source
+    assert "BlockExclusiveScan" in source
+    assert "for (uint32_t other = 0; other < tid; ++other)" not in source
+    assert "query_values[query_chunk]" in source
+    assert "local_slots[query_chunk]" in source
+    assert "slot_out[offset] != DSA_SPARSE_NOT_FOUND" not in source
     assert "request_free_head[0] = 0" in source
     assert "request_free_head[1]" in source
     assert "request_free_slots" in source
     assert "lru_slots" not in source
 
 
-def test_hidden_workspace_uses_aclnn_user_workspace_region() -> None:
+def test_only_aclnn_system_workspace_is_requested() -> None:
     kernel_source = KERNEL_ENTRY_SOURCE.read_text(encoding="utf-8")
     tiling_source = TILING_SOURCE.read_text(encoding="utf-8")
 
     assert "GetUserWorkspace" not in kernel_source
-    assert (
-        "reinterpret_cast<__gm__ int32_t*>(\n"
-        "                user_workspace)"
-        in kernel_source
-    )
+    assert "shared_scratch[DSA_SPARSE_UB_SCRATCH_WORDS]" in kernel_source
+    assert "shared_scratch," in kernel_source
+    assert "workspaceStride" not in kernel_source
     assert "platform.GetLibApiWorkSpaceSize()" in tiling_source
-    assert (
-        "system_workspace_bytes + user_workspace_bytes"
-        in tiling_source
-    )
+    assert "user_workspace_bytes" not in tiling_source
+    assert "kWorkspaceStride" not in tiling_source
 
 
 def test_torch_schema_matches_asu_lookup_shape() -> None:

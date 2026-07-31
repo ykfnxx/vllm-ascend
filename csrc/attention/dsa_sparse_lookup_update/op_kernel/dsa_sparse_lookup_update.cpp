@@ -50,6 +50,8 @@ extern "C" __global__ __aicore__ void dsa_sparse_lookup_update(
         return;
     }
 
+    __ubuf__ uint32_t
+        shared_scratch[DSA_SPARSE_UB_SCRATCH_WORDS];
     for (uint32_t req_id = first_req_id;
          req_id < tiling_data.reqNum;
          req_id += aiv_count) {
@@ -65,11 +67,9 @@ extern "C" __global__ __aicore__ void dsa_sparse_lookup_update(
             reinterpret_cast<__gm__ int32_t*>(lookup_mask),
             reinterpret_cast<__gm__ int32_t*>(slot_out),
             reinterpret_cast<__gm__ int32_t*>(miss_out),
-            reinterpret_cast<__gm__ int32_t*>(
-                user_workspace),
+            shared_scratch,
             req_id,
-            tiling_data.poolCapacity,
-            tiling_data.workspaceStride);
+            tiling_data.poolCapacity);
     }
 #endif
 }
