@@ -85,19 +85,38 @@ def test_only_aclnn_system_workspace_is_requested() -> None:
     assert "kWorkspaceStride" not in tiling_source
 
 
-def test_each_request_owns_one_logical_block_and_ub_scratch() -> None:
+def test_one_vf_distributes_requests_across_physical_aivs() -> None:
+    simt_source = KERNEL_SOURCE.read_text(encoding="utf-8")
     kernel_source = KERNEL_ENTRY_SOURCE.read_text(encoding="utf-8")
     tiling_source = TILING_SOURCE.read_text(encoding="utf-8")
 
-    assert "const uint32_t req_id =" in kernel_source
-    assert "req_id += aiv_count" not in kernel_source
-    assert "AscendC::GetBlockNum()" not in kernel_source
     assert kernel_source.count("asc_vf_call<") == 1
+    assert "tiling_data.reqNum," in kernel_source
+    assert "gridDim.x" in simt_source
+    assert "blockIdx.x" in simt_source
+    assert "req_id += request_stride" in simt_source
+    assert "DsaSparseLookupUpdateOneRequest(" in simt_source
     assert (
-        "context->SetBlockDim(static_cast<uint32_t>(req_num));"
+        "context->SetBlockDim(std::min("
         in tiling_source
     )
-    assert "std::min(" not in tiling_source
+    assert "static_cast<uint32_t>(req_num), aiv_count" in tiling_source
+    assert "PipeBarrier<PIPE_V>" not in kernel_source
+    assert "PipeBarrier<PIPE_V>" not in simt_source
+
+
+def test_zero_miss_reuse_waits_only_when_another_request_follows() -> None:
+    source = KERNEL_SOURCE.read_text(encoding="utf-8")
+
+    zero_miss = source.index("if (total_misses == 0)")
+    next_request = source.index("if (reuse_scratch)", zero_miss)
+    reuse_barrier = source.index("asc_syncthreads();", next_request)
+    output_store = source.index(
+        "slot_out[offset] = local_slots[local_entry]",
+        reuse_barrier,
+    )
+
+    assert zero_miss < next_request < reuse_barrier < output_store
 
 
 def test_torch_schema_matches_asu_lookup_shape() -> None:

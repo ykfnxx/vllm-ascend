@@ -5,6 +5,7 @@
 
 #include "dsa_sparse_lookup_update_tiling.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -274,7 +275,8 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
     system_workspace[0] = static_cast<size_t>(workspace_bytes);
 
     context->SetTilingKey(0);
-    context->SetBlockDim(static_cast<uint32_t>(req_num));
+    context->SetBlockDim(std::min(
+        static_cast<uint32_t>(req_num), aiv_count));
     return ge::GRAPH_SUCCESS;
 }
 

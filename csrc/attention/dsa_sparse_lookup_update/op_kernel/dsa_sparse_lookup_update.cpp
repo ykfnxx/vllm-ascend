@@ -41,15 +41,9 @@ extern "C" __global__ __aicore__ void dsa_sparse_lookup_update(
         tiling_data,
         tiling);
 
-    const uint32_t req_id =
-        static_cast<uint32_t>(AscendC::GetBlockIdx());
-    if (req_id >= tiling_data.reqNum) {
-        return;
-    }
-
-    // Keep the collaboration state private to one logical block. Requests
-    // beyond the physical AIV count are dispatched in later waves instead of
-    // reusing this UB scratch across consecutive SIMT VF calls.
+    // Launch one VF per active AIV. The VF distributes complete requests
+    // across the physical AIV grid so the per-request cooperative SIMT work
+    // and UB scratch lifetime stay inside one thread block.
     __ubuf__ uint32_t
         shared_scratch[DSA_SPARSE_UB_SCRATCH_WORDS];
     asc_vf_call<
@@ -65,7 +59,7 @@ extern "C" __global__ __aicore__ void dsa_sparse_lookup_update(
         reinterpret_cast<__gm__ int32_t*>(slot_out),
         reinterpret_cast<__gm__ int32_t*>(miss_out),
         shared_scratch,
-        req_id,
+        tiling_data.reqNum,
         tiling_data.poolCapacity);
 #endif
 }

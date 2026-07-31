@@ -88,8 +88,7 @@ __simt_callee__ inline int32_t BlockExclusiveScan(
     return warp_prefix + inclusive - value;
 }
 
-__simt_vf__ __launch_bounds__(DSA_SPARSE_SIMT_THREADS) inline void
-DsaSparseLookupUpdateSimt(
+__simt_callee__ inline void DsaSparseLookupUpdateOneRequest(
     __gm__ int32_t* index,
     __gm__ int32_t* slot_to_index,
     __gm__ int32_t* free_slots,
@@ -101,7 +100,8 @@ DsaSparseLookupUpdateSimt(
     __gm__ int32_t* miss_out,
     __ubuf__ uint32_t* shared_scratch,
     uint32_t req_id,
-    uint32_t pool_capacity)
+    uint32_t pool_capacity,
+    bool reuse_scratch)
 {
     const uint32_t tid = static_cast<uint32_t>(threadIdx.x);
     const uint32_t thread_count =
@@ -403,6 +403,12 @@ DsaSparseLookupUpdateSimt(
         }
     }
     if (total_misses == 0) {
+        // Only a block that owns another request will reuse protected_bits.
+        // Wait for every thread's final ProtectSlot before clearing it in the
+        // next iteration; no vector-pipeline barrier is required.
+        if (reuse_scratch) {
+            asc_syncthreads();
+        }
 #pragma unroll
         for (uint32_t local_entry = 0U;
              local_entry < query_chunk;
@@ -507,6 +513,44 @@ DsaSparseLookupUpdateSimt(
             query_base + query_begin + local_entry;
         slot_out[offset] = local_slots[local_entry];
         miss_out[offset] = local_misses[local_entry];
+    }
+}
+
+__simt_vf__ __launch_bounds__(DSA_SPARSE_SIMT_THREADS) inline void
+DsaSparseLookupUpdateSimt(
+    __gm__ int32_t* index,
+    __gm__ int32_t* slot_to_index,
+    __gm__ int32_t* free_slots,
+    __gm__ int32_t* free_head,
+    __gm__ int32_t* req_pool_entries,
+    __gm__ int32_t* query_index,
+    __gm__ int32_t* lookup_mask,
+    __gm__ int32_t* slot_out,
+    __gm__ int32_t* miss_out,
+    __ubuf__ uint32_t* shared_scratch,
+    uint32_t req_num,
+    uint32_t pool_capacity)
+{
+    const uint32_t request_stride =
+        static_cast<uint32_t>(gridDim.x);
+    for (uint32_t req_id =
+             static_cast<uint32_t>(blockIdx.x);
+         req_id < req_num;
+         req_id += request_stride) {
+        DsaSparseLookupUpdateOneRequest(
+            index,
+            slot_to_index,
+            free_slots,
+            free_head,
+            req_pool_entries,
+            query_index,
+            lookup_mask,
+            slot_out,
+            miss_out,
+            shared_scratch,
+            req_id,
+            pool_capacity,
+            req_id + request_stride < req_num);
     }
 }
 
