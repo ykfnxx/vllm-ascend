@@ -85,6 +85,21 @@ def test_only_aclnn_system_workspace_is_requested() -> None:
     assert "kWorkspaceStride" not in tiling_source
 
 
+def test_each_request_owns_one_logical_block_and_ub_scratch() -> None:
+    kernel_source = KERNEL_ENTRY_SOURCE.read_text(encoding="utf-8")
+    tiling_source = TILING_SOURCE.read_text(encoding="utf-8")
+
+    assert "const uint32_t req_id =" in kernel_source
+    assert "req_id += aiv_count" not in kernel_source
+    assert "AscendC::GetBlockNum()" not in kernel_source
+    assert kernel_source.count("asc_vf_call<") == 1
+    assert (
+        "context->SetBlockDim(static_cast<uint32_t>(req_num));"
+        in tiling_source
+    )
+    assert "std::min(" not in tiling_source
+
+
 def test_torch_schema_matches_asu_lookup_shape() -> None:
     source = BINDING_SOURCE.read_text(encoding="utf-8")
     schema_start = source.index('"dsa_sparse_lookup_update("')
