@@ -123,11 +123,19 @@ the seed between invocations to match the framework's scan-start behavior.
 ```bash
 python3 tools/dsa_sparse_lookup_update/profile_operator.py \
   --device npu:0 \
-  --requests 8
+  --requests 8 \
+  --miss-rate 10
 ```
 
-The profile workload is a steady all-hit lookup over the fixed 2K query
-width. It writes a manifest and, unless `--no-trace` is used, a parsed
+Choose either `--miss-rate` or `--miss-count`; omitting both profiles the
+all-hit path. For a nonzero miss workload, the script restores all persistent
+state before every invocation so every sample performs the requested fused
+lookup/update work. State restoration is outside the NPU Event timing window
+but appears in the profiler trace; filter the parsed files by
+`DsaSparseLookupUpdate` to inspect the custom kernel itself.
+
+The fixed workload has 8K resident entries and a 2K query width. The script
+writes a manifest and, unless `--no-trace` is used, a parsed
 `torch_npu.profiler` trace under
 `tools/dsa_sparse_lookup_update/profiles/<timestamp>/`. The script fails if
 the parsed profile does not contain the custom operator name.

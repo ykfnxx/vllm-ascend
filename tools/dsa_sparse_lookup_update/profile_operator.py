@@ -19,9 +19,11 @@ from common import (
     TOOL_DIR,
     OperatorInputs,
     Runtime,
+    clone_operator_inputs,
     invoke,
     load_runtime,
     make_profile_inputs,
+    restore_operator_inputs,
     validate_requests,
 )
 
@@ -50,9 +52,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--profile-iters", type=int, default=20)
+    miss_group = parser.add_mutually_exclusive_group()
+    miss_group.add_argument("--miss-rate", type=float)
+    miss_group.add_argument("--miss-count", type=int)
     parser.add_argument("--no-trace", action="store_true")
     parser.add_argument("--output-dir", type=Path)
     return parser.parse_args()
+
+
+def _requested_misses(args: argparse.Namespace) -> int:
+    if args.miss_count is not None:
+        return args.miss_count
+    if args.miss_rate is not None:
+        return math.floor(
+            QUERY_COUNT * args.miss_rate / 100.0 + 0.5
+        )
+    return 0
 
 
 def _percentile(sorted_values: list[float], percentile: float) -> float:
@@ -75,13 +90,17 @@ def _summarize_us(samples_us: list[float]) -> dict[str, float | int]:
 def _event_benchmark(
     runtime: Runtime,
     inputs: OperatorInputs,
+    reference: OperatorInputs,
     *,
+    reset_state: bool,
     warmup: int,
     iterations: int,
 ) -> dict[str, float | int]:
     torch = runtime.torch
 
     for _ in range(warmup):
+        if reset_state:
+            restore_operator_inputs(inputs, reference)
         invoke(runtime, inputs)
     torch.npu.synchronize()
 
@@ -94,6 +113,8 @@ def _event_benchmark(
         for _ in range(iterations)
     ]
     for iteration in range(iterations):
+        if reset_state:
+            restore_operator_inputs(inputs, reference)
         start_events[iteration].record()
         invoke(runtime, inputs)
         end_events[iteration].record()
@@ -140,13 +161,17 @@ def _create_profiler(runtime: Runtime, trace_dir: Path) -> Any:
 def _trace(
     runtime: Runtime,
     inputs: OperatorInputs,
+    reference: OperatorInputs,
     *,
+    reset_state: bool,
     iterations: int,
     trace_dir: Path,
 ) -> None:
     profiler = _create_profiler(runtime, trace_dir)
     profiler.start()
     for _ in range(iterations):
+        if reset_state:
+            restore_operator_inputs(inputs, reference)
         invoke(runtime, inputs)
         profiler.step()
     runtime.torch.npu.synchronize()
@@ -198,15 +223,31 @@ def main() -> int:
         value = getattr(args, name)
         if value <= 0:
             raise ValueError(f"{name.replace('_', '-')} must be positive, got {value}.")
+    if (
+        args.miss_rate is not None
+        and not 0.0 <= args.miss_rate <= 100.0
+    ):
+        raise ValueError("miss-rate must be in [0, 100]")
+    if (
+        args.miss_count is not None
+        and not 0 <= args.miss_count <= QUERY_COUNT
+    ):
+        raise ValueError(
+            f"miss-count must be in [0, {QUERY_COUNT}]"
+        )
+    miss_count = _requested_misses(args)
 
     runtime = load_runtime(
         device=args.device,
         install_root=args.install_root,
     )
-    inputs = make_profile_inputs(
+    reference = make_profile_inputs(
         runtime,
         requests=args.requests,
+        miss_count=miss_count,
     )
+    inputs = clone_operator_inputs(reference)
+    reset_state = miss_count > 0
 
     timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     output_dir = (
@@ -222,6 +263,8 @@ def main() -> int:
         timing = _event_benchmark(
             runtime,
             inputs,
+            reference,
+            reset_state=reset_state,
             warmup=args.warmup,
             iterations=args.iterations,
         )
@@ -235,6 +278,8 @@ def main() -> int:
             _trace(
                 runtime,
                 inputs,
+                reference,
+                reset_state=reset_state,
                 iterations=args.profile_iters,
                 trace_dir=trace_dir,
             )
@@ -259,12 +304,21 @@ def main() -> int:
                 RESIDENT_SLOT_COUNT
             ),
             "query_width": QUERY_COUNT,
-            "miss_count": 0,
+            "requested_miss_rate_percent": args.miss_rate,
+            "requested_miss_count": args.miss_count,
+            "miss_count": miss_count,
+            "effective_miss_rate_percent": (
+                100.0 * miss_count / QUERY_COUNT
+            ),
         },
         "measurement": {
             "warmup": args.warmup,
             "iterations": args.iterations,
             "profile_iterations": 0 if args.no_trace else args.profile_iters,
+            "state_reset_excluded_from_event_timing": reset_state,
+            "trace_contains_state_reset": (
+                reset_state and not args.no_trace
+            ),
             **timing,
         },
         "trace_dir": str(trace_dir) if trace_dir is not None else None,
