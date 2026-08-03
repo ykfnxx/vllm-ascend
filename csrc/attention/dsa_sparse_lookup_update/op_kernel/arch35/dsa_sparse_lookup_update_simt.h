@@ -222,15 +222,14 @@ __simt_callee__ inline void DsaSparseLookupUpdateOneRequest(
         static_cast<uint64_t>(pool_entry) *
             DSA_SPARSE_FREE_HEAD_STRIDE;
 
-    // First pass: return resident hits and place a deterministic negative
-    // claim in index[token] for each missing token. A smaller flat query
-    // position always replaces a later claim, so duplicate misses have one
-    // stable owner independent of SIMT scheduling.
+    // First pass: return resident hits and mark active misses. The framework
+    // supplies one pool row per request and unique active query positions, so
+    // a missing token has exactly one owner in this invocation. No claim is
+    // installed in the index table and no atomic arbitration is required.
 #pragma unroll
     for (uint32_t local_entry = 0U;
          local_entry < query_chunk;
          ++local_entry) {
-        const uint32_t entry = query_begin + local_entry;
         if (query_masks[local_entry] == 0) {
             continue;
         }
@@ -254,56 +253,19 @@ __simt_callee__ inline void DsaSparseLookupUpdateOneRequest(
             continue;
         }
 
-        const int32_t desired_claim =
-            DSA_SPARSE_CLAIM_BASE -
-            static_cast<int32_t>(entry);
-        while (observed == DSA_SPARSE_NOT_FOUND ||
-               observed <= DSA_SPARSE_CLAIM_BASE) {
-            if (observed <= DSA_SPARSE_CLAIM_BASE) {
-                const int32_t claimed_entry =
-                    DSA_SPARSE_CLAIM_BASE - observed;
-                if (claimed_entry <=
-                    static_cast<int32_t>(entry)) {
-                    break;
-                }
-            }
-            const int32_t old = asc_atomic_cas(
-                token_slot, observed, desired_claim);
-            if (old == observed) {
-                break;
-            }
-            observed = old;
-        }
+        local_misses[local_entry] = 1;
     }
-    asc_threadfence_block();
-    asc_syncthreads();
-
-    // Count canonical misses per contiguous query chunk. BlockExclusiveScan
-    // preserves input order for free-list allocation.
+    // Count misses per contiguous query chunk. BlockExclusiveScan preserves
+    // input order for free-list allocation.
     int32_t local_miss_count = 0;
 #pragma unroll
     for (uint32_t local_entry = 0U;
          local_entry < query_chunk;
          ++local_entry) {
-        if (query_masks[local_entry] == 0 ||
-            local_slots[local_entry] !=
-                DSA_SPARSE_NOT_FOUND) {
+        if (local_misses[local_entry] == 0) {
             continue;
         }
-        const uint32_t entry = query_begin + local_entry;
-        const int32_t token = query_values[local_entry];
-        if (token < 0 ||
-            token >= static_cast<int32_t>(
-                         DSA_SPARSE_INDEX_CAPACITY)) {
-            continue;
-        }
-        const int32_t claim =
-            DSA_SPARSE_CLAIM_BASE -
-            static_cast<int32_t>(entry);
-        if (request_index[
-                static_cast<uint32_t>(token)] == claim) {
-            ++local_miss_count;
-        }
+        ++local_miss_count;
     }
     const int32_t miss_prefix =
         BlockExclusiveScan(local_miss_count, warp_totals);
@@ -317,25 +279,10 @@ __simt_callee__ inline void DsaSparseLookupUpdateOneRequest(
     for (uint32_t local_entry = 0U;
          local_entry < query_chunk;
          ++local_entry) {
-        if (query_masks[local_entry] == 0 ||
-            local_slots[local_entry] !=
-                DSA_SPARSE_NOT_FOUND) {
+        if (local_misses[local_entry] == 0) {
             continue;
         }
-        const uint32_t entry = query_begin + local_entry;
         const int32_t token = query_values[local_entry];
-        if (token < 0 ||
-            token >= static_cast<int32_t>(
-                         DSA_SPARSE_INDEX_CAPACITY)) {
-            continue;
-        }
-        const int32_t claim =
-            DSA_SPARSE_CLAIM_BASE -
-            static_cast<int32_t>(entry);
-        if (request_index[
-                static_cast<uint32_t>(token)] != claim) {
-            continue;
-        }
 
         const int32_t miss_rank =
             miss_prefix + local_rank;
@@ -345,9 +292,7 @@ __simt_callee__ inline void DsaSparseLookupUpdateOneRequest(
             free_offset >=
                 static_cast<int32_t>(
                     DSA_SPARSE_FREE_SLOT_COUNT)) {
-            request_index[
-                static_cast<uint32_t>(token)] =
-                DSA_SPARSE_NOT_FOUND;
+            local_misses[local_entry] = 0;
             continue;
         }
         const int32_t slot =
@@ -356,9 +301,7 @@ __simt_callee__ inline void DsaSparseLookupUpdateOneRequest(
         if (slot < 0 ||
             slot >= static_cast<int32_t>(
                         DSA_SPARSE_SLOT_COUNT)) {
-            request_index[
-                static_cast<uint32_t>(token)] =
-                DSA_SPARSE_NOT_FOUND;
+            local_misses[local_entry] = 0;
             continue;
         }
         request_slot_to_index[
@@ -374,34 +317,6 @@ __simt_callee__ inline void DsaSparseLookupUpdateOneRequest(
     asc_threadfence_block();
     asc_syncthreads();
 
-    // Duplicate followers observe the canonical occurrence's installed slot.
-    // Invalid and masked entries retain the initialized (-1, 0) result.
-#pragma unroll
-    for (uint32_t local_entry = 0U;
-         local_entry < query_chunk;
-         ++local_entry) {
-        if (local_slots[local_entry] !=
-                DSA_SPARSE_NOT_FOUND ||
-            query_masks[local_entry] == 0) {
-            continue;
-        }
-        const int32_t token = query_values[local_entry];
-        if (token < 0 ||
-            token >= static_cast<int32_t>(
-                         DSA_SPARSE_INDEX_CAPACITY)) {
-            continue;
-        }
-        const int32_t slot =
-            request_index[static_cast<uint32_t>(token)];
-        if (slot >= 0 &&
-            slot <
-                static_cast<int32_t>(DSA_SPARSE_SLOT_COUNT)) {
-            local_slots[local_entry] = slot;
-            ProtectSlot(
-                protected_bits,
-                static_cast<uint32_t>(slot));
-        }
-    }
     if (total_misses == 0) {
         // Only a block that owns another request will reuse protected_bits.
         // Wait for every thread's final ProtectSlot before clearing it in the
@@ -420,9 +335,6 @@ __simt_callee__ inline void DsaSparseLookupUpdateOneRequest(
         }
         return;
     }
-    asc_threadfence_block();
-    asc_syncthreads();
-
     // Fused maintain phase. Scan occupied, non-protected slots in circular
     // cursor order and compact them by per-thread counts. The first M slots
     // replace the M free-list entries consumed above.

@@ -62,16 +62,16 @@ def run(
     )
 
 
-def test_hit_duplicate_miss_mask_and_maintain() -> None:
+def test_hit_miss_mask_and_maintain() -> None:
     state = make_state()
 
     slots, misses = run(
         state,
-        [[1, 6, 6, -1, 8, 2]],
-        mask=[[1, 1, 1, 1, 0, 1]],
+        [[1, 6, -1, 8, 2, 3]],
+        mask=[[1, 1, 1, 0, 1, 1]],
     )
 
-    assert slots == [[1, 4, 4, -1, -1, 2]]
+    assert slots == [[1, 4, -1, -1, 2, 3]]
     assert misses == [[0, 1, 0, 0, 0, 0]]
     assert state.index[0][6] == 4
     assert state.slot_to_index[0][4] == 6
@@ -100,9 +100,9 @@ def test_all_hit_does_not_mutate_state_or_cursor() -> None:
     state = make_state()
     before = copy.deepcopy(state)
 
-    slots, misses = run(state, [[3, 1, 3]])
+    slots, misses = run(state, [[3, 1, 2]])
 
-    assert slots == [[3, 1, 3]]
+    assert slots == [[3, 1, 2]]
     assert misses == [[0, 0, 0]]
     assert state == before
 
@@ -127,10 +127,10 @@ def test_reordered_pool_rows_address_stable_state_rows() -> None:
 def test_multiple_misses_allocate_and_refill_in_input_order() -> None:
     state = make_state(resident_count=4, free_count=3)
 
-    slots, misses = run(state, [[8, 7, 8, 6]])
+    slots, misses = run(state, [[8, 7, 6]])
 
-    assert slots == [[4, 5, 4, 6]]
-    assert misses == [[1, 1, 0, 1]]
+    assert slots == [[4, 5, 6]]
+    assert misses == [[1, 1, 1]]
     assert state.free_slots[0] == [2, 1, 0]
     assert state.free_head[0][:2] == [0, 3]
 
@@ -144,6 +144,13 @@ def test_duplicate_pool_entries_are_rejected() -> None:
             [[1], [2]],
             req_pool_entries=[0, 0],
         )
+
+
+def test_duplicate_active_query_positions_are_rejected() -> None:
+    state = make_state()
+
+    with pytest.raises(ValueError, match="active query positions"):
+        run(state, [[1, 6, 6]])
 
 
 def test_nonzero_entry_head_is_rejected() -> None:

@@ -58,8 +58,10 @@ python3 tools/dsa_sparse_lookup_update/test_correctness.py \
 
 The script checks `slot_out`, `miss_out`, and all four persistent state
 tensors against the CPU oracle. It covers hits, masked/invalid entries,
-duplicate misses, reordered pool rows, fused eviction, free-list refill,
-cursor movement, and the final `free_head[:, 0] == 0` invariant.
+unique misses, reordered pool rows, fused eviction, free-list refill, cursor
+movement, and the final `free_head[:, 0] == 0` invariant. Active valid query
+positions must be unique within each request; duplicate positions are outside
+the operator contract.
 
 ## Independent single-operator benchmark
 
@@ -116,7 +118,7 @@ from its complement, followed by shuffling all 2K query entries. Different
 request rows receive different resident sets and TopK orders. Use `--seed` to
 reproduce or change the workload. The generator deliberately does not add
 duplicate, masked, or invalid positions, so `--miss-count` remains the exact
-canonical miss count.
+miss count for the selected workload.
 
 Every sample restores its operator-specific state before the start event.
 State restoration, tensor creation, synchronization, validation, and JSON

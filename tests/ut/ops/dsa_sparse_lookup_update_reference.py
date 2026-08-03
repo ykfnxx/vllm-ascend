@@ -90,9 +90,9 @@ def dsa_sparse_lookup_update_reference(
     query_index: Sequence[Sequence[int]],
     lookup_mask: Sequence[Sequence[int]],
 ) -> tuple[list[list[int]], list[list[int]]]:
-    """Run lookup, allocate canonical misses, and maintain the free list.
+    """Run lookup, allocate misses, and maintain the free list.
 
-    The first active flat query occurrence owns a duplicate miss. Every
+    Active valid query positions must be unique within each request. Every
     returned slot is protected from this call's maintenance phase.
     """
 
@@ -127,28 +127,28 @@ def dsa_sparse_lookup_update_reference(
         row_free_slots = state.free_slots[pool_row]
         cursor = state.free_head[pool_row][1]
 
-        canonical_misses: list[tuple[int, int]] = []
-        first_miss_entry: dict[int, int] = {}
+        misses: list[tuple[int, int]] = []
+        seen_tokens: set[int] = set()
         for entry, token in enumerate(query_index[req_id]):
             if lookup_mask[req_id][entry] == 0:
                 continue
             if not 0 <= token < index_capacity:
                 continue
+            if token in seen_tokens:
+                raise ValueError(
+                    "active query positions must be unique per request"
+                )
+            seen_tokens.add(token)
             slot = row_index[token]
             if slot != INVALID_INDEX:
                 slot_out[req_id][entry] = slot
                 continue
-            owner = first_miss_entry.get(token)
-            if owner is None:
-                first_miss_entry[token] = entry
-                canonical_misses.append((entry, token))
+            misses.append((entry, token))
 
-        if len(canonical_misses) > free_count:
+        if len(misses) > free_count:
             raise RuntimeError("miss count exceeds the free-list capacity")
 
-        for miss_rank, (entry, token) in enumerate(
-            canonical_misses
-        ):
+        for miss_rank, (entry, token) in enumerate(misses):
             slot = row_free_slots[miss_rank]
             if row_slot_to_index[slot] != INVALID_INDEX:
                 raise ValueError("free list points to an occupied slot")
@@ -157,15 +157,7 @@ def dsa_sparse_lookup_update_reference(
             slot_out[req_id][entry] = slot
             miss_out[req_id][entry] = 1
 
-        for entry, token in enumerate(query_index[req_id]):
-            if (
-                lookup_mask[req_id][entry] != 0
-                and 0 <= token < index_capacity
-                and slot_out[req_id][entry] == INVALID_INDEX
-            ):
-                slot_out[req_id][entry] = row_index[token]
-
-        miss_count = len(canonical_misses)
+        miss_count = len(misses)
         state.free_head[pool_row][0] = miss_count
         if miss_count == 0:
             state.free_head[pool_row][0] = 0

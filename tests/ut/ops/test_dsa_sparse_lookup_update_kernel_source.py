@@ -61,6 +61,10 @@ def test_kernel_contains_fused_maintain_and_ub_scratch() -> None:
     assert "__ubuf__ uint32_t* protected_bits" in source
     assert "__simt_callee__ inline int32_t BlockExclusiveScan" in source
     assert "asc_atomic_or(protected_bits + word, bit)" in source
+    assert "DSA_SPARSE_CLAIM_BASE" not in source
+    assert "asc_atomic_cas" not in source
+    assert "desired_claim" not in source
+    assert "Duplicate followers" not in source
     assert "BlockExclusiveScan" in source
     assert "for (uint32_t other = 0; other < tid; ++other)" not in source
     assert "query_values[query_chunk]" in source

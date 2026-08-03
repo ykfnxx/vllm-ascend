@@ -36,7 +36,6 @@ static_assert(
     DSA_SPARSE_SLOT_COUNT % 32U == 0U,
     "protected slot bitset must contain complete words");
 constexpr int32_t DSA_SPARSE_NOT_FOUND = -1;
-constexpr int32_t DSA_SPARSE_CLAIM_BASE = -2;
 
 struct DsaSparseLookupUpdateTilingData {
     uint32_t reqNum;

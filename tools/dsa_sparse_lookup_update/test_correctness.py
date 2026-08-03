@@ -80,7 +80,7 @@ def _handcrafted_case(requests: int) -> CorrectnessCase:
     query = []
     mask = []
     for row in range(requests):
-        values = [row, 9000 + row, 9000 + row, -1]
+        values = [row, 9000 + row, 9001 + row, -1]
         values.extend(
             [INVALID_INDEX] * (QUERY_COUNT - len(values))
         )
@@ -89,7 +89,7 @@ def _handcrafted_case(requests: int) -> CorrectnessCase:
         query.append(values)
         mask.append(active)
     return CorrectnessCase(
-        name="hit_duplicate_miss_masked_padding_reordered_rows",
+        name="hit_miss_masked_padding_reordered_rows",
         state=_make_resident_state(requests),
         req_pool_entries=list(reversed(range(requests))),
         query_index=query,
@@ -107,20 +107,25 @@ def _random_case(
     query: list[list[int]] = []
     mask: list[list[int]] = []
     for _ in range(requests):
+        resident_tokens = rng.sample(
+            range(RESIDENT_SLOT_COUNT), QUERY_COUNT
+        )
         miss_tokens = [
             RESIDENT_SLOT_COUNT + rank
             for rank in range(QUERY_COUNT)
         ]
+        resident_cursor = 0
+        miss_cursor = 0
         values = []
         active = []
         for entry in range(QUERY_COUNT):
             selector = rng.random()
             if selector < 0.45:
-                token = rng.randrange(RESIDENT_SLOT_COUNT)
+                token = resident_tokens[resident_cursor]
+                resident_cursor += 1
             elif selector < 0.8:
-                token = miss_tokens[
-                    rng.randrange(0, entry + 1)
-                ]
+                token = miss_tokens[miss_cursor]
+                miss_cursor += 1
             elif selector < 0.9:
                 token = INVALID_INDEX
             else:
