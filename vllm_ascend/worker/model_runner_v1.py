@@ -103,6 +103,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend import dsa_sparse_probe
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -1263,6 +1264,12 @@ class NPUModelRunner(GPUModelRunner):
                     f"request {request_id!r}."
                 )
             handoffs[request_id] = handoff
+            dsa_sparse_probe.emit_pd_handoff(
+                "handoff_receive",
+                role="D",
+                request_id=request_id,
+                handoff=handoff,
+            )
 
     def _pad_query_start_loc_for_fia(
         self,

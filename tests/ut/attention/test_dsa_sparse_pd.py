@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
+import json
 from dataclasses import dataclass, field
+from unittest.mock import patch
 
 import pytest
 
+from vllm_ascend import dsa_sparse_probe
 from vllm_ascend.attention.dsa_sparse import RequestIndexManager
 from vllm_ascend.attention.dsa_sparse_pd import (
     DSASparsePDHandoff,
@@ -265,6 +268,50 @@ def test_pd_handoff_round_trips_without_backend_payload():
     assert DSASparsePDHandoff.from_dict(
         handoff.to_dict()
     ) == handoff
+
+
+def test_pd_handoff_trace_logs_full_handoff_and_stable_hashes():
+    topk = list(range(DSA_SPARSE_QUERY_WIDTH))
+    handoff = DSASparsePDHandoff(
+        remote_request_id="prefill-request",
+        stored_token_count=4097,
+        block_size=128,
+        layer_topk_by_rank={
+            0: {
+                "model.layers.0.self_attn": topk,
+            },
+        },
+    )
+
+    with (
+        patch.object(
+            dsa_sparse_probe,
+            "pd_trace_is_enabled",
+            return_value=True,
+        ),
+        patch.object(dsa_sparse_probe.logger, "info") as log_info,
+    ):
+        dsa_sparse_probe.emit_pd_handoff(
+            "handoff_send",
+            role="P",
+            request_id="prefill-request",
+            handoff=handoff,
+            tp_size=1,
+        )
+
+    assert log_info.call_count == 1
+    prefix, encoded_payload = log_info.call_args.args
+    assert prefix == dsa_sparse_probe.DSA_SPARSE_PD_LOG_PREFIX
+    payload = json.loads(encoded_payload)
+    assert payload["event"] == "handoff_send"
+    assert payload["role"] == "P"
+    assert payload["request_id"] == "prefill-request"
+    assert payload["handoff"] == handoff.to_dict()
+    assert payload["tp_size"] == 1
+    assert payload["handoff_sha256"]
+    assert payload["layer_topk_sha256_by_rank"]["0"][
+        "model.layers.0.self_attn"
+    ]
 
 
 def test_pd_handoff_rejects_non_integer_topk_ids():
