@@ -8,8 +8,10 @@
 #   - the fused ASU-shaped Lookup/Maintain custom operator;
 #   - per-layer Hot Cache Sparse Flash Attention.
 #
-# Payload movement remains mocked. This script validates control flow and
-# operator execution, not Main/history/newest payload correctness.
+# Payload movement remains mocked by default. Use
+# --enable-indexer-cache-transfer to exercise the existing Mooncake payload
+# path for the D-side Indexer cache; Main/history/newest payload correctness is
+# still outside this probe's scope.
 #
 # Example:
 #   bash examples/dsa_sparse_pd_mock_probe.sh \
@@ -43,6 +45,7 @@ STARTUP_TIMEOUT="900"
 GPU_MEMORY_UTILIZATION="0.50"
 LOG_DIR=""
 VERIFY_PATH="0"
+ENABLE_INDEXER_CACHE_TRANSFER="0"
 
 usage() {
     cat <<'EOF'
@@ -71,6 +74,9 @@ Options:
   --gpu-memory-utilization F   Per-engine NPU memory fraction. Default: 0.50
   --startup-timeout SEC        Per-service startup timeout. Default: 900
   --log-dir DIR                Keep logs in DIR. Default: a new /tmp directory
+  --enable-indexer-cache-transfer
+                               Enable Mooncake payload transfer for the
+                               D-side Indexer cache. Default: disabled.
   --verify-path                Profile Decode and verify the fused lookup op
                                plus every per-layer Hot Cache SFA call.
   -h, --help                   Show this help.
@@ -78,7 +84,8 @@ Options:
 Without --verify-path, success only proves process isolation and P/D routing.
 With --verify-path, success also proves that each Decode step called the fused
 Lookup/Maintain operator once per cohort and that the Decode profile contains
-the custom operator. Payload movement remains mocked.
+the custom operator. Payload movement remains mocked unless
+--enable-indexer-cache-transfer is specified.
 EOF
 }
 
@@ -182,6 +189,10 @@ while (($# > 0)); do
             LOG_DIR="$2"
             shift 2
             ;;
+        --enable-indexer-cache-transfer)
+            ENABLE_INDEXER_CACHE_TRANSFER="1"
+            shift
+            ;;
         --verify-path)
             VERIFY_PATH="1"
             shift
@@ -226,6 +237,11 @@ if [[ -z "$LOG_DIR" ]]; then
 else
     mkdir -p "$LOG_DIR"
     LOG_DIR="$(cd "$LOG_DIR" && pwd)"
+fi
+
+MOONCAKE_SKIP_PAYLOAD="1"
+if [[ "$ENABLE_INDEXER_CACHE_TRANSFER" == "1" ]]; then
+    MOONCAKE_SKIP_PAYLOAD="0"
 fi
 
 PREFILL_LOG="$LOG_DIR/prefill.log"
@@ -302,7 +318,7 @@ COMMON_NETWORK_ENV=(
     "HCCL_SOCKET_IFNAME=$IFNAME"
     "OMP_PROC_BIND=false"
     "OMP_NUM_THREADS=1"
-    "VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE=1"
+    "VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE=$MOONCAKE_SKIP_PAYLOAD"
     "VLLM_ASCEND_DSA_SPARSE_PD_TRACE=1"
 )
 
@@ -530,9 +546,17 @@ else
     echo "PASS: process isolation and P/D routing completed."
     echo "Run again with --verify-path to verify the custom-op and Hot Cache path."
 fi
-echo "NOT VALIDATED: Main/history/newest payload transfer or model accuracy."
+if [[ "$ENABLE_INDEXER_CACHE_TRANSFER" == "1" ]]; then
+    echo "Indexer cache payload transfer was enabled; inspect Mooncake transfer metadata below."
+else
+    echo "NOT VALIDATED: Indexer/Main/history/newest payload transfer or model accuracy."
+fi
 echo "Inspect Decode logs with:"
 echo "  grep -Ein 'DSA_SPARSE_PROBE|dsa_sparse|lookup_update|mock|error|traceback' '$DECODE_LOG'"
 echo "Inspect P/D TopK handoff logs with:"
 echo "  grep -E 'DSA_SPARSE_PD .*handoff_(send|receive)' '$PREFILL_LOG' '$DECODE_LOG'"
 echo "Compare the handoff_sha256 and layer_topk_sha256_by_rank fields between P and D."
+if [[ "$ENABLE_INDEXER_CACHE_TRANSFER" == "1" ]]; then
+    echo "Inspect Indexer cache transfer mapping with:"
+    echo "  grep -E 'Mooncake P/D KV layer mapping|Mooncake kv transfer meta|KV cache transfer' '$DECODE_LOG'"
+fi

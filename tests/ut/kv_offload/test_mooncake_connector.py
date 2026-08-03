@@ -911,6 +911,51 @@ class TestCoreFunctionality(unittest.TestCase):
         mock_get_meta.assert_not_called()
 
     @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
+    def test_transfer_dsa_sparse_indexer_uses_remote_layer_name_mapping(self, mock_get_meta):
+        """D's Indexer layer may have a different physical index than P's."""
+        req = dict(self.test_req)
+        self.thread.kv_group2layeridx = {
+            0: (
+                {
+                    "kv_cache_spec_type": "UniformTypeKVCacheSpecs",
+                    "layer_names": ["model.layers.0.self_attn.indexer.k_cache"],
+                },
+                [0],
+            )
+        }
+        self.thread.kv_caches_base_addr["local_engine"][5555] = [[0x1000, 0x1100]]
+        self.thread.block_len_per_addr = [[1024, 256]]
+        self.thread.block_stride_per_addr = [[1024, 256]]
+        self.thread.kv_caches_base_addr["remote_engine"] = {6666: [[0x3000], [0x9000, 0xA000]]}
+        self.thread.remote_block_stride_per_addr["remote_engine"][6666] = [[1024], [4096, 512]]
+        self.thread.remote_kv_group2layeridx["remote_engine"][6666] = {
+            0: (
+                {
+                    "kv_cache_spec_type": "FullAttentionSpec",
+                    "layer_names": ["model.layers.0.self_attn"],
+                },
+                [0],
+            ),
+            1: (
+                {
+                    "kv_cache_spec_type": "AscendSFAIndexerCacheSpec",
+                    "layer_names": ["model.layers.0.self_attn.indexer.k_cache"],
+                },
+                [1],
+            ),
+        }
+
+        with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config") as mock_config:
+            mock_config.return_value.enable_kv_nz = False
+            self.thread._transfer_kv_cache_all_groups(req)
+
+        call_args, _ = self.engine.batch_transfer_sync_read.call_args
+        self.assertEqual(call_args[1], [0x1000 + 1 * 1024, 0x1100 + 1 * 256])
+        self.assertEqual(call_args[2], [0x9000 + 3 * 4096, 0xA000 + 3 * 512])
+        self.assertEqual(call_args[3], [2 * 1024, 2 * 256])
+        mock_get_meta.assert_not_called()
+
+    @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
     def test_transfer_kv_cache_dsa_sparse_mock_skips_payload(self, mock_get_meta):
         self.thread.kv_caches_base_addr["remote_engine"] = {6666: [[0x3000]]}
         self.thread.remote_block_size_scale["remote_engine"] = {6666: [[1]]}

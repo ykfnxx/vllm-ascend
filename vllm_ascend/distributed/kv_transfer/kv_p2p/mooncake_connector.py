@@ -830,6 +830,8 @@ class KVCacheRecvingThread(threading.Thread):
             local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
             remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
             remote_block_stride_per_addr = self.remote_block_stride_per_addr[remote_engine_id][remote_handshake_port]
+            remote_kv_group2layeridx = self.remote_kv_group2layeridx[remote_engine_id][remote_handshake_port]
+        remote_layer_name_to_idx = self._build_remote_layer_name_to_idx(remote_kv_group2layeridx)
         session_id = f"{remote_host}:{remote_transfer_port}"
 
         req_start_time = time.perf_counter()
@@ -855,9 +857,26 @@ class KVCacheRecvingThread(threading.Thread):
             group_idx = group_pull.group_id
             group_spec, layer_indices = self.kv_group2layeridx[group_idx]
             kv_cache_group_id = group_spec.get("kv_cache_group_id", group_idx)
-            layer_indices = pp_layer_indices(layer_indices, group_pull.prefill_pp_rank)
-            if not layer_indices:
+            layer_names = group_spec.get("layer_names")
+            if layer_names is not None and len(layer_names) != len(layer_indices):
+                raise RuntimeError(
+                    "Mooncake KV group metadata has inconsistent layer names and indices: "
+                    f"group_idx={group_idx}, layer_names={layer_names}, layer_indices={layer_indices}."
+                )
+            if layer_names is None:
+                layer_entries = [(None, layer_idx) for layer_idx in layer_indices]
+            else:
+                layer_entries = list(zip(layer_names, layer_indices))
+            valid_layer_indices = set(pp_layer_indices(layer_indices, group_pull.prefill_pp_rank))
+            layer_entries = [
+                (layer_name, layer_idx)
+                for layer_name, layer_idx in layer_entries
+                if layer_idx in valid_layer_indices
+            ]
+            if not layer_entries:
                 continue
+            layer_names = [layer_name for layer_name, _ in layer_entries]
+            layer_indices = [layer_idx for _, layer_idx in layer_entries]
             tp_num_need_pulls = group_pull.num_group_pulls
             inner_offset = group_pull.remote_tp_offset
             is_mamba_group = group_spec["kv_cache_spec_type"] == "MambaSpec"
@@ -897,7 +916,14 @@ class KVCacheRecvingThread(threading.Thread):
                 grouped_local_block_ids = [[local_group_block_ids[0]]]
 
             if is_mamba_group:
-                for layer_idx in layer_indices:
+                for layer_name, layer_idx in zip(layer_names, layer_indices):
+                    remote_layer_idx = self._resolve_remote_layer_idx(
+                        remote_layer_name_to_idx,
+                        layer_name,
+                        layer_idx,
+                        remote_engine_id,
+                        remote_handshake_port,
+                    )
                     start_meta_idx = len(src_list)
                     self._append_mamba_transfer_meta(
                         src_list,
@@ -905,10 +931,10 @@ class KVCacheRecvingThread(threading.Thread):
                         length_list,
                         group_spec=group_spec,
                         src_layer_base_addr=local_kv_caches_base_addrs[layer_idx],
-                        dst_layer_base_addr=remote_kv_caches_base_addrs[layer_idx],
+                        dst_layer_base_addr=remote_kv_caches_base_addrs[remote_layer_idx],
                         block_len=self.block_len_per_addr[layer_idx],
                         block_stride=self.block_stride_per_addr[layer_idx],
-                        remote_block_stride=remote_block_stride_per_addr[layer_idx],
+                        remote_block_stride=remote_block_stride_per_addr[remote_layer_idx],
                         remote_block_id=grouped_remote_block_ids[0][0],
                         local_block_id=grouped_local_block_ids[0][0],
                         tp_num_need_pulls=tp_num_need_pulls,
@@ -920,11 +946,14 @@ class KVCacheRecvingThread(threading.Thread):
                         ):
                             logger.debug(
                                 "Mooncake mamba transfer meta: request_id=%s group_idx=%s layer_idx=%s "
-                                "local_block_id=%s remote_block_id=%s tp_num_need_pulls=%s "
+                                "remote_layer_idx=%s layer_name=%s local_block_id=%s remote_block_id=%s "
+                                "tp_num_need_pulls=%s "
                                 "remote_tp_offset=%s  session_id=%s",
                                 remote_request_id,
                                 group_idx,
                                 layer_idx,
+                                remote_layer_idx,
+                                layer_name,
                                 grouped_local_block_ids[0][0],
                                 grouped_remote_block_ids[0][0],
                                 tp_num_need_pulls,
@@ -933,13 +962,20 @@ class KVCacheRecvingThread(threading.Thread):
                             )
                 continue
 
-            for layer_idx in layer_indices:
+            for layer_name, layer_idx in zip(layer_names, layer_indices):
+                remote_layer_idx = self._resolve_remote_layer_idx(
+                    remote_layer_name_to_idx,
+                    layer_name,
+                    layer_idx,
+                    remote_engine_id,
+                    remote_handshake_port,
+                )
                 for cache_idx in range(len(local_kv_caches_base_addrs[layer_idx])):
                     src_layer_base_addr = local_kv_caches_base_addrs[layer_idx][cache_idx]
-                    dst_layer_base_addr = remote_kv_caches_base_addrs[layer_idx][cache_idx]
+                    dst_layer_base_addr = remote_kv_caches_base_addrs[remote_layer_idx][cache_idx]
                     block_len = self.block_len_per_addr[layer_idx][cache_idx]
                     block_stride = self.block_stride_per_addr[layer_idx][cache_idx]
-                    remote_block_stride = remote_block_stride_per_addr[layer_idx][cache_idx]
+                    remote_block_stride = remote_block_stride_per_addr[remote_layer_idx][cache_idx]
                     inner_block_len = block_len // tp_num_need_pulls
                     if self.enable_sfa_dcp_replicated_indexer and self.block_size_scale[layer_idx][cache_idx] > 1:
                         if has_replicate_k_blocks:
@@ -965,17 +1001,21 @@ class KVCacheRecvingThread(threading.Thread):
                         dst_list.append(dst)
                         length_list.append(length)
                     logger.debug(
-                        "Mooncake kv transfer meta: request_id=%s group_idx=%s layer_idx=%s local_block_ids=%s "
-                        "remote_block_ids=%s tp_num_need_pulls=%s remote_tp_offset=%s session_id=%s",
+                        "Mooncake kv transfer meta: request_id=%s group_idx=%s layer_idx=%s remote_layer_idx=%s "
+                        "layer_name=%s local_block_ids=%s remote_block_ids=%s tp_num_need_pulls=%s "
+                        "remote_tp_offset=%s session_id=%s",
                         remote_request_id,
                         group_idx,
                         layer_idx,
+                        remote_layer_idx,
+                        layer_name,
                         grouped_local_block_ids,
                         grouped_remote_block_ids,
                         tp_num_need_pulls,
                         inner_offset,
                         session_id,
                     )
+
         if not src_list:
             return
 
@@ -1082,6 +1122,75 @@ class KVCacheRecvingThread(threading.Thread):
                     need_nz_cache,
                     group_kv_caches,
                 )
+
+    @staticmethod
+    def _build_remote_layer_name_to_idx(
+        remote_kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]],
+    ) -> dict[str, int]:
+        """Build the remote physical layer index map from handshake metadata.
+
+        P and D may expose different physical layer indices for the same model
+        layer.  This happens for DSA Sparse because P registers Main and
+        Indexer layers while D registers only Indexer layers.  The serialized
+        layer names are stable across the two workers, so they are the
+        authoritative mapping for the remote address arrays.
+
+        Older or hand-written test metadata may not include ``layer_names``.
+        Returning an empty map preserves the historical index-based behavior
+        for that metadata; production metadata generated by
+        ``_serialize_kv_group_spec`` always includes the names.
+        """
+
+        layer_name_to_idx: dict[str, int] = {}
+        for remote_group_idx, (remote_group_spec, remote_layer_indices) in remote_kv_group2layeridx.items():
+            remote_layer_names = remote_group_spec.get("layer_names")
+            if remote_layer_names is None:
+                continue
+            if len(remote_layer_names) != len(remote_layer_indices):
+                raise RuntimeError(
+                    "Mooncake remote KV group metadata has inconsistent layer names and indices: "
+                    f"group_idx={remote_group_idx}, layer_names={remote_layer_names}, "
+                    f"layer_indices={remote_layer_indices}."
+                )
+            for layer_name, layer_idx in zip(remote_layer_names, remote_layer_indices):
+                previous_idx = layer_name_to_idx.get(layer_name)
+                if previous_idx is not None and previous_idx != layer_idx:
+                    raise RuntimeError(
+                        "Mooncake remote KV metadata maps one layer name to multiple physical indices: "
+                        f"layer_name={layer_name!r}, indices=({previous_idx}, {layer_idx})."
+                    )
+                layer_name_to_idx[layer_name] = layer_idx
+        return layer_name_to_idx
+
+    @staticmethod
+    def _resolve_remote_layer_idx(
+        remote_layer_name_to_idx: dict[str, int],
+        layer_name: str | None,
+        local_layer_idx: int,
+        remote_engine_id: str,
+        remote_handshake_port: int,
+    ) -> int:
+        if layer_name is None:
+            return local_layer_idx
+        try:
+            remote_layer_idx = remote_layer_name_to_idx[layer_name]
+        except KeyError as error:
+            raise RuntimeError(
+                "Mooncake remote KV metadata does not contain the local layer: "
+                f"layer_name={layer_name!r}, local_layer_idx={local_layer_idx}, "
+                f"remote_engine_id={remote_engine_id!r}, remote_handshake_port={remote_handshake_port}."
+            ) from error
+        if remote_layer_idx != local_layer_idx:
+            logger.debug(
+                "Mooncake P/D KV layer mapping: layer_name=%s local_layer_idx=%s remote_layer_idx=%s "
+                "remote_engine_id=%s remote_handshake_port=%s",
+                layer_name,
+                local_layer_idx,
+                remote_layer_idx,
+                remote_engine_id,
+                remote_handshake_port,
+            )
+        return remote_layer_idx
 
     @torch.no_grad()
     def reformat_kv_cache_hybrid_linear_torch(
