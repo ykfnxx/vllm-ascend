@@ -43,6 +43,7 @@ def test_default_plan_covers_fixed_optimization_workloads() -> None:
         "resource-conflict",
         "l2-cache",
     ]
+    assert args.seed == 0
 
 
 def test_multiple_request_counts_and_miss_rates_form_matrix() -> None:
@@ -136,3 +137,19 @@ def test_workload_directory_name_is_stable() -> None:
     )
 
     assert workload.name == "req-0032_miss-0205"
+
+
+def test_profile_matrix_accepts_reproducible_workload_seed() -> None:
+    args = PROFILE_MATRIX._parse_args(["--seed", "1234"])
+
+    PROFILE_MATRIX._validate_iterations(args)
+
+    assert args.seed == 1234
+
+
+@pytest.mark.parametrize("seed", ("-1", "2147483648"))
+def test_profile_matrix_rejects_invalid_seed(seed: str) -> None:
+    args = PROFILE_MATRIX._parse_args(["--seed", seed])
+
+    with pytest.raises(ValueError, match="seed"):
+        PROFILE_MATRIX._validate_iterations(args)

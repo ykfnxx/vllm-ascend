@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,7 @@ FREE_SLOT_COUNT = 2 * 1024
 SLOT_COUNT = 10 * 1024
 QUERY_COUNT = 2 * 1024
 FREE_HEAD_STRIDE = 16
+MAX_SEED = 0x7FFFFFFF
 
 TOOL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TOOL_DIR.parents[1]
@@ -243,6 +245,7 @@ def make_profile_inputs(
     *,
     requests: int,
     miss_count: int = 0,
+    seed: int = 0,
 ) -> OperatorInputs:
     validate_requests(requests)
     _validate_miss_count(miss_count)
@@ -288,23 +291,13 @@ def make_profile_inputs(
         dtype=torch.int32,
         device=device,
     )
-    hit_count = QUERY_COUNT - miss_count
-    query_row = torch.cat(
-        (
-            torch.arange(
-                hit_count,
-                dtype=torch.int32,
-                device=device,
-            ),
-            torch.arange(
-                RESIDENT_SLOT_COUNT,
-                RESIDENT_SLOT_COUNT + miss_count,
-                dtype=torch.int32,
-                device=device,
-            ),
-        )
+    query_index = _make_random_query_index(
+        torch,
+        requests=requests,
+        miss_count=miss_count,
+        seed=seed,
+        device=device,
     )
-    query_index = query_row.expand(requests, -1).clone()
     lookup_mask = torch.ones(
         (requests, QUERY_COUNT),
         dtype=torch.int32,
@@ -326,39 +319,40 @@ def make_maintain_profile_inputs(
     *,
     requests: int,
     miss_count: int,
+    seed: int = 0,
 ) -> MaintainInputs:
     _validate_miss_count(miss_count)
+    torch = runtime.torch
     lookup_inputs = make_profile_inputs(
         runtime,
         requests=requests,
         miss_count=miss_count,
+        seed=seed,
     )
-    torch = runtime.torch
-    device = runtime.device
-    hit_count = QUERY_COUNT - miss_count
-    allocated_slots = torch.arange(
-        RESIDENT_SLOT_COUNT,
-        RESIDENT_SLOT_COUNT + miss_count,
-        dtype=torch.int32,
-        device=device,
+    query_positions = lookup_inputs.query_index.long()
+    initial_slots = lookup_inputs.index.gather(
+        1,
+        query_positions,
     )
     if miss_count:
-        lookup_inputs.index[
-            :, RESIDENT_SLOT_COUNT : RESIDENT_SLOT_COUNT + miss_count
-        ].copy_(allocated_slots.expand(requests, -1))
-        lookup_inputs.slot_to_index[
-            :, RESIDENT_SLOT_COUNT : RESIDENT_SLOT_COUNT + miss_count
-        ].copy_(allocated_slots.expand(requests, -1))
-        lookup_inputs.free_head[:, 0].fill_(miss_count)
-    last_query_row = torch.cat(
-        (
-            torch.arange(
-                hit_count,
-                dtype=torch.int32,
-                device=device,
-            ),
+        miss_positions = lookup_inputs.query_index.masked_select(
+            initial_slots.eq(INVALID_INDEX)
+        ).view(requests, miss_count)
+        allocated_slots = lookup_inputs.free_slots[:, :miss_count]
+        lookup_inputs.index.scatter_(
+            1,
+            miss_positions.long(),
             allocated_slots,
         )
+        lookup_inputs.slot_to_index.scatter_(
+            1,
+            allocated_slots.long(),
+            miss_positions,
+        )
+        lookup_inputs.free_head[:, 0].fill_(miss_count)
+    last_query_slots = lookup_inputs.index.gather(
+        1,
+        query_positions,
     )
     return MaintainInputs(
         index=lookup_inputs.index,
@@ -366,7 +360,7 @@ def make_maintain_profile_inputs(
         free_slots=lookup_inputs.free_slots,
         free_head=lookup_inputs.free_head,
         req_pool_entries=lookup_inputs.req_pool_entries,
-        last_query_slots=last_query_row.expand(requests, -1).clone(),
+        last_query_slots=last_query_slots.to(torch.int32).contiguous(),
     )
 
 
@@ -434,3 +428,38 @@ def _validate_miss_count(miss_count: int) -> None:
             f"miss_count must be in [0, {QUERY_COUNT}], "
             f"got {miss_count}."
         )
+
+
+def _make_random_query_index(
+    torch: Any,
+    *,
+    requests: int,
+    miss_count: int,
+    seed: int,
+    device: Any,
+) -> Any:
+    """Build reproducible, unique, per-request shuffled TopK positions."""
+
+    rng = random.Random(seed)
+    hit_count = QUERY_COUNT - miss_count
+    query_rows: list[list[int]] = []
+    resident_positions = range(RESIDENT_SLOT_COUNT)
+    absent_positions = range(
+        RESIDENT_SLOT_COUNT,
+        INDEX_CAPACITY,
+    )
+    for _ in range(requests):
+        query_row = rng.sample(
+            resident_positions,
+            hit_count,
+        )
+        query_row.extend(
+            rng.sample(absent_positions, miss_count)
+        )
+        rng.shuffle(query_row)
+        query_rows.append(query_row)
+    return torch.tensor(
+        query_rows,
+        dtype=torch.int32,
+        device=device,
+    )

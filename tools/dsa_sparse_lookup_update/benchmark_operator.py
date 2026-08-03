@@ -16,6 +16,7 @@ from typing import Any
 from common import (
     INVALID_INDEX,
     LOOKUP_OPERATOR,
+    MAX_SEED,
     MAINTAIN_OPERATOR,
     QUERY_COUNT,
     RESIDENT_SLOT_COUNT,
@@ -43,7 +44,6 @@ OPERATOR_SELECTIONS = {
     "legacy": (LOOKUP_OPERATOR, MAINTAIN_OPERATOR),
     "all": (SIMT_OPERATOR, LOOKUP_OPERATOR, MAINTAIN_OPERATOR),
 }
-MAX_SEED = 0x7FFFFFFF
 
 
 def _parse_args() -> argparse.Namespace:
@@ -195,6 +195,7 @@ def _run_lookup_like_benchmark(
     *,
     concurrency: int,
     miss_count: int,
+    seed: int,
     warmup: int,
     iterations: int,
 ) -> dict[str, float | int | bool]:
@@ -203,6 +204,7 @@ def _run_lookup_like_benchmark(
         runtime,
         requests=concurrency,
         miss_count=miss_count,
+        seed=seed,
     )
     inputs = clone_operator_inputs(reference)
     fused_maintenance = runtime.operator_name == SIMT_OPERATOR
@@ -263,6 +265,7 @@ def _run_lookup_like_benchmark(
 
 def _validate_maintain_result(
     inputs: MaintainInputs,
+    reference: MaintainInputs,
     *,
     concurrency: int,
 ) -> None:
@@ -282,12 +285,19 @@ def _validate_maintain_result(
             f"{occupied_slots} occupied slots, "
             f"expected {expected_occupied}"
         )
-    protected_tokens = inputs.slot_to_index.gather(
+    protected_slots = reference.last_query_slots.long()
+    expected_protected_tokens = reference.slot_to_index.gather(
         1,
-        inputs.last_query_slots.long(),
+        protected_slots,
+    )
+    actual_protected_tokens = inputs.slot_to_index.gather(
+        1,
+        protected_slots,
     )
     if not bool(
-        protected_tokens.eq(inputs.last_query_slots).all().item()
+        actual_protected_tokens.eq(
+            expected_protected_tokens
+        ).all().item()
     ):
         raise AssertionError(
             "asu_hbm_index_maintain_aicpu evicted a protected slot"
@@ -308,6 +318,7 @@ def _run_maintain_benchmark(
         runtime,
         requests=concurrency,
         miss_count=miss_count,
+        seed=seed,
     )
     inputs = clone_maintain_inputs(reference)
     seed_cursor = seed
@@ -318,6 +329,7 @@ def _run_maintain_benchmark(
     torch.npu.synchronize()
     _validate_maintain_result(
         inputs,
+        reference,
         concurrency=concurrency,
     )
 
@@ -348,6 +360,7 @@ def _run_maintain_benchmark(
     torch.npu.synchronize()
     _validate_maintain_result(
         inputs,
+        reference,
         concurrency=concurrency,
     )
     samples_us = [
@@ -388,6 +401,7 @@ def _run_operator_benchmark(
         runtime,
         concurrency=concurrency,
         miss_count=miss_count,
+        seed=seed,
         warmup=warmup,
         iterations=iterations,
     )
@@ -490,6 +504,7 @@ def main() -> int:
             "query_width": QUERY_COUNT,
             "requested_miss_rate_percent": args.miss_rate,
             "requested_miss_count": args.miss_count,
+            "query_pattern": "seeded-random-unique",
             "seed": args.seed,
             "warmup": args.warmup,
             "iterations": args.iterations,

@@ -41,26 +41,31 @@ def _runtime(operator_name: str) -> object:
 def test_lookup_workload_has_exact_requested_misses(
     miss_count: int,
 ) -> None:
+    seed = 1234
     inputs = COMMON.make_profile_inputs(
         _runtime(COMMON.LOOKUP_OPERATOR),
         requests=2,
         miss_count=miss_count,
+        seed=seed,
     )
-    hit_count = COMMON.QUERY_COUNT - miss_count
 
     assert inputs.query_index.shape == (2, COMMON.QUERY_COUNT)
-    assert torch.equal(
-        inputs.query_index[0, :hit_count],
-        torch.arange(hit_count, dtype=torch.int32),
+    assert not torch.equal(
+        inputs.query_index[0],
+        inputs.query_index[1],
     )
-    assert torch.equal(
-        inputs.query_index[0, hit_count:],
-        torch.arange(
-            COMMON.RESIDENT_SLOT_COUNT,
-            COMMON.RESIDENT_SLOT_COUNT + miss_count,
-            dtype=torch.int32,
-        ),
-    )
+    for row in range(2):
+        query_row = inputs.query_index[row]
+        assert torch.unique(query_row).numel() == COMMON.QUERY_COUNT
+        assert int(query_row.min().item()) >= 0
+        assert int(query_row.max().item()) < COMMON.INDEX_CAPACITY
+        mapped_slots = inputs.index[row].gather(
+            0,
+            query_row.long(),
+        )
+        assert int(mapped_slots.eq(COMMON.INVALID_INDEX).sum()) == (
+            miss_count
+        )
     assert inputs.free_head[:, 0].tolist() == [0, 0]
     assert (
         inputs.index[:, COMMON.RESIDENT_SLOT_COUNT :]
@@ -69,42 +74,84 @@ def test_lookup_workload_has_exact_requested_misses(
     )
 
 
+def test_lookup_workload_seed_is_reproducible() -> None:
+    runtime = _runtime(COMMON.LOOKUP_OPERATOR)
+    first = COMMON.make_profile_inputs(
+        runtime,
+        requests=2,
+        miss_count=205,
+        seed=7,
+    )
+    repeated = COMMON.make_profile_inputs(
+        runtime,
+        requests=2,
+        miss_count=205,
+        seed=7,
+    )
+    different = COMMON.make_profile_inputs(
+        runtime,
+        requests=2,
+        miss_count=205,
+        seed=8,
+    )
+
+    assert torch.equal(first.query_index, repeated.query_index)
+    assert not torch.equal(first.query_index, different.query_index)
+
+
 @pytest.mark.parametrize("miss_count", (0, 205, 2048))
 def test_maintain_workload_is_direct_post_lookup_state(
     miss_count: int,
 ) -> None:
-    inputs = COMMON.make_maintain_profile_inputs(
-        _runtime(COMMON.MAINTAIN_OPERATOR),
+    runtime = _runtime(COMMON.MAINTAIN_OPERATOR)
+    seed = 1234
+    lookup_inputs = COMMON.make_profile_inputs(
+        runtime,
         requests=2,
         miss_count=miss_count,
+        seed=seed,
     )
-    hit_count = COMMON.QUERY_COUNT - miss_count
-    allocated_slots = torch.arange(
-        COMMON.RESIDENT_SLOT_COUNT,
-        COMMON.RESIDENT_SLOT_COUNT + miss_count,
-        dtype=torch.int32,
+    inputs = COMMON.make_maintain_profile_inputs(
+        runtime,
+        requests=2,
+        miss_count=miss_count,
+        seed=seed,
     )
 
     assert inputs.free_head[:, 0].tolist() == [
         miss_count,
         miss_count,
     ]
-    assert torch.equal(
-        inputs.last_query_slots[0, :hit_count],
-        torch.arange(hit_count, dtype=torch.int32),
+    initial_slots = lookup_inputs.index.gather(
+        1,
+        lookup_inputs.query_index.long(),
     )
-    assert torch.equal(
-        inputs.last_query_slots[0, hit_count:],
-        allocated_slots,
+    if miss_count:
+        miss_positions = lookup_inputs.query_index.masked_select(
+            initial_slots.eq(COMMON.INVALID_INDEX)
+        ).view(2, miss_count)
+        allocated_slots = inputs.free_slots[:, :miss_count]
+        assert torch.equal(
+            inputs.index.gather(1, miss_positions.long()),
+            allocated_slots,
+        )
+        assert torch.equal(
+            inputs.slot_to_index.gather(
+                1,
+                allocated_slots.long(),
+            ),
+            miss_positions,
+        )
+    expected_query_slots = inputs.index.gather(
+        1,
+        lookup_inputs.query_index.long(),
     )
-    assert torch.equal(
-        inputs.index[
-            0,
-            COMMON.RESIDENT_SLOT_COUNT:
-            COMMON.RESIDENT_SLOT_COUNT + miss_count,
-        ],
-        allocated_slots,
+    assert torch.equal(inputs.last_query_slots, expected_query_slots)
+    protected_tokens = inputs.slot_to_index.gather(
+        1,
+        inputs.last_query_slots.long(),
     )
+    assert protected_tokens.ne(COMMON.INVALID_INDEX).all()
     occupied = inputs.slot_to_index.ne(
         COMMON.INVALID_INDEX
     ).sum(dim=1)
@@ -122,10 +169,12 @@ def test_workload_rejects_miss_count_outside_query_width() -> None:
             runtime,
             requests=1,
             miss_count=-1,
+            seed=0,
         )
     with pytest.raises(ValueError, match="miss_count"):
         COMMON.make_profile_inputs(
             runtime,
             requests=1,
             miss_count=COMMON.QUERY_COUNT + 1,
+            seed=0,
         )

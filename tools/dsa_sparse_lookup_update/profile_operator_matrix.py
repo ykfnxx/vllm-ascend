@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from common import (
+    MAX_SEED,
     QUERY_COUNT,
     RESIDENT_SLOT_COUNT,
     TOOL_DIR,
@@ -85,6 +86,7 @@ def _parse_args(
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--profile-iters", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=0)
     miss_group = parser.add_mutually_exclusive_group()
     miss_group.add_argument(
         "--miss-counts",
@@ -186,6 +188,8 @@ def _validate_iterations(args: argparse.Namespace) -> None:
                 f"{name.replace('_', '-')} must be positive, "
                 f"got {value}."
             )
+    if not 0 <= args.seed <= MAX_SEED:
+        raise ValueError(f"seed must be in [0, {MAX_SEED}]")
 
 
 def _create_profiler(
@@ -302,11 +306,13 @@ def _run_workload(
     iterations: int,
     profile_iterations: int,
     skip_event: bool,
+    seed: int,
 ) -> dict[str, Any]:
     reference = make_profile_inputs(
         runtime,
         requests=workload.requests,
         miss_count=workload.miss_count,
+        seed=seed,
     )
     inputs = clone_operator_inputs(reference)
     reset_state = workload.miss_count > 0
@@ -366,6 +372,8 @@ def _run_workload(
         "resident_entries_per_request": RESIDENT_SLOT_COUNT,
         "query_width": QUERY_COUNT,
         "miss_count": workload.miss_count,
+        "query_pattern": "seeded-random-unique",
+        "seed": seed,
         "effective_miss_rate_percent": (
             100.0 * workload.miss_count / QUERY_COUNT
         ),
@@ -417,6 +425,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     iterations=args.iterations,
                     profile_iterations=args.profile_iters,
                     skip_event=args.skip_event,
+                    seed=args.seed,
                 )
             )
 
@@ -443,6 +452,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "metric_profiles": [
                 metric.name for metric in metrics
             ],
+            "query_pattern": "seeded-random-unique",
+            "seed": args.seed,
         },
         "workloads": results,
     }

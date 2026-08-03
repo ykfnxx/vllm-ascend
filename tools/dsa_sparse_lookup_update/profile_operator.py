@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from common import (
+    MAX_SEED,
     QUERY_COUNT,
     RESIDENT_SLOT_COUNT,
     TOOL_DIR,
@@ -55,6 +56,7 @@ def _parse_args() -> argparse.Namespace:
     miss_group = parser.add_mutually_exclusive_group()
     miss_group.add_argument("--miss-rate", type=float)
     miss_group.add_argument("--miss-count", type=int)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-trace", action="store_true")
     parser.add_argument("--output-dir", type=Path)
     return parser.parse_args()
@@ -235,6 +237,8 @@ def main() -> int:
         raise ValueError(
             f"miss-count must be in [0, {QUERY_COUNT}]"
         )
+    if not 0 <= args.seed <= MAX_SEED:
+        raise ValueError(f"seed must be in [0, {MAX_SEED}]")
     miss_count = _requested_misses(args)
 
     runtime = load_runtime(
@@ -245,6 +249,7 @@ def main() -> int:
         runtime,
         requests=args.requests,
         miss_count=miss_count,
+        seed=args.seed,
     )
     inputs = clone_operator_inputs(reference)
     reset_state = miss_count > 0
@@ -307,6 +312,8 @@ def main() -> int:
             "requested_miss_rate_percent": args.miss_rate,
             "requested_miss_count": args.miss_count,
             "miss_count": miss_count,
+            "query_pattern": "seeded-random-unique",
+            "seed": args.seed,
             "effective_miss_rate_percent": (
                 100.0 * miss_count / QUERY_COUNT
             ),

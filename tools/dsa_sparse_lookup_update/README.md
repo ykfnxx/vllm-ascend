@@ -108,6 +108,14 @@ constructs the equivalent post-lookup state: `free_head` equals the requested
 miss count, those misses occupy free slots, and `last_query_slots` protects the
 current query. Maintain setup does not invoke lookup.
 
+TopK positions are reproducible randomized workloads. For every request, the
+tool independently samples the exact requested number of unique nonresident
+positions and fills the rest with unique resident positions, then shuffles all
+2K entries. Different request rows receive different TopK orders. Use `--seed`
+to reproduce or change the query pattern. The workload deliberately does not
+add duplicate, masked, or invalid positions, so `--miss-count` remains the
+exact canonical miss count.
+
 Every sample restores its operator-specific state before the start event.
 State restoration, tensor creation, synchronization, validation, and JSON
 serialization are excluded. The NPU Event interval contains exactly one
@@ -116,7 +124,8 @@ the expected `free_head`, the occupied-slot count, and protected slots.
 
 `--miss-rate 0` exercises a no-op maintain path because `free_head` is zero.
 Use a nonzero miss rate to measure maintain eviction work. Maintain increments
-the seed between invocations to match the framework's scan-start behavior.
+the seed between invocations to match the framework's scan-start behavior. The
+same initial `--seed` also controls randomized TopK generation.
 
 ## NPU profile
 
@@ -124,7 +133,8 @@ the seed between invocations to match the framework's scan-start behavior.
 python3 tools/dsa_sparse_lookup_update/profile_operator.py \
   --device npu:0 \
   --requests 8 \
-  --miss-rate 10
+  --miss-rate 10 \
+  --seed 1234
 ```
 
 Choose either `--miss-rate` or `--miss-count`; omitting both profiles the
@@ -133,6 +143,9 @@ state before every invocation so every sample performs the requested fused
 lookup/update work. State restoration is outside the NPU Event timing window
 but appears in the profiler trace; filter the parsed files by
 `DsaSparseLookupUpdate` to inspect the custom kernel itself.
+
+The profile workload uses the same unique, per-request randomized TopK
+generator as the benchmark. Reusing a seed reproduces the same query tensor.
 
 The fixed workload has 8K resident entries and a 2K query width. The script
 writes a manifest and, unless `--no-trace` is used, a parsed
@@ -172,7 +185,8 @@ python3 tools/dsa_sparse_lookup_update/profile_operator_matrix.py \
   --requests 1 8 32 \
   --miss-rates 0 10 100 \
   --metrics pipe-utilization memory resource-conflict \
-  --profile-iters 10
+  --profile-iters 10 \
+  --seed 1234
 ```
 
 Use either `--miss-counts` or `--miss-rates`. Repeated request counts, miss
