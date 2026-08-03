@@ -120,6 +120,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_DSA_SPARSE_RUNTIME_PROBE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_DSA_SPARSE_RUNTIME_PROBE", "0"))
     ),
+    # Test-only: emit the complete P/D DSA Sparse TopK handoff at the
+    # producer send and consumer receive boundaries.
+    "VLLM_ASCEND_DSA_SPARSE_PD_TRACE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_DSA_SPARSE_PD_TRACE", "0"))
+    ),
 }
 
 # end-env-vars-definition

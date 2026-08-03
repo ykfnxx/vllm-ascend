@@ -56,6 +56,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import RequestStatus
 
+from vllm_ascend import dsa_sparse_probe
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.attention.dsa_sparse_pd import (
@@ -2001,6 +2002,13 @@ class MooncakeConnectorScheduler:
             transfer_params[
                 DSA_SPARSE_PD_HANDOFF_KEY
             ] = handoff.to_dict()
+            dsa_sparse_probe.emit_pd_handoff(
+                "handoff_send",
+                role="P",
+                request_id=request.request_id,
+                handoff=handoff,
+                tp_size=self.tp_size,
+            )
         return delay_free_blocks, transfer_params
 
     def update_connector_output(

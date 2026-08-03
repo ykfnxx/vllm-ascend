@@ -303,6 +303,7 @@ COMMON_NETWORK_ENV=(
     "OMP_PROC_BIND=false"
     "OMP_NUM_THREADS=1"
     "VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE=1"
+    "VLLM_ASCEND_DSA_SPARSE_PD_TRACE=1"
 )
 
 DECODE_PROBE_ENV=()
@@ -532,3 +533,6 @@ fi
 echo "NOT VALIDATED: Main/history/newest payload transfer or model accuracy."
 echo "Inspect Decode logs with:"
 echo "  grep -Ein 'DSA_SPARSE_PROBE|dsa_sparse|lookup_update|mock|error|traceback' '$DECODE_LOG'"
+echo "Inspect P/D TopK handoff logs with:"
+echo "  grep -E 'DSA_SPARSE_PD .*handoff_(send|receive)' '$PREFILL_LOG' '$DECODE_LOG'"
+echo "Compare the handoff_sha256 and layer_topk_sha256_by_rank fields between P and D."
