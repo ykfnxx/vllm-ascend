@@ -54,7 +54,29 @@ def test_lookup_workload_has_exact_requested_misses(
         inputs.query_index[0],
         inputs.query_index[1],
     )
+    assert not torch.equal(
+        inputs.slot_to_index[0, :COMMON.RESIDENT_SLOT_COUNT],
+        inputs.slot_to_index[1, :COMMON.RESIDENT_SLOT_COUNT],
+    )
+    resident_slots = torch.arange(
+        COMMON.RESIDENT_SLOT_COUNT,
+        dtype=torch.int32,
+    )
     for row in range(2):
+        resident_positions = inputs.slot_to_index[
+            row, :COMMON.RESIDENT_SLOT_COUNT
+        ]
+        assert (
+            torch.unique(resident_positions).numel()
+            == COMMON.RESIDENT_SLOT_COUNT
+        )
+        assert torch.equal(
+            inputs.index[row].gather(
+                0,
+                resident_positions.long(),
+            ),
+            resident_slots,
+        )
         query_row = inputs.query_index[row]
         assert torch.unique(query_row).numel() == COMMON.QUERY_COUNT
         assert int(query_row.min().item()) >= 0
@@ -67,11 +89,13 @@ def test_lookup_workload_has_exact_requested_misses(
             miss_count
         )
     assert inputs.free_head[:, 0].tolist() == [0, 0]
-    assert (
-        inputs.index[:, COMMON.RESIDENT_SLOT_COUNT :]
-        .eq(COMMON.INVALID_INDEX)
-        .all()
-    )
+    assert inputs.index.ne(COMMON.INVALID_INDEX).sum(dim=1).tolist() == [
+        COMMON.RESIDENT_SLOT_COUNT,
+        COMMON.RESIDENT_SLOT_COUNT,
+    ]
+    assert inputs.slot_to_index[
+        :, COMMON.RESIDENT_SLOT_COUNT:
+    ].eq(COMMON.INVALID_INDEX).all()
 
 
 def test_lookup_workload_seed_is_reproducible() -> None:
@@ -96,7 +120,10 @@ def test_lookup_workload_seed_is_reproducible() -> None:
     )
 
     assert torch.equal(first.query_index, repeated.query_index)
+    assert torch.equal(first.index, repeated.index)
+    assert torch.equal(first.slot_to_index, repeated.slot_to_index)
     assert not torch.equal(first.query_index, different.query_index)
+    assert not torch.equal(first.index, different.index)
 
 
 @pytest.mark.parametrize("miss_count", (0, 205, 2048))

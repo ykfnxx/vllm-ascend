@@ -109,12 +109,14 @@ miss count, those misses occupy free slots, and `last_query_slots` protects the
 current query. Maintain setup does not invoke lookup.
 
 TopK positions are reproducible randomized workloads. For every request, the
-tool independently samples the exact requested number of unique nonresident
-positions and fills the rest with unique resident positions, then shuffles all
-2K entries. Different request rows receive different TopK orders. Use `--seed`
-to reproduce or change the query pattern. The workload deliberately does not
-add duplicate, masked, or invalid positions, so `--miss-count` remains the
-exact canonical miss count.
+tool first samples 8K resident positions from the full 128K logical-position
+space and maps them onto the 8K resident Hot Cache slots. It then samples the
+hit portion from that resident set and the exact requested number of misses
+from its complement, followed by shuffling all 2K query entries. Different
+request rows receive different resident sets and TopK orders. Use `--seed` to
+reproduce or change the workload. The generator deliberately does not add
+duplicate, masked, or invalid positions, so `--miss-count` remains the exact
+canonical miss count.
 
 Every sample restores its operator-specific state before the start event.
 State restoration, tensor creation, synchronization, validation, and JSON

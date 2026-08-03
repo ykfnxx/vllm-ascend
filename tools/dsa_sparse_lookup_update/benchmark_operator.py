@@ -504,7 +504,7 @@ def main() -> int:
             "query_width": QUERY_COUNT,
             "requested_miss_rate_percent": args.miss_rate,
             "requested_miss_count": args.miss_count,
-            "query_pattern": "seeded-random-unique",
+            "query_pattern": "seeded-random-resident-and-query",
             "seed": args.seed,
             "warmup": args.warmup,
             "iterations": args.iterations,

@@ -312,7 +312,7 @@ def main() -> int:
             "requested_miss_rate_percent": args.miss_rate,
             "requested_miss_count": args.miss_count,
             "miss_count": miss_count,
-            "query_pattern": "seeded-random-unique",
+            "query_pattern": "seeded-random-resident-and-query",
             "seed": args.seed,
             "effective_miss_rate_percent": (
                 100.0 * miss_count / QUERY_COUNT

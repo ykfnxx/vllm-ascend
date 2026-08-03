@@ -264,13 +264,26 @@ def make_profile_inputs(
         dtype=torch.int32,
         device=device,
     )
-    resident = torch.arange(
+    resident_positions, query_index = _make_random_workload(
+        torch,
+        requests=requests,
+        miss_count=miss_count,
+        seed=seed,
+        device=device,
+    )
+    resident_slots = torch.arange(
         RESIDENT_SLOT_COUNT,
         dtype=torch.int32,
         device=device,
     ).expand(requests, -1)
-    index[:, :RESIDENT_SLOT_COUNT].copy_(resident)
-    slot_to_index[:, :RESIDENT_SLOT_COUNT].copy_(resident)
+    index.scatter_(
+        1,
+        resident_positions.long(),
+        resident_slots,
+    )
+    slot_to_index[:, :RESIDENT_SLOT_COUNT].copy_(
+        resident_positions
+    )
     free_slots = (
         torch.arange(
             RESIDENT_SLOT_COUNT,
@@ -289,13 +302,6 @@ def make_profile_inputs(
     req_pool_entries = torch.arange(
         requests,
         dtype=torch.int32,
-        device=device,
-    )
-    query_index = _make_random_query_index(
-        torch,
-        requests=requests,
-        miss_count=miss_count,
-        seed=seed,
         device=device,
     )
     lookup_mask = torch.ones(
@@ -430,36 +436,51 @@ def _validate_miss_count(miss_count: int) -> None:
         )
 
 
-def _make_random_query_index(
+def _make_random_workload(
     torch: Any,
     *,
     requests: int,
     miss_count: int,
     seed: int,
     device: Any,
-) -> Any:
-    """Build reproducible, unique, per-request shuffled TopK positions."""
+) -> tuple[Any, Any]:
+    """Build random resident sets and exact-miss TopK positions."""
 
     rng = random.Random(seed)
     hit_count = QUERY_COUNT - miss_count
+    resident_rows: list[list[int]] = []
     query_rows: list[list[int]] = []
-    resident_positions = range(RESIDENT_SLOT_COUNT)
-    absent_positions = range(
-        RESIDENT_SLOT_COUNT,
-        INDEX_CAPACITY,
-    )
     for _ in range(requests):
+        resident_positions = rng.sample(
+            range(INDEX_CAPACITY),
+            RESIDENT_SLOT_COUNT,
+        )
+        resident_set = set(resident_positions)
         query_row = rng.sample(
             resident_positions,
             hit_count,
         )
-        query_row.extend(
-            rng.sample(absent_positions, miss_count)
-        )
+        miss_positions: list[int] = []
+        miss_set: set[int] = set()
+        while len(miss_positions) < miss_count:
+            position = rng.randrange(INDEX_CAPACITY)
+            if position in resident_set or position in miss_set:
+                continue
+            miss_set.add(position)
+            miss_positions.append(position)
+        query_row.extend(miss_positions)
         rng.shuffle(query_row)
+        resident_rows.append(resident_positions)
         query_rows.append(query_row)
-    return torch.tensor(
-        query_rows,
-        dtype=torch.int32,
-        device=device,
+    return (
+        torch.tensor(
+            resident_rows,
+            dtype=torch.int32,
+            device=device,
+        ),
+        torch.tensor(
+            query_rows,
+            dtype=torch.int32,
+            device=device,
+        ),
     )

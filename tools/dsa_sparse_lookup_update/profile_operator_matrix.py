@@ -372,7 +372,7 @@ def _run_workload(
         "resident_entries_per_request": RESIDENT_SLOT_COUNT,
         "query_width": QUERY_COUNT,
         "miss_count": workload.miss_count,
-        "query_pattern": "seeded-random-unique",
+        "query_pattern": "seeded-random-resident-and-query",
         "seed": seed,
         "effective_miss_rate_percent": (
             100.0 * workload.miss_count / QUERY_COUNT
@@ -452,7 +452,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "metric_profiles": [
                 metric.name for metric in metrics
             ],
-            "query_pattern": "seeded-random-unique",
+            "query_pattern": "seeded-random-resident-and-query",
             "seed": args.seed,
         },
         "workloads": results,
