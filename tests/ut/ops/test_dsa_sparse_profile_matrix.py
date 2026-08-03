@@ -147,6 +147,24 @@ def test_profile_matrix_accepts_reproducible_workload_seed() -> None:
     assert args.seed == 1234
 
 
+@pytest.mark.parametrize(
+    "mode",
+    ("steady", "step-random", "cache-thrash"),
+)
+def test_profile_matrix_accepts_workload_modes(mode: str) -> None:
+    args = PROFILE_MATRIX._parse_args(["--workload", mode])
+
+    assert args.workload_mode == mode
+
+
+def test_profile_matrix_accepts_workload_mode_alias() -> None:
+    args = PROFILE_MATRIX._parse_args(
+        ["--workload-mode", "cache-thrash"]
+    )
+
+    assert args.workload_mode == "cache-thrash"
+
+
 @pytest.mark.parametrize("seed", ("-1", "2147483648"))
 def test_profile_matrix_rejects_invalid_seed(seed: str) -> None:
     args = PROFILE_MATRIX._parse_args(["--seed", seed])

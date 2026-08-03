@@ -142,20 +142,48 @@ python3 tools/dsa_sparse_lookup_update/profile_operator.py \
 ```
 
 Choose either `--miss-rate` or `--miss-count`; omitting both profiles the
-all-hit path. For a nonzero miss workload, the script restores all persistent
-state before every invocation so every sample performs the requested fused
-lookup/update work. State restoration is outside the NPU Event timing window
-but appears in the profiler trace; filter the parsed files by
+all-hit path. In the default `steady` workload, a nonzero-miss run restores
+all persistent state before every invocation so every sample performs the
+requested fused lookup/update work. State restoration is outside the NPU Event
+timing window but appears in the profiler trace; filter the parsed files by
 `DsaSparseLookupUpdate` to inspect the custom kernel itself.
 
 The profile workload uses the same unique, per-request randomized TopK
-generator as the benchmark. Reusing a seed reproduces the same query tensor.
+generator as the benchmark. Reusing a seed reproduces the same initial state;
+for `step-random`, it also reproduces the generated per-step query schedule.
 
 The fixed workload has 8K resident entries and a 2K query width. The script
 writes a manifest and, unless `--no-trace` is used, a parsed
 `torch_npu.profiler` trace under
 `tools/dsa_sparse_lookup_update/profiles/<timestamp>/`. The script fails if
 the parsed profile does not contain the custom operator name.
+
+The single-operator profiler supports the same cache-behavior workloads as the
+matrix profiler:
+
+```bash
+# A new TopK query on every step while one state mapping evolves.
+python3 tools/dsa_sparse_lookup_update/profile_operator.py \
+  --device npu:2 \
+  --requests 32 \
+  --miss-rate 10 \
+  --workload step-random \
+  --profile-iters 20
+
+# An independent state buffer for every profiled step.
+python3 tools/dsa_sparse_lookup_update/profile_operator.py \
+  --device npu:2 \
+  --requests 32 \
+  --miss-rate 10 \
+  --workload cache-thrash \
+  --profile-iters 20
+```
+
+`step-random` uses the requested miss count for the initial step and then
+allows the fused operator state to evolve. `cache-thrash` keeps all per-step
+state buffers alive, so its aggregate GM allocation grows with the number of
+profile steps. In both dynamic modes, state restoration is not included in the
+trace because no restoration is performed.
 
 ## Multi-profile optimization matrix
 
@@ -178,8 +206,10 @@ then creates four separately parsed profiler traces:
 - `l2-cache`.
 
 The metric groups are collected in separate profiler sessions because they
-use different hardware counters. State restoration is outside each Event
-interval and appears in every nonzero-miss trace.
+use different hardware counters. In the default `steady` workload, state
+restoration is outside each Event interval and appears in every nonzero-miss
+trace. The dynamic workloads prepare their input schedule before profiling
+and do not restore state inside the profiler trace.
 
 Specify a smaller or larger matrix as needed:
 
@@ -192,6 +222,41 @@ python3 tools/dsa_sparse_lookup_update/profile_operator_matrix.py \
   --profile-iters 10 \
   --seed 1234
 ```
+
+The matrix supports three cache-behavior workloads:
+
+```bash
+# Reuse one fixed random state and TopK query (default).
+python3 tools/dsa_sparse_lookup_update/profile_operator_matrix.py \
+  --workload steady \
+  --metrics l2-cache \
+  --miss-counts 205
+
+# Use a new TopK query on every step while evolving one state mapping.
+python3 tools/dsa_sparse_lookup_update/profile_operator_matrix.py \
+  --workload step-random \
+  --metrics l2-cache \
+  --miss-counts 205 \
+  --profile-iters 20 \
+  --skip-event
+
+# Allocate independent state buffers and use each one once.
+python3 tools/dsa_sparse_lookup_update/profile_operator_matrix.py \
+  --workload cache-thrash \
+  --metrics l2-cache \
+  --miss-counts 205 \
+  --profile-iters 20 \
+  --skip-event
+```
+
+`steady` resets the same state before every nonzero-miss invocation and is a
+warmed steady-state measurement. `step-random` keeps the initial state
+mapping and changes the TopK tensor on every invocation; after the first
+invocation the fused operator state is allowed to evolve, so the requested
+miss count describes the initial step. `cache-thrash` holds one independent
+`index`/slot-state buffer per profile step, which grows the aggregate GM
+working set instead of reusing the same addresses. Dynamic workloads do not
+restore state inside the profiler trace.
 
 Use either `--miss-counts` or `--miss-rates`. Repeated request counts, miss
 counts, and metric names are deduplicated. The output layout is:

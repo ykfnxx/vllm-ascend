@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from common import (
+    INDEX_CAPACITY,
     MAX_SEED,
     QUERY_COUNT,
     RESIDENT_SLOT_COUNT,
@@ -32,6 +34,7 @@ from profile_operator import (
     _event_benchmark,
     _git_head,
     _profile_contains_custom_op,
+    _summarize_us,
 )
 
 DEFAULT_REQUEST_COUNTS = (32,)
@@ -62,6 +65,12 @@ METRIC_PROFILES = (
     MetricProfile("l2-cache", "L2Cache", collect_l2_cache=True),
 )
 METRIC_NAMES = tuple(profile.name for profile in METRIC_PROFILES)
+WORKLOAD_MODES = ("steady", "step-random", "cache-thrash")
+WORKLOAD_PATTERNS = {
+    "steady": "fixed-random-resident-and-query",
+    "step-random": "per-step-random-topk-shared-state",
+    "cache-thrash": "independent-state-buffer-per-step",
+}
 
 
 def _parse_args(
@@ -87,6 +96,18 @@ def _parse_args(
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--profile-iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--workload",
+        "--workload-mode",
+        dest="workload_mode",
+        choices=WORKLOAD_MODES,
+        default="steady",
+        help=(
+            "Workload schedule: steady reuses one state and resets it; "
+            "step-random changes TopK each step on one evolving state; "
+            "cache-thrash uses an independent state buffer per step."
+        ),
+    )
     miss_group = parser.add_mutually_exclusive_group()
     miss_group.add_argument(
         "--miss-counts",
@@ -192,6 +213,140 @@ def _validate_iterations(args: argparse.Namespace) -> None:
         raise ValueError(f"seed must be in [0, {MAX_SEED}]")
 
 
+def _query_variants(
+    runtime: Runtime,
+    base: OperatorInputs,
+    *,
+    miss_count: int,
+    variants: int,
+    seed: int,
+) -> tuple[Any, ...]:
+    """Build per-step TopK tensors for the evolving-state workload.
+
+    The resident mapping is sampled once for the workload. Each variant then
+    samples a fresh unique TopK row from that initial resident set and its
+    complement. The operator is allowed to mutate the shared mapping between
+    variants, so the requested miss count is the initial-step workload rather
+    than a promise about every later step.
+    """
+
+    resident_rows = (
+        base.slot_to_index[:, :RESIDENT_SLOT_COUNT]
+        .detach()
+        .cpu()
+        .tolist()
+    )
+    rng = random.Random(seed)
+    query_rows: list[list[list[int]]] = []
+    hit_count = QUERY_COUNT - miss_count
+    for _ in range(variants):
+        step_rows: list[list[int]] = []
+        for resident_row in resident_rows:
+            resident_set = set(resident_row)
+            query_row = rng.sample(resident_row, hit_count)
+            miss_positions: list[int] = []
+            miss_set: set[int] = set()
+            while len(miss_positions) < miss_count:
+                position = rng.randrange(INDEX_CAPACITY)
+                if position in resident_set or position in miss_set:
+                    continue
+                miss_set.add(position)
+                miss_positions.append(position)
+            query_row.extend(miss_positions)
+            rng.shuffle(query_row)
+            step_rows.append(query_row)
+        query_rows.append(step_rows)
+
+    return tuple(
+        runtime.torch.tensor(
+            step_rows,
+            dtype=runtime.torch.int32,
+            device=runtime.device,
+        ).contiguous()
+        for step_rows in query_rows
+    )
+
+
+def _make_step_random_schedule(
+    runtime: Runtime,
+    workload: Workload,
+    *,
+    steps: int,
+    seed: int,
+) -> tuple[OperatorInputs, ...]:
+    base = make_profile_inputs(
+        runtime,
+        requests=workload.requests,
+        miss_count=workload.miss_count,
+        seed=seed,
+    )
+    query_variants = _query_variants(
+        runtime,
+        base,
+        miss_count=workload.miss_count,
+        variants=steps,
+        seed=seed + 1,
+    )
+    return tuple(
+        OperatorInputs(
+            index=base.index,
+            slot_to_index=base.slot_to_index,
+            free_slots=base.free_slots,
+            free_head=base.free_head,
+            req_pool_entries=base.req_pool_entries,
+            query_index=query_index,
+            lookup_mask=base.lookup_mask,
+        )
+        for query_index in query_variants
+    )
+
+
+def _make_cache_thrash_schedule(
+    runtime: Runtime,
+    workload: Workload,
+    *,
+    steps: int,
+    seed: int,
+) -> tuple[OperatorInputs, ...]:
+    # Keep every state buffer alive and use it only once. Even when logical
+    # positions overlap, the backing index/slot tensors occupy independent GM
+    # ranges, so the aggregate profile working set grows with `steps`.
+    return tuple(
+        make_profile_inputs(
+            runtime,
+            requests=workload.requests,
+            miss_count=workload.miss_count,
+            seed=seed + step,
+        )
+        for step in range(steps)
+    )
+
+
+def _make_dynamic_schedule(
+    runtime: Runtime,
+    workload: Workload,
+    *,
+    mode: str,
+    steps: int,
+    seed: int,
+) -> tuple[OperatorInputs, ...]:
+    if mode == "step-random":
+        return _make_step_random_schedule(
+            runtime,
+            workload,
+            steps=steps,
+            seed=seed,
+        )
+    if mode == "cache-thrash":
+        return _make_cache_thrash_schedule(
+            runtime,
+            workload,
+            steps=steps,
+            seed=seed,
+        )
+    raise ValueError(f"Unsupported dynamic workload mode: {mode}")
+
+
 def _create_profiler(
     runtime: Runtime,
     trace_dir: Path,
@@ -262,6 +417,55 @@ def _trace(
     profiler.stop()
 
 
+def _event_schedule_benchmark(
+    runtime: Runtime,
+    schedule: tuple[OperatorInputs, ...],
+    *,
+    warmup: int,
+    iterations: int,
+) -> dict[str, float | int]:
+    torch = runtime.torch
+    for inputs in schedule[:warmup]:
+        invoke(runtime, inputs)
+    torch.npu.synchronize()
+
+    starts = [
+        torch.npu.Event(enable_timing=True)
+        for _ in range(iterations)
+    ]
+    ends = [
+        torch.npu.Event(enable_timing=True)
+        for _ in range(iterations)
+    ]
+    for iteration in range(iterations):
+        starts[iteration].record()
+        invoke(runtime, schedule[warmup + iteration])
+        ends[iteration].record()
+    torch.npu.synchronize()
+    samples_us = [
+        start.elapsed_time(end) * 1000.0
+        for start, end in zip(starts, ends)
+    ]
+    return _summarize_us(samples_us)
+
+
+def _trace_schedule(
+    runtime: Runtime,
+    schedule: tuple[OperatorInputs, ...],
+    *,
+    iterations: int,
+    trace_dir: Path,
+    metric: MetricProfile,
+) -> None:
+    profiler = _create_profiler(runtime, trace_dir, metric)
+    profiler.start()
+    for inputs in schedule[:iterations]:
+        invoke(runtime, inputs)
+        profiler.step()
+    runtime.torch.npu.synchronize()
+    profiler.stop()
+
+
 def _profile_files(trace_dir: Path) -> list[str]:
     return sorted(
         str(path.relative_to(trace_dir))
@@ -307,28 +511,48 @@ def _run_workload(
     profile_iterations: int,
     skip_event: bool,
     seed: int,
+    workload_mode: str,
 ) -> dict[str, Any]:
-    reference = make_profile_inputs(
-        runtime,
-        requests=workload.requests,
-        miss_count=workload.miss_count,
-        seed=seed,
-    )
-    inputs = clone_operator_inputs(reference)
-    reset_state = workload.miss_count > 0
     workload_dir = output_dir / workload.name
     workload_dir.mkdir()
 
+    is_steady = workload_mode == "steady"
+    reset_state = is_steady and workload.miss_count > 0
     event_timing: dict[str, float | int] | None = None
     if not skip_event:
-        event_timing = _event_benchmark(
-            runtime,
-            inputs,
-            reference,
-            reset_state=reset_state,
-            warmup=warmup,
-            iterations=iterations,
-        )
+        if is_steady:
+            reference = make_profile_inputs(
+                runtime,
+                requests=workload.requests,
+                miss_count=workload.miss_count,
+                seed=seed,
+            )
+            inputs = clone_operator_inputs(reference)
+            event_timing = _event_benchmark(
+                runtime,
+                inputs,
+                reference,
+                reset_state=reset_state,
+                warmup=warmup,
+                iterations=iterations,
+            )
+            del inputs, reference
+        else:
+            event_schedule = _make_dynamic_schedule(
+                runtime,
+                workload,
+                mode=workload_mode,
+                steps=warmup + iterations,
+                seed=seed,
+            )
+            event_timing = _event_schedule_benchmark(
+                runtime,
+                event_schedule,
+                warmup=warmup,
+                iterations=iterations,
+            )
+            del event_schedule
+            runtime.torch.npu.synchronize()
         print(
             f"[{workload.name}] Event median: "
             f"{event_timing['median_us']:.3f} us"
@@ -342,15 +566,41 @@ def _run_workload(
             f"[{workload.name}] Profiling {metric.name} "
             f"for {profile_iterations} iterations..."
         )
-        _trace(
-            runtime,
-            inputs,
-            reference,
-            reset_state=reset_state,
-            iterations=profile_iterations,
-            trace_dir=trace_dir,
-            metric=metric,
-        )
+        if is_steady:
+            reference = make_profile_inputs(
+                runtime,
+                requests=workload.requests,
+                miss_count=workload.miss_count,
+                seed=seed,
+            )
+            inputs = clone_operator_inputs(reference)
+            _trace(
+                runtime,
+                inputs,
+                reference,
+                reset_state=reset_state,
+                iterations=profile_iterations,
+                trace_dir=trace_dir,
+                metric=metric,
+            )
+            del inputs, reference
+        else:
+            profile_schedule = _make_dynamic_schedule(
+                runtime,
+                workload,
+                mode=workload_mode,
+                steps=profile_iterations,
+                seed=seed,
+            )
+            _trace_schedule(
+                runtime,
+                profile_schedule,
+                iterations=profile_iterations,
+                trace_dir=trace_dir,
+                metric=metric,
+            )
+            del profile_schedule
+            runtime.torch.npu.synchronize()
         custom_op_found = _profile_contains_custom_op(trace_dir)
         if not custom_op_found:
             raise RuntimeError(
@@ -368,11 +618,12 @@ def _run_workload(
 
     workload_manifest: dict[str, Any] = {
         "name": workload.name,
+        "workload_mode": workload_mode,
         "requests": workload.requests,
         "resident_entries_per_request": RESIDENT_SLOT_COUNT,
         "query_width": QUERY_COUNT,
         "miss_count": workload.miss_count,
-        "query_pattern": "seeded-random-resident-and-query",
+        "query_pattern": WORKLOAD_PATTERNS[workload_mode],
         "seed": seed,
         "effective_miss_rate_percent": (
             100.0 * workload.miss_count / QUERY_COUNT
@@ -426,6 +677,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     profile_iterations=args.profile_iters,
                     skip_event=args.skip_event,
                     seed=args.seed,
+                    workload_mode=args.workload_mode,
                 )
             )
 
@@ -449,10 +701,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 0 if args.skip_event else args.iterations
             ),
             "profile_iterations": args.profile_iters,
+            "workload_mode": args.workload_mode,
             "metric_profiles": [
                 metric.name for metric in metrics
             ],
-            "query_pattern": "seeded-random-resident-and-query",
+            "query_pattern": WORKLOAD_PATTERNS[args.workload_mode],
             "seed": args.seed,
         },
         "workloads": results,
