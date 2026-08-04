@@ -472,6 +472,7 @@ class KVCacheRecvingThread(threading.Thread):
         local_kv_caches_base_addr: list[list[int]],
         block_len_per_addr: list[list[int]],
         block_stride_per_addr: list[list[int]],
+        block_shape_per_addr: list[list[int]] | None = None,
         is_hma_required=False,
         ready_event: threading.Event | None = None,
         vllm_config: VllmConfig | None = None,
@@ -499,6 +500,7 @@ class KVCacheRecvingThread(threading.Thread):
         self.kv_caches_base_addr[local_engine_id][local_handshake_port] = local_kv_caches_base_addr
         self.block_len_per_addr = block_len_per_addr
         self.block_stride_per_addr = block_stride_per_addr
+        self.block_shape_per_addr = block_shape_per_addr or []
         if kv_group2layeridx is None:
             kv_group2layeridx = {}
         self.kv_group2layeridx = kv_group2layeridx
@@ -912,8 +914,24 @@ class KVCacheRecvingThread(threading.Thread):
 
                 local_base = local_kv_caches_base_addrs[layer_idx][cache_idx]
                 remote_base = remote_kv_caches_base_addrs[remote_layer_idx][cache_idx]
-                local_tensor_shape = self.block_shape_per_addr[layer_idx][cache_idx]
-                remote_tensor_shape = self.block_shape_per_addr[remote_layer_idx][cache_idx]
+                local_shape_list = self.block_shape_per_addr[layer_idx] if layer_idx < len(self.block_shape_per_addr) else []
+                remote_shape_list = (
+                    self.block_shape_per_addr[remote_layer_idx]
+                    if remote_layer_idx < len(self.block_shape_per_addr)
+                    else []
+                )
+                if cache_idx >= len(local_shape_list):
+                    issue["reason"] = "invalid_local_block_shape_index"
+                    issue["local_block_shape_count"] = len(local_shape_list)
+                    issues.append(issue)
+                    continue
+                if cache_idx >= len(remote_shape_list):
+                    issue["reason"] = "invalid_remote_block_shape_index"
+                    issue["remote_block_shape_count"] = len(remote_shape_list)
+                    issues.append(issue)
+                    continue
+                local_tensor_shape = local_shape_list[cache_idx]
+                remote_tensor_shape = remote_shape_list[cache_idx]
                 local_tensor_blocks = local_tensor_shape[0] if local_tensor_shape else 0
                 remote_tensor_blocks = remote_tensor_shape[0] if remote_tensor_shape else 0
                 local_reg_len = self.block_len_per_addr[layer_idx][cache_idx] * local_tensor_blocks
@@ -3096,6 +3114,7 @@ class MooncakeConnectorWorker:
                 self.kv_caches_base_addr,
                 self.block_len_per_addr,
                 self.block_stride_per_addr,
+                self.block_shape_per_addr,
                 self._is_hma_required,
                 ready_event,
                 self.vllm_config,
