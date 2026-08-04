@@ -823,9 +823,141 @@ class KVCacheRecvingThread(threading.Thread):
             return list(zip(src_list, dst_list, length_list))[:limit]
 
         def _preview_block_pairs(
-            values: list[tuple[int, int, int, int, int, int]], limit: int = 6
-        ) -> list[tuple[int, int, int, int, int, int]]:
+            values: list[tuple[int, int, int, int, int, int, int]], limit: int = 6
+        ) -> list[tuple[int, int, int, int, int, int, int]]:
             return values[:limit]
+
+        def _preview_mapping_issues(
+            values: list[dict[str, Any]], limit: int = 8
+        ) -> list[dict[str, Any]]:
+            return values[:limit]
+
+        def _is_overlap(
+            src: int, length: int, base: int, registered_length: int
+        ) -> tuple[bool, int, int, int]:
+            if length <= 0:
+                return False, src, base, base + registered_length
+            end_addr = src + length
+            reg_end = base + registered_length
+            return base <= src < reg_end and end_addr <= reg_end, src, src + length, reg_end
+
+        def _get_block_mapping_issues() -> tuple[bool, list[dict[str, Any]]]:
+            issues: list[dict[str, Any]] = []
+            for idx, ((src, dst, length), block_pair) in enumerate(
+                zip(zip(src_list, dst_list, length_list), transfer_block_pairs)
+            ):
+                layer_idx, remote_layer_idx, cache_idx, local_block_start, remote_block_start, local_span, remote_span = (
+                    block_pair
+                )
+                issue: dict[str, Any] = {
+                    "op": idx,
+                    "src": src,
+                    "dst": dst,
+                    "length": length,
+                    "layer_idx": layer_idx,
+                    "remote_layer_idx": remote_layer_idx,
+                    "cache_idx": cache_idx,
+                    "local_block_start": local_block_start,
+                    "remote_block_start": remote_block_start,
+                    "local_span": local_span,
+                    "remote_span": remote_span,
+                }
+
+                if layer_idx < 0 or layer_idx >= len(local_kv_caches_base_addrs):
+                    issue["reason"] = "invalid_local_layer_idx"
+                    issues.append(issue)
+                    continue
+                if remote_layer_idx < 0 or remote_layer_idx >= len(remote_kv_caches_base_addrs):
+                    issue["reason"] = "invalid_remote_layer_idx"
+                    issues.append(issue)
+                    continue
+
+                local_cache_count = len(local_kv_caches_base_addrs[layer_idx])
+                remote_cache_count = len(remote_kv_caches_base_addrs[remote_layer_idx])
+                if cache_idx < 0 or cache_idx >= local_cache_count:
+                    issue["reason"] = "invalid_local_cache_idx"
+                    issue["local_cache_count"] = local_cache_count
+                    issues.append(issue)
+                    continue
+                if cache_idx >= remote_cache_count:
+                    issue["reason"] = "invalid_remote_cache_idx"
+                    issue["remote_cache_count"] = remote_cache_count
+                    issues.append(issue)
+                    continue
+
+                block_len_list = self.block_len_per_addr[layer_idx]
+                block_stride_list = self.block_stride_per_addr[layer_idx]
+                remote_block_len_list = self.block_len_per_addr[remote_layer_idx]
+                remote_block_stride_list = remote_block_stride_per_addr[remote_layer_idx]
+                if cache_idx >= len(block_len_list):
+                    issue["reason"] = "invalid_local_block_len_index"
+                    issue["local_block_len_count"] = len(block_len_list)
+                    issues.append(issue)
+                    continue
+                if cache_idx >= len(block_stride_list):
+                    issue["reason"] = "invalid_local_block_stride_index"
+                    issue["local_block_stride_count"] = len(block_stride_list)
+                    issues.append(issue)
+                    continue
+                if cache_idx >= len(remote_block_len_list):
+                    issue["reason"] = "invalid_remote_block_len_index"
+                    issue["remote_block_len_count"] = len(remote_block_len_list)
+                    issues.append(issue)
+                    continue
+                if cache_idx >= len(remote_block_stride_list):
+                    issue["reason"] = "invalid_remote_block_stride_index"
+                    issue["remote_block_stride_count"] = len(remote_block_stride_list)
+                    issues.append(issue)
+                    continue
+
+                local_base = local_kv_caches_base_addrs[layer_idx][cache_idx]
+                remote_base = remote_kv_caches_base_addrs[remote_layer_idx][cache_idx]
+                local_reg_len = self.block_len_per_addr[layer_idx][cache_idx]
+                remote_reg_len = self.block_len_per_addr[remote_layer_idx][cache_idx]
+                local_hit, _, local_end, local_reg_end = _is_overlap(src, length, local_base, local_reg_len)
+                remote_hit, _, remote_end, remote_reg_end = _is_overlap(
+                    dst, length, remote_base, remote_reg_len
+                )
+                if not local_hit:
+                    issue["reason"] = "src_out_of_registered_range"
+                    issue["local_base"] = local_base
+                    issue["local_registered_len"] = local_reg_len
+                    issue["local_end"] = local_end
+                    issue["local_reg_end"] = local_reg_end
+                    issues.append(issue)
+                    continue
+                if not remote_hit:
+                    issue["reason"] = "dst_out_of_registered_range"
+                    issue["remote_base"] = remote_base
+                    issue["remote_registered_len"] = remote_reg_len
+                    issue["remote_end"] = remote_end
+                    issue["remote_reg_end"] = remote_reg_end
+                    issues.append(issue)
+                    continue
+
+                local_stride = block_stride_list[cache_idx]
+                remote_stride = remote_block_stride_list[cache_idx]
+                local_max_blocks = int(local_reg_len / local_stride) if local_stride else 0
+                remote_max_blocks = int(remote_reg_len / remote_stride) if remote_stride else 0
+                if local_block_start < 0 or local_block_start + local_span > local_max_blocks:
+                    issue["reason"] = "local_cache_block_overflow"
+                    issue["local_stride"] = local_stride
+                    issue["local_max_blocks"] = local_max_blocks
+                    issues.append(issue)
+                    continue
+                if remote_block_start < 0 or remote_block_start + remote_span > remote_max_blocks:
+                    issue["reason"] = "remote_cache_block_overflow"
+                    issue["remote_stride"] = remote_stride
+                    issue["remote_max_blocks"] = remote_max_blocks
+                    issues.append(issue)
+                    continue
+
+                if local_cache_count != remote_cache_count:
+                    issue["reason"] = "cache_count_mismatch"
+                    issue["local_cache_count"] = local_cache_count
+                    issue["remote_cache_count"] = remote_cache_count
+                    issues.append(issue)
+            return (len(issues) == 0), issues
 
         logger.debug(
             "Mooncake kv transfer start: remote_request_id=%s remote_engine_id=%s remote=%s:%d local_engine_id=%s "
@@ -861,7 +993,7 @@ class KVCacheRecvingThread(threading.Thread):
             remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
             remote_block_stride_per_addr = self.remote_block_stride_per_addr[remote_engine_id][remote_handshake_port]
             remote_kv_group2layeridx = self.remote_kv_group2layeridx[remote_engine_id][remote_handshake_port]
-        transfer_block_pairs: list[tuple[int, int, int, int, int, int]] = []
+        transfer_block_pairs: list[tuple[int, int, int, int, int, int, int]] = []
         remote_block_dup_count: dict[tuple[int, int, int, int], int] = {}
         remote_layer_name_to_idx = self._build_remote_layer_name_to_idx(remote_kv_group2layeridx)
         logger.debug(
@@ -1060,7 +1192,15 @@ class KVCacheRecvingThread(threading.Thread):
                         local_span = len(local_block_id)
                         remote_span = len(remote_block_id)
                         transfer_block_pairs.append(
-                            (layer_idx, cache_idx, local_block_start, remote_block_start, local_span, remote_span)
+                            (
+                                layer_idx,
+                                remote_layer_idx,
+                                cache_idx,
+                                local_block_start,
+                                remote_block_start,
+                                local_span,
+                                remote_span,
+                            )
                         )
                         block_key = (layer_idx, cache_idx, remote_block_start, remote_span)
                         remote_block_dup_count[block_key] = remote_block_dup_count.get(block_key, 0) + 1
@@ -1134,6 +1274,27 @@ class KVCacheRecvingThread(threading.Thread):
         )
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
         if ret < 0:
+            precheck_ok, mapping_issues = _get_block_mapping_issues()
+            if precheck_ok:
+                logger.error(
+                    "Mooncake transfer address precheck: remote_request_id=%s remote_engine_id=%s session_id=%s "
+                    "result=PASS ops=%d",
+                    remote_request_id,
+                    remote_engine_id,
+                    session_id,
+                    len(length_list),
+                )
+            else:
+                logger.error(
+                    "Mooncake transfer address precheck: remote_request_id=%s remote_engine_id=%s session_id=%s "
+                    "result=FAIL ops=%d issue_count=%d samples=%s",
+                    remote_request_id,
+                    remote_engine_id,
+                    session_id,
+                    len(length_list),
+                    len(mapping_issues),
+                    _preview_mapping_issues(mapping_issues),
+                )
             logger.error(
                 "Mooncake transfer failed for request. remote_request_id=%s remote_engine_id=%s remote_session=%s ret=%d "
                 "ops=%d total_bytes=%d min_len=%d max_len=%d first_pairs=%s last_pairs=%s block_ops=%s",
