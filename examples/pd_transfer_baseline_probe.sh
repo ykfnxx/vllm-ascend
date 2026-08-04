@@ -367,14 +367,20 @@ check_required_kv_handshake_metadata() {
     local label="$1"
     local log_file="$2"
     local expected_port="$3"
+    local timeout="${4:-30}"
+    local deadline=$((SECONDS + timeout))
 
     echo "Checking $label handshake metadata for port: $expected_port"
-    if ! grep -q "handshake_port: $expected_port" "$log_file"; then
-        echo "Did not find handshake metadata with port $expected_port in $log_file." >&2
-        return 1
-    fi
 
-    return 0
+    while ((SECONDS < deadline)); do
+        if grep -Eq "handshake_port['\"]?:[[:space:]]*${expected_port}|handshake_port[[:space:]]*:[[:space:]]*${expected_port}" "$log_file"; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "Did not find handshake metadata with port $expected_port in $log_file within ${timeout}s." >&2
+    return 1
 }
 
 COMMON_NETWORK_ENV=(
