@@ -912,8 +912,12 @@ class KVCacheRecvingThread(threading.Thread):
 
                 local_base = local_kv_caches_base_addrs[layer_idx][cache_idx]
                 remote_base = remote_kv_caches_base_addrs[remote_layer_idx][cache_idx]
-                local_reg_len = self.block_len_per_addr[layer_idx][cache_idx]
-                remote_reg_len = self.block_len_per_addr[remote_layer_idx][cache_idx]
+                local_tensor_shape = self.block_shape_per_addr[layer_idx][cache_idx]
+                remote_tensor_shape = self.block_shape_per_addr[remote_layer_idx][cache_idx]
+                local_tensor_blocks = local_tensor_shape[0] if local_tensor_shape else 0
+                remote_tensor_blocks = remote_tensor_shape[0] if remote_tensor_shape else 0
+                local_reg_len = self.block_len_per_addr[layer_idx][cache_idx] * local_tensor_blocks
+                remote_reg_len = self.block_len_per_addr[remote_layer_idx][cache_idx] * remote_tensor_blocks
                 local_hit, _, local_end, local_reg_end = _is_overlap(src, length, local_base, local_reg_len)
                 remote_hit, _, remote_end, remote_reg_end = _is_overlap(
                     dst, length, remote_base, remote_reg_len
