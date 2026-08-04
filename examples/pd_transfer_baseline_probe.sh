@@ -282,6 +282,86 @@ wait_for_health() {
     return 1
 }
 
+check_listen_port() {
+    local port="$1"
+    local found
+    found="$(python3 - "$port" <<'PY'
+import os
+import sys
+
+port = int(sys.argv[1])
+for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+    if not os.path.exists(path):
+        continue
+    with open(path, "r", encoding="utf-8") as proc_tcp:
+        header = proc_tcp.readline()
+        for line in proc_tcp:
+            cols = line.split()
+            if len(cols) < 4:
+                continue
+            if cols[3] != "0A":
+                continue
+            local_hex = cols[1]
+            if ":" not in local_hex:
+                continue
+            try:
+                local_port = int(local_hex.split(":")[1], 16)
+            except ValueError:
+                continue
+            if local_port == port:
+                print(path)
+                sys.exit(0)
+print("NOT_FOUND")
+sys.exit(1)
+PY
+)"
+
+    if [[ "$found" == "NOT_FOUND" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+check_tcp_connect() {
+    local host="$1"
+    local port="$2"
+    local timeout="${3:-1}"
+    python3 - "$host" "$port" "$timeout" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+timeout = float(sys.argv[3])
+try:
+    with socket.create_connection((host, port), timeout=timeout):
+        print("OK")
+    sys.exit(0)
+except Exception as exc:
+    print(type(exc).__name__)
+    sys.exit(1)
+PY
+}
+
+check_required_kv_ports() {
+    local label="$1"
+    local ip="$2"
+    local port="$3"
+    echo "Checking $label port reachability: $ip:$port"
+
+    if ! check_listen_port "$port"; then
+        echo "Port $port is not LISTEN on this host (/proc/net/tcp has no 0A state)." >&2
+        return 1
+    fi
+
+    if ! check_tcp_connect "$ip" "$port" 1; then
+        echo "Cannot establish TCP connection to $ip:$port from current container." >&2
+        return 1
+    fi
+
+    return 0
+}
+
 COMMON_NETWORK_ENV=(
     "VLLM_HOST_IP=$HOST_IP"
     "HCCL_IF_IP=$HOST_IP"
@@ -349,6 +429,20 @@ wait_for_health \
     "http://127.0.0.1:$DECODE_HTTP_PORT/health" \
     "$DECODE_PID" \
     "$DECODE_LOG"
+
+echo "Checking local Mooncake listen/connect for prefill/decode ports..."
+if ! check_required_kv_ports "Prefill KV" "$HOST_IP" "$PREFILL_KV_PORT"; then
+    echo "Prefill KV port check failed before starting proxy." >&2
+    tail -n 120 "$PREFILL_LOG" >&2 || true
+    tail -n 120 "$DECODE_LOG" >&2 || true
+    exit 1
+fi
+if ! check_required_kv_ports "Decode KV" "$HOST_IP" "$DECODE_KV_PORT"; then
+    echo "Decode KV port check failed before starting proxy." >&2
+    tail -n 120 "$PREFILL_LOG" >&2 || true
+    tail -n 120 "$DECODE_LOG" >&2 || true
+    exit 1
+fi
 
 echo "Starting the standard P/D proxy..."
 python3 "$SCRIPT_DIR/disaggregated_prefill_v1/load_balance_proxy_server_example.py" \
