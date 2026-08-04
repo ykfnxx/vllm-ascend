@@ -343,10 +343,12 @@ except Exception as exc:
 PY
 }
 
-check_required_kv_ports() {
+check_required_kv_listen_port() {
     local label="$1"
     local ip="$2"
     local port="$3"
+    local peer_pid="$4"
+
     echo "Checking $label port reachability: $ip:$port"
 
     if ! check_listen_port "$port"; then
@@ -356,6 +358,20 @@ check_required_kv_ports() {
 
     if ! check_tcp_connect "$ip" "$port" 1; then
         echo "Cannot establish TCP connection to $ip:$port from current container." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+check_required_kv_handshake_metadata() {
+    local label="$1"
+    local log_file="$2"
+    local expected_port="$3"
+
+    echo "Checking $label handshake metadata for port: $expected_port"
+    if ! grep -q "handshake_port: $expected_port" "$log_file"; then
+        echo "Did not find handshake metadata with port $expected_port in $log_file." >&2
         return 1
     fi
 
@@ -431,13 +447,13 @@ wait_for_health \
     "$DECODE_LOG"
 
 echo "Checking local Mooncake listen/connect for prefill/decode ports..."
-if ! check_required_kv_ports "Prefill KV" "$HOST_IP" "$PREFILL_KV_PORT"; then
+if ! check_required_kv_listen_port "Prefill KV" "$HOST_IP" "$PREFILL_KV_PORT"; then
     echo "Prefill KV port check failed before starting proxy." >&2
     tail -n 120 "$PREFILL_LOG" >&2 || true
     tail -n 120 "$DECODE_LOG" >&2 || true
     exit 1
 fi
-if ! check_required_kv_ports "Decode KV" "$HOST_IP" "$DECODE_KV_PORT"; then
+if ! check_required_kv_handshake_metadata "Decode KV" "$DECODE_LOG" "$DECODE_KV_PORT"; then
     echo "Decode KV port check failed before starting proxy." >&2
     tail -n 120 "$PREFILL_LOG" >&2 || true
     tail -n 120 "$DECODE_LOG" >&2 || true
