@@ -37,6 +37,7 @@ STARTUP_TIMEOUT="900"
 LOG_DIR=""
 
 VERIFY_TRANSFER="1"
+STRICT_KV_LISTEN_CHECK="0"
 
 usage() {
     cat <<'EOF'
@@ -58,6 +59,7 @@ Options:
   --proxy-http-port PORT       Proxy HTTP port. Default: 18000
   --prefill-kv-port PORT       Prefill Mooncake base port. Default: 30000
   --decode-kv-port PORT        Decode Mooncake base port. Default: 30100
+  --strict-kv-listen-check     Require successful LISTEN/connect validation before continuing (default: disabled).
   --prompt-tokens N            Repeated input token count. Default: 2333
   --prompt-token-id ID         Repeated vocabulary token ID. Default: 100
   --max-tokens N               Decode token count. Default: 1
@@ -134,6 +136,10 @@ while (($# > 0)); do
             require_value "$@"
             DECODE_KV_PORT="$2"
             shift 2
+            ;;
+        --strict-kv-listen-check)
+            STRICT_KV_LISTEN_CHECK="1"
+            shift
             ;;
         --prompt-tokens)
             require_value "$@"
@@ -391,21 +397,61 @@ check_required_kv_port_with_metadata() {
     local timeout="${5:-30}"
     local deadline=$((SECONDS + timeout))
 
+    local strict_check="$STRICT_KV_LISTEN_CHECK"
+    local metadata_ready=0
+    local listen_ready=0
+    local connect_ready=0
+
     echo "Checking local Mooncake listen/connect and metadata for $label: $ip:$port"
 
     while ((SECONDS < deadline)); do
-        if check_listen_port "$port" && check_tcp_connect "$ip" "$port" 1 && \
-           check_required_kv_handshake_metadata "$label" "$log_file" "$port" 1; then
+        metadata_ready=0
+        listen_ready=0
+        connect_ready=0
+
+        if check_required_kv_handshake_metadata "$label" "$log_file" "$port" 1; then
+            metadata_ready=1
+        fi
+
+        if check_listen_port "$port"; then
+            listen_ready=1
+        fi
+
+        if check_tcp_connect "$ip" "$port" 1; then
+            connect_ready=1
+        fi
+
+        if ((metadata_ready == 1 && listen_ready == 1 && connect_ready == 1)); then
             return 0
         fi
         sleep 1
     done
 
     echo "Failed to confirm Mooncake reachability+metadata for $label on port $port." >&2
-    if ! check_listen_port "$port"; then
+    if ((metadata_ready == 0)); then
+        echo "Handshake metadata for port $port not found in $log_file within ${timeout}s." >&2
+    elif ((listen_ready == 0)); then
         echo "Port $port is not LISTEN on this host (/proc/net/tcp has no 0A state)." >&2
+    elif ((connect_ready == 0)); then
+        echo "Cannot connect to $ip:$port from current container." >&2
+    fi
+
+    if ((strict_check == 1)); then
+        return 1
+    fi
+
+    if ((metadata_ready == 1)); then
+        echo "Continue anyway because strict listen/connect check is disabled." >&2
+        return 0
+    fi
+
+    echo "Strict check is disabled but metadata is also unavailable; cannot continue safely." >&2
+
+    if ((metadata_ready == 0)); then
+        echo "Hint: remove --strict-kv-listen-check to allow metadata-only gating, or fix Mooncake startup logs first." >&2
     else
-        echo "Port $port listen/connect looks ready but handshake metadata missing in $log_file." >&2
+        # unreachable in this branch, kept for historical consistency
+        echo "Port $port check state: metadata_ready=$metadata_ready listen_ready=$listen_ready connect_ready=$connect_ready" >&2
     fi
     return 1
 }
