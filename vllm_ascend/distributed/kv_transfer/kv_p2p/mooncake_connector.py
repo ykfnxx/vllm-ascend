@@ -1160,6 +1160,11 @@ class KVCacheRecvingThread(threading.Thread):
                         f"layer_name={layer_name!r}, indices=({previous_idx}, {layer_idx})."
                     )
                 layer_name_to_idx[layer_name] = layer_idx
+        if not layer_name_to_idx:
+            logger.warning(
+                "Mooncake remote layer name map is empty, using index-based fallback. remote_kv_group2layeridx=%s",
+                remote_kv_group2layeridx,
+            )
         return layer_name_to_idx
 
     @staticmethod
@@ -1171,10 +1176,24 @@ class KVCacheRecvingThread(threading.Thread):
         remote_handshake_port: int,
     ) -> int:
         if layer_name is None:
+            logger.debug(
+                "Mooncake remote layer mapping: layer_name is None, fallback to local_layer_idx=%s",
+                local_layer_idx,
+            )
             return local_layer_idx
         try:
             remote_layer_idx = remote_layer_name_to_idx[layer_name]
         except KeyError as error:
+            logger.error(
+                "Mooncake remote KV metadata does not contain the local layer. "
+                "layer_name=%r local_layer_idx=%s remote_engine_id=%r remote_handshake_port=%s "
+                "available_remote_layer_names_sample=%s",
+                layer_name,
+                local_layer_idx,
+                remote_engine_id,
+                remote_handshake_port,
+                list(remote_layer_name_to_idx.keys())[:64],
+            )
             raise RuntimeError(
                 "Mooncake remote KV metadata does not contain the local layer: "
                 f"layer_name={layer_name!r}, local_layer_idx={local_layer_idx}, "
@@ -1479,6 +1498,11 @@ class KVCacheRecvingThread(threading.Thread):
 
     def _get_remote_metadata(self, remote_host: str, remote_handshake_port: int) -> None:
         """Get the metadata from the remote host."""
+        logger.debug(
+            "Requesting Mooncake remote metadata: remote_host=%s remote_handshake_port=%s",
+            remote_host,
+            remote_handshake_port,
+        )
         sock: zmq.Socket | None = None  # type: ignore
         try:
             sock = self._get_remote_socket(remote_host, remote_handshake_port)
@@ -1501,6 +1525,19 @@ class KVCacheRecvingThread(threading.Thread):
                 self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
                 self.remote_block_size_scale[engine_id][remote_handshake_port] = agent_meta.block_size_scale
                 self.remote_block_stride_per_addr[engine_id][remote_handshake_port] = agent_meta.block_strides
+            logger.debug(
+                "Received Mooncake remote metadata: remote_engine_id=%s te_rpc_port=%s kv_group2layeridx_keys=%s",
+                engine_id,
+                agent_meta.te_rpc_port,
+                list(agent_meta.kv_group2layeridx.keys()),
+            )
+            logger.debug(
+                "Mooncake remote metadata detail: remote_engine_id=%s kv_caches_base_addr_sizes=%s block_strides=%s block_size_scale=%s",
+                engine_id,
+                [len(v) for v in agent_meta.kv_caches_base_addr],
+                [len(v) for v in agent_meta.block_strides],
+                [len(v) for v in agent_meta.block_size_scale],
+            )
         except Exception:
             if isinstance(sock, zmq.Socket):  # type: ignore
                 sock.close()
