@@ -811,6 +811,36 @@ class KVCacheRecvingThread(threading.Thread):
         remote_engine_id = req_meta["remote_engine_id"]
         remote_host = req_meta["remote_host"]
         remote_handshake_port = req_meta["remote_handshake_port"]
+
+        def _preview_ids(values: list[Any], limit: int = 8) -> str:
+            if not values:
+                return "[]"
+            if len(values) <= limit:
+                return str(values)
+            return f"{values[:limit]} (+{len(values) - limit} more)"
+
+        def _preview_pairs(limit: int = 6) -> list[tuple[int, int, int]]:
+            return list(zip(src_list, dst_list, length_list))[:limit]
+
+        def _preview_block_pairs(
+            values: list[tuple[int, int, int, int, int, int]], limit: int = 6
+        ) -> list[tuple[int, int, int, int, int, int]]:
+            return values[:limit]
+
+        logger.debug(
+            "Mooncake kv transfer start: remote_request_id=%s remote_engine_id=%s remote=%s:%d local_engine_id=%s "
+            "local_handshake_port=%d group_pulls=%d has_replicate_k_blocks=%s local_group_count=%d remote_group_count=%d",
+            remote_request_id,
+            remote_engine_id,
+            remote_host,
+            remote_handshake_port,
+            self.local_engine_id,
+            self.local_handshake_port,
+            len(group_pulls),
+            has_replicate_k_blocks,
+            len(local_block_ids),
+            len(remote_block_ids),
+        )
         # Full prefix cache hit: do not need to read remote blocks, just notify
         # P worker that we have the blocks we need.
         num_local_blocks = sum(len(group_block_ids) for group_block_ids in local_block_ids)
@@ -831,7 +861,19 @@ class KVCacheRecvingThread(threading.Thread):
             remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
             remote_block_stride_per_addr = self.remote_block_stride_per_addr[remote_engine_id][remote_handshake_port]
             remote_kv_group2layeridx = self.remote_kv_group2layeridx[remote_engine_id][remote_handshake_port]
+        transfer_block_pairs: list[tuple[int, int, int, int, int, int]] = []
+        remote_block_dup_count: dict[tuple[int, int, int, int], int] = {}
         remote_layer_name_to_idx = self._build_remote_layer_name_to_idx(remote_kv_group2layeridx)
+        logger.debug(
+            "Mooncake metadata loaded for request=%s remote_engine_id=%s remote_te_port=%s remote_group_count=%s "
+            "local_group_count=%s remote_group2layeridx_keys=%s",
+            remote_request_id,
+            remote_engine_id,
+            remote_transfer_port,
+            len(remote_kv_group2layeridx),
+            len(local_kv_caches_base_addrs),
+            list(remote_kv_group2layeridx.keys()),
+        )
         session_id = f"{remote_host}:{remote_transfer_port}"
 
         req_start_time = time.perf_counter()
@@ -1000,6 +1042,28 @@ class KVCacheRecvingThread(threading.Thread):
                         src_list.append(src)
                         dst_list.append(dst)
                         length_list.append(length)
+                        if len(local_block_id) != len(remote_block_id):
+                            logger.warning(
+                                "Mooncake transfer span mismatch: request_id=%s group_idx=%s layer_idx=%s cache_idx=%s "
+                                "local_block_ids=%s remote_block_ids=%s local_span=%d remote_span=%d",
+                                remote_request_id,
+                                group_idx,
+                                layer_idx,
+                                cache_idx,
+                                local_block_id,
+                                remote_block_id,
+                                len(local_block_id),
+                                len(remote_block_id),
+                            )
+                        local_block_start = local_block_id[0]
+                        remote_block_start = remote_block_id[0]
+                        local_span = len(local_block_id)
+                        remote_span = len(remote_block_id)
+                        transfer_block_pairs.append(
+                            (layer_idx, cache_idx, local_block_start, remote_block_start, local_span, remote_span)
+                        )
+                        block_key = (layer_idx, cache_idx, remote_block_start, remote_span)
+                        remote_block_dup_count[block_key] = remote_block_dup_count.get(block_key, 0) + 1
                     logger.debug(
                         "Mooncake kv transfer meta: request_id=%s group_idx=%s layer_idx=%s remote_layer_idx=%s "
                         "layer_name=%s local_block_ids=%s remote_block_ids=%s tp_num_need_pulls=%s "
@@ -1016,7 +1080,28 @@ class KVCacheRecvingThread(threading.Thread):
                         session_id,
                     )
 
+        duplicated_remote_blocks = [(key, count) for key, count in remote_block_dup_count.items() if count > 1]
+        if duplicated_remote_blocks:
+            logger.warning(
+                "Mooncake transfer block reuse detected: remote_request_id=%s duplicates=%s total_ops=%d duplicate_samples=%s block_ops=%s",
+                remote_request_id,
+                len(duplicated_remote_blocks),
+                len(transfer_block_pairs),
+                _preview_ids(duplicated_remote_blocks),
+                _preview_block_pairs(transfer_block_pairs),
+            )
+
         if not src_list:
+            logger.warning(
+                "Mooncake transfer skipped: no src/dst/len entries generated. remote_request_id=%s remote_engine_id=%s "
+                "group_pulls=%d local_blocks=%d remote_blocks=%d replicate_k_blocks=%s",
+                remote_request_id,
+                remote_engine_id,
+                len(group_pulls),
+                num_local_blocks,
+                sum(len(group_block_ids) for group_block_ids in remote_block_ids),
+                has_replicate_k_blocks,
+            )
             return
 
         if ascend_envs.VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE:
@@ -1035,12 +1120,34 @@ class KVCacheRecvingThread(threading.Thread):
             dst_list,
             length_list,
         )
+        logger.info(
+            "Mooncake transfer preflight: remote_request_id=%s session_id=%s ops=%d total_bytes=%d min_len=%d max_len=%d "
+            "pair_sample=%s block_pair_sample=%s",
+            remote_request_id,
+            session_id,
+            len(length_list),
+            sum(length_list),
+            min(length_list),
+            max(length_list),
+            _preview_pairs(),
+            _preview_block_pairs(transfer_block_pairs),
+        )
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
         if ret < 0:
             logger.error(
-                "Mooncake transfer failed for request. remote_request_id=%s, ret=%d. ",
-                req_meta["remote_request_id"],
+                "Mooncake transfer failed for request. remote_request_id=%s remote_engine_id=%s remote_session=%s ret=%d "
+                "ops=%d total_bytes=%d min_len=%d max_len=%d first_pairs=%s last_pairs=%s block_ops=%s",
+                remote_request_id,
+                remote_engine_id,
+                session_id,
                 ret,
+                len(length_list),
+                sum(length_list),
+                min(length_list),
+                max(length_list),
+                _preview_pairs(4),
+                list(zip(src_list, dst_list, length_list))[-4:],
+                _preview_block_pairs(transfer_block_pairs, 4),
             )
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
 
