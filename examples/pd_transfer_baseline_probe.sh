@@ -373,13 +373,40 @@ check_required_kv_handshake_metadata() {
     echo "Checking $label handshake metadata for port: $expected_port"
 
     while ((SECONDS < deadline)); do
-        if grep -Eq "handshake_port['\"]?:[[:space:]]*${expected_port}|handshake_port[[:space:]]*:[[:space:]]*${expected_port}" "$log_file"; then
+        if grep -Eq "set_xfer_handshake_metadata|handshake_port[[:space:]]*[:=][[:space:]]*${expected_port}|KVCacheSendingThread started listening on path: tcp://[^[:space:]]*:${expected_port}" "$log_file"; then
             return 0
         fi
         sleep 1
     done
 
     echo "Did not find handshake metadata with port $expected_port in $log_file within ${timeout}s." >&2
+    return 1
+}
+
+check_required_kv_port_with_metadata() {
+    local label="$1"
+    local ip="$2"
+    local port="$3"
+    local log_file="$4"
+    local timeout="${5:-30}"
+    local deadline=$((SECONDS + timeout))
+
+    echo "Checking local Mooncake listen/connect and metadata for $label: $ip:$port"
+
+    while ((SECONDS < deadline)); do
+        if check_listen_port "$port" && check_tcp_connect "$ip" "$port" 1 && \
+           check_required_kv_handshake_metadata "$label" "$log_file" "$port" 1; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "Failed to confirm Mooncake reachability+metadata for $label on port $port." >&2
+    if ! check_listen_port "$port"; then
+        echo "Port $port is not LISTEN on this host (/proc/net/tcp has no 0A state)." >&2
+    else
+        echo "Port $port listen/connect looks ready but handshake metadata missing in $log_file." >&2
+    fi
     return 1
 }
 
@@ -452,13 +479,13 @@ wait_for_health \
     "$DECODE_LOG"
 
 echo "Checking local Mooncake listen/connect for prefill/decode ports..."
-if ! check_required_kv_listen_port "Prefill KV" "$HOST_IP" "$PREFILL_KV_PORT"; then
+if ! check_required_kv_port_with_metadata "Prefill KV" "$HOST_IP" "$PREFILL_KV_PORT" "$PREFILL_LOG" 60; then
     echo "Prefill KV port check failed before starting proxy." >&2
     tail -n 120 "$PREFILL_LOG" >&2 || true
     tail -n 120 "$DECODE_LOG" >&2 || true
     exit 1
 fi
-if ! check_required_kv_handshake_metadata "Decode KV" "$DECODE_LOG" "$DECODE_KV_PORT"; then
+if ! check_required_kv_port_with_metadata "Decode KV" "$HOST_IP" "$DECODE_KV_PORT" "$DECODE_LOG" 60; then
     echo "Decode KV port check failed before starting proxy." >&2
     tail -n 120 "$PREFILL_LOG" >&2 || true
     tail -n 120 "$DECODE_LOG" >&2 || true
