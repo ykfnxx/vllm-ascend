@@ -347,7 +347,6 @@ check_required_kv_listen_port() {
     local label="$1"
     local ip="$2"
     local port="$3"
-    local peer_pid="$4"
 
     echo "Checking $label port reachability: $ip:$port"
 
