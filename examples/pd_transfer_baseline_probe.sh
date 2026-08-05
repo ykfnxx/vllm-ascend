@@ -39,6 +39,7 @@ PORT_LOG=""
 
 VERIFY_TRANSFER="1"
 STRICT_KV_LISTEN_CHECK="0"
+DYNAMIC_LIBRARY_CHECK="1"
 
 usage() {
     cat <<'EOF'
@@ -61,6 +62,7 @@ Options:
   --prefill-kv-port PORT       Prefill Mooncake base port. Default: 30000
   --decode-kv-port PORT        Decode Mooncake base port. Default: 30100
   --strict-kv-listen-check     Require successful LISTEN/connect validation before continuing (default: disabled).
+  --no-dynamic-library-check   Skip runtime CANN/ADXL/HCCL library diagnostics.
   --prompt-tokens N            Repeated input token count. Default: 2333
   --prompt-token-id ID         Repeated vocabulary token ID. Default: 100
   --max-tokens N               Decode token count. Default: 1
@@ -140,6 +142,10 @@ while (($# > 0)); do
             ;;
         --strict-kv-listen-check)
             STRICT_KV_LISTEN_CHECK="1"
+            shift
+            ;;
+        --no-dynamic-library-check)
+            DYNAMIC_LIBRARY_CHECK="0"
             shift
             ;;
         --prompt-tokens)
@@ -229,6 +235,8 @@ PROXY_LOG="$LOG_DIR/proxy.log"
 REQUEST_JSON="$LOG_DIR/request.json"
 RESPONSE_JSON="$LOG_DIR/response.json"
 PORT_LOG="$LOG_DIR/ports.log"
+DYNAMIC_LIBRARY_LOG="$LOG_DIR/dynamic-libs.log"
+DYNAMIC_LIBRARY_DIR="$LOG_DIR/dynamic-libs"
 
 declare -a CHILD_PIDS=()
 PROFILE_STARTED="0"
@@ -256,6 +264,7 @@ cleanup() {
     local pid
     stop_decode_profile || true
     stop_port_monitor || true
+    snapshot_native_runtime "cleanup" || true
     for pid in "${CHILD_PIDS[@]:-}"; do
         if kill -0 "$pid" >/dev/null 2>&1; then
             kill "$pid" >/dev/null 2>&1 || true
@@ -401,6 +410,194 @@ stop_port_monitor() {
     kill "$PORT_MONITOR_PID" >/dev/null 2>&1 || true
     wait "$PORT_MONITOR_PID" >/dev/null 2>&1 || true
     PORT_MONITOR_PID=""
+}
+
+list_enginecore_pids() {
+    python3 - "$PREFILL_PID" "$DECODE_PID" <<'PY'
+import os
+import sys
+
+roots = (("prefill", sys.argv[1]), ("decode", sys.argv[2]))
+children = {}
+for entry in os.listdir("/proc"):
+    if not entry.isdigit():
+        continue
+    try:
+        with open(f"/proc/{entry}/status", "r", encoding="utf-8") as status_file:
+            parent = next(
+                int(line.split()[1])
+                for line in status_file
+                if line.startswith("PPid:")
+            )
+    except (FileNotFoundError, PermissionError, StopIteration, ValueError):
+        continue
+    children.setdefault(parent, []).append(entry)
+
+def descendants(root):
+    result = []
+    pending = [root]
+    while pending:
+        parent = pending.pop()
+        for child in children.get(int(parent), []):
+            result.append(child)
+            pending.append(child)
+    return result
+
+for role, root in roots:
+    candidates = [root] + descendants(root)
+    for pid in sorted(set(candidates), key=int):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as cmdline_file:
+                cmdline = cmdline_file.read().replace(b"\0", b" ").decode(
+                    "utf-8", "replace"
+                )
+            with open(f"/proc/{pid}/comm", "r", encoding="utf-8") as comm_file:
+                comm = comm_file.read().strip()
+        except (FileNotFoundError, PermissionError):
+            continue
+        identity = f"{comm} {cmdline}".lower()
+        if "enginecore" in identity or "vllm::enginecor" in identity:
+            print(role, pid)
+PY
+}
+
+snapshot_native_runtime() {
+    local reason="${1:-manual}"
+    local timestamp
+    local snapshot_dir
+    local pid_records
+    local role
+    local pid
+    local cmdline
+    local comm
+    local exe
+    local env_line
+    local lib
+    local resolved
+    local digest
+    local role_paths
+    local process_paths
+    local process_resolved
+    local role_resolved
+
+    if [[ "$DYNAMIC_LIBRARY_CHECK" != "1" ]]; then
+        return 0
+    fi
+
+    timestamp="$(date +%Y%m%dT%H%M%S%z)"
+    snapshot_dir="$DYNAMIC_LIBRARY_DIR/${timestamp}-${reason}"
+    mkdir -p "$snapshot_dir"
+    {
+        echo
+        echo "=== native runtime snapshot ${timestamp} (${reason}) ==="
+        echo "prefill_api_pid=$PREFILL_PID decode_api_pid=$DECODE_PID"
+        echo "library_filter=hccl|adxl|ascend|acl|torch_npu|mooncake|transfer|opapi|optiling"
+    } >>"$DYNAMIC_LIBRARY_LOG"
+
+    pid_records="$(list_enginecore_pids 2>/dev/null || true)"
+    if [[ -z "$pid_records" ]]; then
+        echo "No EngineCore descendant found while collecting native runtime state." \
+            | tee -a "$DYNAMIC_LIBRARY_LOG" >&2
+        return 0
+    fi
+
+    for role in prefill decode; do
+        : >"$DYNAMIC_LIBRARY_DIR/${role}.latest.paths"
+        : >"$DYNAMIC_LIBRARY_DIR/${role}.latest.resolved.tsv"
+    done
+
+    while read -r role pid; do
+        [[ -n "$role" && -n "$pid" ]] || continue
+        [[ -r "/proc/$pid/maps" ]] || continue
+
+        role_paths="$DYNAMIC_LIBRARY_DIR/${role}.latest.paths"
+        process_paths="$snapshot_dir/${role}.${pid}.mapped.paths"
+        process_resolved="$snapshot_dir/${role}.${pid}.resolved.tsv"
+        role_resolved="$DYNAMIC_LIBRARY_DIR/${role}.latest.resolved.tsv"
+        : >"$process_paths"
+        : >"$process_resolved"
+
+        cmdline="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+        comm="$(cat "/proc/$pid/comm" 2>/dev/null || true)"
+        exe="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+        {
+            echo
+            echo "--- role=$role pid=$pid comm=$comm ---"
+            echo "exe=$exe"
+            echo "cmdline=$cmdline"
+            echo "environment:"
+            tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null \
+                | grep -E '^(LD_LIBRARY_PATH|ASCEND_HOME_PATH|ASCEND_RT_VISIBLE_DEVICES|HCCL_|GLOO_SOCKET_IFNAME|TP_SOCKET_IFNAME|RANK|LOCAL_RANK|WORLD_SIZE|MASTER_ADDR|MASTER_PORT|RANK_TABLE_FILE)=' \
+                | sort || true
+            echo "mapped native libraries:"
+        } >>"$DYNAMIC_LIBRARY_LOG"
+
+        awk '$6 ~ /^\// && $6 ~ /\.so/ {print $6}' "/proc/$pid/maps" \
+            | grep -Ei 'hccl|adxl|ascend|acl|torch_npu|mooncake|transfer|opapi|optiling' \
+            | sort -u >"$process_paths" || true
+        cat "$process_paths" >>"$role_paths"
+
+        while IFS= read -r lib; do
+            [[ -n "$lib" ]] || continue
+            resolved="$(readlink -f "$lib" 2>/dev/null || true)"
+            if [[ -z "$resolved" || ! -e "$resolved" ]]; then
+                digest="UNRESOLVED"
+            elif command -v sha256sum >/dev/null 2>&1; then
+                digest="$(sha256sum "$resolved" 2>/dev/null | awk '{print $1}' || true)"
+                [[ -n "$digest" ]] || digest="HASH_FAILED"
+            else
+                digest="sha256sum-unavailable"
+            fi
+            printf '%s\t%s\t%s\n' "$lib" "$resolved" "$digest" \
+                | tee -a "$process_resolved" \
+                | tee -a "$role_resolved" >>"$DYNAMIC_LIBRARY_LOG"
+        done <"$process_paths"
+
+        if command -v ldd >/dev/null 2>&1; then
+            echo "ldd missing dependencies and native matches:" >>"$DYNAMIC_LIBRARY_LOG"
+            sort -u "$process_resolved" | while IFS=$'\t' read -r _ resolved _; do
+                [[ -n "$resolved" && -e "$resolved" ]] || continue
+                echo "[$resolved]" >>"$DYNAMIC_LIBRARY_LOG"
+                ldd "$resolved" 2>&1 \
+                    | grep -Ei 'not found|hccl|adxl|ascend|acl|torch_npu|mooncake|transfer|opapi|optiling' \
+                    >>"$DYNAMIC_LIBRARY_LOG" || true
+            done
+        else
+            echo "ldd unavailable; dependency check skipped." >>"$DYNAMIC_LIBRARY_LOG"
+        fi
+    done <<<"$pid_records"
+
+    for role in prefill decode; do
+        if [[ -f "$DYNAMIC_LIBRARY_DIR/${role}.latest.paths" ]]; then
+            sort -u "$DYNAMIC_LIBRARY_DIR/${role}.latest.paths" \
+                >"$DYNAMIC_LIBRARY_DIR/${role}.latest.paths.sorted"
+            mv "$DYNAMIC_LIBRARY_DIR/${role}.latest.paths.sorted" \
+                "$DYNAMIC_LIBRARY_DIR/${role}.latest.paths"
+        fi
+        if [[ -f "$DYNAMIC_LIBRARY_DIR/${role}.latest.resolved.tsv" ]]; then
+            sort -u "$DYNAMIC_LIBRARY_DIR/${role}.latest.resolved.tsv" \
+                >"$DYNAMIC_LIBRARY_DIR/${role}.latest.resolved.tsv.sorted"
+            mv "$DYNAMIC_LIBRARY_DIR/${role}.latest.resolved.tsv.sorted" \
+                "$DYNAMIC_LIBRARY_DIR/${role}.latest.resolved.tsv"
+        fi
+    done
+
+    if [[ -s "$DYNAMIC_LIBRARY_DIR/prefill.latest.paths" \
+        && -s "$DYNAMIC_LIBRARY_DIR/decode.latest.paths" ]]; then
+        {
+            echo
+            echo "--- prefill/decode mapped native library path diff ---"
+            diff -u \
+                "$DYNAMIC_LIBRARY_DIR/prefill.latest.paths" \
+                "$DYNAMIC_LIBRARY_DIR/decode.latest.paths" || true
+            echo "--- prefill/decode resolved library and SHA-256 diff ---"
+            diff -u \
+                "$DYNAMIC_LIBRARY_DIR/prefill.latest.resolved.tsv" \
+                "$DYNAMIC_LIBRARY_DIR/decode.latest.resolved.tsv" || true
+        } >>"$DYNAMIC_LIBRARY_LOG"
+    fi
+
+    echo "Native runtime snapshot written: $DYNAMIC_LIBRARY_LOG"
 }
 
 check_required_kv_listen_port() {
@@ -579,6 +776,8 @@ wait_for_health \
     "$DECODE_PID" \
     "$DECODE_LOG"
 
+snapshot_native_runtime "engines-ready"
+
 echo "Checking local Mooncake listen/connect for prefill/decode ports..."
 if ! check_required_kv_port_with_metadata "Prefill KV" "$HOST_IP" "$PREFILL_KV_PORT" "$PREFILL_LOG" 60; then
     echo "Prefill KV port check failed before starting proxy." >&2
@@ -683,3 +882,6 @@ echo "Response:"
 echo "  cat '$RESPONSE_JSON'"
 echo "Logs kept in: $LOG_DIR"
 echo "Port state log: $PORT_LOG"
+if [[ "$DYNAMIC_LIBRARY_CHECK" == "1" ]]; then
+    echo "Dynamic library diagnostics: $DYNAMIC_LIBRARY_LOG"
+fi
