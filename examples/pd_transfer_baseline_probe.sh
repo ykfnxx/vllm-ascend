@@ -35,7 +35,6 @@ MAX_MODEL_LEN="4096"
 GPU_MEMORY_UTILIZATION="0.50"
 STARTUP_TIMEOUT="900"
 LOG_DIR=""
-PORT_LOG=""
 
 VERIFY_TRANSFER="1"
 STRICT_KV_LISTEN_CHECK="0"
@@ -234,7 +233,6 @@ DECODE_LOG="$LOG_DIR/decode.log"
 PROXY_LOG="$LOG_DIR/proxy.log"
 REQUEST_JSON="$LOG_DIR/request.json"
 RESPONSE_JSON="$LOG_DIR/response.json"
-PORT_LOG="$LOG_DIR/ports.log"
 DYNAMIC_LIBRARY_LOG="$LOG_DIR/dynamic-libs.log"
 DYNAMIC_LIBRARY_DIR="$LOG_DIR/dynamic-libs"
 
@@ -243,7 +241,6 @@ PROFILE_STARTED="0"
 PREFILL_PID=""
 DECODE_PID=""
 PROXY_PID=""
-PORT_MONITOR_PID=""
 
 stop_decode_profile() {
     if [[ "$PROFILE_STARTED" != "1" ]]; then
@@ -263,7 +260,6 @@ stop_decode_profile() {
 cleanup() {
     local pid
     stop_decode_profile || true
-    stop_port_monitor || true
     snapshot_native_runtime "cleanup" || true
     for pid in "${CHILD_PIDS[@]:-}"; do
         if kill -0 "$pid" >/dev/null 2>&1; then
@@ -363,53 +359,6 @@ except Exception as exc:
     print(type(exc).__name__)
     sys.exit(1)
 PY
-}
-
-snapshot_port_state() {
-    {
-        printf '\n=== port snapshot %s ===\n' "$(date --iso-8601=seconds)"
-        printf 'host_ip=%s ifname=%s prefill_kv_port=%s decode_kv_port=%s\n' \
-            "$HOST_IP" "$IFNAME" "$PREFILL_KV_PORT" "$DECODE_KV_PORT"
-
-        echo "--- interface ---"
-        ip -4 addr show dev "$IFNAME" 2>&1 || true
-        echo "--- route ---"
-        ip route get "$HOST_IP" 2>&1 || true
-
-        if command -v ss >/dev/null 2>&1; then
-            echo "--- tcp listen ---"
-            ss -lntp 2>&1 || true
-            echo "--- tcp connections ---"
-            ss -ntp 2>&1 || true
-        else
-            echo "--- ss unavailable; raw tcp tables ---"
-            cat /proc/net/tcp 2>&1 || true
-            cat /proc/net/tcp6 2>&1 || true
-        fi
-    } >>"$PORT_LOG" 2>&1
-}
-
-port_monitor_loop() {
-    while true; do
-        snapshot_port_state
-        sleep 1
-    done
-}
-
-start_port_monitor() {
-    port_monitor_loop &
-    PORT_MONITOR_PID=$!
-    echo "Port monitor started: pid=$PORT_MONITOR_PID log=$PORT_LOG"
-}
-
-stop_port_monitor() {
-    if [[ -z "$PORT_MONITOR_PID" ]]; then
-        return 0
-    fi
-    snapshot_port_state
-    kill "$PORT_MONITOR_PID" >/dev/null 2>&1 || true
-    wait "$PORT_MONITOR_PID" >/dev/null 2>&1 || true
-    PORT_MONITOR_PID=""
 }
 
 list_enginecore_pids() {
@@ -763,7 +712,6 @@ env \
     >"$DECODE_LOG" 2>&1 &
 DECODE_PID=$!
 CHILD_PIDS+=("$DECODE_PID")
-start_port_monitor
 
 wait_for_health \
     "Prefill" \
@@ -881,7 +829,6 @@ echo "  tail -n 80 '$PROXY_LOG'"
 echo "Response:"
 echo "  cat '$RESPONSE_JSON'"
 echo "Logs kept in: $LOG_DIR"
-echo "Port state log: $PORT_LOG"
 if [[ "$DYNAMIC_LIBRARY_CHECK" == "1" ]]; then
     echo "Dynamic library diagnostics: $DYNAMIC_LIBRARY_LOG"
 fi
