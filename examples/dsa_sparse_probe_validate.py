@@ -10,18 +10,11 @@ from pathlib import Path
 from typing import Any
 
 PROBE_LOG_PREFIX = "DSA_SPARSE_PROBE "
-CUSTOM_OP_NAMES = {
-    "dsa_sparse_lookup_update": (
-        "dsasparselookupupdate",
-        "dsa_sparse_lookup_update",
-        "aclnndsasparselookupupdate",
-    ),
-    "asu_hbm_index_lookup": (
-        "asuhbmindexlookup",
-        "asu_hbm_index_lookup",
-        "aclnnasuhbmindexlookup",
-    ),
-}
+CUSTOM_OP_NAMES = (
+    "dsasparselookupupdate",
+    "dsa_sparse_lookup_update",
+    "aclnndsasparselookupupdate",
+)
 PROFILE_FILENAMES = {
     "kernel_details.csv",
     "operator_details.csv",
@@ -110,9 +103,7 @@ def _read_completion_tokens(response_json: Path) -> int:
 
 def _profile_contains_custom_op(
     profile_dir: Path,
-    lookup_backend: str,
 ) -> bool:
-    expected_names = CUSTOM_OP_NAMES[lookup_backend]
     profile_files = [
         path
         for path in profile_dir.rglob("*")
@@ -132,7 +123,7 @@ def _profile_contains_custom_op(
                 lowered = line.lower()
                 if any(
                     op_name in lowered
-                    for op_name in expected_names
+                    for op_name in CUSTOM_OP_NAMES
                 ):
                     return True
     return False
@@ -143,33 +134,32 @@ def validate(
     decode_log: Path,
     response_json: Path,
     profile_dir: Path,
-    lookup_backend: str = "dsa_sparse_lookup_update",
 ) -> dict[str, int]:
     events = _read_probe_events(decode_log)
-    runtime_events = _events_named(events, "runtime_ready")
+    runtime_events = _events_named(events, "coordinators_ready")
     if len(runtime_events) != 1:
         _fail(
-            "Expected exactly one runtime_ready event, got "
+            "Expected exactly one coordinators_ready event, got "
             f"{len(runtime_events)}"
         )
     runtime = runtime_events[0]
     cohort_count = _require_positive_int(
         runtime.get("cohort_count"),
-        "runtime_ready.cohort_count",
+        "coordinators_ready.cohort_count",
     )
     layer_count = _require_positive_int(
         runtime.get("layer_count"),
-        "runtime_ready.layer_count",
+        "coordinators_ready.layer_count",
     )
     index_topk = _require_positive_int(
         runtime.get("index_topk"),
-        "runtime_ready.index_topk",
+        "coordinators_ready.index_topk",
     )
 
     cohorts = runtime.get("cohorts")
     if not isinstance(cohorts, list) or len(cohorts) != cohort_count:
         _fail(
-            "runtime_ready.cohorts does not match cohort_count: "
+            "coordinators_ready.cohorts does not match cohort_count: "
             f"{cohorts!r}"
         )
     cohort_layers: dict[str, tuple[str, ...]] = {}
@@ -206,7 +196,7 @@ def validate(
         or len(set(declared_layers)) != layer_count
     ):
         _fail(
-            "runtime_ready layer descriptors do not match layer_count: "
+            "coordinators_ready layer descriptors do not match layer_count: "
             f"{declared_layers!r}"
         )
 
@@ -391,11 +381,9 @@ def validate(
 
     if not _profile_contains_custom_op(
         profile_dir,
-        lookup_backend,
     ):
         _fail(
-            "Decode profile does not contain selected lookup backend "
-            f"{lookup_backend!r}."
+            "Decode profile does not contain dsa_sparse_lookup_update."
         )
 
     return {
@@ -429,17 +417,11 @@ def main() -> None:
         type=Path,
         required=True,
     )
-    parser.add_argument(
-        "--lookup-backend",
-        choices=tuple(CUSTOM_OP_NAMES),
-        default="dsa_sparse_lookup_update",
-    )
     args = parser.parse_args()
     summary = validate(
         decode_log=args.decode_log,
         response_json=args.response_json,
         profile_dir=args.profile_dir,
-        lookup_backend=args.lookup_backend,
     )
     print(
         "PASS: DSA Sparse custom operator and Hot Cache path verified: "

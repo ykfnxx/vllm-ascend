@@ -11,7 +11,6 @@ from tests.ut.base import TestBase
 from vllm_ascend import dsa_sparse_probe
 from vllm_ascend.ascend_config import init_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.dsa_sparse import DSASparseResolution
 
 if "torch_npu._inductor" not in sys.modules:
     sys.modules["torch_npu._inductor"] = MagicMock()
@@ -109,6 +108,7 @@ class TestAscendSFABackend(TestBase):
 class TestAscendSFAKVCacheComposition(TestBase):
     def test_compose_returns_main_cache_without_indexer(self):
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.dsa_sparse_coordinator = None
         impl.has_indexer = False
         main_cache = (torch.empty(1), torch.empty(2))
 
@@ -171,6 +171,7 @@ class TestAscendSFAKVCacheComposition(TestBase):
             pass
 
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.dsa_sparse_coordinator = None
         main_cache = (torch.empty(1), torch.empty(2))
         impl._compose_sfa_kv_cache = MagicMock(
             side_effect=CompositionReached,
@@ -181,7 +182,9 @@ class TestAscendSFAKVCacheComposition(TestBase):
                 layer_name="model.layers.0.self_attn.attn",
                 hidden_states=torch.empty(1),
                 kv_cache=main_cache,
-                attn_metadata=object(),
+                attn_metadata=SimpleNamespace(
+                    dsa_sparse_req_pool_entries=None,
+                ),
                 output=torch.empty(1),
             )
 
@@ -198,11 +201,6 @@ class TestAscendSFAKVCacheComposition(TestBase):
         )
         local_indices = torch.zeros((2, 4), dtype=torch.int32)
         hot_block_table = torch.arange(8, dtype=torch.int32).view(2, 4)
-        resolution = DSASparseResolution(
-            hot_main_cache=hot_main_cache,
-            attention_indices=local_indices,
-            hot_block_table=hot_block_table,
-        )
         attn_metadata = SimpleNamespace(
             block_table=torch.full((2, 4), 99, dtype=torch.int32),
         )
@@ -232,7 +230,9 @@ class TestAscendSFAKVCacheComposition(TestBase):
             result = impl._execute_dsa_sparse_hot_cache_attention(
                 ql_nope,
                 q_pe,
-                resolution,
+                hot_main_cache,
+                local_indices,
+                hot_block_table,
                 attn_metadata,
                 seq_lens,
                 seq_lens,

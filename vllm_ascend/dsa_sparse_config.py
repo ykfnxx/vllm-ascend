@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
-from typing import Any, Literal
+from typing import Literal
 
 from vllm_ascend.dsa_sparse_constants import (
     DSA_SPARSE_FREE_SLOT_COUNT,
@@ -14,24 +12,16 @@ from vllm_ascend.dsa_sparse_constants import (
 )
 
 DSASparseKVRole = Literal["kv_producer", "kv_consumer"]
-DSASparseLookupBackend = Literal[
-    "dsa_sparse_lookup_update",
-    "asu_hbm_index_lookup",
-]
 DSA_SPARSE_MOCK_IO_BACKEND = "mock"
-DSA_SPARSE_FUSED_LOOKUP_BACKEND = "dsa_sparse_lookup_update"
-DSA_SPARSE_ASU_LOOKUP_BACKEND = "asu_hbm_index_lookup"
 
 
 @dataclass(frozen=True)
 class DSASparseConfig:
-    """Validated framework configuration for the eager DSA Sparse milestone."""
+    """Validated configuration for the eager DSASparse path."""
 
     io_backend: str
-    io_backend_options: Mapping[str, Any]
     kv_role: DSASparseKVRole
     index_topk: int
-    lookup_backend: DSASparseLookupBackend
 
     @property
     def is_producer(self) -> bool:
@@ -62,11 +52,7 @@ def load_dsa_sparse_config(vllm_config: object) -> DSASparseConfig | None:
     if not isinstance(raw_config, dict):
         raise TypeError("dsa_sparse_config must be a dictionary.")
 
-    allowed_keys = {
-        "io_backend",
-        "io_backend_options",
-        "lookup_backend",
-    }
+    allowed_keys = {"io_backend"}
     unknown_keys = sorted(set(raw_config) - allowed_keys)
     if unknown_keys:
         raise ValueError(f"Unknown dsa_sparse_config fields: {unknown_keys}.")
@@ -78,23 +64,6 @@ def load_dsa_sparse_config(vllm_config: object) -> DSASparseConfig | None:
         raise ValueError(
             "The current DSA Sparse Graph-out milestone supports only "
             "io_backend='mock'; no concrete I/O backend is implemented."
-        )
-
-    io_backend_options = raw_config.get("io_backend_options", {})
-    if not isinstance(io_backend_options, dict):
-        raise TypeError("dsa_sparse_config.io_backend_options must be a dictionary.")
-
-    lookup_backend = raw_config.get(
-        "lookup_backend",
-        DSA_SPARSE_FUSED_LOOKUP_BACKEND,
-    )
-    if lookup_backend not in {
-        DSA_SPARSE_FUSED_LOOKUP_BACKEND,
-        DSA_SPARSE_ASU_LOOKUP_BACKEND,
-    }:
-        raise ValueError(
-            "dsa_sparse_config.lookup_backend must be "
-            "'dsa_sparse_lookup_update' or 'asu_hbm_index_lookup'."
         )
 
     model_config = getattr(vllm_config, "model_config", None)
@@ -150,10 +119,8 @@ def load_dsa_sparse_config(vllm_config: object) -> DSASparseConfig | None:
 
     return DSASparseConfig(
         io_backend=io_backend,
-        io_backend_options=MappingProxyType(dict(io_backend_options)),
         kv_role=kv_role,
         index_topk=index_topk,
-        lookup_backend=lookup_backend,
     )
 
 

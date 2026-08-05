@@ -9,10 +9,6 @@ from math import prod
 
 import torch
 
-from vllm_ascend.attention.dsa_sparse import (
-    DSASparseCacheConfig,
-    DSASparseLayerLayout,
-)
 from vllm_ascend.dsa_sparse_constants import (
     DSA_SPARSE_FREE_HEAD_STRIDE,
     DSA_SPARSE_FREE_SLOT_COUNT,
@@ -28,7 +24,6 @@ class DSASparseFixedHBMBreakdown:
     hot_payload_bytes: int
     lookup_state_bytes_per_cohort: int
     cohort_count: int
-    backend_auxiliary_bytes: int
 
     @property
     def lookup_state_bytes(self) -> int:
@@ -40,25 +35,30 @@ class DSASparseFixedHBMBreakdown:
 
     @property
     def fixed_hbm_bytes(self) -> int:
-        return self.core_fixed_tensor_bytes + self.backend_auxiliary_bytes
+        return self.core_fixed_tensor_bytes
 
 
 def calculate_dsa_sparse_fixed_hbm_bytes(
-    config: DSASparseCacheConfig,
-    layer_layouts: Iterable[DSASparseLayerLayout],
+    max_num_seqs: int,
+    block_size: int,
+    main_layouts: Iterable[tuple[torch.dtype, int, int]],
     *,
     cohort_count: int,
-    backend_auxiliary_bytes: int = 0,
 ) -> DSASparseFixedHBMBreakdown:
-    layouts = tuple(layer_layouts)
+    layouts = tuple(main_layouts)
     return DSASparseFixedHBMBreakdown(
         hot_payload_bytes=sum(
-            _hot_payload_bytes(config, layout)
-            for layout in layouts
+            _hot_payload_bytes(
+                max_num_seqs,
+                block_size,
+                dtype,
+                num_kv_heads,
+                head_size,
+            )
+            for dtype, num_kv_heads, head_size in layouts
         ),
-        lookup_state_bytes_per_cohort=_lookup_state_bytes(config),
+        lookup_state_bytes_per_cohort=_lookup_state_bytes(max_num_seqs),
         cohort_count=cohort_count,
-        backend_auxiliary_bytes=backend_auxiliary_bytes,
     )
 
 
@@ -81,43 +81,42 @@ def reserve_dsa_sparse_fixed_hbm_bytes(
 
 
 def _hot_payload_bytes(
-    config: DSASparseCacheConfig,
-    layout: DSASparseLayerLayout,
+    max_num_seqs: int,
+    block_size: int,
+    dtype: torch.dtype,
+    num_kv_heads: int,
+    head_size: int,
 ) -> int:
-    hot_rows = config.total_hot_blocks * config.block_size
-    return sum(
-        _tensor_bytes((hot_rows, *row_shape), dtype)
-        for dtype, row_shape in zip(
-            layout.plane_dtypes,
-            layout.plane_row_shapes,
-        )
+    hot_rows = max_num_seqs * (
+        DSA_SPARSE_LOOKUP_SLOT_COUNT + block_size
     )
+    return _tensor_bytes((hot_rows, num_kv_heads, head_size), dtype)
 
 
-def _lookup_state_bytes(config: DSASparseCacheConfig) -> int:
+def _lookup_state_bytes(max_num_seqs: int) -> int:
     return sum(
         (
             _tensor_bytes(
-                (config.max_num_seqs, DSA_SPARSE_INDEX_CAPACITY),
+                (max_num_seqs, DSA_SPARSE_INDEX_CAPACITY),
                 torch.int32,
             ),
             _tensor_bytes(
                 (
-                    config.max_num_seqs,
+                    max_num_seqs,
                     DSA_SPARSE_LOOKUP_SLOT_COUNT,
                 ),
                 torch.int32,
             ),
             _tensor_bytes(
                 (
-                    config.max_num_seqs,
+                    max_num_seqs,
                     DSA_SPARSE_FREE_SLOT_COUNT,
                 ),
                 torch.int32,
             ),
             _tensor_bytes(
                 (
-                    config.max_num_seqs,
+                    max_num_seqs,
                     DSA_SPARSE_FREE_HEAD_STRIDE,
                 ),
                 torch.int32,

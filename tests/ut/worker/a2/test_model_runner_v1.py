@@ -1,4 +1,5 @@
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -21,9 +22,6 @@ from vllm_ascend.attention.indexer import (
 )
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
-from vllm_ascend.worker.dsa_sparse_external_main import (
-    DSASparseExternalMainSpecs,
-)
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -48,7 +46,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner.c8_k_cache_dtype = torch.float8_e4m3fn
         runner.c8_k_scale_cache_dtype = torch.float32
         runner.ascend_config = SimpleNamespace(dsa_sparse_config=None)
-        runner._dsa_sparse_external_main_specs = DSASparseExternalMainSpecs.empty()
+        runner._dsa_sparse_main_specs = {}
         backend = MagicMock()
         backend.get_kv_cache_shape.side_effect = lambda num_blocks, block_size, num_kv_heads, head_size: (
             2,
@@ -258,11 +256,11 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(set(scheduler_specs), {indexer_layer_name})
         self.assertEqual(
-            set(runner._dsa_sparse_external_main_specs.by_layer),
+            set(runner._dsa_sparse_main_specs),
             {main_layer_name},
         )
         self.assertIsInstance(
-            runner._dsa_sparse_external_main_specs.by_layer[main_layer_name],
+            runner._dsa_sparse_main_specs[main_layer_name],
             AscendMLAAttentionSpec,
         )
 
@@ -308,7 +306,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             set(scheduler_specs),
             {main_layer_name, indexer_layer_name},
         )
-        self.assertFalse(runner._dsa_sparse_external_main_specs)
+        self.assertFalse(runner._dsa_sparse_main_specs)
 
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
     def test_dsa_sparse_fixed_hbm_uses_ordered_local_layers_and_cohorts(
@@ -366,54 +364,30 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         )
         mock_get_layers.assert_called_once()
 
-    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
-    def test_dsa_sparse_fixed_hbm_rejects_first_cohort_follower(
-        self,
-        mock_get_layers,
-    ):
-        runner = self._build_runner()
-        runner.model = MagicMock()
-        runner.use_sparse = True
-        module = MLAAttention.__new__(MLAAttention)
-        torch.nn.Module.__init__(module)
-        module.impl = SimpleNamespace(
-            skip_topk=True,
-            enable_sparse_sfa_c8=False,
-        )
-        module.kv_lora_rank = 512
-        module.qk_rope_head_dim = 64
-        mock_get_layers.return_value = {
-            "model.layers.0.self_attn.attn": module,
-        }
-
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "cannot reuse a previous IndexCache cohort",
-        ):
-            runner._get_dsa_sparse_memory_layouts_and_cohorts()
-
     def test_dsa_sparse_fixed_hbm_builds_packed_c8_main_layout(self):
         runner = self._build_runner()
         runner.c8_k_cache_dtype = torch.float8_e4m3fn
         module = MLAAttention.__new__(MLAAttention)
         torch.nn.Module.__init__(module)
-        module.impl = SimpleNamespace(enable_sparse_sfa_c8=True)
+        module.impl = SimpleNamespace(
+            enable_sparse_sfa_c8=True,
+            skip_topk=False,
+        )
         module.kv_lora_rank = 512
         module.qk_rope_head_dim = 64
+        runner._get_dsa_sparse_ordered_layers = MagicMock(
+            return_value=[("model.layers.0.self_attn.attn", module)]
+        )
 
-        layout = runner._get_dsa_sparse_layer_layout(
-            "model.layers.0.self_attn.attn",
-            module,
+        layouts, cohort_count = (
+            runner._get_dsa_sparse_main_layouts_and_cohort_count()
         )
 
         self.assertEqual(
-            layout.plane_dtypes,
-            (torch.float8_e4m3fn,),
+            layouts,
+            ((torch.float8_e4m3fn, 1, get_sfa_qsfa_packed_head_dim(512, 64)),),
         )
-        self.assertEqual(
-            layout.plane_row_shapes,
-            ((1, get_sfa_qsfa_packed_head_dim(512, 64)),),
-        )
+        self.assertEqual(cohort_count, 1)
 
     def test_dsa_sparse_fixed_hbm_non_consumer_is_zero(self):
         runner = self._build_runner()
@@ -783,9 +757,9 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
                     indexer_c8,
                     dcp_size,
                 )
-                runner._dsa_sparse_external_main_specs = DSASparseExternalMainSpecs.from_mapping(
-                    {main_layer_name: main_spec},
-                )
+                runner._dsa_sparse_main_specs = {
+                    main_layer_name: main_spec,
+                }
                 scheduler_cache_config = KVCacheConfig(
                     num_blocks=2,
                     kv_cache_tensors=[
@@ -837,6 +811,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
                 runner.maybe_add_kv_sharing_layers_to_kv_cache_groups = MagicMock()
                 runner.initialize_attn_backend = MagicMock()
                 runner.may_reinitialize_input_batch = MagicMock()
+                runner._initialize_dsa_sparse_coordinators = MagicMock()
                 transfer_group.reset_mock()
 
                 runner.initialize_kv_cache(scheduler_cache_config)
@@ -933,177 +908,63 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
                     )
 
 
-class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
-    def _build_runner(self, *, consumer: bool = True):
+class TestNPUModelRunnerDSASparse(unittest.TestCase):
+    def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)
         runner.ascend_config = SimpleNamespace(
-            dsa_sparse_config=SimpleNamespace(
-                is_consumer=consumer,
-                is_producer=not consumer,
-                io_backend="mock",
-                lookup_backend="dsa_sparse_lookup_update",
-            )
+            dsa_sparse_config=SimpleNamespace(kv_role="kv_consumer")
         )
-        runner.dsa_sparse_eager_runtime = None
+        runner.dsa_sparse_req_to_pool_entry = {}
+        runner.dsa_sparse_free_pool_entries = deque(range(3))
+        runner._dsa_sparse_leader_coordinators = (MagicMock(),)
+        runner._dsa_sparse_main_specs = {
+            "layer.0": object(),
+            "layer.1": object(),
+        }
+        runner.input_batch = SimpleNamespace(
+            req_ids=["request-a", "request-b", None]
+        )
         runner.attn_state = AscendAttentionState.DecodeOnly
-        runner.input_batch = SimpleNamespace(req_ids=["request-a", "request-b", None])
+        runner.device = torch.device("cpu")
         return runner
 
-    @patch("vllm_ascend.worker.model_runner_v1.create_dsa_sparse_eager_mock_runtime")
-    def test_initialize_mock_runtime_after_fixed_hbm_reservation(
-        self,
-        mock_create_runtime,
-    ):
+    def test_request_pool_entry_is_stable_and_released_rows_are_reset(self):
         runner = self._build_runner()
-        runner.device = torch.device("cpu")
-        runner._dsa_sparse_fixed_hbm_breakdown = object()
-        cache_config = object()
-        cohort_layouts = (object(),)
-        runner._get_dsa_sparse_cache_config = MagicMock(
-            return_value=cache_config,
+        leader = runner._dsa_sparse_leader_coordinators[0]
+
+        runner._admit_dsa_sparse_request("request-a")
+        runner._admit_dsa_sparse_request("request-b")
+
+        self.assertEqual(
+            runner.dsa_sparse_req_to_pool_entry,
+            {"request-a": 0, "request-b": 1},
         )
-        runner._get_dsa_sparse_eager_cohort_layouts = MagicMock(
-            return_value=cohort_layouts,
-        )
-        runtime = MagicMock()
-        mock_create_runtime.return_value = runtime
-
-        runner._initialize_dsa_sparse_eager_mock_runtime()
-
-        mock_create_runtime.assert_called_once_with(
-            cache_config,
-            cohort_layouts,
-            device=torch.device("cpu"),
-            lookup_backend="dsa_sparse_lookup_update",
-        )
-        self.assertIs(runner.dsa_sparse_eager_runtime, runtime)
-
-    def test_initialize_mock_runtime_requires_fixed_hbm_reservation(self):
-        runner = self._build_runner()
-        runner._dsa_sparse_fixed_hbm_breakdown = None
-
-        with self.assertRaisesRegex(RuntimeError, "must be reserved"):
-            runner._initialize_dsa_sparse_eager_mock_runtime()
-
-    def test_initialize_mock_runtime_rejects_concrete_backend_name(self):
-        runner = self._build_runner()
-        runner.ascend_config.dsa_sparse_config.io_backend = "vendor"
-
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "explicit no-op io_backend='mock'",
-        ):
-            runner._initialize_dsa_sparse_eager_mock_runtime()
-
-    def test_bind_and_begin_target_batch(self):
-        runner = self._build_runner()
-        runtime = MagicMock()
-        execution = object()
-        runtime.begin_target_batch.return_value = execution
-        runner.bind_dsa_sparse_eager_runtime(runtime)
-        positions = torch.tensor([5, 9, 10, -1], dtype=torch.int64)
-        metadata = {"model.layers.0.self_attn.attn": object()}
-
-        result = runner._begin_dsa_sparse_eager_execution(
-            num_reqs=2,
-            num_scheduled_tokens=np.array([1, 1], dtype=np.int32),
-            positions=positions,
-            attn_metadata=metadata,
+        self.assertEqual(
+            leader.initialize_request.call_args_list,
+            [call(0), call(1)],
         )
 
-        self.assertIs(result, execution)
-        call = runtime.begin_target_batch.call_args
-        self.assertEqual(call.kwargs["request_ids"], ["request-a", "request-b"])
-        self.assertTrue(
-            torch.equal(
-                call.kwargs["query_positions"],
-                torch.tensor([5, 9], dtype=torch.int64),
-            )
+        runner._release_dsa_sparse_request("request-a")
+
+        leader.reset_request.assert_called_once_with(0)
+        self.assertEqual(
+            runner.dsa_sparse_req_to_pool_entry,
+            {"request-b": 1},
         )
-        self.assertIs(call.kwargs["layer_metadata"], metadata)
-
-    def test_rejects_more_than_one_decode_token_per_request(self):
-        runner = self._build_runner()
-        runner.bind_dsa_sparse_eager_runtime(MagicMock())
-
-        with self.assertRaisesRegex(RuntimeError, "exactly one"):
-            runner._begin_dsa_sparse_eager_execution(
-                num_reqs=2,
-                num_scheduled_tokens=np.array([1, 2], dtype=np.int32),
-                positions=torch.tensor([5, 9, 10]),
-                attn_metadata={},
-            )
-
-    def test_consumer_without_runtime_fails_instead_of_falling_back(self):
-        runner = self._build_runner()
-
-        with self.assertRaisesRegex(RuntimeError, "no runtime is bound"):
-            runner._begin_dsa_sparse_eager_execution(
-                num_reqs=1,
-                num_scheduled_tokens=np.array([1], dtype=np.int32),
-                positions=torch.tensor([5]),
-                attn_metadata={},
-            )
-
-    def test_consumer_rejects_prefill_and_microbatch_metadata(self):
-        runner = self._build_runner()
-        runner.bind_dsa_sparse_eager_runtime(MagicMock())
-        runner.attn_state = AscendAttentionState.PrefillNoCache
-
-        with self.assertRaisesRegex(RuntimeError, "DecodeOnly"):
-            runner._begin_dsa_sparse_eager_execution(
-                num_reqs=1,
-                num_scheduled_tokens=np.array([1], dtype=np.int32),
-                positions=torch.tensor([5]),
-                attn_metadata={},
-            )
-
-        runner.attn_state = AscendAttentionState.SpecDecoding
-        with self.assertRaisesRegex(RuntimeError, "DecodeOnly"):
-            runner._begin_dsa_sparse_eager_execution(
-                num_reqs=1,
-                num_scheduled_tokens=np.array([1], dtype=np.int32),
-                positions=torch.tensor([5]),
-                attn_metadata={},
-            )
-
-        runner.attn_state = AscendAttentionState.DecodeOnly
-        with self.assertRaisesRegex(RuntimeError, "microbatch"):
-            runner._begin_dsa_sparse_eager_execution(
-                num_reqs=1,
-                num_scheduled_tokens=np.array([1], dtype=np.int32),
-                positions=torch.tensor([5]),
-                attn_metadata=[{}],
-            )
-
-    def test_producer_keeps_baseline_and_cannot_bind_decode_runtime(self):
-        runner = self._build_runner(consumer=False)
-
-        with self.assertRaisesRegex(RuntimeError, "Decode KV consumer"):
-            runner.bind_dsa_sparse_eager_runtime(MagicMock())
-
-        execution = runner._begin_dsa_sparse_eager_execution(
-            num_reqs=1,
-            num_scheduled_tokens=np.array([1], dtype=np.int32),
-            positions=torch.tensor([5]),
-            attn_metadata={},
-        )
-        with execution:
-            pass
+        self.assertEqual(list(runner.dsa_sparse_free_pool_entries), [2, 0])
 
     @patch(
         "vllm_ascend.worker.model_runner_v1.GPUModelRunner._update_states",
         return_value="deferred-correction",
     )
-    def test_update_states_preflights_then_updates_and_transitions_mock(
+    def test_update_states_applies_direct_request_lifecycle(
         self,
         mock_upstream_update,
     ):
         runner = self._build_runner()
         runner.use_async_scheduling = False
-        runtime = MagicMock()
-        runtime.has_mock_request.return_value = True
-        runner.dsa_sparse_eager_runtime = runtime
+        runner._release_dsa_sparse_request = MagicMock()
+        runner._admit_dsa_sparse_request = MagicMock()
         scheduler_output = SimpleNamespace(
             scheduled_cached_reqs=SimpleNamespace(
                 req_ids=[],
@@ -1112,102 +973,94 @@ class TestNPUModelRunnerDSASparseEager(unittest.TestCase):
             ),
             finished_req_ids={"finished"},
             preempted_req_ids={"preempted"},
-            scheduled_new_reqs=[
-                SimpleNamespace(req_id="new"),
-            ],
+            scheduled_new_reqs=[SimpleNamespace(req_id="new")],
         )
 
         result = runner._update_states(scheduler_output)
 
         self.assertEqual(result, "deferred-correction")
-        runtime.preflight_mock_retire.assert_called_once()
         mock_upstream_update.assert_called_once_with(scheduler_output)
-        runtime.retire_mock_request.assert_any_call(
-            "finished",
-            preempted=False,
-        )
-        runtime.retire_mock_request.assert_any_call(
-            "preempted",
-            preempted=True,
-        )
-        runtime.retire_mock_request.assert_any_call(
-            "resumed",
-            preempted=True,
+        self.assertEqual(
+            set(
+                call_args.args[0]
+                for call_args in runner._release_dsa_sparse_request.call_args_list
+            ),
+            {"finished", "preempted"},
         )
         self.assertEqual(
-            runtime.admit_mock_request.call_args_list,
-            [
-                call("new"),
-                call("resumed"),
-            ],
+            runner._admit_dsa_sparse_request.call_args_list,
+            [call("new"), call("resumed")],
         )
 
-    @patch(
-        "vllm_ascend.worker.model_runner_v1.GPUModelRunner._update_states",
-    )
-    def test_update_states_does_not_mutate_mock_lifecycle_if_upstream_fails(
-        self,
-        mock_upstream_update,
-    ):
+    def test_metadata_contains_only_the_shared_pool_entry_tensor(self):
         runner = self._build_runner()
-        runner.use_async_scheduling = False
-        runtime = MagicMock()
-        runner.dsa_sparse_eager_runtime = runtime
-        mock_upstream_update.side_effect = RuntimeError("upstream failed")
-        scheduler_output = SimpleNamespace(
-            scheduled_cached_reqs=SimpleNamespace(
-                req_ids=[],
-                num_computed_tokens=[],
-                resumed_req_ids=[],
-            ),
-            finished_req_ids={"finished"},
-            preempted_req_ids=set(),
-            scheduled_new_reqs=[],
+        runner.dsa_sparse_req_to_pool_entry = {
+            "request-a": 0,
+            "request-b": 2,
+        }
+        metadata = {
+            "layer.0": SimpleNamespace(dsa_sparse_req_pool_entries=None),
+            "layer.1": SimpleNamespace(dsa_sparse_req_pool_entries=None),
+        }
+
+        runner._set_dsa_sparse_req_pool_entries(
+            metadata,
+            2,
+            np.array([1, 1], dtype=np.int32),
         )
 
-        with self.assertRaisesRegex(RuntimeError, "upstream failed"):
-            runner._update_states(scheduler_output)
+        entries = metadata["layer.0"].dsa_sparse_req_pool_entries
+        self.assertEqual(entries.tolist(), [0, 2])
+        self.assertEqual(entries.dtype, torch.int32)
+        self.assertIs(
+            entries,
+            metadata["layer.1"].dsa_sparse_req_pool_entries,
+        )
 
-        runtime.preflight_mock_retire.assert_called_once()
-        runtime.retire_mock_request.assert_not_called()
-        runtime.admit_mock_request.assert_not_called()
-
-    @patch(
-        "vllm_ascend.worker.model_runner_v1.GPUModelRunner._update_states",
-        return_value=None,
-    )
-    def test_update_states_rolls_back_partial_mock_admission(
-        self,
-        _mock_upstream_update,
-    ):
+    def test_coordinators_follow_skip_topk_layer_order(self):
         runner = self._build_runner()
-        runner.use_async_scheduling = False
-        runtime = MagicMock()
-        runtime.admit_mock_request.side_effect = [
-            object(),
-            RuntimeError("admission failed"),
-        ]
-        runner.dsa_sparse_eager_runtime = runtime
-        scheduler_output = SimpleNamespace(
-            scheduled_cached_reqs=SimpleNamespace(
-                req_ids=[],
-                num_computed_tokens=[],
-                resumed_req_ids=[],
-            ),
-            finished_req_ids=set(),
-            preempted_req_ids=set(),
-            scheduled_new_reqs=[
-                SimpleNamespace(req_id="new-a"),
-                SimpleNamespace(req_id="new-b"),
-            ],
+        runner.max_num_reqs = 2
+        runner.block_size = 128
+        leader_impl = SimpleNamespace(skip_topk=False)
+        follower_impl = SimpleNamespace(skip_topk=True)
+        leader_layer = SimpleNamespace(impl=leader_impl)
+        follower_layer = SimpleNamespace(impl=follower_impl)
+        runner._get_dsa_sparse_ordered_layers = MagicMock(
+            return_value=[
+                ("layer.0", leader_layer),
+                ("layer.1", follower_layer),
+            ]
         )
+        runner._get_attention_kv_cache_dims = MagicMock(
+            return_value=(6, 2)
+        )
+        runner._dsa_sparse_main_specs = {
+            layer_name: AscendMLAAttentionSpec(
+                block_size=128,
+                num_kv_heads=1,
+                head_size=8,
+                dtype=torch.bfloat16,
+                cache_dtype_str="auto",
+                cache_sparse_sfa_c8=False,
+            )
+            for layer_name in ("layer.0", "layer.1")
+        }
 
-        with self.assertRaisesRegex(RuntimeError, "admission failed"):
-            runner._update_states(scheduler_output)
+        runner._initialize_dsa_sparse_coordinators()
 
-        runtime.retire_mock_request.assert_called_once_with(
-            "new-a",
-            preempted=True,
+        leader = leader_impl.dsa_sparse_coordinator
+        follower = follower_impl.dsa_sparse_coordinator
+        self.assertIsNone(leader.leader)
+        self.assertIs(follower.leader, leader)
+        self.assertIsNone(follower.index)
+        self.assertEqual(len(runner._dsa_sparse_leader_coordinators), 1)
+        self.assertIs(
+            runner._dsa_sparse_leader_coordinators[0],
+            leader,
+        )
+        self.assertIsNot(
+            follower.hot_main_cache[0],
+            leader.hot_main_cache[0],
         )
 
 

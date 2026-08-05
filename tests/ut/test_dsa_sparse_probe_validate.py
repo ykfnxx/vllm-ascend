@@ -40,7 +40,7 @@ def _write_fixture(
             "hot_cache_shapes": [[8, 128, 4], [8, 128, 2]],
         },
         {
-            "event": "runtime_ready",
+            "event": "coordinators_ready",
             "cohort_count": 2,
             "layer_count": 2,
             "index_topk": 4,
@@ -149,7 +149,7 @@ def test_validate_rejects_hot_cache_address_reuse(
         )
 
 
-def test_validate_accepts_selected_asu_lookup_backend(
+def test_validate_rejects_a_different_lookup_operator(
     tmp_path: Path,
 ):
     decode_log, response_json, profile_dir = _write_fixture(
@@ -157,25 +157,7 @@ def test_validate_accepts_selected_asu_lookup_backend(
         operator_name="AsuHbmIndexLookup",
     )
 
-    summary = validate(
-        decode_log=decode_log,
-        response_json=response_json,
-        profile_dir=profile_dir,
-        lookup_backend="asu_hbm_index_lookup",
-    )
-
-    assert summary["lookup_update_done"] == 2
-
-
-def test_validate_rejects_unselected_lookup_backend(
-    tmp_path: Path,
-):
-    decode_log, response_json, profile_dir = _write_fixture(
-        tmp_path,
-        operator_name="AsuHbmIndexLookup",
-    )
-
-    with pytest.raises(RuntimeError, match="selected lookup backend"):
+    with pytest.raises(RuntimeError, match="dsa_sparse_lookup_update"):
         validate(
             decode_log=decode_log,
             response_json=response_json,
