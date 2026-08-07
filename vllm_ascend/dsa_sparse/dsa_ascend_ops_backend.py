@@ -55,6 +55,7 @@ class AscendDSAOpsBackend:
         kv_backend: DSAKVBackend,
         state: DSAResidentLookupState,
         pool_entries: torch.Tensor,
+        storage_request_ids: torch.Tensor,
         initialize_rows: torch.Tensor,
         resident_tokens: int,
         selection_block_table: torch.Tensor,
@@ -71,7 +72,7 @@ class AscendDSAOpsBackend:
 
         kv_backend.load_tokens_into(
             layer_id=int(layer_id),
-            request_pool_entries=pool_entries,
+            storage_request_ids=storage_request_ids,
             token_positions=tokens,
             destination_slots=slots,
             load_mask=init_mask,
@@ -122,6 +123,7 @@ class AscendDSAOpsBackend:
         kv_backend: DSAKVBackend,
         selection_topk_indices: torch.Tensor,
         req_pool_entries: torch.Tensor,
+        storage_request_ids: torch.Tensor,
         sparse_local_row_indices: torch.Tensor,
         selection_block_table: torch.Tensor,
         lookup_state: DSAResidentLookupState,
@@ -139,6 +141,11 @@ class AscendDSAOpsBackend:
         topk = self._normalize_topk(selection_topk_indices, device)
         pool_entries = self._as_device_i32(
             req_pool_entries, device).reshape(-1)
+        storage_request_ids = storage_request_ids.to(
+            device=device, dtype=torch.long).reshape(-1).contiguous()
+        if int(storage_request_ids.numel()) != int(pool_entries.numel()):
+            raise ValueError(
+                "DSA storage request ids must align with request pool rows")
         row_modes = self._as_device_i32(row_modes, device).reshape(-1)
         lookup_init_mask = lookup_init_mask.to(
             device=device, dtype=torch.bool).reshape(-1)
@@ -164,6 +171,7 @@ class AscendDSAOpsBackend:
                 kv_backend=kv_backend,
                 state=lookup_state,
                 pool_entries=pool_entries,
+                storage_request_ids=storage_request_ids,
                 initialize_rows=lookup_init_mask,
                 resident_tokens=int(resident_tokens),
                 selection_block_table=selection_block_table,
@@ -178,6 +186,8 @@ class AscendDSAOpsBackend:
                 self._resident_init_logged = True
         sparse_topk = topk.index_select(0, sparse_local_rows).contiguous()
         sparse_pool_entries = pool_entries.index_select(
+            0, sparse_local_rows).contiguous()
+        sparse_storage_request_ids = storage_request_ids.index_select(
             0, sparse_local_rows).contiguous()
         sparse_dense_tail_starts = dense_tail_starts.index_select(
             0, sparse_local_rows).view(-1, 1)
@@ -222,7 +232,7 @@ class AscendDSAOpsBackend:
             0, sparse_local_rows)
         kv_backend.load_tokens_into(
             layer_id=int(layer_id),
-            request_pool_entries=sparse_pool_entries,
+            storage_request_ids=sparse_storage_request_ids,
             token_positions=sparse_topk,
             destination_slots=sparse_slot_out,
             load_mask=sparse_misses,

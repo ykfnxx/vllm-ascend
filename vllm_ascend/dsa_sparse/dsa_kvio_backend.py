@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib
 from dataclasses import dataclass
 from types import ModuleType
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -13,6 +13,9 @@ from vllm.logger import init_logger
 from vllm_ascend.dsa_sparse.dsa_kv_backend import DSAKVBackend
 
 logger = init_logger("vllm.dsa_sparse")
+
+_KVIO_PUT_OPCODE = 0x05
+_KVIO_GET_OPCODE = 0x06
 
 
 @dataclass(frozen=True)
@@ -39,10 +42,13 @@ class KVIODSAKVBackend(DSAKVBackend):
         pd_flag: int,
         max_model_len: int,
         ops_module: ModuleType | None = None,
+        tensor_ops: Any | None = None,
     ) -> None:
         self._ops = (
             importlib.import_module("rdma_kv_ops")
             if ops_module is None else ops_module)
+        self._tensor_ops = (
+            torch.ops._C_ascend if tensor_ops is None else tensor_ops)
         self._model_id = int(model_id)
         self._pd_flag = int(pd_flag)
         self._max_model_len = int(max_model_len)
@@ -50,37 +56,67 @@ class KVIODSAKVBackend(DSAKVBackend):
             int, tuple[int, torch.Tensor, torch.Tensor]] = {}
         self._regions: dict[int, tuple[_KVIOCacheRegion,
                                        _KVIOCacheRegion]] = {}
-        self._next_task_id = 1
         self._initialized = False
-        self._request_ids_by_pool: dict[int, int] = {}
+        self._task_id_tensor: torch.Tensor | None = None
+        self._model_id_tensor: torch.Tensor | None = None
+        self._pd_flag_tensor: torch.Tensor | None = None
+        self._put_opcode_tensor: torch.Tensor | None = None
+        self._get_opcode_tensor: torch.Tensor | None = None
 
     @staticmethod
     def _tensor_bytes(tensor: torch.Tensor) -> int:
         return int(tensor.numel()) * int(tensor.element_size())
 
-    def _next_task(self) -> int:
-        task_id = self._next_task_id
-        self._next_task_id += 1
-        return task_id
-
     @staticmethod
-    def _encode_request_id(request_id) -> int:
-        if isinstance(request_id, int):
-            return int(request_id)
-        digest = hashlib.blake2b(
-            str(request_id).encode("utf-8"), digest_size=8).digest()
-        return int.from_bytes(digest, byteorder="little") & 0x7FFFFFFFFFFFFFFF
-
-    def _remote_request_id(self, pool_entry: int) -> int:
-        return self._request_ids_by_pool[int(pool_entry)]
-
-    def _check(self, operation: str, error_code) -> None:
-        if error_code != self._ops.ErrorCode.SUCCESS:
+    def _check(operation: str, error_code) -> None:
+        if torch.is_tensor(error_code):
+            if int(error_code.numel()) != 1:
+                raise RuntimeError(
+                    f"KVIO {operation} returned a non-scalar error code")
+            error_code = int(error_code.detach().cpu().reshape(-1)[0])
+        else:
+            error_code = int(error_code)
+        if error_code != 0:
             raise RuntimeError(
                 f"KVIO {operation} failed with error code {error_code}")
 
-    def _wait(self, task_id: int) -> None:
-        self._check("aiv_wait", self._ops.aiv_wait([int(task_id)]))
+    @staticmethod
+    def _interleave(first: torch.Tensor,
+                    second: torch.Tensor) -> torch.Tensor:
+        return torch.stack((first, second), dim=1).reshape(-1).contiguous()
+
+    def _submit(
+        self,
+        *,
+        opcode: torch.Tensor,
+        cache_ids: torch.Tensor,
+        storage_request_ids: torch.Tensor,
+        cache_offsets: torch.Tensor,
+        storage_offsets: torch.Tensor,
+        block_lengths: torch.Tensor,
+    ) -> None:
+        if (self._task_id_tensor is None or self._model_id_tensor is None
+                or self._pd_flag_tensor is None):
+            raise RuntimeError("KVIO tensor controls are not initialized")
+        io_nums = cache_ids.new_full((1,), int(cache_ids.numel()))
+        error_code = self._tensor_ops.npu_get_put_batch(
+            self._task_id_tensor,
+            self._model_id_tensor,
+            self._pd_flag_tensor,
+            io_nums,
+            opcode,
+            cache_ids,
+            storage_request_ids,
+            cache_offsets,
+            storage_offsets,
+            block_lengths,
+        )
+        self._check("npu_get_put_batch", error_code)
+        self._check(
+            "npu_send_wait",
+            self._tensor_ops.npu_send_wait(self._task_id_tensor, io_nums),
+        )
+        self._task_id_tensor.add_(1)
 
     def register_layer_cache(
         self,
@@ -106,11 +142,17 @@ class KVIODSAKVBackend(DSAKVBackend):
         cache_addresses: list[int] = []
         cache_lengths: list[int] = []
         storage_base = 0
+        cache_device: torch.device | None = None
         for layer_id in sorted(self._registered_caches):
             block_size, nopek_cache, ropek_cache = self._registered_caches[
                 layer_id]
             layer_regions = []
             for cache in (nopek_cache, ropek_cache):
+                if cache_device is None:
+                    cache_device = cache.device
+                elif cache.device != cache_device:
+                    raise RuntimeError(
+                        "KVIO registered caches must share one device")
                 cache_id = len(cache_addresses)
                 cache_bytes = self._tensor_bytes(cache)
                 block_bytes = cache_bytes // int(cache.shape[0])
@@ -128,10 +170,22 @@ class KVIODSAKVBackend(DSAKVBackend):
                 storage_base += self._max_model_len * token_bytes
             self._regions[layer_id] = (layer_regions[0], layer_regions[1])
 
+        if cache_device is None:
+            raise RuntimeError("KVIO requires at least one registered cache")
         self._check(
             "aiv_init",
             self._ops.aiv_init(cache_addresses, cache_lengths),
         )
+        tensor_kwargs = {"dtype": torch.long, "device": cache_device}
+        self._task_id_tensor = torch.ones((1,), **tensor_kwargs)
+        self._model_id_tensor = torch.full(
+            (1,), self._model_id, **tensor_kwargs)
+        self._pd_flag_tensor = torch.full(
+            (1,), self._pd_flag, **tensor_kwargs)
+        self._put_opcode_tensor = torch.full(
+            (1,), _KVIO_PUT_OPCODE, **tensor_kwargs)
+        self._get_opcode_tensor = torch.full(
+            (1,), _KVIO_GET_OPCODE, **tensor_kwargs)
         self._initialized = True
         logger.info(
             "DSA KVIO backend initialized: cache_regions=%d, model_id=%d, "
@@ -145,73 +199,74 @@ class KVIODSAKVBackend(DSAKVBackend):
         self,
         *,
         layer_id: int,
-        request_ids: list,
-        request_pool_indices: list[int],
-        logical_block_index_rows: list[list[int]],
-        block_key_rows: list[list],
-        source_block_id_rows: list[list[int]],
+        storage_request_ids: torch.Tensor,
+        logical_block_indices: torch.Tensor,
+        source_block_ids: torch.Tensor,
     ) -> None:
-        _ = block_key_rows
         nopek_region, ropek_region = self._regions[int(layer_id)]
-        cache_ids: list[int] = []
-        remote_request_ids: list[int] = []
-        cache_offsets: list[int] = []
-        storage_offsets: list[int] = []
-        request_lengths: list[int] = []
-
-        for request_id, pool_entry, logical_blocks, physical_blocks in zip(
-                request_ids,
-                request_pool_indices,
-                logical_block_index_rows,
-                source_block_id_rows,
-                strict=True):
-            pool_entry = int(pool_entry)
-            if pool_entry not in self._request_ids_by_pool:
-                self._request_ids_by_pool[pool_entry] = (
-                    self._encode_request_id(request_id))
-            remote_request_id = self._remote_request_id(pool_entry)
-            for logical_block, physical_block in zip(
-                    logical_blocks, physical_blocks, strict=True):
-                for region in (nopek_region, ropek_region):
-                    cache_ids.append(region.cache_id)
-                    remote_request_ids.append(remote_request_id)
-                    cache_offsets.append(
-                        int(physical_block) * region.block_bytes)
-                    storage_offsets.append(
-                        region.storage_base
-                        + int(logical_block) * region.block_bytes)
-                    request_lengths.append(region.block_bytes)
-
-        if not cache_ids:
+        device = nopek_region.cache.device
+        storage_request_ids = storage_request_ids.to(
+            device=device, dtype=torch.long).reshape(-1).contiguous()
+        logical_block_indices = logical_block_indices.to(
+            device=device, dtype=torch.long).reshape(-1).contiguous()
+        source_block_ids = source_block_ids.to(
+            device=device, dtype=torch.long).reshape(-1).contiguous()
+        block_count = int(storage_request_ids.numel())
+        if (int(logical_block_indices.numel()) != block_count
+                or int(source_block_ids.numel()) != block_count):
+            raise ValueError(
+                "KVIO block descriptor tensors must have equal size")
+        if block_count == 0:
             return
-        task_id = self._next_task()
-        error_code, kernel_us = self._ops.aiv_put_batch(
-            task_id,
-            self._model_id,
-            self._pd_flag,
-            cache_ids,
-            remote_request_ids,
-            cache_offsets,
-            storage_offsets,
-            request_lengths,
+
+        cache_ids = self._interleave(
+            torch.full_like(storage_request_ids, nopek_region.cache_id),
+            torch.full_like(storage_request_ids, ropek_region.cache_id),
         )
-        self._check("aiv_put_batch", error_code)
-        self._wait(task_id)
+        request_ids = storage_request_ids.repeat_interleave(2).contiguous()
+        cache_offsets = self._interleave(
+            source_block_ids * nopek_region.block_bytes,
+            source_block_ids * ropek_region.block_bytes,
+        )
+        storage_offsets = self._interleave(
+            logical_block_indices * nopek_region.block_bytes
+            + nopek_region.storage_base,
+            logical_block_indices * ropek_region.block_bytes
+            + ropek_region.storage_base,
+        )
+        block_lengths = self._interleave(
+            torch.full_like(storage_request_ids, nopek_region.block_bytes),
+            torch.full_like(storage_request_ids, ropek_region.block_bytes),
+        )
+        if self._put_opcode_tensor is None:
+            raise RuntimeError("KVIO PUT opcode tensor is not initialized")
+        self._submit(
+            opcode=self._put_opcode_tensor,
+            cache_ids=cache_ids,
+            storage_request_ids=request_ids,
+            cache_offsets=cache_offsets,
+            storage_offsets=storage_offsets,
+            block_lengths=block_lengths,
+        )
         logger.debug(
-            "DSA KVIO put completed: layer=%d, transfers=%d, kernel_us=%s",
-            int(layer_id), len(cache_ids), kernel_us)
+            "DSA KVIO put completed: layer=%d, transfers=%d",
+            int(layer_id), int(cache_ids.numel()))
 
     def load_tokens_into(
         self,
         *,
         layer_id: int,
-        request_pool_entries: torch.Tensor,
+        storage_request_ids: torch.Tensor,
         token_positions: torch.Tensor,
         destination_slots: torch.Tensor,
         load_mask: torch.Tensor,
         destination_block_table: torch.Tensor,
     ) -> None:
         nopek_region, ropek_region = self._regions[int(layer_id)]
+        request_count = int(storage_request_ids.numel())
+        if request_count != int(load_mask.shape[0]):
+            raise ValueError(
+                "KVIO storage request ids must align with lookup rows")
         row_indices, token_indices = load_mask.to(
             dtype=torch.bool).nonzero(as_tuple=True)
         if int(row_indices.numel()) == 0:
@@ -230,58 +285,56 @@ class KVIODSAKVBackend(DSAKVBackend):
             physical_blocks
             * (nopek_region.block_bytes // nopek_region.token_bytes)
             + block_offsets)
-        transfer_rows = torch.stack(
-            (
-                request_pool_entries.index_select(
-                    0, row_indices).to(dtype=torch.long),
-                token_positions[row_indices,
-                                token_indices].to(dtype=torch.long),
-                physical_slots,
-            ),
-            dim=1,
-        ).cpu().tolist()
-
-        cache_ids: list[int] = []
-        remote_request_ids: list[int] = []
-        cache_offsets: list[int] = []
-        storage_offsets: list[int] = []
-        request_lengths: list[int] = []
-        for pool_entry, token_position, physical_slot in transfer_rows:
-            remote_request_id = self._remote_request_id(pool_entry)
-            for region in (nopek_region, ropek_region):
-                cache_ids.append(region.cache_id)
-                remote_request_ids.append(remote_request_id)
-                cache_offsets.append(int(physical_slot) * region.token_bytes)
-                storage_offsets.append(
-                    region.storage_base
-                    + int(token_position) * region.token_bytes)
-                request_lengths.append(region.token_bytes)
-
-        task_id = self._next_task()
-        error_code, kernel_us = self._ops.aiv_get_batch(
-            task_id,
-            self._model_id,
-            self._pd_flag,
-            cache_ids,
-            remote_request_ids,
-            cache_offsets,
-            storage_offsets,
-            request_lengths,
+        device = nopek_region.cache.device
+        request_ids = storage_request_ids.to(
+            device=device, dtype=torch.long).reshape(-1).index_select(
+                0, row_indices).contiguous()
+        token_positions = token_positions[
+            row_indices, token_indices].to(dtype=torch.long).contiguous()
+        cache_ids = self._interleave(
+            torch.full_like(request_ids, nopek_region.cache_id),
+            torch.full_like(request_ids, ropek_region.cache_id),
         )
-        self._check("aiv_get_batch", error_code)
-        self._wait(task_id)
+        request_ids = request_ids.repeat_interleave(2).contiguous()
+        cache_offsets = self._interleave(
+            physical_slots * nopek_region.token_bytes,
+            physical_slots * ropek_region.token_bytes,
+        )
+        storage_offsets = self._interleave(
+            token_positions * nopek_region.token_bytes
+            + nopek_region.storage_base,
+            token_positions * ropek_region.token_bytes
+            + ropek_region.storage_base,
+        )
+        block_lengths = self._interleave(
+            torch.full_like(token_positions, nopek_region.token_bytes),
+            torch.full_like(token_positions, ropek_region.token_bytes),
+        )
+        if self._get_opcode_tensor is None:
+            raise RuntimeError("KVIO GET opcode tensor is not initialized")
+        self._submit(
+            opcode=self._get_opcode_tensor,
+            cache_ids=cache_ids,
+            storage_request_ids=request_ids,
+            cache_offsets=cache_offsets,
+            storage_offsets=storage_offsets,
+            block_lengths=block_lengths,
+        )
         logger.debug(
-            "DSA KVIO get completed: layer=%d, transfers=%d, kernel_us=%s",
-            int(layer_id), len(cache_ids), kernel_us)
+            "DSA KVIO get completed: layer=%d, transfers=%d",
+            int(layer_id), int(cache_ids.numel()))
 
     def release_request(self, *, request_id, request_pool_idx: int) -> None:
-        self._request_ids_by_pool.pop(int(request_pool_idx), None)
+        return
 
     def close(self) -> None:
         if not self._initialized:
             return
-        self._ops.aiv_destroy()
         self._initialized = False
         self._regions.clear()
         self._registered_caches.clear()
-        self._request_ids_by_pool.clear()
+        self._task_id_tensor = None
+        self._model_id_tensor = None
+        self._pd_flag_tensor = None
+        self._put_opcode_tensor = None
+        self._get_opcode_tensor = None

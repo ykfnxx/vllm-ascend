@@ -326,12 +326,16 @@ backend 和 KVIO 标识改为：
 ```
 
 KV cache 分配完成后，框架会把每个本地 MLA 层的 nope/rope tensor 地址和
-字节长度一次性传给 `aiv_init`。完整 block 使用同步的
-`aiv_put_batch + aiv_wait` 写入远端；lookup miss 使用同步的
-`aiv_get_batch + aiv_wait` 直接写入 resident physical slot。KVIO Python
-接口只接收整数列表，因此 GET 热路径需要将一次批量地址元数据从 NPU 搬到
-CPU。当前 KVIO 接口没有远端删除 API，请求结束只清理本地 pool entry 到
-整数 request ID 的映射。
+字节长度一次性传给 `aiv_init`，并且该初始化发生在首次模型编译或图捕获
+之前。完整 block 和 lookup miss 都通过 tensor-native 的
+`torch.ops._C_ascend.npu_get_put_batch` 提交，并使用相同的 `task_id` 与
+`io_nums` 调用 `torch.ops._C_ascend.npu_send_wait`。PUT 使用 opcode `0x05`，
+GET 使用 opcode `0x06`。每个 forward 的 block 元数据只转换成一次 NPU
+`int64` tensor；GET 的 cache/storage 偏移也直接在 NPU 上生成，不再经过
+`.cpu().tolist()` 或 Python descriptor loop。当前 KVIO 接口没有远端删除
+API，请求结束只释放本地 DSA 请求状态。KVIO 的 `request_ids` 来自稳定的
+vLLM 请求 ID，而不是会随 batch 重排或抢占而变化的 batch/pool 下标；服务
+调用方应避免在同一 KVIO namespace 中复用已结束请求的 ID。
 
 ### 静态诊断运行中的服务
 

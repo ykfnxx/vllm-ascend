@@ -623,6 +623,7 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             kv_backend=self.kv_backend,
             selection_topk_indices=selection_topk,
             req_pool_entries=forward_batch.resident_pool_indices_tensor,
+            storage_request_ids=forward_batch.storage_request_ids_tensor,
             sparse_local_row_indices=(
                 forward_batch.sparse_local_row_indices_tensor),
             selection_block_table=forward_batch.batch_hbm_block_table,
@@ -734,15 +735,15 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         prefill-to-decode phase guard.
         """
         dump_tables = layer_batch.full_block_dump_tables
-        if dump_tables.request_ids:
+        if dump_tables:
             layer_id = layer_batch.layer_id
             self.kv_backend.put_blocks(
                 layer_id=layer_id,
-                request_ids=dump_tables.request_ids,
-                request_pool_indices=dump_tables.request_pool_indices,
-                logical_block_index_rows=dump_tables.logical_block_index_rows,
-                block_key_rows=dump_tables.block_hash_rows,
-                source_block_id_rows=dump_tables.block_id_rows,
+                storage_request_ids=(
+                    dump_tables.storage_request_ids_tensor),
+                logical_block_indices=(
+                    dump_tables.logical_block_indices_tensor),
+                source_block_ids=dump_tables.source_block_ids_tensor,
             )
 
         self._mark_full_dump_done(

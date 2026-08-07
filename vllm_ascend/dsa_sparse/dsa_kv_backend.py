@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import random
 from abc import ABC, abstractmethod
 
@@ -11,13 +12,32 @@ from vllm.logger import init_logger
 logger = init_logger("vllm.dsa_sparse")
 
 
+def encode_dsa_storage_request_id(request_id) -> int:
+    """Encode a stable framework request id into a signed int64 namespace.
+
+    The framework request id is stable across scheduling steps and preemption,
+    while batch indices and resident-pool indices are not. KVIO therefore uses
+    this deterministic value as storage identity instead of either local index.
+    """
+    if isinstance(request_id, int):
+        encoded = int(request_id)
+        if 0 <= encoded <= 0x7FFFFFFFFFFFFFFF:
+            return encoded
+        raise ValueError("integer request id does not fit positive int64")
+    digest = hashlib.blake2b(
+        str(request_id).encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little") & 0x7FFFFFFFFFFFFFFF
+
+
 class DSAKVBackend(ABC):
     """Worker-local DSA KV I/O boundary.
 
     The framework decides which full blocks to put and which lookup misses to
     load. Implementations own storage, address translation, and I/O ordering.
     Loads write directly into the registered resident cache and return no KV
-    tensor.
+    tensor. Request identities and block/token descriptors cross this boundary
+    as tensors so a backend never has to materialize device metadata as Python
+    lists.
     """
 
     @property
@@ -45,20 +65,18 @@ class DSAKVBackend(ABC):
         self,
         *,
         layer_id: int,
-        request_ids: list,
-        request_pool_indices: list[int],
-        logical_block_index_rows: list[list[int]],
-        block_key_rows: list[list],
-        source_block_id_rows: list[list[int]],
+        storage_request_ids: torch.Tensor,
+        logical_block_indices: torch.Tensor,
+        source_block_ids: torch.Tensor,
     ) -> None:
-        """Write complete HBM blocks to backend-owned storage."""
+        """Write flattened complete HBM blocks to backend-owned storage."""
 
     @abstractmethod
     def load_tokens_into(
         self,
         *,
         layer_id: int,
-        request_pool_entries: torch.Tensor,
+        storage_request_ids: torch.Tensor,
         token_positions: torch.Tensor,
         destination_slots: torch.Tensor,
         load_mask: torch.Tensor,
@@ -113,18 +131,17 @@ class MockDSAKVBackend(DSAKVBackend):
         self,
         *,
         layer_id: int,
-        request_ids: list,
-        request_pool_indices: list[int],
-        logical_block_index_rows: list[list[int]],
-        block_key_rows: list[list],
-        source_block_id_rows: list[list[int]],
+        storage_request_ids: torch.Tensor,
+        logical_block_indices: torch.Tensor,
+        source_block_ids: torch.Tensor,
     ) -> None:
+        _ = (storage_request_ids, logical_block_indices, source_block_ids)
         if not self._put_logged:
             logger.info(
                 "DSA mock KV backend accepted block puts without storage: "
-                "layer=%d, requests=%d",
+                "layer=%d, blocks=%d",
                 int(layer_id),
-                len(request_ids),
+                int(storage_request_ids.numel()),
             )
             self._put_logged = True
 
@@ -132,7 +149,7 @@ class MockDSAKVBackend(DSAKVBackend):
         self,
         *,
         layer_id: int,
-        request_pool_entries: torch.Tensor,
+        storage_request_ids: torch.Tensor,
         token_positions: torch.Tensor,
         destination_slots: torch.Tensor,
         load_mask: torch.Tensor,
@@ -163,7 +180,7 @@ class MockDSAKVBackend(DSAKVBackend):
                 "DSA mock KV backend wrote lookup misses directly to resident "
                 "HBM: layer=%d, request_rows=%d",
                 int(layer_id),
-                int(request_pool_entries.numel()),
+                int(storage_request_ids.numel()),
             )
             self._load_logged = True
 

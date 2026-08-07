@@ -1,8 +1,7 @@
-import hashlib
-
 import torch
 
-from vllm_ascend.dsa_sparse.dsa_kv_backend import MockDSAKVBackend
+from vllm_ascend.dsa_sparse.dsa_kv_backend import (
+    MockDSAKVBackend, encode_dsa_storage_request_id)
 from vllm_ascend.dsa_sparse.dsa_kvio_backend import KVIODSAKVBackend
 
 
@@ -15,32 +14,49 @@ class FakeKVIOOps:
         self.put_calls = []
         self.get_calls = []
         self.wait_calls = []
-        self.destroy_calls = 0
+
+    @staticmethod
+    def _clone_args(args):
+        return tuple(
+            arg.clone() if torch.is_tensor(arg) else arg for arg in args)
 
     def aiv_init(self, cache_addresses, cache_lengths):
         self.init_args = (cache_addresses, cache_lengths)
         return self.ErrorCode.SUCCESS
 
-    def aiv_put_batch(self, *args):
-        self.put_calls.append(args)
-        return self.ErrorCode.SUCCESS, 11.0
-
-    def aiv_get_batch(self, *args):
-        self.get_calls.append(args)
-        return self.ErrorCode.SUCCESS, 13.0
-
-    def aiv_wait(self, task_ids):
-        self.wait_calls.append(task_ids)
+    def npu_get_put_batch(self, *args):
+        cloned_args = self._clone_args(args)
+        opcode = int(cloned_args[4].reshape(-1)[0])
+        if opcode == 0x05:
+            self.put_calls.append(cloned_args)
+        elif opcode == 0x06:
+            self.get_calls.append(cloned_args)
+        else:
+            raise AssertionError(f"unexpected KVIO opcode {opcode}")
         return self.ErrorCode.SUCCESS
 
-    def aiv_destroy(self):
-        self.destroy_calls += 1
+    def npu_send_wait(self, *args):
+        self.wait_calls.append(self._clone_args(args))
+        return self.ErrorCode.SUCCESS
 
 
-def encode_request_id(request_id: str) -> int:
-    digest = hashlib.blake2b(
-        request_id.encode("utf-8"), digest_size=8).digest()
-    return int.from_bytes(digest, byteorder="little") & 0x7FFFFFFFFFFFFFFF
+def tensor_call_values(call):
+    return tuple(arg.tolist() if torch.is_tensor(arg) else arg for arg in call)
+
+
+def test_storage_request_id_is_stable_and_signed_int64_safe():
+    encoded = encode_dsa_storage_request_id("request-0")
+    assert encoded == encode_dsa_storage_request_id("request-0")
+    assert 0 <= encoded <= 0x7FFFFFFFFFFFFFFF
+    assert encode_dsa_storage_request_id(42) == 42
+
+    for invalid_request_id in (-1, 0x8000000000000000):
+        try:
+            encode_dsa_storage_request_id(invalid_request_id)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("out-of-range request id must be rejected")
 
 
 def test_mock_backend_writes_only_lookup_miss_destinations():
@@ -56,11 +72,12 @@ def test_mock_backend_writes_only_lookup_miss_destinations():
 
     backend.load_tokens_into(
         layer_id=0,
-        request_pool_entries=torch.tensor([4, 7], dtype=torch.int32),
+        storage_request_ids=torch.tensor([44, 77], dtype=torch.long),
         token_positions=torch.tensor([[9, 10], [11, 12]], dtype=torch.int32),
         destination_slots=torch.tensor([[0, 3], [1, 2]], dtype=torch.int32),
         load_mask=torch.tensor([[True, False], [False, True]]),
-        destination_block_table=torch.tensor([[2, 0], [1, 3]], dtype=torch.int32),
+        destination_block_table=torch.tensor(
+            [[2, 0], [1, 3]], dtype=torch.int32),
     )
 
     expected_rows = torch.tensor([4, 6])
@@ -92,11 +109,9 @@ def test_mock_backend_put_release_and_close_are_storage_free():
 
     backend.put_blocks(
         layer_id=3,
-        request_ids=[42],
-        request_pool_indices=[0],
-        logical_block_index_rows=[[0]],
-        block_key_rows=[["block-0"]],
-        source_block_id_rows=[[0]],
+        storage_request_ids=torch.tensor([42], dtype=torch.long),
+        logical_block_indices=torch.tensor([0], dtype=torch.long),
+        source_block_ids=torch.tensor([0], dtype=torch.long),
     )
     backend.release_request(request_id="request-0", request_pool_idx=0)
 
@@ -120,6 +135,7 @@ def test_kvio_backend_translates_block_put_offsets_and_waits():
         pd_flag=1,
         max_model_len=8,
         ops_module=ops,
+        tensor_ops=ops,
     )
     nopek_cache = torch.zeros((4, 2, 1, 3), dtype=torch.float32)
     ropek_cache = torch.zeros((4, 2, 1, 1), dtype=torch.float32)
@@ -138,27 +154,28 @@ def test_kvio_backend_translates_block_put_offsets_and_waits():
     )
 
     request_id = "request-0"
-    remote_request_id = encode_request_id(request_id)
+    remote_request_id = encode_dsa_storage_request_id(request_id)
     backend.put_blocks(
         layer_id=3,
-        request_ids=[request_id],
-        request_pool_indices=[1],
-        logical_block_index_rows=[[1]],
-        block_key_rows=[["block-1"]],
-        source_block_id_rows=[[2]],
+        storage_request_ids=torch.tensor(
+            [remote_request_id], dtype=torch.long),
+        logical_block_indices=torch.tensor([1], dtype=torch.long),
+        source_block_ids=torch.tensor([2], dtype=torch.long),
     )
 
-    assert ops.put_calls == [(
-        1,
-        7,
-        1,
+    assert tensor_call_values(ops.put_calls[0]) == (
+        [1],
+        [7],
+        [1],
+        [2],
+        [0x05],
         [0, 1],
         [remote_request_id, remote_request_id],
         [48, 16],
         [24, 104],
         [24, 8],
-    )]
-    assert ops.wait_calls == [[1]]
+    )
+    assert tensor_call_values(ops.wait_calls[0]) == ([1], [2])
 
 
 def test_kvio_backend_translates_token_get_offsets_and_closes():
@@ -168,6 +185,7 @@ def test_kvio_backend_translates_token_get_offsets_and_closes():
         pd_flag=1,
         max_model_len=8,
         ops_module=ops,
+        tensor_ops=ops,
     )
     nopek_cache = torch.zeros((4, 2, 1, 3), dtype=torch.float32)
     ropek_cache = torch.zeros((4, 2, 1, 1), dtype=torch.float32)
@@ -179,39 +197,40 @@ def test_kvio_backend_translates_token_get_offsets_and_closes():
     )
     backend.finalize_cache_registration()
     request_id = "request-0"
-    remote_request_id = encode_request_id(request_id)
+    remote_request_id = encode_dsa_storage_request_id(request_id)
     backend.put_blocks(
         layer_id=3,
-        request_ids=[request_id],
-        request_pool_indices=[1],
-        logical_block_index_rows=[[0]],
-        block_key_rows=[["block-0"]],
-        source_block_id_rows=[[0]],
+        storage_request_ids=torch.tensor(
+            [remote_request_id], dtype=torch.long),
+        logical_block_indices=torch.tensor([0], dtype=torch.long),
+        source_block_ids=torch.tensor([0], dtype=torch.long),
     )
     ops.put_calls.clear()
     ops.wait_calls.clear()
 
     backend.load_tokens_into(
         layer_id=3,
-        request_pool_entries=torch.tensor([1], dtype=torch.int32),
+        storage_request_ids=torch.tensor(
+            [remote_request_id], dtype=torch.long),
         token_positions=torch.tensor([[5, 6]], dtype=torch.int32),
         destination_slots=torch.tensor([[0, 3]], dtype=torch.int32),
         load_mask=torch.tensor([[True, True]]),
         destination_block_table=torch.tensor([[2, 0]], dtype=torch.int32),
     )
 
-    assert ops.get_calls == [(
-        2,
-        7,
-        1,
+    assert tensor_call_values(ops.get_calls[0]) == (
+        [2],
+        [7],
+        [1],
+        [4],
+        [0x06],
         [0, 1, 0, 1],
         [remote_request_id] * 4,
         [48, 16, 12, 4],
         [60, 116, 72, 120],
         [12, 4, 12, 4],
-    )]
-    assert ops.wait_calls == [[2]]
+    )
+    assert tensor_call_values(ops.wait_calls[0]) == ([2], [4])
 
     backend.close()
     backend.close()
-    assert ops.destroy_calls == 1

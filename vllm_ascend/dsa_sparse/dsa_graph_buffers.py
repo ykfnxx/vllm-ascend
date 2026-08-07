@@ -227,6 +227,8 @@ class DSAGraphBuffersMixin:
             score_topk_k=budget_tokens,
             resident_pool_indices_tensor=torch.empty(
                 (row_count,), dtype=torch.int32, device=device),
+            storage_request_ids_tensor=torch.empty(
+                (row_count,), dtype=torch.long, device=device),
             query_position_rows_tensor=torch.empty(
                 (row_count, 1), dtype=torch.int32, device=device),
             tail_valid_token_counts_tensor=torch.empty(
@@ -296,6 +298,8 @@ class DSAGraphBuffersMixin:
 
         row_ids = torch.arange(row_count, dtype=torch.int32, device=device)
         graph_batch.resident_pool_indices_tensor.copy_(row_ids)
+        graph_batch.storage_request_ids_tensor.copy_(row_ids.to(
+            dtype=torch.long))
         graph_batch.query_start_locs_tensor.copy_(row_ids)
         graph_batch.query_lens_tensor.fill_(1)
         graph_batch.query_last_token_indices_tensor.copy_(row_ids.to(
@@ -471,6 +475,11 @@ class DSAGraphBuffersMixin:
             graph_batch.resident_pool_indices_tensor,
             real_batch.resident_pool_indices_tensor,
             fill_value=-1,
+        )
+        self._copy_tensor_region(
+            graph_batch.storage_request_ids_tensor,
+            real_batch.storage_request_ids_tensor,
+            fill_value=0,
         )
         self._copy_tensor_region(
             graph_batch.query_position_rows_tensor,
