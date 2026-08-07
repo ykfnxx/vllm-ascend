@@ -16,6 +16,8 @@ logger = init_logger("vllm.dsa_sparse")
 
 _KVIO_PUT_OPCODE = 0x05
 _KVIO_GET_OPCODE = 0x06
+_KVIO_PREFILL_PD_FLAG = 0
+_KVIO_DECODE_PD_FLAG = 1
 
 
 @dataclass(frozen=True)
@@ -60,6 +62,8 @@ class KVIODSAKVBackend(DSAKVBackend):
         self._task_id_tensor: torch.Tensor | None = None
         self._model_id_tensor: torch.Tensor | None = None
         self._pd_flag_tensor: torch.Tensor | None = None
+        self._prefill_pd_flag_tensor: torch.Tensor | None = None
+        self._decode_pd_flag_tensor: torch.Tensor | None = None
         self._put_opcode_tensor: torch.Tensor | None = None
         self._get_opcode_tensor: torch.Tensor | None = None
 
@@ -88,6 +92,7 @@ class KVIODSAKVBackend(DSAKVBackend):
     def _submit(
         self,
         *,
+        pd_flag: torch.Tensor,
         opcode: torch.Tensor,
         cache_ids: torch.Tensor,
         storage_request_ids: torch.Tensor,
@@ -102,7 +107,7 @@ class KVIODSAKVBackend(DSAKVBackend):
         error_code = self._tensor_ops.npu_get_put_batch(
             self._task_id_tensor,
             self._model_id_tensor,
-            self._pd_flag_tensor,
+            pd_flag,
             io_nums,
             opcode,
             cache_ids,
@@ -182,6 +187,10 @@ class KVIODSAKVBackend(DSAKVBackend):
             (1,), self._model_id, **tensor_kwargs)
         self._pd_flag_tensor = torch.full(
             (1,), self._pd_flag, **tensor_kwargs)
+        self._prefill_pd_flag_tensor = torch.full(
+            (1,), _KVIO_PREFILL_PD_FLAG, **tensor_kwargs)
+        self._decode_pd_flag_tensor = torch.full(
+            (1,), _KVIO_DECODE_PD_FLAG, **tensor_kwargs)
         self._put_opcode_tensor = torch.full(
             (1,), _KVIO_PUT_OPCODE, **tensor_kwargs)
         self._get_opcode_tensor = torch.full(
@@ -240,14 +249,20 @@ class KVIODSAKVBackend(DSAKVBackend):
         )
         if self._put_opcode_tensor is None:
             raise RuntimeError("KVIO PUT opcode tensor is not initialized")
-        self._submit(
-            opcode=self._put_opcode_tensor,
-            cache_ids=cache_ids,
-            storage_request_ids=request_ids,
-            cache_offsets=cache_offsets,
-            storage_offsets=storage_offsets,
-            block_lengths=block_lengths,
-        )
+        for pd_flag in (
+                self._prefill_pd_flag_tensor,
+                self._decode_pd_flag_tensor,
+        ):
+            assert pd_flag is not None
+            self._submit(
+                pd_flag=pd_flag,
+                opcode=self._put_opcode_tensor,
+                cache_ids=cache_ids,
+                storage_request_ids=request_ids,
+                cache_offsets=cache_offsets,
+                storage_offsets=storage_offsets,
+                block_lengths=block_lengths,
+            )
         logger.debug(
             "DSA KVIO put completed: layer=%d, transfers=%d",
             int(layer_id), int(cache_ids.numel()))
@@ -313,6 +328,7 @@ class KVIODSAKVBackend(DSAKVBackend):
         if self._get_opcode_tensor is None:
             raise RuntimeError("KVIO GET opcode tensor is not initialized")
         self._submit(
+            pd_flag=self._pd_flag_tensor,
             opcode=self._get_opcode_tensor,
             cache_ids=cache_ids,
             storage_request_ids=request_ids,
@@ -336,5 +352,7 @@ class KVIODSAKVBackend(DSAKVBackend):
         self._task_id_tensor = None
         self._model_id_tensor = None
         self._pd_flag_tensor = None
+        self._prefill_pd_flag_tensor = None
+        self._decode_pd_flag_tensor = None
         self._put_opcode_tensor = None
         self._get_opcode_tensor = None

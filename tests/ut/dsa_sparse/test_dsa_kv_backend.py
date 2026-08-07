@@ -166,7 +166,7 @@ def test_kvio_backend_translates_block_put_offsets_and_waits():
     assert tensor_call_values(ops.put_calls[0]) == (
         [1],
         [7],
-        [1],
+        [0],
         [2],
         [0x05],
         [0, 1],
@@ -176,6 +176,19 @@ def test_kvio_backend_translates_block_put_offsets_and_waits():
         [24, 8],
     )
     assert tensor_call_values(ops.wait_calls[0]) == ([1], [2])
+    assert tensor_call_values(ops.put_calls[1]) == (
+        [2],
+        [7],
+        [1],
+        [2],
+        [0x05],
+        [0, 1],
+        [remote_request_id, remote_request_id],
+        [48, 16],
+        [24, 104],
+        [24, 8],
+    )
+    assert tensor_call_values(ops.wait_calls[1]) == ([2], [2])
 
 
 def test_kvio_backend_translates_token_get_offsets_and_closes():
@@ -219,7 +232,7 @@ def test_kvio_backend_translates_token_get_offsets_and_closes():
     )
 
     assert tensor_call_values(ops.get_calls[0]) == (
-        [2],
+        [3],
         [7],
         [1],
         [4],
@@ -230,7 +243,7 @@ def test_kvio_backend_translates_token_get_offsets_and_closes():
         [60, 116, 72, 120],
         [12, 4, 12, 4],
     )
-    assert tensor_call_values(ops.wait_calls[0]) == ([2], [4])
+    assert tensor_call_values(ops.wait_calls[0]) == ([3], [4])
 
     backend.close()
     backend.close()
