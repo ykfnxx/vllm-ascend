@@ -25,7 +25,6 @@ def make_vllm_config(
 ):
     dsa_config = {
         "io_backend": io_backend,
-        "io_backend_options": {"namespace": "test"},
         **(extra_dsa_fields or {}),
     }
     return SimpleNamespace(
@@ -63,10 +62,11 @@ def test_config_exposes_only_fixed_lookup_contract_inputs():
     assert config is not None
     assert config.is_consumer
     assert config.index_topk == 2048
+    assert config.io_backend == "mock"
     assert not hasattr(config, "device_buffer_size")
     assert not hasattr(config, "max_query_tokens_per_request")
-    with pytest.raises(TypeError):
-        config.io_backend_options["namespace"] = "changed"
+    assert not hasattr(config, "lookup_backend")
+    assert not hasattr(config, "io_backend_options")
 
 
 def test_device_buffer_size_is_removed_from_user_configuration():
@@ -92,6 +92,12 @@ def test_graph_execution_is_rejected():
 def test_only_mock_io_is_supported():
     with pytest.raises(ValueError, match="only io_backend='mock'"):
         load_dsa_sparse_config(make_vllm_config(io_backend="vendor"))
+
+
+@pytest.mark.parametrize("field", ["lookup_backend", "io_backend_options"])
+def test_removed_backend_abstractions_are_rejected(field):
+    with pytest.raises(ValueError, match="Unknown"):
+        load_dsa_sparse_config(make_vllm_config(extra_dsa_fields={field: {}}))
 
 
 @pytest.mark.parametrize(

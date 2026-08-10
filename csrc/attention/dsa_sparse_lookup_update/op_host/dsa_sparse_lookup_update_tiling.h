@@ -11,7 +11,6 @@
 struct DsaSparseLookupUpdateTilingData {
     uint32_t reqNum;
     uint32_t poolCapacity;
-    uint32_t workspaceStride;
 };
 
 struct DsaSparseLookupUpdateCompileInfo {};

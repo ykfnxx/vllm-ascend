@@ -21,7 +21,7 @@ import logging
 import math
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -109,13 +109,14 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAtt
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.dsa_sparse import (
-    DSASparseCacheConfig,
-    DSASparseLayerLayout,
+    DSASparseCoordinator,
 )
-from vllm_ascend.attention.dsa_sparse_io import (
-    MockDSASparseIOOperator,
+from vllm_ascend.attention.dsa_sparse_pd import (
+    DSASparsePDHandoff,
+    DSASparseProducerExecution,
+    begin_dsa_sparse_producer_execution,
+    build_dsa_sparse_resident_token_ids,
 )
-from vllm_ascend.attention.dsa_sparse_pd import DSASparsePDHandoff
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import (
@@ -132,7 +133,6 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
-from vllm_ascend.dsa_sparse_config import DSA_SPARSE_MOCK_IO_BACKEND
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -177,17 +177,8 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
     vllm_version_is,
 )
-from vllm_ascend.worker.dsa_sparse_eager import (
-    DSASparseEagerCohortLayout,
-    DSASparseEagerExecution,
-    DSASparseEagerRuntime,
-    DSASparseProducerExecution,
-    begin_dsa_sparse_producer_execution,
-    create_dsa_sparse_eager_mock_runtime,
-)
 from vllm_ascend.worker.dsa_sparse_external_main import (
-    DSASparseExternalMainSpecs,
-    add_external_main_metadata,
+    add_dsa_sparse_main_metadata,
 )
 from vllm_ascend.worker.dsa_sparse_memory import (
     DSASparseFixedHBMBreakdown,
@@ -363,25 +354,19 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
-        self.dsa_sparse_eager_runtime: DSASparseEagerRuntime | None = None
-        self.dsa_sparse_mock_io_operator = (
-            MockDSASparseIOOperator()
-            if self.ascend_config.dsa_sparse_config is not None
-            else None
-        )
-        self._dsa_sparse_pd_handoffs: dict[
-            str,
-            DSASparsePDHandoff,
-        ] = {}
-        self._dsa_sparse_external_main_specs = (
-            DSASparseExternalMainSpecs.empty()
-        )
+        self._dsa_sparse_main_specs: dict[str, AscendMLAAttentionSpec] = {}
         self._dsa_sparse_fixed_hbm_breakdown: (
             DSASparseFixedHBMBreakdown | None
         ) = None
-        self._dsa_sparse_eager_cohort_layouts: (
-            tuple[DSASparseEagerCohortLayout, ...] | None
-        ) = None
+        self.dsa_sparse_req_to_pool_entry: dict[str, int] = {}
+        self.dsa_sparse_free_pool_entries = deque(range(self.max_num_reqs))
+        self._dsa_sparse_leader_coordinators: tuple[
+            DSASparseCoordinator, ...
+        ] = ()
+        self._dsa_sparse_leader_by_layer: dict[
+            str, DSASparseCoordinator
+        ] = {}
+        self._dsa_sparse_pd_handoffs: dict[str, DSASparsePDHandoff] = {}
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -638,49 +623,7 @@ class NPUModelRunner(GPUModelRunner):
     def use_cp(self) -> bool:
         return self.pcp_size * self.dcp_size > 1
 
-    def bind_dsa_sparse_eager_runtime(
-        self,
-        runtime: DSASparseEagerRuntime,
-    ) -> None:
-        config = self.ascend_config.dsa_sparse_config
-        if config is None or not config.is_consumer:
-            raise RuntimeError(
-                "A DSA Sparse eager runtime can only be bound on an enabled "
-                "Decode KV consumer."
-            )
-        if self.dsa_sparse_eager_runtime is not None:
-            raise RuntimeError("The DSA Sparse eager runtime is already bound.")
-        self.dsa_sparse_eager_runtime = runtime
-
-    def _initialize_dsa_sparse_eager_mock_runtime(self) -> None:
-        """Bind the unimplemented Lookup boundary and mock I/O fixture."""
-
-        config = self.ascend_config.dsa_sparse_config
-        if config is None or not getattr(config, "is_consumer", False):
-            return
-        if getattr(self, "dsa_sparse_eager_runtime", None) is not None:
-            return
-        if config.io_backend != DSA_SPARSE_MOCK_IO_BACKEND:
-            raise RuntimeError(
-                "The current DSA Sparse Graph-out milestone implements only "
-                "the explicit no-op io_backend='mock'; no concrete I/O "
-                "backend is available."
-            )
-
-        if self._dsa_sparse_fixed_hbm_breakdown is None:
-            raise RuntimeError(
-                "DSA Sparse fixed HBM must be reserved before eager runtime "
-                "allocation."
-            )
-        runtime = create_dsa_sparse_eager_mock_runtime(
-            self._get_dsa_sparse_cache_config(),
-            self._get_dsa_sparse_eager_cohort_layouts(),
-            device=self.device,
-            io_operator=self.dsa_sparse_mock_io_operator,
-        )
-        self.bind_dsa_sparse_eager_runtime(runtime)
-
-    def _uses_dsa_sparse_external_main(self) -> bool:
+    def _uses_dsa_sparse_main_cache(self) -> bool:
         config = getattr(self.ascend_config, "dsa_sparse_config", None)
         return getattr(config, "kv_role", None) == "kv_consumer"
 
@@ -702,300 +645,285 @@ class NPUModelRunner(GPUModelRunner):
                 "DSA Sparse fixed HBM can be calculated only after load_model()."
             )
 
-        layer_layouts, cohort_count = self._get_dsa_sparse_memory_layouts_and_cohorts()
-        cache_config = self._get_dsa_sparse_cache_config()
+        main_layouts, cohort_count = (
+            self._get_dsa_sparse_main_layouts_and_cohort_count()
+        )
         breakdown = calculate_dsa_sparse_fixed_hbm_bytes(
-            cache_config,
-            layer_layouts,
+            self.max_num_reqs,
+            self.block_size,
+            main_layouts,
             cohort_count=cohort_count,
-            backend_auxiliary_bytes=0,
         )
         self._dsa_sparse_fixed_hbm_breakdown = breakdown
         return breakdown.fixed_hbm_bytes
 
-    def _get_dsa_sparse_cache_config(self) -> DSASparseCacheConfig:
-        config = self.ascend_config.dsa_sparse_config
-        if config is None or getattr(config, "kv_role", None) != "kv_consumer":
-            raise RuntimeError(
-                "DSA Sparse Decode cache config requires an enabled KV consumer."
-            )
-        return DSASparseCacheConfig(
-            max_num_seqs=self.max_num_reqs,
-            max_model_len=self.model_config.max_model_len,
-            block_size=self.block_size,
-            index_topk=config.index_topk,
-        )
-
-    def _get_dsa_sparse_memory_layouts_and_cohorts(
+    def _get_dsa_sparse_ordered_layers(
         self,
-    ) -> tuple[tuple[DSASparseLayerLayout, ...], int]:
-        """Inspect local sparse MLA modules without guessing cohort sharing."""
-
-        cohort_layouts = self._get_dsa_sparse_eager_cohort_layouts()
-        layer_layouts = tuple(
-            layer_layout
-            for cohort_layout in cohort_layouts
-            for layer_layout in cohort_layout.layer_layouts
-        )
-        return layer_layouts, len(cohort_layouts)
-
-    def _get_dsa_sparse_eager_cohort_layouts(
-        self,
-    ) -> tuple[DSASparseEagerCohortLayout, ...]:
-        """Group ordered local Main layouts by their IndexCache leader."""
-
-        cached_layouts = getattr(
-            self,
-            "_dsa_sparse_eager_cohort_layouts",
-            None,
-        )
-        if cached_layouts is not None:
-            return cached_layouts
-
-        if not self.use_sparse:
-            raise RuntimeError(
-                "DSA Sparse Decode requires sparse MLAAttention modules."
-            )
+    ) -> list[tuple[str, MLAAttention]]:
         attn_layers = get_layers_from_vllm_config(
             self.vllm_config,
             AttentionLayerBase,
         )
         ordered_layers: list[tuple[int, str, MLAAttention]] = []
         for layer_name, attn_module in attn_layers.items():
-            if not isinstance(attn_module, MLAAttention):
-                continue
-            try:
-                layer_index = extract_layer_index(layer_name)
-            except (
-                AssertionError,
-                IndexError,
-                TypeError,
-                ValueError,
-            ) as error:
-                raise RuntimeError(
-                    "Cannot identify the model-layer order for DSA Sparse "
-                    f"MLA layer {layer_name!r}."
-                ) from error
-            if (
-                isinstance(layer_index, bool)
-                or not isinstance(layer_index, int)
-                or layer_index < 0
-            ):
-                raise RuntimeError(
-                    "Cannot identify the model-layer order for DSA Sparse "
-                    f"MLA layer {layer_name!r}."
+            if isinstance(attn_module, MLAAttention):
+                ordered_layers.append(
+                    (extract_layer_index(layer_name), layer_name, attn_module)
                 )
-            ordered_layers.append(
-                (layer_index, layer_name, attn_module),
-            )
-
-        if not ordered_layers:
-            raise RuntimeError(
-                "No local sparse MLAAttention layers were found for the "
-                "DSA Sparse Decode HBM budget."
-            )
         ordered_layers.sort(key=lambda layer: layer[0])
-        layer_indices = [layer_index for layer_index, _, _ in ordered_layers]
-        if len(set(layer_indices)) != len(layer_indices):
-            raise RuntimeError(
-                "DSA Sparse cannot determine cohort order because multiple "
-                "local MLAAttention modules have the same model-layer index."
-            )
+        return [
+            (layer_name, attn_module)
+            for _, layer_name, attn_module in ordered_layers
+        ]
 
-        grouped_layouts: list[list[DSASparseLayerLayout]] = []
-        for _, layer_name, attn_module in ordered_layers:
-            impl = getattr(attn_module, "impl", None)
-            skip_topk = getattr(impl, "skip_topk", None)
-            if not isinstance(skip_topk, bool):
-                raise RuntimeError(
-                    "DSA Sparse cannot identify IndexCache cohort ownership "
-                    f"for layer {layer_name!r}: skip_topk is unavailable."
-                )
-            if skip_topk:
-                if not grouped_layouts:
-                    raise RuntimeError(
-                        "The first local DSA Sparse MLAAttention layer cannot "
-                        "reuse a previous IndexCache cohort."
-                    )
-            else:
-                grouped_layouts.append([])
-            grouped_layouts[-1].append(
-                self._get_dsa_sparse_layer_layout(
-                    layer_name,
-                    attn_module,
-                )
-            )
-
-        cohort_layouts = tuple(
-            DSASparseEagerCohortLayout(
-                cohort_name=cohort_layouts[0].layer_name,
-                layer_layouts=tuple(cohort_layouts),
-            )
-            for cohort_layouts in grouped_layouts
-        )
-        self._dsa_sparse_eager_cohort_layouts = cohort_layouts
-        return cohort_layouts
-
-    def _get_dsa_sparse_layer_layout(
+    def _get_dsa_sparse_main_layouts_and_cohort_count(
         self,
-        layer_name: str,
-        attn_module: MLAAttention,
-    ) -> DSASparseLayerLayout:
-        impl = getattr(attn_module, "impl", None)
-        enable_sparse_sfa_c8 = getattr(
-            impl,
-            "enable_sparse_sfa_c8",
-            None,
-        )
-        if not isinstance(enable_sparse_sfa_c8, bool):
-            raise RuntimeError(
-                "DSA Sparse Main cache layout is unavailable for layer "
-                f"{layer_name!r}."
-            )
-        kv_lora_rank = getattr(attn_module, "kv_lora_rank", None)
-        qk_rope_head_dim = getattr(
-            attn_module,
-            "qk_rope_head_dim",
-            None,
-        )
-        for dimension_name, dimension in (
-            ("kv_lora_rank", kv_lora_rank),
-            ("qk_rope_head_dim", qk_rope_head_dim),
-        ):
-            if (
-                isinstance(dimension, bool)
-                or not isinstance(dimension, int)
-                or dimension <= 0
-            ):
-                raise RuntimeError(
-                    f"DSA Sparse layer {layer_name!r} has invalid "
-                    f"{dimension_name}={dimension!r}."
+    ) -> tuple[tuple[tuple[torch.dtype, int, int], ...], int]:
+        layouts: list[tuple[torch.dtype, int, int]] = []
+        cohort_count = 0
+        for _, attn_module in self._get_dsa_sparse_ordered_layers():
+            impl = attn_module.impl
+            if impl.enable_sparse_sfa_c8:
+                dtype = self.c8_k_cache_dtype
+                head_size = get_sfa_qsfa_packed_head_dim(
+                    attn_module.kv_lora_rank,
+                    attn_module.qk_rope_head_dim,
+                )
+            else:
+                dtype = self.kv_cache_dtype
+                head_size = (
+                    attn_module.kv_lora_rank
+                    + attn_module.qk_rope_head_dim
+                )
+            layouts.append((dtype, 1, head_size))
+            if not impl.skip_topk:
+                cohort_count += 1
+        return tuple(layouts), cohort_count
+
+    def _initialize_dsa_sparse_coordinators(self) -> None:
+        if not self._uses_dsa_sparse_main_cache():
+            return
+
+        leader: DSASparseCoordinator | None = None
+        leaders: list[DSASparseCoordinator] = []
+        leaders_by_layer: dict[str, DSASparseCoordinator] = {}
+        cohorts: list[dict[str, Any]] = []
+        for layer_name, attn_module in self._get_dsa_sparse_ordered_layers():
+            impl = attn_module.impl
+            spec = self._dsa_sparse_main_specs[layer_name]
+            if impl.skip_topk:
+                assert leader is not None
+            if spec.cache_sparse_sfa_c8:
+                plane_layouts = (
+                    (
+                        spec.dtype,
+                        (spec.num_kv_heads, spec.head_size),
+                    ),
+                )
+            else:
+                k_dim, v_dim = self._get_attention_kv_cache_dims(
+                    layer_name,
+                    spec,
+                )
+                plane_layouts = (
+                    (spec.dtype, (spec.num_kv_heads, k_dim)),
+                    (spec.dtype, (spec.num_kv_heads, v_dim)),
                 )
 
-        if enable_sparse_sfa_c8:
-            return DSASparseLayerLayout(
-                layer_name=layer_name,
-                plane_dtypes=(self.c8_k_cache_dtype,),
-                plane_row_shapes=(
-                    (
-                        1,
-                        get_sfa_qsfa_packed_head_dim(
-                            kv_lora_rank,
-                            qk_rope_head_dim,
-                        ),
-                    ),
-                ),
+            coordinator = DSASparseCoordinator(
+                max_num_seqs=self.max_num_reqs,
+                block_size=self.block_size,
+                plane_layouts=plane_layouts,
+                device=self.device,
+                leader=leader if impl.skip_topk else None,
             )
-        return DSASparseLayerLayout(
-            layer_name=layer_name,
-            plane_dtypes=(
-                self.kv_cache_dtype,
-                self.kv_cache_dtype,
-            ),
-            plane_row_shapes=(
-                (1, kv_lora_rank),
-                (1, qk_rope_head_dim),
-            ),
+            if not impl.skip_topk:
+                leader = coordinator
+                leaders.append(coordinator)
+                leaders_by_layer[layer_name] = coordinator
+                cohorts.append({"name": layer_name, "layers": [layer_name]})
+            else:
+                cohorts[-1]["layers"].append(layer_name)
+            impl.dsa_sparse_coordinator = coordinator
+            if dsa_sparse_probe.is_enabled():
+                dsa_sparse_probe.emit(
+                    "hot_cache_registered",
+                    layer=layer_name,
+                    hot_cache_ptrs=[
+                        plane.data_ptr()
+                        for plane in coordinator.hot_main_cache
+                    ],
+                    hot_cache_shapes=[
+                        list(plane.shape)
+                        for plane in coordinator.hot_main_cache
+                    ],
+                )
+
+        self._dsa_sparse_leader_coordinators = tuple(leaders)
+        self._dsa_sparse_leader_by_layer = leaders_by_layer
+        if dsa_sparse_probe.is_enabled():
+            dsa_sparse_probe.emit(
+                "coordinators_ready",
+                cohort_count=len(cohorts),
+                layer_count=sum(len(cohort["layers"]) for cohort in cohorts),
+                index_topk=self.ascend_config.dsa_sparse_config.index_topk,
+                cohorts=cohorts,
+            )
+
+    def _admit_dsa_sparse_request(
+        self,
+        request_id: str,
+        handoff: DSASparsePDHandoff | None = None,
+    ) -> None:
+        assert request_id not in self.dsa_sparse_req_to_pool_entry
+        pool_entry = self.dsa_sparse_free_pool_entries.popleft()
+        self.dsa_sparse_req_to_pool_entry[request_id] = pool_entry
+        try:
+            if handoff is None:
+                for coordinator in self._dsa_sparse_leader_coordinators:
+                    coordinator.initialize_request(pool_entry)
+            else:
+                self._initialize_dsa_sparse_request_from_handoff(
+                    request_id,
+                    pool_entry,
+                    handoff,
+                )
+        except BaseException:
+            for coordinator in self._dsa_sparse_leader_coordinators:
+                coordinator.reset_request(pool_entry)
+            self.dsa_sparse_req_to_pool_entry.pop(request_id)
+            self.dsa_sparse_free_pool_entries.appendleft(pool_entry)
+            raise
+
+    def _initialize_dsa_sparse_request_from_handoff(
+        self,
+        request_id: str,
+        pool_entry: int,
+        handoff: DSASparsePDHandoff,
+    ) -> None:
+        if handoff.block_size != self.block_size:
+            raise ValueError(
+                "DSA Sparse P/D block size mismatch: "
+                f"P={handoff.block_size}, D={self.block_size}."
+            )
+        rank = get_tp_group().rank_in_group
+        try:
+            layer_topk = handoff.layer_topk_by_rank[rank]
+        except KeyError as error:
+            raise RuntimeError(
+                "DSA Sparse P/D handoff has no TopK for Decode rank "
+                f"{rank}: request={request_id!r}."
+            ) from error
+        missing_layers = set(self._dsa_sparse_leader_by_layer) - set(
+            layer_topk
+        )
+        if missing_layers:
+            raise RuntimeError(
+                "DSA Sparse P/D handoff is missing Decode leader layers: "
+                f"request={request_id!r}, missing={sorted(missing_layers)}."
+            )
+        for layer_name, coordinator in (
+            self._dsa_sparse_leader_by_layer.items()
+        ):
+            resident_token_ids = build_dsa_sparse_resident_token_ids(
+                topk_token_ids=layer_topk[layer_name],
+                stored_token_count=handoff.stored_token_count,
+                block_size=handoff.block_size,
+            )
+            coordinator.initialize_request(pool_entry, resident_token_ids)
+
+        dsa_sparse_probe.emit_pd_handoff(
+            "handoff_receive",
+            role="D",
+            request_id=request_id,
+            handoff=handoff,
+            tp_rank=rank,
         )
 
-    def _begin_dsa_sparse_eager_execution(
+    def _release_dsa_sparse_request(self, request_id: str) -> None:
+        pool_entry = self.dsa_sparse_req_to_pool_entry.pop(request_id)
+        for coordinator in self._dsa_sparse_leader_coordinators:
+            coordinator.reset_request(pool_entry)
+        self.dsa_sparse_free_pool_entries.append(pool_entry)
+
+    def _set_dsa_sparse_req_pool_entries(
+        self,
+        attn_metadata: PerLayerAttnMetadata,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+    ) -> None:
+        if not self._uses_dsa_sparse_main_cache():
+            return
+        if self.attn_state != AscendAttentionState.DecodeOnly:
+            raise RuntimeError("DSA Sparse accepts only DecodeOnly batches.")
+        if isinstance(attn_metadata, list):
+            raise RuntimeError("DSA Sparse does not support attention microbatches.")
+        if not np.all(num_scheduled_tokens[:num_reqs] == 1):
+            raise RuntimeError(
+                "DSA Sparse requires exactly one decode token per request."
+            )
+
+        req_pool_entries = torch.tensor(
+            [
+                self.dsa_sparse_req_to_pool_entry[request_id]
+                for request_id in self.input_batch.req_ids[:num_reqs]
+            ],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        for layer_name in self._dsa_sparse_main_specs:
+            attn_metadata[
+                layer_name
+            ].dsa_sparse_req_pool_entries = req_pool_entries
+
+    def _begin_dsa_sparse_producer_execution(
         self,
         *,
         num_reqs: int,
         num_scheduled_tokens: np.ndarray,
-        positions: torch.Tensor,
         attn_metadata: PerLayerAttnMetadata,
-    ) -> (
-        DSASparseEagerExecution
-        | DSASparseProducerExecution
-        | nullcontext[None]
-    ):
+    ) -> DSASparseProducerExecution | nullcontext[None]:
         config = self.ascend_config.dsa_sparse_config
-        if config is None:
+        if config is None or not config.is_producer:
             return nullcontext()
-        if config.is_producer:
-            if isinstance(attn_metadata, list):
-                raise RuntimeError(
-                    "DSA Sparse P publication does not support attention "
-                    "microbatch metadata."
-                )
-            io_operator = self.dsa_sparse_mock_io_operator
-            if io_operator is None:
-                raise RuntimeError(
-                    "DSA Sparse P publication has no I/O operator."
-                )
-            request_ids = list(self.input_batch.req_ids[:num_reqs])
-            scheduled_counts = [
-                int(count)
-                for count in num_scheduled_tokens[:num_reqs]
-            ]
-            stored_counts: list[int] = []
-            publish_requests: list[bool] = []
-            for request_id, scheduled_count in zip(
-                request_ids,
-                scheduled_counts,
-            ):
-                request_state = self.requests[request_id]
-                stored_token_count = (
-                    request_state.num_prompt_tokens
-                )
-                stored_counts.append(stored_token_count)
-                prefill_start = request_state.num_computed_tokens
-                publish_requests.append(
-                    prefill_start < stored_token_count
-                    <= prefill_start + scheduled_count
-                )
-            if not any(publish_requests):
-                return nullcontext()
-            layer_metadata = {
-                layer_name: metadata
-                for layer_name, metadata in attn_metadata.items()
-                if hasattr(
-                    metadata,
-                    "dsa_sparse_producer_context",
-                )
-            }
-            if not layer_metadata:
-                raise RuntimeError(
-                    "DSA Sparse P publication found no SFA layer metadata."
-                )
-            return begin_dsa_sparse_producer_execution(
-                io_operator=io_operator,
-                request_ids=request_ids,
-                scheduled_token_counts=scheduled_counts,
-                stored_token_counts=stored_counts,
-                publish_requests=publish_requests,
-                layer_metadata=layer_metadata,
-                block_size=self.block_size,
-            )
-        if self.dsa_sparse_eager_runtime is None:
-            raise RuntimeError(
-                "DSA Sparse eager Decode is enabled, but no runtime is bound. "
-                "Initialize the eager mock runtime before executing the "
-                "model."
-            )
-        if self.attn_state != AscendAttentionState.DecodeOnly:
-            raise RuntimeError(
-                "DSA Sparse eager accepts only DecodeOnly batches, got "
-                f"{self.attn_state!r}."
-            )
         if isinstance(attn_metadata, list):
             raise RuntimeError(
-                "DSA Sparse eager Decode does not support attention "
+                "DSA Sparse P TopK capture does not support attention "
                 "microbatch metadata."
             )
 
         request_ids = list(self.input_batch.req_ids[:num_reqs])
-        scheduled = num_scheduled_tokens[:num_reqs]
-        if any(int(count) != 1 for count in scheduled):
-            raise RuntimeError(
-                "DSA Sparse currently requires exactly one decode token "
-                "per request per model forward."
+        scheduled_counts = [
+            int(count) for count in num_scheduled_tokens[:num_reqs]
+        ]
+        publish_requests: list[bool] = []
+        for request_id, scheduled_count in zip(
+            request_ids, scheduled_counts
+        ):
+            request_state = self.requests[request_id]
+            stored_token_count = request_state.num_prompt_tokens
+            prefill_start = request_state.num_computed_tokens
+            publish_requests.append(
+                prefill_start < stored_token_count
+                <= prefill_start + scheduled_count
             )
-        return self.dsa_sparse_eager_runtime.begin_target_batch(
+        if not any(publish_requests):
+            return nullcontext()
+
+        layer_metadata = {
+            layer_name: metadata
+            for layer_name, metadata in attn_metadata.items()
+            if hasattr(metadata, "dsa_sparse_producer_context")
+        }
+        if not layer_metadata:
+            raise RuntimeError(
+                "DSA Sparse P TopK capture found no SFA layer metadata."
+            )
+        return begin_dsa_sparse_producer_execution(
             request_ids=request_ids,
-            query_positions=positions[:num_reqs],
-            layer_metadata=attn_metadata,
+            scheduled_token_counts=scheduled_counts,
+            publish_requests=publish_requests,
+            layer_metadata=layer_metadata,
         )
 
     def _init_device_properties(self) -> None:
@@ -1131,87 +1059,35 @@ class NPUModelRunner(GPUModelRunner):
                 if num_computed_tokens < req_state.num_computed_tokens:
                     req_state.prev_num_draft_len = 0
 
-        runtime = getattr(self, "dsa_sparse_eager_runtime", None)
-        resumed_req_ids = set(req_data.resumed_req_ids)
-        finished_req_ids = set(scheduler_output.finished_req_ids)
-        preempted_req_ids = set(
-            scheduler_output.preempted_req_ids or ()
-        )
-        mock_runtime = (
-            runtime
-            if runtime is not None and runtime.uses_mock_lifecycle
-            else None
-        )
-        retiring_req_ids = (
-            finished_req_ids
-            | preempted_req_ids
-            | resumed_req_ids
-        )
-        if mock_runtime is not None:
-            mock_runtime.preflight_mock_retire(retiring_req_ids)
-
         deferred_correction = super()._update_states(scheduler_output)
 
-        if mock_runtime is not None:
+        if self._uses_dsa_sparse_main_cache():
+            retiring_req_ids = set(scheduler_output.finished_req_ids)
+            retiring_req_ids.update(
+                scheduler_output.preempted_req_ids or ()
+            )
             for request_id in retiring_req_ids:
-                if mock_runtime.has_mock_request(request_id):
-                    mock_runtime.retire_mock_request(
-                        request_id,
-                        preempted=(
-                            request_id in preempted_req_ids
-                            or request_id in resumed_req_ids
-                        ),
-                    )
+                self._release_dsa_sparse_request(request_id)
 
-            admission_order = [
-                request.req_id
-                for request in scheduler_output.scheduled_new_reqs
-            ]
-            admission_order.extend(req_data.resumed_req_ids)
-            admitted_request_ids: list[str] = []
-            try:
-                for request_id in dict.fromkeys(admission_order):
-                    mock_runtime.admit_mock_request(request_id)
-                    admitted_request_ids.append(request_id)
-                    handoff = self._dsa_sparse_pd_handoffs.get(
-                        request_id
-                    )
-                    if handoff is not None:
-                        mock_runtime.initialize_mock_request_from_handoff(
-                            request_id,
-                            handoff,
-                            rank=get_tp_group().rank_in_group,
-                        )
-            except BaseException as admission_error:
-                for request_id in reversed(admitted_request_ids):
-                    try:
-                        mock_runtime.retire_mock_request(
-                            request_id,
-                            preempted=True,
-                        )
-                    except BaseException as cleanup_error:
-                        add_note = getattr(
-                            admission_error,
-                            "add_note",
-                            None,
-                        )
-                        if add_note is not None:
-                            add_note(
-                                "DSA Sparse mock admission rollback also "
-                                f"failed for {request_id!r}: "
-                                f"{cleanup_error!r}"
-                            )
-                raise
+            for request in scheduler_output.scheduled_new_reqs:
+                self._admit_dsa_sparse_request(
+                    request.req_id,
+                    self._dsa_sparse_pd_handoffs.get(request.req_id),
+                )
+            for request_id in req_data.resumed_req_ids:
+                self._admit_dsa_sparse_request(
+                    request_id,
+                    self._dsa_sparse_pd_handoffs.get(request_id),
+                )
+
             new_request_ids = {
                 request.req_id
-                for request
-                in scheduler_output.scheduled_new_reqs
+                for request in scheduler_output.scheduled_new_reqs
             }
-            for request_id in finished_req_ids - new_request_ids:
-                self._dsa_sparse_pd_handoffs.pop(
-                    request_id,
-                    None,
-                )
+            for request_id in (
+                set(scheduler_output.finished_req_ids) - new_request_ids
+            ):
+                self._dsa_sparse_pd_handoffs.pop(request_id, None)
 
         return deferred_correction
 
@@ -1222,31 +1098,15 @@ class NPUModelRunner(GPUModelRunner):
         config = self.ascend_config.dsa_sparse_config
         if config is None or not config.is_consumer:
             return
-        handoffs = getattr(
-            self,
-            "_dsa_sparse_pd_handoffs",
-            None,
-        )
-        if handoffs is None:
-            handoffs = {}
-            self._dsa_sparse_pd_handoffs = handoffs
         connector_metadata = getattr(
-            scheduler_output,
-            "kv_connector_metadata",
-            None,
+            scheduler_output, "kv_connector_metadata", None
         )
-        requests = getattr(
-            connector_metadata,
-            "requests",
-            None,
-        )
+        requests = getattr(connector_metadata, "requests", None)
         if not isinstance(requests, dict):
             return
         for request_id, request_metadata in requests.items():
             handoff = getattr(
-                request_metadata,
-                "dsa_sparse_handoff",
-                None,
+                request_metadata, "dsa_sparse_handoff", None
             )
             if handoff is None:
                 continue
@@ -1255,21 +1115,13 @@ class NPUModelRunner(GPUModelRunner):
                     "DSA Sparse connector metadata contains an invalid "
                     f"handoff for request {request_id!r}."
                 )
-            current = handoffs.get(
-                request_id
-            )
+            current = self._dsa_sparse_pd_handoffs.get(request_id)
             if current is not None and current != handoff:
                 raise RuntimeError(
                     "DSA Sparse D received conflicting P/D handoffs for "
                     f"request {request_id!r}."
                 )
-            handoffs[request_id] = handoff
-            dsa_sparse_probe.emit_pd_handoff(
-                "handoff_receive",
-                role="D",
-                request_id=request_id,
-                handoff=handoff,
-            )
+            self._dsa_sparse_pd_handoffs[request_id] = handoff
 
     def _pad_query_start_loc_for_fia(
         self,
@@ -2719,6 +2571,11 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
+                self._set_dsa_sparse_req_pool_entries(
+                    attn_metadata,
+                    num_reqs,
+                    num_scheduled_tokens_np,
+                )
 
                 self._sanitize_placeholder_input_ids_for_forward(
                     scheduler_output,
@@ -2767,14 +2624,15 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
-        dsa_sparse_execution = self._begin_dsa_sparse_eager_execution(
-            num_reqs=num_reqs,
-            num_scheduled_tokens=num_scheduled_tokens_np,
-            positions=positions,
-            attn_metadata=attn_metadata,
+        dsa_sparse_producer_execution = (
+            self._begin_dsa_sparse_producer_execution(
+                num_reqs=num_reqs,
+                num_scheduled_tokens=num_scheduled_tokens_np,
+                attn_metadata=attn_metadata,
+            )
         )
         with (
-            dsa_sparse_execution,
+            dsa_sparse_producer_execution,
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
                 attn_metadata,
@@ -4325,19 +4183,17 @@ class NPUModelRunner(GPUModelRunner):
             cache size of each layer
         """
         kv_cache_config = deepcopy(kv_cache_config)
-        if self._uses_dsa_sparse_external_main():
-            external_main_specs = self._dsa_sparse_external_main_specs
-            assert external_main_specs, (
+        if self._uses_dsa_sparse_main_cache():
+            main_specs = self._dsa_sparse_main_specs
+            assert main_specs, (
                 "DSA Sparse Decode Main specs are unavailable. "
                 "get_kv_cache_spec() must run before initialize_kv_cache()."
             )
-            add_external_main_metadata(
+            add_dsa_sparse_main_metadata(
                 kv_cache_config,
-                external_main_specs,
+                main_specs,
             )
-            self.runner_only_attn_layers.update(
-                external_main_specs.layer_names
-            )
+            self.runner_only_attn_layers.update(main_specs)
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
         self._mamba_copy_bufs = None
@@ -4353,7 +4209,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
-        self._initialize_dsa_sparse_eager_mock_runtime()
+        self._initialize_dsa_sparse_coordinators()
         # TODO: refactor the logic of attention
         if (
             self.speculative_config
@@ -4462,7 +4318,7 @@ class NPUModelRunner(GPUModelRunner):
                     num_attn_module,
                 )
 
-        self._bind_dsa_sparse_external_main_placeholders()
+        self._bind_dsa_sparse_main_placeholders()
 
         if self.enable_hamming_sparse is True:
             from vllm_ascend.worker.kvcomp_utils import init_and_bind_hashk_cache
@@ -4477,14 +4333,13 @@ class NPUModelRunner(GPUModelRunner):
 
         return kv_caches
 
-    def _bind_dsa_sparse_external_main_placeholders(self) -> None:
+    def _bind_dsa_sparse_main_placeholders(self) -> None:
         """Bind zero-block Main cache tensors without exporting their storage."""
 
-        if not self._uses_dsa_sparse_external_main():
+        if not self._uses_dsa_sparse_main_cache():
             return
 
-        external_main_specs = self._dsa_sparse_external_main_specs
-        for layer_name, spec in external_main_specs.by_layer.items():
+        for layer_name, spec in self._dsa_sparse_main_specs.items():
             shape_prefix = (
                 0,
                 spec.block_size,
@@ -5363,15 +5218,13 @@ class NPUModelRunner(GPUModelRunner):
             format. Layers that do not need KV cache are not included.
         """
 
-        self._dsa_sparse_external_main_specs = (
-            DSASparseExternalMainSpecs.empty()
-        )
+        self._dsa_sparse_main_specs = {}
         if has_ec_transfer() and get_ec_transfer().is_producer:
             return {}
 
         kv_cache_spec: dict[str, KVCacheSpec] = {}
-        external_main_specs: dict[str, AscendMLAAttentionSpec] = {}
-        use_external_main = self._uses_dsa_sparse_external_main()
+        main_specs: dict[str, AscendMLAAttentionSpec] = {}
+        use_dsa_sparse_main = self._uses_dsa_sparse_main_cache()
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 
@@ -5424,8 +5277,8 @@ class NPUModelRunner(GPUModelRunner):
                         cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                         cache_sparse_sfa_c8=impl.enable_sparse_sfa_c8,
                     )
-                    if use_external_main:
-                        external_main_specs[layer_name] = main_spec
+                    if use_dsa_sparse_main:
+                        main_specs[layer_name] = main_spec
                     else:
                         kv_cache_spec[layer_name] = main_spec
                 elif spec := attn_module.get_kv_cache_spec(self.vllm_config):
@@ -5490,11 +5343,7 @@ class NPUModelRunner(GPUModelRunner):
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
 
-        self._dsa_sparse_external_main_specs = (
-            DSASparseExternalMainSpecs.from_mapping(
-                external_main_specs,
-            )
-        )
+        self._dsa_sparse_main_specs = main_specs
         return kv_cache_spec
 
     def _check_and_update_cudagraph_mode(

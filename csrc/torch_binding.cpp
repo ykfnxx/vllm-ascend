@@ -50,6 +50,8 @@
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
+#include "attention/asu_hbm_index_lookup/asu_hbm_index_lookup_torch_adpt.h"
+#include "attention/asu_hbm_index_maintain_aicpu/asu_hbm_index_maintain_aicpu_torch_adpt.h"
 #include "attention/dsa_sparse_lookup_update/dsa_sparse_lookup_update_torch_adpt.h"
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
@@ -2951,6 +2953,40 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "store_kv_block(Tensor key_in, Tensor key_cache_in, Tensor group_len, Tensor group_key_idx,Tensor group_key_cache_idx, int block_size=0) -> ()"
     );
     ops.impl("store_kv_block", torch::kPrivateUse1, &vllm_ascend::store_kv_block);
+
+    ops.def(
+        "asu_hbm_index_lookup("
+            "Tensor(a!) index, "
+            "Tensor(b!) slot_to_index, "
+            "Tensor(c!) free_slots, "
+            "Tensor(d!) free_head, "
+            "Tensor req_pool_entries, "
+            "Tensor query_index, "
+            "Tensor lookup_mask, "
+            "int req_num"
+        ") -> (Tensor, Tensor)"
+    );
+    ops.impl(
+        "asu_hbm_index_lookup",
+        torch::kPrivateUse1,
+        &vllm_ascend::asu_hbm_index_lookup);
+
+    ops.def(
+        "asu_hbm_index_maintain_aicpu("
+            "Tensor(a!) index, "
+            "Tensor(b!) slot_to_index, "
+            "Tensor(c!) free_slots, "
+            "Tensor(d!) free_head, "
+            "Tensor req_pool_entries, "
+            "Tensor last_query_slots, "
+            "int req_num, "
+            "int seed"
+        ") -> ()"
+    );
+    ops.impl(
+        "asu_hbm_index_maintain_aicpu",
+        torch::kPrivateUse1,
+        &vllm_ascend::asu_hbm_index_maintain_aicpu);
 
     ops.def(
         "dsa_sparse_lookup_update("

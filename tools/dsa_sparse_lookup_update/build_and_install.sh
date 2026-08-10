@@ -10,7 +10,8 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 INSTALL_ROOT="${SCRIPT_DIR}/.install"
 BUILD_ONLY=0
 FORCE_FRESH_CONFIGURE=0
-EXPECTED_OP="dsa_sparse_lookup_update"
+OPERATOR_SELECTION="all"
+SOC_VERSION="ascend950"
 CMAKE_BUILD_DIR="${REPO_ROOT}/csrc/build"
 CMAKE_CACHE="${CMAKE_BUILD_DIR}/CMakeCache.txt"
 
@@ -18,13 +19,17 @@ usage() {
     cat <<'EOF'
 Usage: build_and_install.sh [OPTIONS]
 
-Build only dsa_sparse_lookup_update for Ascend 950 and install it into an
-isolated directory.
+Build selected DSA sparse metadata operators and install them into an isolated
+directory.
 
 Options:
   --build-only           Build the .run package without installing it.
   --fresh                Force a fresh CMake configure while preserving
                          downloaded third-party sources.
+  --operator NAME        simt, lookup, maintain, legacy, or all
+                         (default: all).
+  --soc NAME             ascend950 or ascend910_93
+                         (default: ascend950).
   --install-root PATH    Install root (default: tools/.../.install).
   -h, --help             Show this message.
 EOF
@@ -39,6 +44,22 @@ while (($# > 0)); do
         --fresh)
             FORCE_FRESH_CONFIGURE=1
             shift
+            ;;
+        --operator)
+            if (($# < 2)); then
+                echo "ERROR: --operator requires a value." >&2
+                exit 2
+            fi
+            OPERATOR_SELECTION="$2"
+            shift 2
+            ;;
+        --soc)
+            if (($# < 2)); then
+                echo "ERROR: --soc requires a value." >&2
+                exit 2
+            fi
+            SOC_VERSION="$2"
+            shift 2
             ;;
         --install-root)
             if (($# < 2)); then
@@ -60,6 +81,56 @@ while (($# > 0)); do
     esac
 done
 
+case "${OPERATOR_SELECTION}" in
+    simt)
+        BUILD_OPS="dsa_sparse_lookup_update"
+        EXPECTED_CMAKE_OPS="${BUILD_OPS}"
+        EXPECT_AICPU=0
+        ;;
+    lookup)
+        BUILD_OPS="asu_hbm_index_lookup"
+        EXPECTED_CMAKE_OPS="${BUILD_OPS}"
+        EXPECT_AICPU=0
+        ;;
+    maintain)
+        BUILD_OPS="asu_hbm_index_maintain_aicpu"
+        EXPECTED_CMAKE_OPS="${BUILD_OPS}"
+        EXPECT_AICPU=1
+        ;;
+    legacy)
+        BUILD_OPS="asu_hbm_index_lookup,asu_hbm_index_maintain_aicpu"
+        EXPECTED_CMAKE_OPS="asu_hbm_index_lookup;asu_hbm_index_maintain_aicpu"
+        EXPECT_AICPU=1
+        ;;
+    all)
+        BUILD_OPS="dsa_sparse_lookup_update,asu_hbm_index_lookup,asu_hbm_index_maintain_aicpu"
+        EXPECTED_CMAKE_OPS="dsa_sparse_lookup_update;asu_hbm_index_lookup;asu_hbm_index_maintain_aicpu"
+        EXPECT_AICPU=1
+        ;;
+    *)
+        echo "ERROR: unsupported --operator ${OPERATOR_SELECTION}." >&2
+        usage >&2
+        exit 2
+        ;;
+esac
+
+case "${SOC_VERSION}" in
+    ascend950 | ascend910_93)
+        ;;
+    *)
+        echo "ERROR: unsupported --soc ${SOC_VERSION}." >&2
+        usage >&2
+        exit 2
+        ;;
+esac
+
+if [[ "${SOC_VERSION}" != "ascend950" ]] &&
+    [[ "${OPERATOR_SELECTION}" == "simt" ||
+       "${OPERATOR_SELECTION}" == "all" ]]; then
+    echo "ERROR: the SIMT operator is packaged only for ascend950." >&2
+    exit 2
+fi
+
 if [[ ! -x "${REPO_ROOT}/csrc/build.sh" ]]; then
     echo "ERROR: csrc/build.sh is missing or not executable under ${REPO_ROOT}." >&2
     exit 1
@@ -67,11 +138,13 @@ fi
 
 STALE_CONFIGURE_REASON=""
 if [[ -f "${CMAKE_CACHE}" ]]; then
-    if ! grep -Eq \
-        "^ASCEND_OP_NAME:[^=]*=${EXPECTED_OP}$" \
-        "${CMAKE_CACHE}"; then
-        STALE_CONFIGURE_REASON="cached ASCEND_OP_NAME differs from ${EXPECTED_OP}"
-    elif grep -Eq \
+    CACHED_OPS="$(
+        sed -n 's/^ASCEND_OP_NAME:[^=]*=//p' "${CMAKE_CACHE}"
+    )"
+    CACHED_OPS="${CACHED_OPS//,/;}"
+    if [[ "${CACHED_OPS}" != "${EXPECTED_CMAKE_OPS}" ]]; then
+        STALE_CONFIGURE_REASON="cached ASCEND_OP_NAME differs from ${EXPECTED_CMAKE_OPS}"
+    elif ((EXPECT_AICPU == 0)) && grep -Eq \
         "^AICPU_CUST_OBJ_TARGETS:[^=]*=.+$|^ENABLE_AICPU:BOOL=ON$" \
         "${CMAKE_CACHE}"; then
         STALE_CONFIGURE_REASON="cached AICPU targets are incompatible with the AIV-only operator"
@@ -90,7 +163,7 @@ fi
 
 (
     cd -- "${REPO_ROOT}/csrc"
-    bash build.sh --pkg --ops="${EXPECTED_OP}" --soc=ascend950
+    bash build.sh --pkg --ops="${BUILD_OPS}" --soc="${SOC_VERSION}"
 )
 
 mapfile -t INSTALLER_RECORDS < <(
@@ -124,10 +197,13 @@ if [[ ! -d "${VENDOR_ROOT}" ]]; then
     exit 1
 fi
 
-echo "Installed dsa_sparse_lookup_update under ${INSTALL_ROOT}"
-echo "Correctness:"
-echo "  python3 tools/dsa_sparse_lookup_update/test_correctness.py --install-root ${INSTALL_ROOT}"
-echo "Profile:"
-echo "  python3 tools/dsa_sparse_lookup_update/profile_operator.py --install-root ${INSTALL_ROOT}"
+echo "Installed ${BUILD_OPS} under ${INSTALL_ROOT}"
+if [[ "${OPERATOR_SELECTION}" == "simt" ||
+      "${OPERATOR_SELECTION}" == "all" ]]; then
+    echo "Correctness:"
+    echo "  python3 tools/dsa_sparse_lookup_update/test_correctness.py --install-root ${INSTALL_ROOT}"
+    echo "Profile:"
+    echo "  python3 tools/dsa_sparse_lookup_update/profile_operator.py --install-root ${INSTALL_ROOT}"
+fi
 echo "Benchmark:"
-echo "  python3 tools/dsa_sparse_lookup_update/benchmark_operator.py --install-root ${INSTALL_ROOT} --concurrency 8"
+echo "  python3 tools/dsa_sparse_lookup_update/benchmark_operator.py --install-root ${INSTALL_ROOT} --operator ${OPERATOR_SELECTION} --concurrency 8"

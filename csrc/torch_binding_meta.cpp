@@ -1756,6 +1756,49 @@ void store_kv_block(
 
 } 
 
+std::tuple<at::Tensor, at::Tensor> asu_hbm_index_lookup(
+    at::Tensor& index,
+    at::Tensor& slot_to_index,
+    at::Tensor& free_slots,
+    at::Tensor& free_head,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& query_index,
+    const at::Tensor& lookup_mask,
+    int64_t req_num)
+{
+    (void)index;
+    (void)slot_to_index;
+    (void)free_slots;
+    (void)free_head;
+    (void)req_pool_entries;
+    (void)lookup_mask;
+    (void)req_num;
+    return {
+        at::empty_like(query_index),
+        at::empty_like(query_index),
+    };
+}
+
+void asu_hbm_index_maintain_aicpu(
+    at::Tensor& index,
+    at::Tensor& slot_to_index,
+    at::Tensor& free_slots,
+    at::Tensor& free_head,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& last_query_slots,
+    int64_t req_num,
+    int64_t seed)
+{
+    (void)index;
+    (void)slot_to_index;
+    (void)free_slots;
+    (void)free_head;
+    (void)req_pool_entries;
+    (void)last_query_slots;
+    (void)req_num;
+    (void)seed;
+}
+
 std::tuple<at::Tensor, at::Tensor> dsa_sparse_lookup_update(
     at::Tensor& index,
     at::Tensor& slot_to_index,
@@ -1897,6 +1940,10 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
      // store_kv_block
     ops.impl("store_kv_block_pre", &vllm_ascend::meta::store_kv_block_metadata);
     ops.impl("store_kv_block", &vllm_ascend::meta::store_kv_block);
+    ops.impl("asu_hbm_index_lookup",
+             &vllm_ascend::meta::asu_hbm_index_lookup);
+    ops.impl("asu_hbm_index_maintain_aicpu",
+             &vllm_ascend::meta::asu_hbm_index_maintain_aicpu);
     ops.impl("dsa_sparse_lookup_update",
              &vllm_ascend::meta::dsa_sparse_lookup_update);
     // npu_fused_gdn_gating

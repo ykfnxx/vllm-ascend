@@ -41,35 +41,25 @@ extern "C" __global__ __aicore__ void dsa_sparse_lookup_update(
         tiling_data,
         tiling);
 
-    const uint32_t first_req_id =
-        static_cast<uint32_t>(AscendC::GetBlockIdx());
-    const uint32_t aiv_count =
-        static_cast<uint32_t>(AscendC::GetBlockNum());
-    if (first_req_id >= tiling_data.reqNum ||
-        aiv_count == 0U) {
-        return;
-    }
-
-    for (uint32_t req_id = first_req_id;
-         req_id < tiling_data.reqNum;
-         req_id += aiv_count) {
-        asc_vf_call<
-            DsaSparseLookupUpdate::DsaSparseLookupUpdateSimt>(
-            dim3(DSA_SPARSE_SIMT_THREADS),
-            reinterpret_cast<__gm__ int32_t*>(index),
-            reinterpret_cast<__gm__ int32_t*>(slot_to_index),
-            reinterpret_cast<__gm__ int32_t*>(free_slots),
-            reinterpret_cast<__gm__ int32_t*>(free_head),
-            reinterpret_cast<__gm__ int32_t*>(req_pool_entries),
-            reinterpret_cast<__gm__ int32_t*>(query_index),
-            reinterpret_cast<__gm__ int32_t*>(lookup_mask),
-            reinterpret_cast<__gm__ int32_t*>(slot_out),
-            reinterpret_cast<__gm__ int32_t*>(miss_out),
-            reinterpret_cast<__gm__ int32_t*>(
-                user_workspace),
-            req_id,
-            tiling_data.poolCapacity,
-            tiling_data.workspaceStride);
-    }
+    // Launch one VF per active AIV. The VF distributes complete requests
+    // across the physical AIV grid so the per-request cooperative SIMT work
+    // and UB scratch lifetime stay inside one thread block.
+    __ubuf__ uint32_t
+        shared_scratch[DSA_SPARSE_UB_SCRATCH_WORDS];
+    asc_vf_call<
+        DsaSparseLookupUpdate::DsaSparseLookupUpdateSimt>(
+        dim3(DSA_SPARSE_SIMT_THREADS),
+        reinterpret_cast<__gm__ int32_t*>(index),
+        reinterpret_cast<__gm__ int32_t*>(slot_to_index),
+        reinterpret_cast<__gm__ int32_t*>(free_slots),
+        reinterpret_cast<__gm__ int32_t*>(free_head),
+        reinterpret_cast<__gm__ int32_t*>(req_pool_entries),
+        reinterpret_cast<__gm__ int32_t*>(query_index),
+        reinterpret_cast<__gm__ int32_t*>(lookup_mask),
+        reinterpret_cast<__gm__ int32_t*>(slot_out),
+        reinterpret_cast<__gm__ int32_t*>(miss_out),
+        shared_scratch,
+        tiling_data.reqNum,
+        tiling_data.poolCapacity);
 #endif
 }

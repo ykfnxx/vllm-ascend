@@ -101,7 +101,9 @@ def _read_completion_tokens(response_json: Path) -> int:
     )
 
 
-def _profile_contains_custom_op(profile_dir: Path) -> bool:
+def _profile_contains_custom_op(
+    profile_dir: Path,
+) -> bool:
     profile_files = [
         path
         for path in profile_dir.rglob("*")
@@ -134,30 +136,30 @@ def validate(
     profile_dir: Path,
 ) -> dict[str, int]:
     events = _read_probe_events(decode_log)
-    runtime_events = _events_named(events, "runtime_ready")
+    runtime_events = _events_named(events, "coordinators_ready")
     if len(runtime_events) != 1:
         _fail(
-            "Expected exactly one runtime_ready event, got "
+            "Expected exactly one coordinators_ready event, got "
             f"{len(runtime_events)}"
         )
     runtime = runtime_events[0]
     cohort_count = _require_positive_int(
         runtime.get("cohort_count"),
-        "runtime_ready.cohort_count",
+        "coordinators_ready.cohort_count",
     )
     layer_count = _require_positive_int(
         runtime.get("layer_count"),
-        "runtime_ready.layer_count",
+        "coordinators_ready.layer_count",
     )
     index_topk = _require_positive_int(
         runtime.get("index_topk"),
-        "runtime_ready.index_topk",
+        "coordinators_ready.index_topk",
     )
 
     cohorts = runtime.get("cohorts")
     if not isinstance(cohorts, list) or len(cohorts) != cohort_count:
         _fail(
-            "runtime_ready.cohorts does not match cohort_count: "
+            "coordinators_ready.cohorts does not match cohort_count: "
             f"{cohorts!r}"
         )
     cohort_layers: dict[str, tuple[str, ...]] = {}
@@ -194,7 +196,7 @@ def validate(
         or len(set(declared_layers)) != layer_count
     ):
         _fail(
-            "runtime_ready layer descriptors do not match layer_count: "
+            "coordinators_ready layer descriptors do not match layer_count: "
             f"{declared_layers!r}"
         )
 
@@ -377,10 +379,11 @@ def validate(
             f"{expected_hot_sfa_counts}, got {dict(hot_sfa_counts)}"
         )
 
-    if not _profile_contains_custom_op(profile_dir):
+    if not _profile_contains_custom_op(
+        profile_dir,
+    ):
         _fail(
-            "Decode profile does not contain DsaSparseLookupUpdate, "
-            "dsa_sparse_lookup_update, or aclnnDsaSparseLookupUpdate."
+            "Decode profile does not contain dsa_sparse_lookup_update."
         )
 
     return {
