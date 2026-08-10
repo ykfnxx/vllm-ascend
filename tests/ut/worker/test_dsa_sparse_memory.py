@@ -8,11 +8,6 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from vllm_ascend.attention.dsa_sparse import (
-    DSASparseCacheConfig,
-    DSASparseLayerLayout,
-)
-from vllm_ascend.dsa_sparse_constants import DSA_SPARSE_QUERY_WIDTH
 from vllm_ascend.worker.dsa_sparse_memory import (
     calculate_dsa_sparse_fixed_hbm_bytes,
     reserve_dsa_sparse_fixed_hbm_bytes,
@@ -20,37 +15,23 @@ from vllm_ascend.worker.dsa_sparse_memory import (
 
 
 def test_budget_covers_persistent_lookup_state_and_hot_cache():
-    config = DSASparseCacheConfig(
-        max_num_seqs=2,
-        max_model_len=512,
-        block_size=128,
-        index_topk=DSA_SPARSE_QUERY_WIDTH,
-    )
     layouts = (
-        DSASparseLayerLayout(
-            layer_name="layer.0",
-            plane_dtypes=(torch.bfloat16,),
-            plane_row_shapes=((2, 3),),
-        ),
-        DSASparseLayerLayout(
-            layer_name="layer.1",
-            plane_dtypes=(torch.uint8,),
-            plane_row_shapes=((5,),),
-        ),
+        (torch.bfloat16, 2, 3),
+        (torch.uint8, 1, 5),
     )
 
     breakdown = calculate_dsa_sparse_fixed_hbm_bytes(
-        config,
+        2,
+        128,
         layouts,
         cohort_count=2,
-        backend_auxiliary_bytes=11,
     )
 
     assert breakdown.hot_payload_bytes == 352_512
     assert breakdown.lookup_state_bytes_per_cohort == 1_147_008
     assert breakdown.lookup_state_bytes == 2_294_016
     assert breakdown.core_fixed_tensor_bytes == 2_646_528
-    assert breakdown.fixed_hbm_bytes == 2_646_539
+    assert breakdown.fixed_hbm_bytes == 2_646_528
 
 
 def test_fixed_hbm_calculation_does_not_allocate_tensors(monkeypatch):
@@ -60,21 +41,10 @@ def test_fixed_hbm_calculation_does_not_allocate_tensors(monkeypatch):
     for name in ("empty", "zeros", "full", "arange", "tensor"):
         monkeypatch.setattr(torch, name, reject_tensor_allocation)
 
-    config = DSASparseCacheConfig(
-        max_num_seqs=1,
-        max_model_len=512,
-        block_size=128,
-        index_topk=DSA_SPARSE_QUERY_WIDTH,
-    )
     breakdown = calculate_dsa_sparse_fixed_hbm_bytes(
-        config,
-        (
-            DSASparseLayerLayout(
-                layer_name="layer.0",
-                plane_dtypes=(torch.bfloat16,),
-                plane_row_shapes=((1,),),
-            ),
-        ),
+        1,
+        128,
+        ((torch.bfloat16, 1, 1),),
         cohort_count=1,
     )
 
@@ -83,19 +53,9 @@ def test_fixed_hbm_calculation_does_not_allocate_tensors(monkeypatch):
 
 def test_breakdown_is_immutable():
     breakdown = calculate_dsa_sparse_fixed_hbm_bytes(
-        DSASparseCacheConfig(
-            max_num_seqs=1,
-            max_model_len=512,
-            block_size=128,
-            index_topk=DSA_SPARSE_QUERY_WIDTH,
-        ),
-        (
-            DSASparseLayerLayout(
-                layer_name="layer.0",
-                plane_dtypes=(torch.bfloat16,),
-                plane_row_shapes=((1,),),
-            ),
-        ),
+        1,
+        128,
+        ((torch.bfloat16, 1, 1),),
         cohort_count=1,
     )
 

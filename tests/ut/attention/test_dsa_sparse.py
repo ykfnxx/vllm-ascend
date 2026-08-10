@@ -1,108 +1,141 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
-import pytest
+from unittest.mock import patch
+
 import torch
 
-from vllm_ascend.attention.dsa_sparse import (
-    DSASparseCacheConfig,
-    DSASparseCohortKey,
-    DSASparseLookupState,
-    RequestIndexManager,
-)
+from vllm_ascend.attention.dsa_sparse import DSASparseCoordinator
 from vllm_ascend.dsa_sparse_constants import (
     DSA_SPARSE_FREE_HEAD_STRIDE,
     DSA_SPARSE_FREE_SLOT_COUNT,
     DSA_SPARSE_INDEX_CAPACITY,
     DSA_SPARSE_LOOKUP_SLOT_COUNT,
     DSA_SPARSE_QUERY_WIDTH,
-    DSA_SPARSE_RESIDENT_SLOT_COUNT,
 )
 
 
-def test_cache_config_freezes_asu_dimensions_and_live_tail_layout():
-    config = DSASparseCacheConfig(
+def make_coordinator(
+    leader: DSASparseCoordinator | None = None,
+) -> DSASparseCoordinator:
+    return DSASparseCoordinator(
         max_num_seqs=3,
-        max_model_len=4096,
         block_size=128,
-        index_topk=DSA_SPARSE_QUERY_WIDTH,
-    )
-
-    assert config.index_capacity == DSA_SPARSE_INDEX_CAPACITY
-    assert config.resident_slot_count == DSA_SPARSE_RESIDENT_SLOT_COUNT
-    assert config.free_slot_count == DSA_SPARSE_FREE_SLOT_COUNT
-    assert config.lookup_slot_count == DSA_SPARSE_LOOKUP_SLOT_COUNT
-    assert config.live_tail_start == DSA_SPARSE_LOOKUP_SLOT_COUNT
-    assert config.hot_stride == DSA_SPARSE_LOOKUP_SLOT_COUNT + 128
-    assert config.hot_blocks_per_request == 81
-    assert config.total_hot_blocks == 243
-
-
-def test_cache_config_rejects_non_asu_topk_and_incompatible_block_size():
-    with pytest.raises(ValueError, match="index_topk"):
-        DSASparseCacheConfig(
-            max_num_seqs=1,
-            max_model_len=4096,
-            block_size=128,
-            index_topk=1024,
-        )
-    with pytest.raises(ValueError, match="block_size"):
-        DSASparseCacheConfig(
-            max_num_seqs=1,
-            max_model_len=4096,
-            block_size=192,
-            index_topk=DSA_SPARSE_QUERY_WIDTH,
-        )
-
-
-def test_lookup_state_uses_four_asu_tensors_and_resets_released_row():
-    config = DSASparseCacheConfig(
-        max_num_seqs=2,
-        max_model_len=4096,
-        block_size=128,
-        index_topk=DSA_SPARSE_QUERY_WIDTH,
-    )
-    state = DSASparseLookupState.allocate(
-        config,
-        DSASparseCohortKey("cohort", "target"),
+        plane_layouts=((torch.bfloat16, (1, 576)),),
         device="cpu",
+        leader=leader,
     )
 
-    assert state.index.shape == (2, DSA_SPARSE_INDEX_CAPACITY)
-    assert state.slot_to_index.shape == (
-        2,
-        DSA_SPARSE_LOOKUP_SLOT_COUNT,
+
+def semantic_topk() -> torch.Tensor:
+    topk = torch.full(
+        (2, 1, DSA_SPARSE_QUERY_WIDTH),
+        -1,
+        dtype=torch.int64,
     )
-    assert state.free_slots.shape == (2, DSA_SPARSE_FREE_SLOT_COUNT)
-    assert state.free_head.shape == (2, DSA_SPARSE_FREE_HEAD_STRIDE)
-    assert state.free_slots[0, 0].item() == DSA_SPARSE_RESIDENT_SLOT_COUNT
-    assert state.free_slots[0, -1].item() == DSA_SPARSE_LOOKUP_SLOT_COUNT - 1
-
-    state.initialize_resident(0)
-    assert state.index[0, 0].item() == 0
-    assert state.index[0, 8191].item() == 8191
-    assert state.slot_to_index[0, 0].item() == 0
-    assert state.slot_to_index[0, 8191].item() == 8191
-
-    state.index[1, 7] = 9
-    state.slot_to_index[1, 3] = 7
-    state.free_slots[1].fill_(-1)
-    state.free_head[1].fill_(6)
-    state.reset_request(1)
-
-    assert state.index[1].eq(-1).all()
-    assert state.slot_to_index[1].eq(-1).all()
-    assert state.free_slots[1, 0].item() == DSA_SPARSE_RESIDENT_SLOT_COUNT
-    assert state.free_slots[1, -1].item() == DSA_SPARSE_LOOKUP_SLOT_COUNT - 1
-    assert state.free_head[1].eq(0).all()
+    topk[0, 0, :2] = torch.tensor([10, 130])
+    topk[1, 0, :2] = torch.tensor([20, 258])
+    return topk
 
 
-def test_request_index_is_stable_and_can_be_non_contiguous():
-    manager = RequestIndexManager(3)
-    assert manager.acquire("a") == 0
-    assert manager.acquire("b") == 1
-    assert manager.acquire("c") == 2
-    assert manager.release("b") == 1
+def test_coordinator_owns_per_layer_hot_cache_and_leader_lookup_state():
+    leader = make_coordinator()
+    follower = make_coordinator(leader)
 
-    assert manager.get_index("a") == 0
-    assert manager.get_index("c") == 2
+    assert leader.hot_main_cache[0].shape == (243, 128, 1, 576)
+    assert follower.hot_main_cache[0].shape == (243, 128, 1, 576)
+    assert follower.hot_main_cache[0] is not leader.hot_main_cache[0]
+    assert leader.index.shape == (3, DSA_SPARSE_INDEX_CAPACITY)
+    assert leader.slot_to_index.shape == (3, DSA_SPARSE_LOOKUP_SLOT_COUNT)
+    assert leader.free_slots.shape == (3, DSA_SPARSE_FREE_SLOT_COUNT)
+    assert leader.free_head.shape == (3, DSA_SPARSE_FREE_HEAD_STRIDE)
+    assert follower.index is None
+    assert follower.slot_to_index is None
+    assert follower.free_slots is None
+    assert follower.free_head is None
+
+
+def test_request_initialization_and_release_reset_the_leader_row():
+    coordinator = make_coordinator()
+
+    coordinator.initialize_request(1)
+    assert coordinator.index[1, 0].item() == 0
+    assert coordinator.index[1, 8191].item() == 8191
+    assert coordinator.slot_to_index[1, 8191].item() == 8191
+    assert coordinator.free_slots[1, 0].item() == 8192
+    assert coordinator.free_slots[1, -1].item() == 10239
+
+    coordinator.index[1, 9000] = 7
+    coordinator.free_head[1].fill_(9)
+    coordinator.reset_request(1)
+    assert coordinator.index[1].eq(-1).all()
+    assert coordinator.slot_to_index[1].eq(-1).all()
+    assert coordinator.free_slots[1, 0].item() == 8192
+    assert coordinator.free_slots[1, -1].item() == 10239
+    assert coordinator.free_head[1].eq(0).all()
+
+
+def test_request_initialization_maps_custom_residents_to_stable_slots():
+    coordinator = make_coordinator()
+
+    coordinator.initialize_request(1, [255, 7, 3, 128])
+
+    assert coordinator.index[1, 255].item() == 0
+    assert coordinator.index[1, 7].item() == 1
+    assert coordinator.index[1, 3].item() == 2
+    assert coordinator.index[1, 128].item() == 3
+    assert coordinator.index[1, 0].item() == -1
+    assert coordinator.slot_to_index[1, :5].tolist() == [
+        255,
+        7,
+        3,
+        128,
+        -1,
+    ]
+
+
+def test_main_write_uses_stable_pool_entry_and_live_tail_offset():
+    coordinator = make_coordinator()
+    slots = coordinator.build_main_slot_mapping(
+        torch.tensor([0, 2], dtype=torch.int32),
+        torch.tensor([131, 261], dtype=torch.int32),
+    )
+
+    assert slots.tolist() == [10242, 2 * 10368 + 10244]
+    assert slots.dtype == torch.int32
+
+
+def test_leader_resolves_once_and_follower_reuses_the_same_plan():
+    leader = make_coordinator()
+    follower = make_coordinator(leader)
+    req_pool_entries = torch.tensor([0, 2], dtype=torch.int32)
+    seq_lens = torch.tensor([131, 261], dtype=torch.int32)
+    calls = []
+
+    def fake_lookup(*args):
+        calls.append(args)
+        query_index = args[5]
+        lookup_mask = args[6]
+        return torch.full_like(query_index, 77), lookup_mask.clone()
+
+    with patch(
+        "vllm_ascend.attention.dsa_sparse.dsa_sparse_lookup_update",
+        side_effect=fake_lookup,
+    ):
+        leader.resolve(semantic_topk(), req_pool_entries, seq_lens)
+        follower.reuse_leader_plan(req_pool_entries)
+
+    assert len(calls) == 1
+    assert calls[0][4] is req_pool_entries
+    assert calls[0][5].shape == (2, DSA_SPARSE_QUERY_WIDTH)
+    assert calls[0][6][0, :3].tolist() == [1, 0, 0]
+    assert calls[0][6][1, :3].tolist() == [1, 0, 0]
+    assert leader.attention_indices[0, :3].tolist() == [77, 10242, -1]
+    assert leader.attention_indices[1, :3].tolist() == [77, 10242, -1]
+    assert leader.hot_block_table.shape == (2, 81)
+    assert leader.hot_block_table[0, :2].tolist() == [0, 1]
+    assert leader.hot_block_table[1, :2].tolist() == [162, 163]
+    assert follower.attention_indices is leader.attention_indices
+    assert follower.hot_block_table is leader.hot_block_table
+    assert follower.slot_out is leader.slot_out
+    assert follower.miss_out is leader.miss_out
