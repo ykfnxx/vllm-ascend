@@ -236,7 +236,7 @@ esac
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="${OUTPUT_ROOT%/}/${TIMESTAMP}"
-BENCHMARK_OUTPUT="${RUN_DIR}/benchmark.json"
+BENCHMARK_OUTPUT="${RUN_DIR}/benchmark-{pid}-{timestamp_ns}.json"
 PREWARM_OUTPUT="${RUN_DIR}/prewarm.json"
 
 PROFILE_COMMAND+=(

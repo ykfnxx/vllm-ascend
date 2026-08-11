@@ -184,7 +184,10 @@ The fused operator mutates its index and slot state in place. The wrapper uses
 state restoration; kernel-level replay would turn the first replay's misses
 into hits on later replays. Since msopprof warm-up is incompatible with
 application replay, `--warm-up` runs a standalone benchmark before starting
-the profiler instead.
+the profiler instead. Roofline also replays the application for its bound
+Default metric collection. Each replay writes its benchmark result to
+`benchmark-{pid}-{timestamp_ns}.json`, so replay processes never target the
+same JSON path.
 
 Inspect the complete command without accessing an NPU:
 

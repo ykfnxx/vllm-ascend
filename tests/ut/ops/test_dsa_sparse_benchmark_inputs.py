@@ -242,3 +242,6 @@ def test_roofline_profiles_stateful_operator_with_application_replay() -> None:
     assert "--warmup 3" in prewarm_command
     assert "--replay-mode=application" in roofline_command
     assert "--warm-up=" not in roofline_command
+    assert "benchmark-\\{pid\\}-\\{timestamp_ns\\}.json" in (
+        roofline_command
+    )
