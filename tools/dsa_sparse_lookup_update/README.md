@@ -179,6 +179,13 @@ back to the compatible `msprof op` entry point. It collects
 The default result root is
 `tools/dsa_sparse_lookup_update/roofline_profiles/`.
 
+The fused operator mutates its index and slot state in place. The wrapper uses
+`--replay-mode=application` so every profiler replay also reruns the benchmark
+state restoration; kernel-level replay would turn the first replay's misses
+into hits on later replays. Since msopprof warm-up is incompatible with
+application replay, `--warm-up` runs a standalone benchmark before starting
+the profiler instead.
+
 Inspect the complete command without accessing an NPU:
 
 ```bash

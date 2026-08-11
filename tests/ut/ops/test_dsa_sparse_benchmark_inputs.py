@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -15,6 +16,12 @@ COMMON_PATH = (
     / "tools"
     / "dsa_sparse_lookup_update"
     / "common.py"
+)
+ROOFLINE_SCRIPT = (
+    ROOT
+    / "tools"
+    / "dsa_sparse_lookup_update"
+    / "profile_roofline.sh"
 )
 SPEC = importlib.util.spec_from_file_location(
     "dsa_sparse_benchmark_common",
@@ -205,3 +212,33 @@ def test_workload_rejects_miss_count_outside_query_width() -> None:
             miss_count=COMMON.QUERY_COUNT + 1,
             seed=0,
         )
+
+
+def test_roofline_profiles_stateful_operator_with_application_replay() -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOFLINE_SCRIPT),
+            "--tool",
+            "msopprof",
+            "--warm-up",
+            "3",
+            "--miss-count",
+            "205",
+            "--dry-run",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    output_lines = result.stdout.splitlines()
+    prewarm_command = next(
+        line for line in output_lines if line.startswith("Prewarm command:")
+    )
+    roofline_command = next(
+        line for line in output_lines if line.startswith("Roofline command:")
+    )
+
+    assert "--warmup 3" in prewarm_command
+    assert "--replay-mode=application" in roofline_command
+    assert "--warm-up=" not in roofline_command

@@ -14,7 +14,7 @@ REQUESTS=32
 MISS_RATE=10
 MISS_COUNT=""
 SEED=1234
-PROFILER_WARMUP=10
+PREWARM_ITERATIONS=10
 LAUNCH_COUNT=1
 KERNEL_NAME="DsaSparseLookupUpdate"
 OUTPUT_ROOT="${SCRIPT_DIR}/roofline_profiles"
@@ -38,7 +38,9 @@ Options:
   --miss-count N          Exact misses in each 2K query; mutually exclusive
                           with --miss-rate.
   --seed N                Random workload seed (default: 1234).
-  --warm-up N             msopprof warm-up count (default: 10).
+  --warm-up N             Standalone benchmark warm-up count before profiling
+                          (default: 10). Application replay cannot use the
+                          msopprof --warm-up option.
   --launch-count N        Target kernel launches to collect (default: 1).
   --kernel-name NAME      Device kernel name filter
                           (default: DsaSparseLookupUpdate).
@@ -94,7 +96,7 @@ while (($# > 0)); do
             ;;
         --warm-up)
             require_value "$@"
-            PROFILER_WARMUP="$2"
+            PREWARM_ITERATIONS="$2"
             shift 2
             ;;
         --launch-count)
@@ -147,7 +149,7 @@ case "${TOOL}" in
         ;;
 esac
 
-for value_name in REQUESTS SEED PROFILER_WARMUP LAUNCH_COUNT; do
+for value_name in REQUESTS SEED PREWARM_ITERATIONS LAUNCH_COUNT; do
     value="${!value_name}"
     if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
         echo "ERROR: ${value_name,,} must be a non-negative integer." >&2
@@ -235,16 +237,17 @@ esac
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="${OUTPUT_ROOT%/}/${TIMESTAMP}"
 BENCHMARK_OUTPUT="${RUN_DIR}/benchmark.json"
+PREWARM_OUTPUT="${RUN_DIR}/prewarm.json"
 
 PROFILE_COMMAND+=(
     "--output=${RUN_DIR}"
-    "--warm-up=${PROFILER_WARMUP}"
     "--launch-count=${LAUNCH_COUNT}"
     "--aic-metrics=Roofline"
     "--kernel-name=${KERNEL_NAME}"
+    "--replay-mode=application"
 )
 
-APP_COMMAND=(
+COMMON_APP_COMMAND=(
     python3
     "${SCRIPT_DIR}/benchmark_operator.py"
     --device "${DEVICE}"
@@ -253,14 +256,31 @@ APP_COMMAND=(
     --concurrency "${REQUESTS}"
     --scenario churn
     --seed "${SEED}"
+)
+if ((MISS_COUNT_SET)); then
+    COMMON_APP_COMMAND+=(--miss-count "${MISS_COUNT}")
+else
+    COMMON_APP_COMMAND+=(--miss-rate "${MISS_RATE}")
+fi
+
+PREWARM_COMMAND=(
+    "${COMMON_APP_COMMAND[@]}"
+    --warmup "${PREWARM_ITERATIONS}"
+    --iterations 1
+    --output "${PREWARM_OUTPUT}"
+)
+
+APP_COMMAND=(
+    "${COMMON_APP_COMMAND[@]}"
     --warmup 1
     --iterations 1
     --output "${BENCHMARK_OUTPUT}"
 )
-if ((MISS_COUNT_SET)); then
-    APP_COMMAND+=(--miss-count "${MISS_COUNT}")
-else
-    APP_COMMAND+=(--miss-rate "${MISS_RATE}")
+
+if ((PREWARM_ITERATIONS > 0)); then
+    printf 'Prewarm command:'
+    printf ' %q' "${PREWARM_COMMAND[@]}"
+    printf '\n'
 fi
 
 printf 'Roofline command:'
@@ -273,6 +293,9 @@ fi
 
 mkdir -p -- "${RUN_DIR}"
 cd -- "${REPO_ROOT}"
+if ((PREWARM_ITERATIONS > 0)); then
+    "${PREWARM_COMMAND[@]}"
+fi
 "${PROFILE_COMMAND[@]}" "${APP_COMMAND[@]}"
 
 echo "Roofline profile root: ${RUN_DIR}"
