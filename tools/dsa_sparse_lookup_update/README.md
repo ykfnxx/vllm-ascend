@@ -158,6 +158,37 @@ writes a manifest and, unless `--no-trace` is used, a parsed
 `tools/dsa_sparse_lookup_update/profiles/<timestamp>/`. The script fails if
 the parsed profile does not contain the custom operator name.
 
+## Roofline profile
+
+Use the standalone benchmark rather than `profile_operator.py` so that the
+outer msopprof session does not conflict with an inner `torch_npu.profiler`
+session:
+
+```bash
+bash tools/dsa_sparse_lookup_update/profile_roofline.sh \
+  --device npu:2 \
+  --requests 32 \
+  --miss-rate 10
+```
+
+The script automatically uses the CANN 9.x `msopprof` executable and falls
+back to the compatible `msprof op` entry point. It collects
+`DsaSparseLookupUpdate` with `--aic-metrics=Roofline` and prints the generated
+`visualize_data.bin` path for import into MindStudio Insight. Use
+`--miss-count` instead of `--miss-rate` when an exact miss count is required.
+The default result root is
+`tools/dsa_sparse_lookup_update/roofline_profiles/`.
+
+Inspect the complete command without accessing an NPU:
+
+```bash
+bash tools/dsa_sparse_lookup_update/profile_roofline.sh \
+  --device npu:2 \
+  --requests 32 \
+  --miss-count 205 \
+  --dry-run
+```
+
 The single-operator profiler supports the same cache-behavior workloads as the
 matrix profiler:
 
