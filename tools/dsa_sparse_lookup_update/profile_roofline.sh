@@ -17,6 +17,8 @@ SEED=1234
 PREWARM_ITERATIONS=10
 LAUNCH_COUNT=1
 KERNEL_NAME="DsaSparseLookupUpdate"
+REPLAY_MODE="application"
+PROFILER_WARM_UP=0
 OUTPUT_ROOT="${SCRIPT_DIR}/roofline_profiles"
 TOOL="auto"
 DRY_RUN=0
@@ -39,8 +41,12 @@ Options:
                           with --miss-rate.
   --seed N                Random workload seed (default: 1234).
   --warm-up N             Standalone benchmark warm-up count before profiling
-                          (default: 10). Application replay cannot use the
-                          msopprof --warm-up option.
+                          (default: 10).
+  --profiler-warm-up N    msopprof kernel warm-up count (default: 0). Keep this
+                          at 0 when profiling stateful miss workloads.
+  --replay-mode MODE      application or kernel (default: application).
+                          Kernel replay is only workload-stable for idempotent
+                          inputs such as --miss-rate 0.
   --launch-count N        Target kernel launches to collect (default: 1).
   --kernel-name NAME      Device kernel name filter
                           (default: DsaSparseLookupUpdate).
@@ -99,6 +105,16 @@ while (($# > 0)); do
             PREWARM_ITERATIONS="$2"
             shift 2
             ;;
+        --profiler-warm-up)
+            require_value "$@"
+            PROFILER_WARM_UP="$2"
+            shift 2
+            ;;
+        --replay-mode)
+            require_value "$@"
+            REPLAY_MODE="$2"
+            shift 2
+            ;;
         --launch-count)
             require_value "$@"
             LAUNCH_COUNT="$2"
@@ -149,7 +165,17 @@ case "${TOOL}" in
         ;;
 esac
 
-for value_name in REQUESTS SEED PREWARM_ITERATIONS LAUNCH_COUNT; do
+case "${REPLAY_MODE}" in
+    application | kernel)
+        ;;
+    *)
+        echo "ERROR: --replay-mode must be application or kernel." >&2
+        exit 2
+        ;;
+esac
+
+for value_name in \
+    REQUESTS SEED PREWARM_ITERATIONS PROFILER_WARM_UP LAUNCH_COUNT; do
     value="${!value_name}"
     if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
         echo "ERROR: ${value_name,,} must be a non-negative integer." >&2
@@ -244,7 +270,8 @@ PROFILE_COMMAND+=(
     "--launch-count=${LAUNCH_COUNT}"
     "--aic-metrics=Roofline"
     "--kernel-name=${KERNEL_NAME}"
-    "--replay-mode=application"
+    "--replay-mode=${REPLAY_MODE}"
+    "--warm-up=${PROFILER_WARM_UP}"
 )
 
 COMMON_APP_COMMAND=(

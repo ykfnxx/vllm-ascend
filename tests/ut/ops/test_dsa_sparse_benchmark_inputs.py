@@ -241,7 +241,36 @@ def test_roofline_profiles_stateful_operator_with_application_replay() -> None:
 
     assert "--warmup 3" in prewarm_command
     assert "--replay-mode=application" in roofline_command
-    assert "--warm-up=" not in roofline_command
+    assert "--warm-up=0" in roofline_command
     assert "benchmark-\\{pid\\}-\\{timestamp_ns\\}.json" in (
         roofline_command
     )
+
+
+def test_roofline_accepts_kernel_replay() -> None:
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOFLINE_SCRIPT),
+            "--tool",
+            "msopprof",
+            "--replay-mode",
+            "kernel",
+            "--profiler-warm-up",
+            "0",
+            "--miss-rate",
+            "0",
+            "--dry-run",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    roofline_command = next(
+        line
+        for line in result.stdout.splitlines()
+        if line.startswith("Roofline command:")
+    )
+
+    assert "--replay-mode=kernel" in roofline_command
+    assert "--warm-up=0" in roofline_command

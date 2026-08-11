@@ -168,6 +168,7 @@ session:
 bash tools/dsa_sparse_lookup_update/profile_roofline.sh \
   --device npu:2 \
   --requests 32 \
+  --replay-mode application \
   --miss-rate 10
 ```
 
@@ -179,15 +180,30 @@ back to the compatible `msprof op` entry point. It collects
 The default result root is
 `tools/dsa_sparse_lookup_update/roofline_profiles/`.
 
-The fused operator mutates its index and slot state in place. The wrapper uses
-`--replay-mode=application` so every profiler replay also reruns the benchmark
-state restoration; kernel-level replay would turn the first replay's misses
-into hits on later replays. Since msopprof warm-up is incompatible with
-application replay, `--warm-up` runs a standalone benchmark before starting
-the profiler instead. Roofline also replays the application for its bound
-Default metric collection. Each replay writes its benchmark result to
+The fused operator mutates its index and slot state in place. The default
+`--replay-mode application` reruns the benchmark input initialization for every
+profiler replay. `--replay-mode kernel` can be selected explicitly for
+idempotent workloads such as `--miss-rate 0`; with nonzero misses, later kernel
+replays observe the index state written by earlier replays and no longer
+represent the same workload. The wrapper passes `--warm-up=0` to msopprof by
+default so profiler-internal kernel warm-up does not mutate the target state.
+Use `--profiler-warm-up` only when that behavior is intentional. The existing
+`--warm-up` option controls a standalone benchmark run before profiling.
+
+In application mode, Roofline reruns the application for its bound Default
+metric collection. Each application replay writes its benchmark result to
 `benchmark-{pid}-{timestamp_ns}.json`, so replay processes never target the
 same JSON path.
+
+Use kernel replay for a read-only all-hit diagnostic:
+
+```bash
+bash tools/dsa_sparse_lookup_update/profile_roofline.sh \
+  --device npu:2 \
+  --requests 32 \
+  --replay-mode kernel \
+  --miss-rate 0
+```
 
 Inspect the complete command without accessing an NPU:
 
