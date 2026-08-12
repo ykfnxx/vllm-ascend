@@ -8,7 +8,7 @@
 #include "arch35/dsa_sparse_lookup_update_simt.h"
 #include "dsa_sparse_lookup_update_common.h"
 
-extern "C" __global__ __vector__ void dsa_sparse_lookup_update(
+extern "C" __vector__ __global__ __aicore__ void dsa_sparse_lookup_update(
     GM_ADDR index,
     GM_ADDR slot_to_index,
     GM_ADDR free_slots,
