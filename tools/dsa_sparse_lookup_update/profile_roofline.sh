@@ -14,7 +14,7 @@ REQUESTS=32
 MISS_RATE=10
 MISS_COUNT=""
 SEED=1234
-PREWARM_ITERATIONS=10
+PREWARM_ITERATIONS=1
 LAUNCH_COUNT=1
 KERNEL_NAME="DsaSparseLookupUpdate"
 REPLAY_MODE="application"
@@ -28,20 +28,22 @@ usage() {
 Usage: profile_roofline.sh [OPTIONS]
 
 Collect a Roofline profile for the standalone Ascend 950
-DsaSparseLookupUpdate SIMT operator. The script wraps benchmark_operator.py
-with CANN msopprof (or the compatible "msprof op" entry point) and produces
+DsaSparseLookupUpdate SIMT operator. The profiled application constructs one
+workload, launches DsaSparseLookupUpdate exactly once, and exits. CANN
+msopprof (or the compatible "msprof op" entry point) produces
 visualize_data.bin for MindStudio Insight.
 
 Options:
-  --device DEVICE         NPU device used by the benchmark (default: npu:0).
+  --device DEVICE         NPU device used by the one-shot runner
+                          (default: npu:0).
   --install-root PATH     Isolated custom-op install root.
   --requests N            Concurrent request rows (default: 32).
   --miss-rate PERCENT     Miss percentage in each 2K query (default: 10).
   --miss-count N          Exact misses in each 2K query; mutually exclusive
                           with --miss-rate.
   --seed N                Random workload seed (default: 1234).
-  --warm-up N             Standalone benchmark warm-up count before profiling
-                          (default: 10).
+  --warm-up N             One-shot application runs before profiling
+                          (default: 1). These runs are outside msopprof.
   --profiler-warm-up N    msopprof kernel warm-up count (default: 0). Keep this
                           at 0 when profiling stateful miss workloads.
   --replay-mode MODE      application or kernel (default: application).
@@ -262,9 +264,6 @@ esac
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="${OUTPUT_ROOT%/}/${TIMESTAMP}"
-BENCHMARK_OUTPUT="${RUN_DIR}/benchmark-{pid}-{timestamp_ns}.json"
-PREWARM_OUTPUT="${RUN_DIR}/prewarm.json"
-
 PROFILE_COMMAND+=(
     "--output=${RUN_DIR}"
     "--launch-count=${LAUNCH_COUNT}"
@@ -276,12 +275,10 @@ PROFILE_COMMAND+=(
 
 COMMON_APP_COMMAND=(
     python3
-    "${SCRIPT_DIR}/benchmark_operator.py"
+    "${SCRIPT_DIR}/roofline_once.py"
     --device "${DEVICE}"
     --install-root "${INSTALL_ROOT}"
-    --operator simt
-    --concurrency "${REQUESTS}"
-    --scenario churn
+    --requests "${REQUESTS}"
     --seed "${SEED}"
 )
 if ((MISS_COUNT_SET)); then
@@ -292,22 +289,17 @@ fi
 
 PREWARM_COMMAND=(
     "${COMMON_APP_COMMAND[@]}"
-    --warmup "${PREWARM_ITERATIONS}"
-    --iterations 1
-    --output "${PREWARM_OUTPUT}"
+    --quiet
 )
 
 APP_COMMAND=(
     "${COMMON_APP_COMMAND[@]}"
-    --warmup 1
-    --iterations 1
-    --output "${BENCHMARK_OUTPUT}"
 )
 
 if ((PREWARM_ITERATIONS > 0)); then
     printf 'Prewarm command:'
     printf ' %q' "${PREWARM_COMMAND[@]}"
-    printf '\n'
+    printf '  # repeat=%s\n' "${PREWARM_ITERATIONS}"
 fi
 
 printf 'Roofline command:'
@@ -321,7 +313,9 @@ fi
 mkdir -p -- "${RUN_DIR}"
 cd -- "${REPO_ROOT}"
 if ((PREWARM_ITERATIONS > 0)); then
-    "${PREWARM_COMMAND[@]}"
+    for ((iteration = 0; iteration < PREWARM_ITERATIONS; ++iteration)); do
+        "${PREWARM_COMMAND[@]}"
+    done
 fi
 "${PROFILE_COMMAND[@]}" "${APP_COMMAND[@]}"
 

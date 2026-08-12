@@ -160,9 +160,9 @@ the parsed profile does not contain the custom operator name.
 
 ## Roofline profile
 
-Use the standalone benchmark rather than `profile_operator.py` so that the
-outer msopprof session does not conflict with an inner `torch_npu.profiler`
-session:
+Use the dedicated one-shot runner so that the outer msopprof session sees
+exactly one `DsaSparseLookupUpdate` launch. The Roofline path does not call the
+benchmark or start an inner `torch_npu.profiler` session:
 
 ```bash
 bash tools/dsa_sparse_lookup_update/profile_roofline.sh \
@@ -181,19 +181,19 @@ The default result root is
 `tools/dsa_sparse_lookup_update/roofline_profiles/`.
 
 The fused operator mutates its index and slot state in place. The default
-`--replay-mode application` reruns the benchmark input initialization for every
+`--replay-mode application` reruns the one-shot input initialization for every
 profiler replay. `--replay-mode kernel` can be selected explicitly for
 idempotent workloads such as `--miss-rate 0`; with nonzero misses, later kernel
 replays observe the index state written by earlier replays and no longer
 represent the same workload. The wrapper passes `--warm-up=0` to msopprof by
 default so profiler-internal kernel warm-up does not mutate the target state.
 Use `--profiler-warm-up` only when that behavior is intentional. The existing
-`--warm-up` option controls a standalone benchmark run before profiling.
+`--warm-up` option controls how many one-shot processes run before profiling;
+these runs are outside msopprof and do not add target launches to the profile.
 
 In application mode, Roofline reruns the application for its bound Default
-metric collection. Each application replay writes its benchmark result to
-`benchmark-{pid}-{timestamp_ns}.json`, so replay processes never target the
-same JSON path.
+metric collection. Every replay reconstructs the same deterministic workload,
+launches the target once, synchronizes, and exits.
 
 Use kernel replay for a read-only all-hit diagnostic:
 

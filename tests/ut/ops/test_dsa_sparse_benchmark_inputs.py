@@ -23,6 +23,12 @@ ROOFLINE_SCRIPT = (
     / "dsa_sparse_lookup_update"
     / "profile_roofline.sh"
 )
+ROOFLINE_RUNNER = (
+    ROOT
+    / "tools"
+    / "dsa_sparse_lookup_update"
+    / "roofline_once.py"
+)
 SPEC = importlib.util.spec_from_file_location(
     "dsa_sparse_benchmark_common",
     COMMON_PATH,
@@ -239,12 +245,14 @@ def test_roofline_profiles_stateful_operator_with_application_replay() -> None:
         line for line in output_lines if line.startswith("Roofline command:")
     )
 
-    assert "--warmup 3" in prewarm_command
+    assert "roofline_once.py" in prewarm_command
+    assert "# repeat=3" in prewarm_command
     assert "--replay-mode=application" in roofline_command
     assert "--warm-up=0" in roofline_command
-    assert "benchmark-\\{pid\\}-\\{timestamp_ns\\}.json" in (
-        roofline_command
-    )
+    assert "roofline_once.py" in roofline_command
+    assert "benchmark_operator.py" not in roofline_command
+    assert "--warmup" not in roofline_command
+    assert "--iterations" not in roofline_command
 
 
 def test_roofline_accepts_kernel_replay() -> None:
@@ -274,3 +282,12 @@ def test_roofline_accepts_kernel_replay() -> None:
 
     assert "--replay-mode=kernel" in roofline_command
     assert "--warm-up=0" in roofline_command
+
+
+def test_roofline_runner_contains_one_target_invocation() -> None:
+    runner_source = ROOFLINE_RUNNER.read_text(encoding="utf-8")
+    script_source = ROOFLINE_SCRIPT.read_text(encoding="utf-8")
+
+    assert runner_source.count("invoke(runtime, inputs)") == 1
+    assert "benchmark_operator.py" not in script_source
+    assert "roofline_once.py" in script_source
