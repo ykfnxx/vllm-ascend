@@ -13,7 +13,6 @@ npu_op_code_gen(
     OUT_DIR ${ASCEND_AUTOGEN_PATH}
     COMPILE_OPTIONS
         -I${CMAKE_CURRENT_SOURCE_DIR}
-        -I${PROJECT_SOURCE_DIR}/include
 )
 
 # The production op_api wrapper is copied under op_host/op_api for source
@@ -52,12 +51,6 @@ npu_op_library(cust_optiling TILING
 foreach(target cust_op_proto cust_optiling)
     target_include_directories(${target} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
-        ${PROJECT_SOURCE_DIR}/include
-    )
-    target_compile_definitions(${target} PRIVATE
-        LOG_CPP
-        OPS_UTILS_LOG_SUB_MOD_NAME="OP_TILING"
-        OPS_UTILS_LOG_PACKAGE_TYPE=""
     )
     target_compile_options(${target} PRIVATE
         -fvisibility=hidden

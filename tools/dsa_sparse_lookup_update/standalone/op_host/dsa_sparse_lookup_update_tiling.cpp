@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <limits>
 
-#include "log/ops_log.h"
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
 
@@ -36,20 +35,15 @@ constexpr int64_t kFreeHeadStride = 16;
 bool GetInputOneDim(
     gert::TilingContext* context,
     uint32_t input_index,
-    const char* input_name,
     int64_t& dim0)
 {
     const gert::StorageShape* shape =
         context->GetInputShape(input_index);
     if (shape == nullptr) {
-        OPS_LOG_E(context->GetNodeName(), "%s shape is null.",
-                  input_name);
         return false;
     }
     const auto& storage_shape = shape->GetStorageShape();
     if (storage_shape.GetDimNum() != 1) {
-        OPS_LOG_E(context->GetNodeName(), "%s must be rank 1.",
-                  input_name);
         return false;
     }
     dim0 = storage_shape.GetDim(0);
@@ -59,21 +53,16 @@ bool GetInputOneDim(
 bool GetInputTwoDims(
     gert::TilingContext* context,
     uint32_t input_index,
-    const char* input_name,
     int64_t& dim0,
     int64_t& dim1)
 {
     const gert::StorageShape* shape =
         context->GetInputShape(input_index);
     if (shape == nullptr) {
-        OPS_LOG_E(context->GetNodeName(), "%s shape is null.",
-                  input_name);
         return false;
     }
     const auto& storage_shape = shape->GetStorageShape();
     if (storage_shape.GetDimNum() != 2) {
-        OPS_LOG_E(context->GetNodeName(), "%s must be rank 2.",
-                  input_name);
         return false;
     }
     dim0 = storage_shape.GetDim(0);
@@ -84,21 +73,16 @@ bool GetInputTwoDims(
 bool GetOutputTwoDims(
     gert::TilingContext* context,
     uint32_t output_index,
-    const char* output_name,
     int64_t& dim0,
     int64_t& dim1)
 {
     const gert::StorageShape* shape =
         context->GetOutputShape(output_index);
     if (shape == nullptr) {
-        OPS_LOG_E(context->GetNodeName(), "%s shape is null.",
-                  output_name);
         return false;
     }
     const auto& storage_shape = shape->GetStorageShape();
     if (storage_shape.GetDimNum() != 2) {
-        OPS_LOG_E(context->GetNodeName(), "%s must be rank 2.",
-                  output_name);
         return false;
     }
     dim0 = storage_shape.GetDim(0);
@@ -109,21 +93,16 @@ bool GetOutputTwoDims(
 bool RequireInputShape(
     gert::TilingContext* context,
     uint32_t input_index,
-    const char* input_name,
     int64_t expected0,
     int64_t expected1)
 {
     int64_t actual0 = 0;
     int64_t actual1 = 0;
     if (!GetInputTwoDims(
-            context, input_index, input_name, actual0, actual1)) {
+            context, input_index, actual0, actual1)) {
         return false;
     }
     if (actual0 != expected0 || actual1 != expected1) {
-        OPS_LOG_E(
-            context->GetNodeName(),
-            "%s has shape [%ld, %ld], expected [%ld, %ld].",
-            input_name, actual0, actual1, expected0, expected1);
         return false;
     }
     return true;
@@ -132,21 +111,16 @@ bool RequireInputShape(
 bool RequireOutputShape(
     gert::TilingContext* context,
     uint32_t output_index,
-    const char* output_name,
     int64_t expected0,
     int64_t expected1)
 {
     int64_t actual0 = 0;
     int64_t actual1 = 0;
     if (!GetOutputTwoDims(
-            context, output_index, output_name, actual0, actual1)) {
+            context, output_index, actual0, actual1)) {
         return false;
     }
     if (actual0 != expected0 || actual1 != expected1) {
-        OPS_LOG_E(
-            context->GetNodeName(),
-            "%s has shape [%ld, %ld], expected [%ld, %ld].",
-            output_name, actual0, actual1, expected0, expected1);
         return false;
     }
     return true;
@@ -164,7 +138,6 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
     }
     const gert::RuntimeAttrs* attrs = context->GetAttrs();
     if (attrs == nullptr) {
-        OPS_LOG_E(context->GetNodeName(), "attrs is null.");
         return ge::GRAPH_FAILED;
     }
     const int64_t* req_num_attr =
@@ -172,8 +145,6 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
     if (req_num_attr == nullptr || *req_num_attr <= 0 ||
         static_cast<uint64_t>(*req_num_attr) >
             std::numeric_limits<uint32_t>::max()) {
-        OPS_LOG_E(context->GetNodeName(),
-                  "reqNum must fit a positive uint32.");
         return ge::GRAPH_FAILED;
     }
     const int64_t req_num = *req_num_attr;
@@ -181,75 +152,54 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
     int64_t pool_capacity = 0;
     int64_t index_width = 0;
     if (!GetInputTwoDims(
-            context, kIndex, "index", pool_capacity, index_width)) {
+            context, kIndex, pool_capacity, index_width)) {
         return ge::GRAPH_FAILED;
     }
     if (index_width != kIndexCapacity) {
-        OPS_LOG_E(context->GetNodeName(),
-                  "index width must be %ld.", kIndexCapacity);
         return ge::GRAPH_FAILED;
     }
     if (req_num > pool_capacity) {
-        OPS_LOG_E(
-            context->GetNodeName(),
-            "reqNum %ld exceeds pool capacity %ld.",
-            req_num,
-            pool_capacity);
         return ge::GRAPH_FAILED;
     }
     if (pool_capacity > std::numeric_limits<uint32_t>::max()) {
-        OPS_LOG_E(context->GetNodeName(),
-                  "pool capacity does not fit uint32.");
         return ge::GRAPH_FAILED;
     }
 
     int64_t req_entries = 0;
     if (!GetInputOneDim(
-            context, kReqPoolEntries, "reqPoolEntries",
-            req_entries) ||
+            context, kReqPoolEntries, req_entries) ||
         req_entries != req_num ||
         !RequireInputShape(
-            context, kSlotToIndex, "slotToIndex",
-            pool_capacity, kSlotCount) ||
+            context, kSlotToIndex, pool_capacity, kSlotCount) ||
         !RequireInputShape(
-            context, kFreeSlots, "freeSlots",
-            pool_capacity, kFreeSlotCount) ||
+            context, kFreeSlots, pool_capacity, kFreeSlotCount) ||
         !RequireInputShape(
-            context, kFreeHead, "freeHead",
-            pool_capacity, kFreeHeadStride) ||
+            context, kFreeHead, pool_capacity, kFreeHeadStride) ||
         !RequireInputShape(
-            context, kQueryIndex, "queryIndex",
-            req_num, kQueryCount) ||
+            context, kQueryIndex, req_num, kQueryCount) ||
         !RequireInputShape(
-            context, kLookupMask, "lookupMask",
-            req_num, kQueryCount) ||
+            context, kLookupMask, req_num, kQueryCount) ||
         !RequireOutputShape(
-            context, kSlotOut, "slotOut",
-            req_num, kQueryCount) ||
+            context, kSlotOut, req_num, kQueryCount) ||
         !RequireOutputShape(
-            context, kMissOut, "missOut",
-            req_num, kQueryCount)) {
+            context, kMissOut, req_num, kQueryCount)) {
         return ge::GRAPH_FAILED;
     }
 
     auto* platform_info = context->GetPlatformInfo();
     if (platform_info == nullptr) {
-        OPS_LOG_E(context->GetNodeName(), "platform info is null.");
         return ge::GRAPH_FAILED;
     }
     auto platform =
         platform_ascendc::PlatformAscendC(platform_info);
     const uint32_t aiv_count = platform.GetCoreNumAiv();
     if (aiv_count == 0U) {
-        OPS_LOG_E(context->GetNodeName(),
-                  "No AIV core is available.");
         return ge::GRAPH_FAILED;
     }
 
     auto* tiling_data =
         context->GetTilingData<DsaSparseLookupUpdateTilingData>();
     if (tiling_data == nullptr) {
-        OPS_LOG_E(context->GetNodeName(), "tiling data is null.");
         return ge::GRAPH_FAILED;
     }
     tiling_data->reqNum = static_cast<uint32_t>(req_num);
@@ -262,14 +212,10 @@ static ge::graphStatus DsaSparseLookupUpdateTilingFunc(
     if (workspace_bytes >
         static_cast<uint64_t>(
             std::numeric_limits<size_t>::max())) {
-        OPS_LOG_E(context->GetNodeName(),
-                  "workspace size overflows size_t.");
         return ge::GRAPH_FAILED;
     }
     size_t* system_workspace = context->GetWorkspaceSizes(1);
     if (system_workspace == nullptr) {
-        OPS_LOG_E(context->GetNodeName(),
-                  "system workspace descriptor is null.");
         return ge::GRAPH_FAILED;
     }
     system_workspace[0] = static_cast<size_t>(workspace_bytes);

@@ -302,7 +302,7 @@ def test_roofline_runner_contains_one_target_invocation() -> None:
     assert "roofline_once.py" not in script_source
 
 
-def test_standalone_kernel_sources_match_production_sources() -> None:
+def test_standalone_log_independent_sources_match_production() -> None:
     production_root = (
         ROOT
         / "csrc"
@@ -312,7 +312,6 @@ def test_standalone_kernel_sources_match_production_sources() -> None:
     relative_sources = (
         "op_host/dsa_sparse_lookup_update_def.cpp",
         "op_host/dsa_sparse_lookup_update_infershape.cpp",
-        "op_host/dsa_sparse_lookup_update_tiling.cpp",
         "op_host/dsa_sparse_lookup_update_tiling.h",
         "op_host/op_api/aclnn_dsa_sparse_lookup_update.cpp",
         "op_host/op_api/aclnn_dsa_sparse_lookup_update.h",
@@ -325,6 +324,22 @@ def test_standalone_kernel_sources_match_production_sources() -> None:
         assert (STANDALONE_ROOT / relative_source).read_bytes() == (
             production_root / relative_source
         ).read_bytes()
+
+
+def test_standalone_tiling_has_no_repository_logging_dependency() -> None:
+    tiling_source = (
+        STANDALONE_ROOT
+        / "op_host"
+        / "dsa_sparse_lookup_update_tiling.cpp"
+    ).read_text(encoding="utf-8")
+    host_cmake = (
+        STANDALONE_ROOT / "op_host" / "CMakeLists.txt"
+    ).read_text(encoding="utf-8")
+
+    assert '"log/' not in tiling_source
+    assert "OPS_LOG" not in tiling_source
+    assert "PROJECT_SOURCE_DIR}/include" not in host_cmake
+    assert "OPS_UTILS_LOG" not in host_cmake
 
 
 def test_standalone_kernel_build_keeps_profile_information() -> None:

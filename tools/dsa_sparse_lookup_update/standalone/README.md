@@ -2,10 +2,11 @@
 
 This directory builds the existing registered `DsaSparseLookupUpdate` operator
 without including the vllm-ascend CMake project or PyTorch extension. The
-copied `op_host`, `op_kernel`, and ACLNN declarations retain the production
-operator structure. The standalone CMake layer uses CANN `npu_op_*` APIs and
-adds `-g` to the optimized Ascend C kernel build for msOpProf source and
-operand-record analysis.
+copied `op_kernel` and ACLNN declarations retain the production operator
+structure. The standalone tiling source retains the production validation and
+launch logic but omits vllm-ascend's private logging headers and macros. The
+standalone CMake layer uses CANN `npu_op_*` APIs and adds `-g` to the optimized
+Ascend C kernel build for msOpProf source and operand-record analysis.
 
 Build, install, and compile the independent ACLNN runner:
 
