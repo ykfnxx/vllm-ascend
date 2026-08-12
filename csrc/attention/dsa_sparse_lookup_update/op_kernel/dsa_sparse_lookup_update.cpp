@@ -8,7 +8,7 @@
 #include "arch35/dsa_sparse_lookup_update_simt.h"
 #include "dsa_sparse_lookup_update_common.h"
 
-extern "C" __vector__ __global__ __aicore__ void dsa_sparse_lookup_update(
+extern "C" __global__ __aicore__ void dsa_sparse_lookup_update(
     GM_ADDR index,
     GM_ADDR slot_to_index,
     GM_ADDR free_slots,
@@ -34,6 +34,7 @@ extern "C" __vector__ __global__ __aicore__ void dsa_sparse_lookup_update(
     (void)user_workspace;
     (void)tiling;
 #else
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     REGISTER_TILING_DEFAULT(DsaSparseLookupUpdateTilingData);
     GET_TILING_DATA_WITH_STRUCT(
         DsaSparseLookupUpdateTilingData,
