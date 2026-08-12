@@ -24,6 +24,25 @@ lifecycle are outside these standalone tools.
 
 Run from the repository root:
 
+For the Ascend 950 SIMT operator used by msOpProf/Roofline, use the truly
+independent registered-op project. It copies the current host, tiling, kernel,
+and ACLNN declaration sources, uses only CANN `npu_op_*` build APIs, and adds
+`-g` without disabling the optimized build:
+
+```bash
+source /usr/local/Ascend/cann-9.1.0/set_env.sh
+bash tools/dsa_sparse_lookup_update/standalone/build.sh --clean
+```
+
+This creates an isolated package under
+`tools/dsa_sparse_lookup_update/standalone/.install` and an ACLNN executable
+under `tools/dsa_sparse_lookup_update/standalone/build_runner`. It does not
+configure or compile the vllm-ascend `csrc` project and does not load
+`vllm_ascend_C`.
+
+The following legacy helper remains available when testing all three metadata
+operators through the vllm-ascend custom-op project:
+
 For all three Ascend 950 operators:
 
 ```bash
@@ -160,11 +179,14 @@ the parsed profile does not contain the custom operator name.
 
 ## Roofline profile
 
-Use the dedicated one-shot runner so that the outer msopprof session sees
+Use the independent ACLNN runner so that the outer msopprof session sees
 exactly one `DsaSparseLookupUpdate` launch. The Roofline path does not call the
-benchmark or start an inner `torch_npu.profiler` session:
+benchmark, import PyTorch/vllm-ascend, or start an inner
+`torch_npu.profiler` session. Build the standalone project first:
 
 ```bash
+bash tools/dsa_sparse_lookup_update/standalone/build.sh --clean
+
 bash tools/dsa_sparse_lookup_update/profile_roofline.sh \
   --device npu:2 \
   --requests 32 \
@@ -177,6 +199,9 @@ back to the compatible `msprof op` entry point. It collects
 `DsaSparseLookupUpdate` with `--aic-metrics=Roofline` and prints the generated
 `visualize_data.bin` path for import into MindStudio Insight. Use
 `--miss-count` instead of `--miss-rate` when an exact miss count is required.
+By default it loads the operator from the standalone isolated install root and
+executes `standalone/build_runner/dsa_sparse_lookup_update_runner`; override
+these with `--install-root` and `--runner` together when using another build.
 The default result root is
 `tools/dsa_sparse_lookup_update/roofline_profiles/`.
 

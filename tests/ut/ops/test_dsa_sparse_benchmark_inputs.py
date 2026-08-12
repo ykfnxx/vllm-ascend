@@ -27,7 +27,15 @@ ROOFLINE_RUNNER = (
     ROOT
     / "tools"
     / "dsa_sparse_lookup_update"
-    / "roofline_once.py"
+    / "standalone"
+    / "runner"
+    / "dsa_sparse_lookup_update_runner.cpp"
+)
+STANDALONE_ROOT = (
+    ROOT
+    / "tools"
+    / "dsa_sparse_lookup_update"
+    / "standalone"
 )
 SPEC = importlib.util.spec_from_file_location(
     "dsa_sparse_benchmark_common",
@@ -245,11 +253,12 @@ def test_roofline_profiles_stateful_operator_with_application_replay() -> None:
         line for line in output_lines if line.startswith("Roofline command:")
     )
 
-    assert "roofline_once.py" in prewarm_command
+    assert "dsa_sparse_lookup_update_runner" in prewarm_command
     assert "# repeat=3" in prewarm_command
     assert "--replay-mode=application" in roofline_command
     assert "--warm-up=0" in roofline_command
-    assert "roofline_once.py" in roofline_command
+    assert "dsa_sparse_lookup_update_runner" in roofline_command
+    assert "roofline_once.py" not in roofline_command
     assert "benchmark_operator.py" not in roofline_command
     assert "--warmup" not in roofline_command
     assert "--iterations" not in roofline_command
@@ -288,6 +297,46 @@ def test_roofline_runner_contains_one_target_invocation() -> None:
     runner_source = ROOFLINE_RUNNER.read_text(encoding="utf-8")
     script_source = ROOFLINE_SCRIPT.read_text(encoding="utf-8")
 
-    assert runner_source.count("invoke(runtime, inputs)") == 1
+    assert runner_source.count("aclnnDsaSparseLookupUpdate(") == 1
     assert "benchmark_operator.py" not in script_source
-    assert "roofline_once.py" in script_source
+    assert "roofline_once.py" not in script_source
+
+
+def test_standalone_kernel_sources_match_production_sources() -> None:
+    production_root = (
+        ROOT
+        / "csrc"
+        / "attention"
+        / "dsa_sparse_lookup_update"
+    )
+    relative_sources = (
+        "op_host/dsa_sparse_lookup_update_def.cpp",
+        "op_host/dsa_sparse_lookup_update_infershape.cpp",
+        "op_host/dsa_sparse_lookup_update_tiling.cpp",
+        "op_host/dsa_sparse_lookup_update_tiling.h",
+        "op_host/op_api/aclnn_dsa_sparse_lookup_update.cpp",
+        "op_host/op_api/aclnn_dsa_sparse_lookup_update.h",
+        "op_kernel/dsa_sparse_lookup_update.cpp",
+        "op_kernel/dsa_sparse_lookup_update_common.h",
+        "op_kernel/arch35/dsa_sparse_lookup_update_simt.h",
+    )
+
+    for relative_source in relative_sources:
+        assert (STANDALONE_ROOT / relative_source).read_bytes() == (
+            production_root / relative_source
+        ).read_bytes()
+
+
+def test_standalone_kernel_build_keeps_profile_information() -> None:
+    kernel_cmake = (
+        STANDALONE_ROOT / "op_kernel" / "CMakeLists.txt"
+    ).read_text(encoding="utf-8")
+    root_cmake = (STANDALONE_ROOT / "CMakeLists.txt").read_text(
+        encoding="utf-8"
+    )
+
+    assert "npu_op_kernel_options(" in kernel_cmake
+    assert "-g" in kernel_cmake
+    assert "-O0" not in kernel_cmake
+    assert "npu_op_package(" in root_cmake
+    assert "vllm" not in root_cmake.lower()

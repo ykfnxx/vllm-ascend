@@ -7,9 +7,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+STANDALONE_DIR="${SCRIPT_DIR}/standalone"
 
 DEVICE="npu:0"
-INSTALL_ROOT="${SCRIPT_DIR}/.install"
+INSTALL_ROOT="${STANDALONE_DIR}/.install"
+RUNNER="${STANDALONE_DIR}/build_runner/dsa_sparse_lookup_update_runner"
 REQUESTS=32
 MISS_RATE=10
 MISS_COUNT=""
@@ -36,7 +38,8 @@ visualize_data.bin for MindStudio Insight.
 Options:
   --device DEVICE         NPU device used by the one-shot runner
                           (default: npu:0).
-  --install-root PATH     Isolated custom-op install root.
+  --install-root PATH     Standalone custom-op install root.
+  --runner PATH           Standalone ACLNN runner executable.
   --requests N            Concurrent request rows (default: 32).
   --miss-rate PERCENT     Miss percentage in each 2K query (default: 10).
   --miss-count N          Exact misses in each 2K query; mutually exclusive
@@ -78,6 +81,11 @@ while (($# > 0)); do
         --install-root)
             require_value "$@"
             INSTALL_ROOT="$2"
+            shift 2
+            ;;
+        --runner)
+            require_value "$@"
+            RUNNER="$2"
             shift 2
             ;;
         --requests)
@@ -274,10 +282,8 @@ PROFILE_COMMAND+=(
 )
 
 COMMON_APP_COMMAND=(
-    python3
-    "${SCRIPT_DIR}/roofline_once.py"
+    "${RUNNER}"
     --device "${DEVICE}"
-    --install-root "${INSTALL_ROOT}"
     --requests "${REQUESTS}"
     --seed "${SEED}"
 )
@@ -308,6 +314,28 @@ printf '\n'
 
 if ((DRY_RUN)); then
     exit 0
+fi
+
+if [[ ! -x "${RUNNER}" ]]; then
+    echo "ERROR: standalone runner is missing or not executable: ${RUNNER}" >&2
+    echo "Build it first with:" >&2
+    echo "  bash ${STANDALONE_DIR}/build.sh --clean --install-root ${INSTALL_ROOT}" >&2
+    exit 1
+fi
+
+VENDOR_ROOT="${INSTALL_ROOT}/vendors/dsa_sparse_prof"
+if [[ ! -d "${VENDOR_ROOT}" ]]; then
+    echo "ERROR: standalone operator is not installed under ${VENDOR_ROOT}." >&2
+    echo "Build it first with:" >&2
+    echo "  bash ${STANDALONE_DIR}/build.sh --clean --install-root ${INSTALL_ROOT}" >&2
+    exit 1
+fi
+if [[ -f "${VENDOR_ROOT}/bin/set_env.bash" ]]; then
+    # shellcheck disable=SC1090
+    source "${VENDOR_ROOT}/bin/set_env.bash"
+else
+    export ASCEND_CUSTOM_OPP_PATH="${VENDOR_ROOT}${ASCEND_CUSTOM_OPP_PATH:+:${ASCEND_CUSTOM_OPP_PATH}}"
+    export LD_LIBRARY_PATH="${VENDOR_ROOT}/op_api/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 fi
 
 mkdir -p -- "${RUN_DIR}"
