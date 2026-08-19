@@ -32,6 +32,47 @@ def test_budget_covers_persistent_lookup_state_and_hot_cache():
     assert breakdown.lookup_state_bytes == 2_294_016
     assert breakdown.core_fixed_tensor_bytes == 2_646_528
     assert breakdown.fixed_hbm_bytes == 2_646_528
+    assert breakdown.lookup_capacity == 10_240
+    assert breakdown.transient_region_span == 128
+    assert breakdown.fallback_slot_count == 0
+    assert breakdown.verify_staging_capacity == 0
+
+
+def test_mtp_verify_staging_reuses_existing_tail_block():
+    baseline = calculate_dsa_sparse_fixed_hbm_bytes(
+        2,
+        128,
+        ((torch.bfloat16, 2, 3), (torch.uint8, 1, 5)),
+        cohort_count=2,
+    )
+    mtp = calculate_dsa_sparse_fixed_hbm_bytes(
+        2,
+        128,
+        ((torch.bfloat16, 2, 3), (torch.uint8, 1, 5)),
+        cohort_count=2,
+        max_verify_tokens_per_request=16,
+        uses_mtp=True,
+    )
+
+    assert mtp.hot_payload_bytes == baseline.hot_payload_bytes
+    assert mtp.fixed_hbm_bytes == baseline.fixed_hbm_bytes
+    assert mtp.transient_region_span == 128
+    assert mtp.fallback_slot_count == 1
+    assert mtp.verify_staging_capacity == 16
+
+
+def test_mtp_verify_staging_grows_by_aligned_blocks_only():
+    mtp = calculate_dsa_sparse_fixed_hbm_bytes(
+        2,
+        128,
+        ((torch.bfloat16, 2, 3), (torch.uint8, 1, 5)),
+        cohort_count=2,
+        max_verify_tokens_per_request=128,
+        uses_mtp=True,
+    )
+
+    assert mtp.transient_region_span == 256
+    assert mtp.hot_payload_bytes == 356_864
 
 
 def test_fixed_hbm_calculation_does_not_allocate_tensors(monkeypatch):

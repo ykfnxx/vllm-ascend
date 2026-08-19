@@ -363,6 +363,10 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_sparse_leader_coordinators: tuple[
             DSASparseCoordinator, ...
         ] = ()
+        self._dsa_sparse_coordinators: tuple[
+            tuple[str, DSASparseCoordinator], ...
+        ] = ()
+        self._dsa_sparse_target_step_id = 0
         self._dsa_sparse_leader_by_layer: dict[
             str, DSASparseCoordinator
         ] = {}
@@ -653,6 +657,10 @@ class NPUModelRunner(GPUModelRunner):
             self.block_size,
             main_layouts,
             cohort_count=cohort_count,
+            max_verify_tokens_per_request=(
+                config.max_verify_tokens_per_request
+            ),
+            uses_mtp=config.uses_mtp,
         )
         self._dsa_sparse_fixed_hbm_breakdown = breakdown
         return breakdown.fixed_hbm_bytes
@@ -707,7 +715,10 @@ class NPUModelRunner(GPUModelRunner):
         leader: DSASparseCoordinator | None = None
         leaders: list[DSASparseCoordinator] = []
         leaders_by_layer: dict[str, DSASparseCoordinator] = {}
+        coordinators: list[tuple[str, DSASparseCoordinator]] = []
         cohorts: list[dict[str, Any]] = []
+        config = self.ascend_config.dsa_sparse_config
+        assert config is not None
         for layer_name, attn_module in self._get_dsa_sparse_ordered_layers():
             impl = attn_module.impl
             spec = self._dsa_sparse_main_specs[layer_name]
@@ -736,6 +747,15 @@ class NPUModelRunner(GPUModelRunner):
                 plane_layouts=plane_layouts,
                 device=self.device,
                 leader=leader if impl.skip_topk else None,
+                mtp_enabled=config.uses_mtp,
+                max_verify_tokens_per_request=(
+                    config.max_verify_tokens_per_request
+                ),
+                cohort_name=(
+                    layer_name
+                    if not impl.skip_topk
+                    else cohorts[-1]["name"]
+                ),
             )
             if not impl.skip_topk:
                 leader = coordinator
@@ -745,6 +765,7 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 cohorts[-1]["layers"].append(layer_name)
             impl.dsa_sparse_coordinator = coordinator
+            coordinators.append((layer_name, coordinator))
             if dsa_sparse_probe.is_enabled():
                 dsa_sparse_probe.emit(
                     "hot_cache_registered",
@@ -760,6 +781,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
 
         self._dsa_sparse_leader_coordinators = tuple(leaders)
+        self._dsa_sparse_coordinators = tuple(coordinators)
         self._dsa_sparse_leader_by_layer = leaders_by_layer
         if dsa_sparse_probe.is_enabled():
             dsa_sparse_probe.emit(
@@ -779,6 +801,8 @@ class NPUModelRunner(GPUModelRunner):
         pool_entry = self.dsa_sparse_free_pool_entries.popleft()
         self.dsa_sparse_req_to_pool_entry[request_id] = pool_entry
         try:
+            for _, coordinator in self._dsa_sparse_coordinators:
+                coordinator.reset_hot_request(pool_entry)
             if handoff is None:
                 for coordinator in self._dsa_sparse_leader_coordinators:
                     coordinator.initialize_request(pool_entry)
@@ -791,6 +815,8 @@ class NPUModelRunner(GPUModelRunner):
         except BaseException:
             for coordinator in self._dsa_sparse_leader_coordinators:
                 coordinator.reset_request(pool_entry)
+            for _, coordinator in self._dsa_sparse_coordinators:
+                coordinator.reset_hot_request(pool_entry)
             self.dsa_sparse_req_to_pool_entry.pop(request_id)
             self.dsa_sparse_free_pool_entries.appendleft(pool_entry)
             raise
@@ -842,6 +868,8 @@ class NPUModelRunner(GPUModelRunner):
 
     def _release_dsa_sparse_request(self, request_id: str) -> None:
         pool_entry = self.dsa_sparse_req_to_pool_entry.pop(request_id)
+        for _, coordinator in self._dsa_sparse_coordinators:
+            coordinator.reset_hot_request(pool_entry)
         for coordinator in self._dsa_sparse_leader_coordinators:
             coordinator.reset_request(pool_entry)
         self.dsa_sparse_free_pool_entries.append(pool_entry)
@@ -854,11 +882,30 @@ class NPUModelRunner(GPUModelRunner):
     ) -> None:
         if not self._uses_dsa_sparse_main_cache():
             return
-        if self.attn_state != AscendAttentionState.DecodeOnly:
-            raise RuntimeError("DSA Sparse accepts only DecodeOnly batches.")
+        config = self.ascend_config.dsa_sparse_config
+        assert config is not None
+        expected_attn_state = (
+            AscendAttentionState.SpecDecoding
+            if config.uses_mtp
+            else AscendAttentionState.DecodeOnly
+        )
+        if self.attn_state != expected_attn_state:
+            raise RuntimeError(
+                "DSA Sparse target batch has an unsupported attention state."
+            )
         if isinstance(attn_metadata, list):
             raise RuntimeError("DSA Sparse does not support attention microbatches.")
-        if not np.all(num_scheduled_tokens[:num_reqs] == 1):
+        scheduled_tokens = num_scheduled_tokens[:num_reqs]
+        if config.uses_mtp:
+            if np.any(scheduled_tokens < 1) or np.any(
+                scheduled_tokens
+                > config.max_verify_tokens_per_request
+            ):
+                raise RuntimeError(
+                    "DSA Sparse MTP target query count is outside the "
+                    "configured verify staging capacity."
+                )
+        elif not np.all(scheduled_tokens == 1):
             raise RuntimeError(
                 "DSA Sparse requires exactly one decode token per request."
             )
@@ -875,6 +922,58 @@ class NPUModelRunner(GPUModelRunner):
             attn_metadata[
                 layer_name
             ].dsa_sparse_req_pool_entries = req_pool_entries
+        if config.uses_mtp:
+            for _, coordinator in self._dsa_sparse_coordinators:
+                coordinator.target_step_id = (
+                    self._dsa_sparse_target_step_id
+                )
+
+    def _store_dsa_sparse_accepted(
+        self,
+        sampled_token_ids: torch.Tensor,
+    ) -> None:
+        config = self.ascend_config.dsa_sparse_config
+        if (
+            config is None
+            or not config.is_consumer
+            or not config.uses_mtp
+        ):
+            return
+        if self.attn_state != AscendAttentionState.SpecDecoding:
+            return
+        if not self._dsa_sparse_leader_coordinators:
+            return
+
+        leader = self._dsa_sparse_leader_coordinators[0]
+        query_start_loc = leader.query_start_loc
+        if query_start_loc is None:
+            raise RuntimeError(
+                "DSA Sparse MTP sampling has no active packed lookup plan."
+        )
+        num_reqs = query_start_loc.shape[0] - 1
+        output_token_ids = sampled_token_ids[:num_reqs]
+        valid_output_mask = (
+            (output_token_ids != -1)
+            & (output_token_ids < self.input_batch.vocab_size)
+        )
+        accepted_input_kv_count = valid_output_mask.sum(dim=1).to(
+            torch.int32
+        )
+        accepted_input_kv_count.masked_fill_(
+            self.discard_request_mask.gpu[:num_reqs],
+            0,
+        )
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        accepted_input_kv_count = torch.minimum(
+            accepted_input_kv_count,
+            query_lens,
+        ).contiguous()
+        for layer_name, coordinator in self._dsa_sparse_coordinators:
+            coordinator.store_accepted(
+                layer_name,
+                accepted_input_kv_count,
+            )
+        self._dsa_sparse_target_step_id += 1
 
     def _begin_dsa_sparse_producer_execution(
         self,
@@ -2797,6 +2896,10 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        self._store_dsa_sparse_accepted(
+            sampler_output.sampled_token_ids,
+        )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:

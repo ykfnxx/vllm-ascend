@@ -13,6 +13,7 @@ from vllm_ascend.dsa_sparse_constants import (
 
 DSASparseKVRole = Literal["kv_producer", "kv_consumer"]
 DSA_SPARSE_MOCK_IO_BACKEND = "mock"
+DSA_SPARSE_MAX_VERIFY_TOKENS_PER_REQUEST = 16
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,8 @@ class DSASparseConfig:
     io_backend: str
     kv_role: DSASparseKVRole
     index_topk: int
+    speculative_method: str | None
+    max_verify_tokens_per_request: int
 
     @property
     def is_producer(self) -> bool:
@@ -30,6 +33,10 @@ class DSASparseConfig:
     @property
     def is_consumer(self) -> bool:
         return self.kv_role == "kv_consumer"
+
+    @property
+    def uses_mtp(self) -> bool:
+        return self.speculative_method == "mtp"
 
 
 def load_dsa_sparse_config(vllm_config: object) -> DSASparseConfig | None:
@@ -90,7 +97,9 @@ def load_dsa_sparse_config(vllm_config: object) -> DSASparseConfig | None:
     _require_parallel_size(parallel_config, "decode_context_parallel_size")
     _require_parallel_size(parallel_config, "prefill_context_parallel_size")
 
-    _require_no_speculative_tokens(vllm_config)
+    speculative_method, max_verify_tokens_per_request = (
+        _get_supported_speculative_config(vllm_config)
+    )
     index_topk = _get_index_topk(model_config)
     if index_topk != DSA_SPARSE_QUERY_WIDTH:
         raise ValueError(
@@ -121,6 +130,8 @@ def load_dsa_sparse_config(vllm_config: object) -> DSASparseConfig | None:
         io_backend=io_backend,
         kv_role=kv_role,
         index_topk=index_topk,
+        speculative_method=speculative_method,
+        max_verify_tokens_per_request=max_verify_tokens_per_request,
     )
 
 
@@ -144,21 +155,43 @@ def _get_index_topk(model_config: object) -> int:
     raise ValueError("DSA Sparse requires a positive GLM-5 index_topk.")
 
 
-def _require_no_speculative_tokens(vllm_config: object) -> None:
+def _get_supported_speculative_config(
+    vllm_config: object,
+) -> tuple[str | None, int]:
     speculative_config = getattr(vllm_config, "speculative_config", None)
+    if speculative_config is None:
+        return None, 1
     num_speculative_tokens = (
-        getattr(speculative_config, "num_speculative_tokens", 0) if speculative_config is not None else 0
+        getattr(speculative_config, "num_speculative_tokens", 0)
     )
     if isinstance(num_speculative_tokens, bool) or not isinstance(
         num_speculative_tokens,
         int,
     ):
         raise ValueError("num_speculative_tokens must be an integer for DSA Sparse.")
-    if num_speculative_tokens != 0:
+    if num_speculative_tokens < 0:
         raise ValueError(
-            "This DSA Sparse eager milestone supports target decode only; "
-            "speculative tokens require a separate draft Hot Cache runtime."
+            "num_speculative_tokens must not be negative for DSA Sparse."
         )
+    if num_speculative_tokens == 0:
+        return None, 1
+
+    speculative_method = getattr(speculative_config, "method", None)
+    if speculative_method != "mtp":
+        raise ValueError(
+            "DSA Sparse supports speculative decoding only with method='mtp'."
+        )
+    max_verify_tokens_per_request = num_speculative_tokens + 1
+    if (
+        max_verify_tokens_per_request
+        > DSA_SPARSE_MAX_VERIFY_TOKENS_PER_REQUEST
+    ):
+        raise ValueError(
+            "DSA Sparse MTP requires num_speculative_tokens + 1 <= "
+            f"{DSA_SPARSE_MAX_VERIFY_TOKENS_PER_REQUEST}, got "
+            f"{max_verify_tokens_per_request}."
+        )
+    return speculative_method, max_verify_tokens_per_request
 
 
 def _require_parallel_size(parallel_config: object, field: str) -> None:

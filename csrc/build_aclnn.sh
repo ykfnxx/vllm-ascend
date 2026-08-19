@@ -228,6 +228,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "asu_hbm_index_lookup"
         "asu_hbm_index_maintain_aicpu"
         "dsa_sparse_lookup_update"
+        "dsa_sparse_lookup_update_batch"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")

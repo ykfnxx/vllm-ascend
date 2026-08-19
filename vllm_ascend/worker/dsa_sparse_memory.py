@@ -24,6 +24,10 @@ class DSASparseFixedHBMBreakdown:
     hot_payload_bytes: int
     lookup_state_bytes_per_cohort: int
     cohort_count: int
+    lookup_capacity: int
+    transient_region_span: int
+    fallback_slot_count: int
+    verify_staging_capacity: int
 
     @property
     def lookup_state_bytes(self) -> int:
@@ -44,13 +48,20 @@ def calculate_dsa_sparse_fixed_hbm_bytes(
     main_layouts: Iterable[tuple[torch.dtype, int, int]],
     *,
     cohort_count: int,
+    max_verify_tokens_per_request: int = 1,
+    uses_mtp: bool = False,
 ) -> DSASparseFixedHBMBreakdown:
     layouts = tuple(main_layouts)
+    transient_region_span = _transient_region_span(
+        block_size,
+        max_verify_tokens_per_request,
+        uses_mtp=uses_mtp,
+    )
     return DSASparseFixedHBMBreakdown(
         hot_payload_bytes=sum(
             _hot_payload_bytes(
                 max_num_seqs,
-                block_size,
+                transient_region_span,
                 dtype,
                 num_kv_heads,
                 head_size,
@@ -59,6 +70,12 @@ def calculate_dsa_sparse_fixed_hbm_bytes(
         ),
         lookup_state_bytes_per_cohort=_lookup_state_bytes(max_num_seqs),
         cohort_count=cohort_count,
+        lookup_capacity=DSA_SPARSE_LOOKUP_SLOT_COUNT,
+        transient_region_span=transient_region_span,
+        fallback_slot_count=int(uses_mtp),
+        verify_staging_capacity=(
+            max_verify_tokens_per_request if uses_mtp else 0
+        ),
     )
 
 
@@ -82,15 +99,35 @@ def reserve_dsa_sparse_fixed_hbm_bytes(
 
 def _hot_payload_bytes(
     max_num_seqs: int,
-    block_size: int,
+    transient_region_span: int,
     dtype: torch.dtype,
     num_kv_heads: int,
     head_size: int,
 ) -> int:
     hot_rows = max_num_seqs * (
-        DSA_SPARSE_LOOKUP_SLOT_COUNT + block_size
+        DSA_SPARSE_LOOKUP_SLOT_COUNT + transient_region_span
     )
     return _tensor_bytes((hot_rows, num_kv_heads, head_size), dtype)
+
+
+def _transient_region_span(
+    block_size: int,
+    max_verify_tokens_per_request: int,
+    *,
+    uses_mtp: bool,
+) -> int:
+    if block_size <= 0:
+        raise ValueError("DSA Sparse block_size must be positive.")
+    if not uses_mtp:
+        return block_size
+    if max_verify_tokens_per_request <= 0:
+        raise ValueError(
+            "DSA Sparse MTP max_verify_tokens_per_request must be positive."
+        )
+    transient_slots = 1 + max_verify_tokens_per_request
+    return (
+        (transient_slots + block_size - 1) // block_size
+    ) * block_size
 
 
 def _lookup_state_bytes(max_num_seqs: int) -> int:

@@ -1822,6 +1822,31 @@ std::tuple<at::Tensor, at::Tensor> dsa_sparse_lookup_update(
     };
 }
 
+std::tuple<at::Tensor, at::Tensor> dsa_sparse_lookup_update_batch(
+    at::Tensor& index,
+    at::Tensor& slot_to_index,
+    at::Tensor& free_slots,
+    at::Tensor& free_head,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& query_index,
+    const at::Tensor& lookup_mask,
+    int64_t req_num)
+{
+    (void)index;
+    (void)slot_to_index;
+    (void)free_slots;
+    (void)free_head;
+    (void)req_pool_entries;
+    (void)query_start_loc;
+    (void)lookup_mask;
+    (void)req_num;
+    return {
+        at::empty_like(query_index),
+        at::empty_like(query_index),
+    };
+}
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -1946,6 +1971,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
              &vllm_ascend::meta::asu_hbm_index_maintain_aicpu);
     ops.impl("dsa_sparse_lookup_update",
              &vllm_ascend::meta::dsa_sparse_lookup_update);
+    ops.impl("dsa_sparse_lookup_update_batch",
+             &vllm_ascend::meta::dsa_sparse_lookup_update_batch);
     // npu_fused_gdn_gating
     ops.impl("npu_fused_gdn_gating", &vllm_ascend::meta::npu_fused_gdn_gating_meta);
 }

@@ -48,6 +48,8 @@ def test_a3_and_a5_packages_select_both_legacy_index_operators() -> None:
 
     assert '"dsa_sparse_lookup_update"' in a5_branch
     assert '"dsa_sparse_lookup_update"' not in a3_branch
+    assert '"dsa_sparse_lookup_update_batch"' in a5_branch
+    assert '"dsa_sparse_lookup_update_batch"' not in a3_branch
 
 
 def test_lookup_is_registered_for_a3_and_a5() -> None:

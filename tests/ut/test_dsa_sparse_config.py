@@ -21,6 +21,7 @@ def make_vllm_config(
     index_topk: int = 2048,
     max_model_len: int = 4096,
     block_size: int = 128,
+    speculative_method: str | None = "mtp",
     extra_dsa_fields: dict | None = None,
 ):
     dsa_config = {
@@ -46,6 +47,7 @@ def make_vllm_config(
         ),
         speculative_config=SimpleNamespace(
             num_speculative_tokens=num_speculative_tokens,
+            method=speculative_method,
         ),
     )
 
@@ -63,6 +65,9 @@ def test_config_exposes_only_fixed_lookup_contract_inputs():
     assert config.is_consumer
     assert config.index_topk == 2048
     assert config.io_backend == "mock"
+    assert config.speculative_method is None
+    assert config.max_verify_tokens_per_request == 1
+    assert not config.uses_mtp
     assert not hasattr(config, "device_buffer_size")
     assert not hasattr(config, "max_query_tokens_per_request")
     assert not hasattr(config, "lookup_backend")
@@ -113,13 +118,44 @@ def test_unsupported_parallel_modes_fail(field, overrides):
         load_dsa_sparse_config(make_vllm_config(**overrides))
 
 
-@pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3])
-def test_speculative_decode_is_rejected(num_speculative_tokens):
-    with pytest.raises(ValueError, match="target decode only"):
+@pytest.mark.parametrize("num_speculative_tokens", [1, 3, 15])
+def test_mtp_speculative_decode_is_supported(num_speculative_tokens):
+    config = load_dsa_sparse_config(
+        make_vllm_config(
+            num_speculative_tokens=num_speculative_tokens,
+        )
+    )
+
+    assert config is not None
+    assert config.uses_mtp
+    assert config.speculative_method == "mtp"
+    assert (
+        config.max_verify_tokens_per_request
+        == num_speculative_tokens + 1
+    )
+
+
+def test_non_mtp_speculative_decode_is_rejected():
+    with pytest.raises(ValueError, match="only with method='mtp'"):
         load_dsa_sparse_config(
             make_vllm_config(
-                num_speculative_tokens=num_speculative_tokens
+                num_speculative_tokens=3,
+                speculative_method="eagle",
             )
+        )
+
+
+def test_negative_speculative_token_count_is_rejected():
+    with pytest.raises(ValueError, match="must not be negative"):
+        load_dsa_sparse_config(
+            make_vllm_config(num_speculative_tokens=-1)
+        )
+
+
+def test_mtp_verify_width_must_fit_current_sfa_limit():
+    with pytest.raises(ValueError, match=r"num_speculative_tokens \+ 1 <= 16"):
+        load_dsa_sparse_config(
+            make_vllm_config(num_speculative_tokens=16)
         )
 
 

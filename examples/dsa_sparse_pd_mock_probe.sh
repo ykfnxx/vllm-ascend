@@ -5,7 +5,7 @@
 # This script exercises:
 #   - two isolated vLLM engines (Prefill TP1 + Decode TP1);
 #   - the standard P/D proxy and kv_transfer_params handoff;
-#   - the dsa_sparse_lookup_update custom operator;
+#   - the single-query or MTP batch DSA Sparse lookup/update operator;
 #   - per-layer Hot Cache Sparse Flash Attention.
 #
 # Payload movement remains mocked. This script validates control flow and
@@ -38,6 +38,7 @@ DECODE_KV_PORT="30100"
 PROMPT_TOKENS="2333"
 PROMPT_TOKEN_ID="100"
 MAX_TOKENS="1"
+MTP_SPECULATIVE_TOKENS="0"
 MAX_MODEL_LEN="4096"
 STARTUP_TIMEOUT="900"
 GPU_MEMORY_UTILIZATION="0.50"
@@ -67,6 +68,8 @@ Options:
   --prompt-tokens N            Repeated input token count. Default: 2333
   --prompt-token-id ID         Repeated vocabulary token ID. Default: 100
   --max-tokens N               Decode token count. Default: 1
+  --mtp-speculative-tokens N   Enable Decode-side MTP with N draft tokens.
+                               Valid range: 1-15. Default: 0 (disabled)
   --max-model-len N            Model context limit. Default: 4096
   --gpu-memory-utilization F   Per-engine NPU memory fraction. Default: 0.50
   --startup-timeout SEC        Per-service startup timeout. Default: 900
@@ -77,8 +80,9 @@ Options:
 
 Without --verify-path, success only proves process isolation and P/D routing.
 With --verify-path, success also proves that each Decode step called the
-dsa_sparse_lookup_update once per cohort and that the Decode profile contains
-that operator. Payload movement remains mocked.
+single-query or MTP batch lookup/update operator once per cohort, performed
+Hot Cache SFA once per physical layer, and committed only the accepted MTP
+prefix to the mock backend. Payload movement remains mocked.
 EOF
 }
 
@@ -162,6 +166,11 @@ while (($# > 0)); do
             MAX_TOKENS="$2"
             shift 2
             ;;
+        --mtp-speculative-tokens)
+            require_value "$@"
+            MTP_SPECULATIVE_TOKENS="$2"
+            shift 2
+            ;;
         --max-model-len)
             require_value "$@"
             MAX_MODEL_LEN="$2"
@@ -213,6 +222,12 @@ done
 
 if [[ "$PREFILL_DEVICE" == "$DECODE_DEVICE" ]]; then
     echo "Prefill and Decode must use different physical NPU IDs." >&2
+    exit 2
+fi
+
+if ! [[ "$MTP_SPECULATIVE_TOKENS" =~ ^[0-9]+$ ]] \
+    || ((MTP_SPECULATIVE_TOKENS > 15)); then
+    echo "mtp-speculative-tokens must be an integer in [0, 15]." >&2
     exit 2
 fi
 
@@ -308,6 +323,13 @@ COMMON_NETWORK_ENV=(
 
 DECODE_PROBE_ENV=()
 DECODE_PROFILER_ARGS=()
+DECODE_SPECULATIVE_ARGS=()
+if ((MTP_SPECULATIVE_TOKENS > 0)); then
+    DECODE_SPECULATIVE_CONFIG="{\"method\":\"mtp\",\"num_speculative_tokens\":$MTP_SPECULATIVE_TOKENS}"
+    DECODE_SPECULATIVE_ARGS+=(
+        --speculative-config "$DECODE_SPECULATIVE_CONFIG"
+    )
+fi
 if [[ "$VERIFY_PATH" == "1" ]]; then
     if [[ -d "$DECODE_PROFILE_DIR" ]] \
         && find "$DECODE_PROFILE_DIR" \
@@ -392,6 +414,7 @@ env \
     --compilation-config '{"cudagraph_mode":"NONE"}' \
     --additional-config "$DECODE_DSA_CONFIG" \
     --kv-transfer-config "$DECODE_KV_CONFIG" \
+    "${DECODE_SPECULATIVE_ARGS[@]}" \
     "${DECODE_PROFILER_ARGS[@]}" \
     >"$DECODE_LOG" 2>&1 &
 DECODE_PID=$!
@@ -525,7 +548,12 @@ fi
 
 echo
 if [[ "$VERIFY_PATH" == "1" ]]; then
-    echo "PASS: P/D routing, dsa_sparse_lookup_update, and per-layer Hot Cache SFA completed."
+    if ((MTP_SPECULATIVE_TOKENS > 0)); then
+        echo "PASS: P/D routing, MTP batch lookup/update, accepted-only" \
+            "mock store, and per-layer Hot Cache SFA completed."
+    else
+        echo "PASS: P/D routing, single-query lookup/update, and per-layer Hot Cache SFA completed."
+    fi
 else
     echo "PASS: process isolation and P/D routing completed."
     echo "Run again with --verify-path to verify the custom-op and Hot Cache path."
