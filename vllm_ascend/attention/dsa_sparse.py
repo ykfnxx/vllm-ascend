@@ -444,6 +444,30 @@ class DSASparseCoordinator:
         self.query_start_loc = leader.query_start_loc
         self.query_positions = leader.query_positions
 
+    def load_initial_resident(
+        self,
+        *,
+        layer_name: str,
+        remote_request_id: str,
+        pool_entry: int,
+        resident_token_ids: list[int],
+    ) -> None:
+        """Initial P/D resident-load boundary; current backend is a mock."""
+
+        if not dsa_sparse_probe.is_enabled():
+            return
+        resident_count = len(resident_token_ids)
+        row_begin = int(pool_entry) * self.request_row_stride
+        dsa_sparse_probe.emit(
+            "initial_resident_load_mock",
+            layer=layer_name,
+            cohort=self.cohort_name,
+            remote_request_id=remote_request_id,
+            pool_entry=int(pool_entry),
+            resident_count=resident_count,
+            destination_slot_range=[row_begin, row_begin + resident_count],
+        )
+
     def load_history_misses(self, layer_name: str) -> None:
         """Tensor-native history load point; mock performs no payload I/O."""
 

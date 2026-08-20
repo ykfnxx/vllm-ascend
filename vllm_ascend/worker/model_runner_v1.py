@@ -870,14 +870,16 @@ class NPUModelRunner(GPUModelRunner):
                 "DSA Sparse P/D handoff has no TopK for Decode rank "
                 f"{rank}: request={request_id!r}."
             ) from error
-        missing_layers = set(self._dsa_sparse_leader_by_layer) - set(
-            layer_topk
-        )
+        expected_layers = {
+            layer_name for layer_name, _ in self._dsa_sparse_coordinators
+        }
+        missing_layers = expected_layers - set(layer_topk)
         if missing_layers:
             raise RuntimeError(
-                "DSA Sparse P/D handoff is missing Decode leader layers: "
+                "DSA Sparse P/D handoff is missing Decode physical layers: "
                 f"request={request_id!r}, missing={sorted(missing_layers)}."
             )
+        resident_by_leader: dict[int, list[int]] = {}
         for layer_name, coordinator in (
             self._dsa_sparse_leader_by_layer.items()
         ):
@@ -885,7 +887,31 @@ class NPUModelRunner(GPUModelRunner):
                 topk_token_ids=layer_topk[layer_name],
                 stored_token_count=handoff.stored_token_count,
                 block_size=handoff.block_size,
+                include_partial_tail=(
+                    self.ascend_config.dsa_sparse_config.uses_mtp
+                ),
             )
+            resident_by_leader[id(coordinator)] = resident_token_ids
+
+        # Each physical layer owns independent Main payload. Followers reuse
+        # their cohort leader's selection but still perform their own load.
+        # Lookup mappings become visible only after every load has completed.
+        for layer_name, coordinator in self._dsa_sparse_coordinators:
+            leader = (
+                coordinator
+                if coordinator.leader is None
+                else coordinator.leader
+            )
+            resident_token_ids = resident_by_leader[id(leader)]
+            coordinator.load_initial_resident(
+                layer_name=layer_name,
+                remote_request_id=handoff.remote_request_id,
+                pool_entry=pool_entry,
+                resident_token_ids=resident_token_ids,
+            )
+
+        for coordinator in self._dsa_sparse_leader_coordinators:
+            resident_token_ids = resident_by_leader[id(coordinator)]
             coordinator.initialize_request(pool_entry, resident_token_ids)
 
         dsa_sparse_probe.emit_pd_handoff(
@@ -1026,11 +1052,13 @@ class NPUModelRunner(GPUModelRunner):
             int(count) for count in num_scheduled_tokens[:num_reqs]
         ]
         publish_requests: list[bool] = []
+        stored_token_counts: list[int] = []
         for request_id, scheduled_count in zip(
             request_ids, scheduled_counts
         ):
             request_state = self.requests[request_id]
             stored_token_count = request_state.num_prompt_tokens
+            stored_token_counts.append(stored_token_count)
             prefill_start = request_state.num_computed_tokens
             publish_requests.append(
                 prefill_start < stored_token_count
@@ -1051,6 +1079,7 @@ class NPUModelRunner(GPUModelRunner):
         return begin_dsa_sparse_producer_execution(
             request_ids=request_ids,
             scheduled_token_counts=scheduled_counts,
+            stored_token_counts=stored_token_counts,
             publish_requests=publish_requests,
             layer_metadata=layer_metadata,
         )

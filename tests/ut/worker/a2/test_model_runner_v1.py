@@ -1085,13 +1085,18 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
                 kv_role="kv_consumer",
                 is_consumer=True,
                 is_producer=False,
+                uses_mtp=False,
             )
         )
         runner.dsa_sparse_req_to_pool_entry = {}
         runner.dsa_sparse_free_pool_entries = deque(range(3))
-        runner._dsa_sparse_leader_coordinators = (MagicMock(),)
+        leader = MagicMock()
+        leader.leader = None
+        leader.request_row_stride = 10368
+        runner._dsa_sparse_leader_coordinators = (leader,)
+        runner._dsa_sparse_coordinators = (("layer.0", leader),)
         runner._dsa_sparse_leader_by_layer = {
-            "layer.0": runner._dsa_sparse_leader_coordinators[0]
+            "layer.0": leader
         }
         runner._dsa_sparse_pd_handoffs = {}
         runner._dsa_sparse_main_specs = {
@@ -1195,6 +1200,61 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         self.assertEqual(pool_entry, 0)
         self.assertEqual(resident[:5], [255, 7, 3, 128, 200])
         self.assertEqual(len(resident), 256)
+        leader.load_initial_resident.assert_called_once_with(
+            layer_name="layer.0",
+            remote_request_id="prefill-request",
+            pool_entry=0,
+            resident_token_ids=resident,
+        )
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_tp_group")
+    def test_handoff_loads_every_physical_layer_before_installing_lookup(
+        self,
+        mock_get_tp_group,
+    ):
+        runner = self._build_runner()
+        mock_get_tp_group.return_value.rank_in_group = 0
+        leader = runner._dsa_sparse_leader_coordinators[0]
+        follower = MagicMock()
+        follower.leader = leader
+        follower.request_row_stride = leader.request_row_stride
+        runner._dsa_sparse_coordinators = (
+            ("layer.0", leader),
+            ("layer.1", follower),
+        )
+        events = []
+        leader.load_initial_resident.side_effect = (
+            lambda **kwargs: events.append(("load", kwargs["layer_name"]))
+        )
+        follower.load_initial_resident.side_effect = (
+            lambda **kwargs: events.append(("load", kwargs["layer_name"]))
+        )
+        leader.initialize_request.side_effect = (
+            lambda *_args: events.append(("initialize", "layer.0"))
+        )
+        topk = list(range(2048))
+        handoff = DSASparsePDHandoff(
+            remote_request_id="prefill-request",
+            stored_token_count=259,
+            block_size=128,
+            layer_topk_by_rank={
+                0: {
+                    "layer.0": topk,
+                    "layer.1": topk,
+                }
+            },
+        )
+
+        runner._admit_dsa_sparse_request("request-a", handoff)
+
+        self.assertEqual(
+            events,
+            [
+                ("load", "layer.0"),
+                ("load", "layer.1"),
+                ("initialize", "layer.0"),
+            ],
+        )
 
     def test_metadata_contains_only_the_shared_pool_entry_tensor(self):
         runner = self._build_runner()

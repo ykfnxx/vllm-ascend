@@ -1717,6 +1717,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 raise RuntimeError("DSA Sparse requires one unpadded token per request.")
             kv_cache = dsa_sparse_coordinator.hot_main_cache
 
+        main_kv_cache = kv_cache
         kv_cache = self._compose_sfa_kv_cache(kv_cache)
 
         cos = attn_metadata.cos
@@ -2180,6 +2181,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             dsa_sparse_producer_context.publish_layer(
                 layer_name,
                 topk_indices,
+                tuple(main_kv_cache),
+                attn_metadata.block_table,
             )
 
         if dsa_sparse_coordinator is None:
