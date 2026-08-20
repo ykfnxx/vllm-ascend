@@ -7,7 +7,8 @@ from typing import NamedTuple
 import torch
 from vllm.logger import init_logger
 
-from vllm_ascend.dsa_sparse.dsa_kv_backend import DSAKVBackend
+from vllm_ascend.dsa_sparse.dsa_kv_backend import (
+    DSAKVBackend, compose_dsa_storage_request_ids)
 from vllm_ascend.dsa_sparse.dsa_resident_pool import DSAResidentLookupState
 from vllm_ascend.dsa_sparse.dsa_types import DSADecodeRowMode
 
@@ -55,10 +56,11 @@ class AscendDSAOpsBackend:
         kv_backend: DSAKVBackend,
         state: DSAResidentLookupState,
         pool_entries: torch.Tensor,
-        storage_request_ids: torch.Tensor,
+        block_hash_ids: torch.Tensor,
         initialize_rows: torch.Tensor,
         resident_tokens: int,
         selection_block_table: torch.Tensor,
+        block_size: int,
     ) -> None:
         pool_rows = pool_entries.to(dtype=torch.long)
         batch_size = int(pool_rows.numel())
@@ -70,13 +72,15 @@ class AscendDSAOpsBackend:
         slots = tokens
         init_mask = initialize_rows.view(-1, 1).expand(-1, resident_tokens)
 
-        kv_backend.load_tokens_into(
+        self._load_selected_tokens(
+            kv_backend=kv_backend,
             layer_id=int(layer_id),
-            storage_request_ids=storage_request_ids,
+            block_hash_ids=block_hash_ids,
             token_positions=tokens,
             destination_slots=slots,
             load_mask=init_mask,
             destination_block_table=selection_block_table,
+            block_size=int(block_size),
         )
         init_batch_rows, init_token_positions = init_mask.nonzero(as_tuple=True)
         init_pool_rows = pool_rows.index_select(0, init_batch_rows)
@@ -88,6 +92,54 @@ class AscendDSAOpsBackend:
             dtype=torch.int32)
         state.slot_to_token[init_pool_rows, init_slots] = init_tokens.to(
             dtype=torch.int32)
+
+    @staticmethod
+    def _load_selected_tokens(
+        *,
+        kv_backend: DSAKVBackend,
+        layer_id: int,
+        block_hash_ids: torch.Tensor,
+        token_positions: torch.Tensor,
+        destination_slots: torch.Tensor,
+        load_mask: torch.Tensor,
+        destination_block_table: torch.Tensor,
+        block_size: int,
+    ) -> None:
+        row_indices, token_indices = load_mask.to(
+            dtype=torch.bool).nonzero(as_tuple=True)
+        if int(row_indices.numel()) == 0:
+            return
+        token_positions = token_positions[
+            row_indices, token_indices].to(dtype=torch.long).contiguous()
+        source_logical_blocks = torch.div(
+            token_positions, int(block_size), rounding_mode="floor")
+        token_offsets_in_block = torch.remainder(
+            token_positions, int(block_size)).contiguous()
+        selected_block_hash_ids = block_hash_ids[
+            row_indices, source_logical_blocks].to(dtype=torch.long)
+        storage_request_ids = compose_dsa_storage_request_ids(
+            selected_block_hash_ids,
+            int(layer_id),
+        )
+
+        destination_slots = destination_slots[
+            row_indices, token_indices].to(dtype=torch.long).contiguous()
+        destination_logical_blocks = torch.div(
+            destination_slots, int(block_size), rounding_mode="floor")
+        destination_block_offsets = torch.remainder(
+            destination_slots, int(block_size))
+        destination_physical_blocks = destination_block_table[
+            row_indices, destination_logical_blocks].to(dtype=torch.long)
+        destination_physical_slots = (
+            destination_physical_blocks * int(block_size)
+            + destination_block_offsets).contiguous()
+
+        kv_backend.load_tokens_into(
+            layer_id=int(layer_id),
+            storage_request_ids=storage_request_ids,
+            token_offsets_in_block=token_offsets_in_block,
+            destination_physical_slots=destination_physical_slots,
+        )
 
     @staticmethod
     def _compose_attention_indices(
@@ -123,9 +175,10 @@ class AscendDSAOpsBackend:
         kv_backend: DSAKVBackend,
         selection_topk_indices: torch.Tensor,
         req_pool_entries: torch.Tensor,
-        storage_request_ids: torch.Tensor,
+        block_hash_ids: torch.Tensor,
         sparse_local_row_indices: torch.Tensor,
         selection_block_table: torch.Tensor,
+        block_size: int,
         lookup_state: DSAResidentLookupState,
         resident_tokens: int,
         dense_tail_starts: torch.Tensor,
@@ -141,11 +194,15 @@ class AscendDSAOpsBackend:
         topk = self._normalize_topk(selection_topk_indices, device)
         pool_entries = self._as_device_i32(
             req_pool_entries, device).reshape(-1)
-        storage_request_ids = storage_request_ids.to(
-            device=device, dtype=torch.long).reshape(-1).contiguous()
-        if int(storage_request_ids.numel()) != int(pool_entries.numel()):
+        block_hash_ids = block_hash_ids.to(
+            device=device, dtype=torch.long).contiguous()
+        if (block_hash_ids.ndim != 2
+                or int(block_hash_ids.shape[0]) != int(pool_entries.numel())):
             raise ValueError(
-                "DSA storage request ids must align with request pool rows")
+                "DSA block hash ids must align with request pool rows")
+        block_size = int(block_size)
+        if block_size <= 0:
+            raise ValueError("DSA block size must be positive")
         row_modes = self._as_device_i32(row_modes, device).reshape(-1)
         lookup_init_mask = lookup_init_mask.to(
             device=device, dtype=torch.bool).reshape(-1)
@@ -171,10 +228,11 @@ class AscendDSAOpsBackend:
                 kv_backend=kv_backend,
                 state=lookup_state,
                 pool_entries=pool_entries,
-                storage_request_ids=storage_request_ids,
+                block_hash_ids=block_hash_ids,
                 initialize_rows=lookup_init_mask,
                 resident_tokens=int(resident_tokens),
                 selection_block_table=selection_block_table,
+                block_size=block_size,
             )
             if not self._resident_init_logged:
                 logger.info(
@@ -187,7 +245,7 @@ class AscendDSAOpsBackend:
         sparse_topk = topk.index_select(0, sparse_local_rows).contiguous()
         sparse_pool_entries = pool_entries.index_select(
             0, sparse_local_rows).contiguous()
-        sparse_storage_request_ids = storage_request_ids.index_select(
+        sparse_block_hash_ids = block_hash_ids.index_select(
             0, sparse_local_rows).contiguous()
         sparse_dense_tail_starts = dense_tail_starts.index_select(
             0, sparse_local_rows).view(-1, 1)
@@ -230,13 +288,15 @@ class AscendDSAOpsBackend:
         )
         sparse_selection_block_table = selection_block_table.index_select(
             0, sparse_local_rows)
-        kv_backend.load_tokens_into(
+        self._load_selected_tokens(
+            kv_backend=kv_backend,
             layer_id=int(layer_id),
-            storage_request_ids=sparse_storage_request_ids,
+            block_hash_ids=sparse_block_hash_ids,
             token_positions=sparse_topk,
             destination_slots=sparse_slot_out,
             load_mask=sparse_misses,
             destination_block_table=sparse_selection_block_table,
+            block_size=block_size,
         )
         sparse_tail_slots = (
             sparse_resident_tail_starts

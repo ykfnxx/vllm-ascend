@@ -19,7 +19,7 @@ from vllm_ascend.dsa_sparse.dsa_batch_tensor_utils import (
     build_hbm_block_table_tensor, build_int_tensor, build_padded_int_tensor,
     compute_sparse_attention_indices_width, sort_decode_rows_by_batch_index)
 from vllm_ascend.dsa_sparse.dsa_kv_backend import (
-    encode_dsa_storage_request_id)
+    encode_dsa_block_hash_id)
 from vllm_ascend.dsa_sparse.dsa_layer_cache_zones import LayerCacheZones
 from vllm_ascend.dsa_sparse.dsa_req_meta import (
     QueryPositionRow, ReqMeta, ReqSparseDecodeForwardPlan, ReqType)
@@ -101,7 +101,7 @@ class DSAForwardSparseDecodeBatch:
     Built once per model forward and reused by every layer's after_indexer
     hook. It contains the tensorized, layer-invariant inputs needed by the
     lookup-resident path, such as resident pool rows, query ranges, HBM block
-    tables, and lookup row metadata.
+    tables, per-request block-hash lookup rows, and lookup row metadata.
 
     row-mode decode 刻意拆开两组“行”语义：
 
@@ -129,7 +129,7 @@ class DSAForwardSparseDecodeBatch:
     max_logical_blocks: int
     score_topk_k: int
     resident_pool_indices_tensor: torch.Tensor
-    storage_request_ids_tensor: torch.Tensor
+    block_hash_ids_tensor: torch.Tensor
     query_position_rows_tensor: torch.Tensor
     tail_valid_token_counts_tensor: torch.Tensor
     dense_tail_starts_tensor: torch.Tensor
@@ -173,8 +173,8 @@ class DSAForwardSparseDecodeBatch:
             score_topk_k=0,
             resident_pool_indices_tensor=torch.empty(
                 (0,), dtype=torch.int32, device=device),
-            storage_request_ids_tensor=torch.empty(
-                (0,), dtype=torch.long, device=device),
+            block_hash_ids_tensor=torch.empty(
+                (0, 0), dtype=torch.long, device=device),
             query_position_rows_tensor=torch.empty(
                 (0, 0), dtype=torch.int32, device=device),
             tail_valid_token_counts_tensor=torch.empty(
@@ -312,18 +312,15 @@ class DSAForwardLayerBatch:
 class DSAFullBlockDumpTables:
     """Forward-level rows consumed by the KV backend block put path.
 
-    This table only carries put row metadata. Prefill put readiness is a
-    separate tensor in DSAForwardLayerBatch because attention_finished only
-    needs resident pool rows to mark readiness; it does not need hashes or
-    logical block ids.
+    This table only carries complete-block hashes and their local physical
+    source blocks. Layer ids are applied later by the per-layer finish hook.
     """
 
-    storage_request_ids_tensor: torch.Tensor
+    block_hash_ids_tensor: torch.Tensor
     source_block_ids_tensor: torch.Tensor
-    logical_block_indices_tensor: torch.Tensor
 
     def __bool__(self) -> bool:
-        return int(self.storage_request_ids_tensor.numel()) > 0
+        return int(self.block_hash_ids_tensor.numel()) > 0
 
     @classmethod
     def empty(
@@ -334,11 +331,9 @@ class DSAFullBlockDumpTables:
         device = torch.device("cpu") if tensor_device is None else torch.device(
             tensor_device)
         return cls(
-            storage_request_ids_tensor=torch.empty(
+            block_hash_ids_tensor=torch.empty(
                 (0,), dtype=torch.long, device=device),
             source_block_ids_tensor=torch.empty(
-                (0,), dtype=torch.long, device=device),
-            logical_block_indices_tensor=torch.empty(
                 (0,), dtype=torch.long, device=device),
         )
 
@@ -364,6 +359,7 @@ def _build_forward_batches_from_dsa_meta(
     query_last_token_indices: list[int] = []
     query_positions: list[QueryPositionRow] = []
     request_ids: list[ReqType] = []
+    block_hash_id_rows: list[list[int]] = []
     batch_row_indices: list[int] = []
     sparse_row_mask: list[bool] = []
     row_modes: list[int] = []
@@ -384,9 +380,8 @@ def _build_forward_batches_from_dsa_meta(
 
     sparse_decode_guard_request_ids: list[ReqType] = []
     sparse_decode_guard_pool_indices: list[int] = []
-    dump_storage_request_ids: list[int] = []
+    dump_block_hash_ids: list[int] = []
     dump_block_ids: list[int] = []
-    dump_logical_block_indices: list[int] = []
     prefill_done_pool_indices: list[int] = []
 
     for req_meta in dsa_meta.requests:
@@ -397,7 +392,7 @@ def _build_forward_batches_from_dsa_meta(
             sparse_decode_guard_pool_indices.append(resident_pool_idx)
 
         block_ids: list[int] = []
-        logical_block_indices: list[int] = []
+        block_hashes: list = []
         mark_prefill_done = False
         if req_meta.num_output_tokens == 0 and req_meta.is_last_prefill_chunk:
             full_hashes = req_meta.req_context_full_blk_hashes
@@ -408,14 +403,14 @@ def _build_forward_batches_from_dsa_meta(
                     for block_id in req_meta.vllm_budget_block_ids[
                         :num_full_blocks]
                 ]
-                logical_block_indices = list(range(num_full_blocks))
+                block_hashes = list(full_hashes)
             mark_prefill_done = True
         elif (req_meta.num_output_tokens > 0
               and req_meta.is_full_block_need_dump_in_decode
               and req_meta.req_context_full_blk_hashes):
             logical_block_idx = len(req_meta.req_context_full_blk_hashes) - 1
             block_ids = [int(req_meta.vllm_budget_block_ids[-1])]
-            logical_block_indices = [logical_block_idx]
+            block_hashes = [req_meta.req_context_full_blk_hashes[-1]]
             logger.debug(
                 "========== DSA DECODE FULL BLOCK DUMP =========="
                 " req_id=%s prompt_tokens=%s output_tokens=%s "
@@ -434,12 +429,13 @@ def _build_forward_batches_from_dsa_meta(
         if mark_prefill_done:
             prefill_done_pool_indices.append(resident_pool_idx)
         if block_ids:
-            storage_request_id = encode_dsa_storage_request_id(
-                req_meta.request_id)
-            dump_storage_request_ids.extend(
-                [storage_request_id] * len(block_ids))
+            if len(block_hashes) != len(block_ids):
+                raise RuntimeError(
+                    "DSA full-block hashes must align with source block ids")
+            dump_block_hash_ids.extend(
+                encode_dsa_block_hash_id(block_hash)
+                for block_hash in block_hashes)
             dump_block_ids.extend(block_ids)
-            dump_logical_block_indices.extend(logical_block_indices)
 
         if req_meta.num_output_tokens <= 0:
             continue
@@ -469,6 +465,10 @@ def _build_forward_batches_from_dsa_meta(
                 f"num_reqs={len(dsa_meta.requests)}")
 
         request_ids.append(req_meta.request_id)
+        block_hash_id_rows.append([
+            encode_dsa_block_hash_id(block_hash)
+            for block_hash in req_meta.req_context_full_blk_hashes
+        ])
         batch_row_indices.append(batch_row_index)
         sparse_row_mask.append(is_sparse_row)
         row_modes.append(int(DSADecodeRowMode.SPARSE if is_sparse_row
@@ -528,6 +528,7 @@ def _build_forward_batches_from_dsa_meta(
     (
         batch_row_indices,
         request_ids,
+        block_hash_id_rows,
         sparse_row_mask,
         row_modes,
         lookup_init_mask,
@@ -548,6 +549,7 @@ def _build_forward_batches_from_dsa_meta(
     ) = sort_decode_rows_by_batch_index(
         batch_row_indices,
         request_ids,
+        block_hash_id_rows,
         sparse_row_mask,
         row_modes,
         lookup_init_mask,
@@ -597,13 +599,11 @@ def _build_forward_batches_from_dsa_meta(
         max_logical_blocks=max_logical_blocks,
         score_topk_k=score_topk_k,
         resident_pool_indices_tensor=resident_pool_indices_tensor,
-        storage_request_ids_tensor=build_int_tensor(
-            [
-                encode_dsa_storage_request_id(request_id)
-                for request_id in request_ids
-            ],
+        block_hash_ids_tensor=build_padded_int_tensor(
+            block_hash_id_rows,
             dtype=torch.long,
             device=device,
+            pad_value=0,
         ),
         query_position_rows_tensor=build_padded_int_tensor(
             query_positions,
@@ -663,15 +663,10 @@ def _build_forward_batches_from_dsa_meta(
             device=torch.device("cpu"),
         ),
         full_block_dump_tables=DSAFullBlockDumpTables(
-            storage_request_ids_tensor=build_int_tensor(
-                dump_storage_request_ids, dtype=torch.long, device=device),
+            block_hash_ids_tensor=build_int_tensor(
+                dump_block_hash_ids, dtype=torch.long, device=device),
             source_block_ids_tensor=build_int_tensor(
                 dump_block_ids, dtype=torch.long, device=device),
-            logical_block_indices_tensor=build_int_tensor(
-                dump_logical_block_indices,
-                dtype=torch.long,
-                device=device,
-            ),
         ),
         prefill_done_pool_indices_tensor=build_int_tensor(
             prefill_done_pool_indices,

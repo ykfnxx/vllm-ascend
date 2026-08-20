@@ -24,7 +24,8 @@ from vllm_ascend.dsa_sparse.dsa_forward_batch import (
     DSALayerSparseDecodeBatch, DSAModelForwardMeta,
     _build_forward_batches_from_dsa_meta)
 from vllm_ascend.dsa_sparse.dsa_graph_buffers import DSAGraphBuffersMixin
-from vllm_ascend.dsa_sparse.dsa_kv_backend import DSAKVBackend
+from vllm_ascend.dsa_sparse.dsa_kv_backend import (
+    DSAKVBackend, compose_dsa_storage_request_ids)
 from vllm_ascend.dsa_sparse.dsa_attention_layout import (
     materialize_query_position_metadata, slice_position_row,
     resolve_full_block_table_tensor, select_forward_shared_metadata)
@@ -623,10 +624,11 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
             kv_backend=self.kv_backend,
             selection_topk_indices=selection_topk,
             req_pool_entries=forward_batch.resident_pool_indices_tensor,
-            storage_request_ids=forward_batch.storage_request_ids_tensor,
+            block_hash_ids=forward_batch.block_hash_ids_tensor,
             sparse_local_row_indices=(
                 forward_batch.sparse_local_row_indices_tensor),
             selection_block_table=forward_batch.batch_hbm_block_table,
+            block_size=int(self._vllm_blk_size),
             lookup_state=lookup_state,
             resident_tokens=self._hbm_resident_tokens,
             dense_tail_starts=(
@@ -737,12 +739,13 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
         dump_tables = layer_batch.full_block_dump_tables
         if dump_tables:
             layer_id = layer_batch.layer_id
+            storage_request_ids = compose_dsa_storage_request_ids(
+                dump_tables.block_hash_ids_tensor,
+                layer_id,
+            )
             self.kv_backend.put_blocks(
                 layer_id=layer_id,
-                storage_request_ids=(
-                    dump_tables.storage_request_ids_tensor),
-                logical_block_indices=(
-                    dump_tables.logical_block_indices_tensor),
+                storage_request_ids=storage_request_ids,
                 source_block_ids=dump_tables.source_block_ids_tensor,
             )
 
@@ -798,16 +801,10 @@ class DSASparseV1(DSAGraphBuffersMixin, DSASparseBase):
 
     def request_finished_in_worker(self, request_id):
         self._clear_full_dump_done(request_id)
-        pool_idx = int(self.resident_token_pool.get_index(request_id))
-        self.kv_backend.release_request(
-            request_id=request_id, request_pool_idx=pool_idx)
         self.resident_token_pool.release(request_id)
 
     def request_preempted_in_worker(self, request_id):
         self._clear_full_dump_done(request_id)
-        pool_idx = int(self.resident_token_pool.get_index(request_id))
-        self.kv_backend.release_request(
-            request_id=request_id, request_pool_idx=pool_idx)
         self.resident_token_pool.release(request_id)
 
     def execute_begin(self, scheduler_output: SchedulerOutput):

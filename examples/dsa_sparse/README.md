@@ -325,17 +325,39 @@ backend 和 KVIO 标识改为：
 }
 ```
 
-KV cache 分配完成后，框架会把每个本地 MLA 层的 nope/rope tensor 地址和
-字节长度一次性传给 `aiv_init`，并且该初始化发生在首次模型编译或图捕获
-之前。完整 block 和 lookup miss 都通过 tensor-native 的
-`torch.ops._C_ascend.npu_get_put_batch` 提交，并使用相同的 `task_id` 与
-`io_nums` 调用 `torch.ops._C_ascend.npu_send_wait`。PUT 使用 opcode `0x05`，
-GET 使用 opcode `0x06`。每个 forward 的 block 元数据只转换成一次 NPU
-`int64` tensor；GET 的 cache/storage 偏移也直接在 NPU 上生成，不再经过
-`.cpu().tolist()` 或 Python descriptor loop。当前 KVIO 接口没有远端删除
-API，请求结束只释放本地 DSA 请求状态。KVIO 的 `request_ids` 来自稳定的
-vLLM 请求 ID，而不是会随 batch 重排或抢占而变化的 batch/pool 下标；服务
-调用方应避免在同一 KVIO namespace 中复用已结束请求的 ID。
+`kvio_model_id` 直接作为 KVIO `model_id` 传入；`kvio_pd_flag` 用作 GET 的
+PD 标识。当前 PUT 会分别以 prefill 标识 `0` 和 decode 标识 `1` 提交一次。
+
+KV cache 分配完成后，框架会在首次模型编译或图捕获前调用一次 `aiv_init`。
+注册对象是所有本地物理 MLA 层的完整 noPE/rope cache tensor，因此注册段数为
+`本地物理层数 * 2`。每段 tensor 的长度已经包含该 worker 上的全部物理 block，
+也就是本地 KV cache 为并发请求预留的总容量；注册段数不再按请求数展开。
+
+KVIO 参数中的 `storage_request_id` 不是 vLLM 语义的 request ID。当前实现先把
+vLLM block hash 转成 55 bit 非负整数，再与物理 `layer_id` 组合：
+`storage_request_id = (block_hash_id << 8) | layer_id`。因此一个 key 唯一标识
+一个编码后的 block 的一个物理层，低 8 bit 要求 `layer_id < 256`。不同原始
+block hash 如果截断后的低 55 bit 相同，仍会映射到同一个 key。对应的远端对象由
+该层完整 noPE block 和 RoPE block 顺序组成：noPE 的 `storage_offset` 从 0
+开始，RoPE 从 `nope_block_bytes` 开始；offset 是对象内部偏移，不是请求级
+连续空间中的偏移。
+
+PUT 以完整 block-layer 为粒度：prefill 结束时写入已经完成的全部 block，
+decode 只在新 block 填满时写入该 block，不逐 token PUT。GET 以
+token-layer 为粒度，先根据 token 所在逻辑 block 从 `[B, K]` 的
+`block_hash_ids_tensor` 中选出对应 block hash；其中 `B` 是 decode batch 行数，
+`K` 是该 batch 中最大的完整逻辑 block 数。选中结果再压紧成实际 miss 数量 `M`
+的一维描述；backend 随后为每个 token 展开 noPE/RoPE 两条传输描述。
+`destination_physical_slots` 表示经过 vLLM block table 映射后的本地物理 token
+槽位，`token_offsets_in_block` 表示该 token 在远端 block 对象内的位置。
+
+完整 block 和 lookup miss 都通过 tensor-native 的
+`torch.ops._C_ascend.npu_get_put_batch` 提交，并通过
+`torch.ops._C_ascend.npu_send_wait` 等待。PUT 使用 opcode `0x05`，GET 使用
+opcode `0x06`。KVIO forward 路径不执行 `.cpu().tolist()`、Python
+descriptor loop 或错误码回读；`aiv_init` 的地址列表和错误码判断只发生在
+初始化阶段。当前 KVIO 接口没有远端删除 API，请求结束只释放本地 DSA 请求
+状态，不删除以 block-layer key 标识的远端对象。
 
 ### 静态诊断运行中的服务
 

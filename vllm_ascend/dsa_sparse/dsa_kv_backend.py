@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import random
 from abc import ABC, abstractmethod
 
@@ -11,22 +10,44 @@ from vllm.logger import init_logger
 
 logger = init_logger("vllm.dsa_sparse")
 
+DSA_STORAGE_LAYER_BITS = 8
+_DSA_STORAGE_LAYER_LIMIT = 1 << DSA_STORAGE_LAYER_BITS
+_DSA_STORAGE_BLOCK_HASH_BITS = 63 - DSA_STORAGE_LAYER_BITS
+_DSA_STORAGE_BLOCK_HASH_MASK = (1 << _DSA_STORAGE_BLOCK_HASH_BITS) - 1
 
-def encode_dsa_storage_request_id(request_id) -> int:
-    """Encode a stable framework request id into a signed int64 namespace.
 
-    The framework request id is stable across scheduling steps and preemption,
-    while batch indices and resident-pool indices are not. KVIO therefore uses
-    this deterministic value as storage identity instead of either local index.
-    """
-    if isinstance(request_id, int):
-        encoded = int(request_id)
-        if 0 <= encoded <= 0x7FFFFFFFFFFFFFFF:
-            return encoded
-        raise ValueError("integer request id does not fit positive int64")
-    digest = hashlib.blake2b(
-        str(request_id).encode("utf-8"), digest_size=8).digest()
-    return int.from_bytes(digest, byteorder="little") & 0x7FFFFFFFFFFFFFFF
+def encode_dsa_block_hash_id(block_hash) -> int:
+    """Convert one vLLM block hash to the positive-int64 storage key prefix."""
+    if isinstance(block_hash, bool):
+        raise TypeError("boolean is not a valid vLLM block hash")
+    if isinstance(block_hash, int):
+        encoded = int(block_hash)
+        if encoded < 0:
+            raise ValueError("integer block hash must be non-negative")
+    elif isinstance(block_hash, (bytes, bytearray, memoryview)):
+        hash_bytes = bytes(block_hash)
+        if not hash_bytes:
+            raise ValueError("vLLM block hash bytes must not be empty")
+        encoded = int.from_bytes(hash_bytes, byteorder="big", signed=False)
+    else:
+        raise TypeError(
+            "vLLM block hash must be an integer or bytes-like value")
+    return encoded & _DSA_STORAGE_BLOCK_HASH_MASK
+
+
+def compose_dsa_storage_request_ids(
+    block_hash_ids: torch.Tensor,
+    layer_id: int,
+) -> torch.Tensor:
+    """Pack block-hash prefixes and one physical layer id into int64 keys."""
+    layer_id = int(layer_id)
+    if layer_id < 0 or layer_id >= _DSA_STORAGE_LAYER_LIMIT:
+        raise ValueError(
+            f"DSA storage layer id must be in [0, {_DSA_STORAGE_LAYER_LIMIT}), "
+            f"got {layer_id}")
+    block_hash_ids = block_hash_ids.to(dtype=torch.long)
+    return ((block_hash_ids << DSA_STORAGE_LAYER_BITS)
+            | layer_id).contiguous()
 
 
 class DSAKVBackend(ABC):
@@ -35,9 +56,9 @@ class DSAKVBackend(ABC):
     The framework decides which full blocks to put and which lookup misses to
     load. Implementations own storage, address translation, and I/O ordering.
     Loads write directly into the registered resident cache and return no KV
-    tensor. Request identities and block/token descriptors cross this boundary
-    as tensors so a backend never has to materialize device metadata as Python
-    lists.
+    tensor. Block-layer identities and block/token descriptors cross this
+    boundary as tensors so a backend never has to materialize device metadata
+    as Python lists.
     """
 
     @property
@@ -66,7 +87,6 @@ class DSAKVBackend(ABC):
         *,
         layer_id: int,
         storage_request_ids: torch.Tensor,
-        logical_block_indices: torch.Tensor,
         source_block_ids: torch.Tensor,
     ) -> None:
         """Write flattened complete HBM blocks to backend-owned storage."""
@@ -77,16 +97,10 @@ class DSAKVBackend(ABC):
         *,
         layer_id: int,
         storage_request_ids: torch.Tensor,
-        token_positions: torch.Tensor,
-        destination_slots: torch.Tensor,
-        load_mask: torch.Tensor,
-        destination_block_table: torch.Tensor,
+        token_offsets_in_block: torch.Tensor,
+        destination_physical_slots: torch.Tensor,
     ) -> None:
         """Load selected tokens directly into registered resident HBM slots."""
-
-    @abstractmethod
-    def release_request(self, *, request_id, request_pool_idx: int) -> None:
-        """Release backend state associated with one request."""
 
     @abstractmethod
     def close(self) -> None:
@@ -132,10 +146,9 @@ class MockDSAKVBackend(DSAKVBackend):
         *,
         layer_id: int,
         storage_request_ids: torch.Tensor,
-        logical_block_indices: torch.Tensor,
         source_block_ids: torch.Tensor,
     ) -> None:
-        _ = (storage_request_ids, logical_block_indices, source_block_ids)
+        _ = source_block_ids
         if not self._put_logged:
             logger.info(
                 "DSA mock KV backend accepted block puts without storage: "
@@ -150,25 +163,17 @@ class MockDSAKVBackend(DSAKVBackend):
         *,
         layer_id: int,
         storage_request_ids: torch.Tensor,
-        token_positions: torch.Tensor,
-        destination_slots: torch.Tensor,
-        load_mask: torch.Tensor,
-        destination_block_table: torch.Tensor,
+        token_offsets_in_block: torch.Tensor,
+        destination_physical_slots: torch.Tensor,
     ) -> None:
-        block_size, nopek_cache, ropek_cache = self._layer_caches[int(
-            layer_id)]
-        row_indices, token_indices = load_mask.to(
-            dtype=torch.bool).nonzero(as_tuple=True)
-        slots = destination_slots[row_indices,
-                                  token_indices].to(dtype=torch.long)
-        logical_blocks = torch.div(slots,
-                                   block_size,
-                                   rounding_mode="floor")
-        block_offsets = torch.remainder(slots, block_size)
-        physical_blocks = destination_block_table[
-            row_indices, logical_blocks].to(dtype=torch.long)
-        physical_slots = physical_blocks * block_size + block_offsets
-
+        _, nopek_cache, ropek_cache = self._layer_caches[int(layer_id)]
+        request_count = int(storage_request_ids.numel())
+        if (int(token_offsets_in_block.numel()) != request_count
+                or int(destination_physical_slots.numel()) != request_count):
+            raise ValueError(
+                "DSA mock token load descriptors must have equal size")
+        physical_slots = destination_physical_slots.to(
+            dtype=torch.long).reshape(-1)
         nopek_value = self._random.uniform(-1.0, 1.0)
         ropek_value = self._random.uniform(-1.0, 1.0)
         nopek_cache.reshape(-1, nopek_cache.shape[-1]).index_fill_(
@@ -178,14 +183,11 @@ class MockDSAKVBackend(DSAKVBackend):
         if not self._load_logged:
             logger.info(
                 "DSA mock KV backend wrote lookup misses directly to resident "
-                "HBM: layer=%d, request_rows=%d",
+                "HBM: layer=%d, tokens=%d",
                 int(layer_id),
-                int(storage_request_ids.numel()),
+                request_count,
             )
             self._load_logged = True
-
-    def release_request(self, *, request_id, request_pool_idx: int) -> None:
-        return
 
     def close(self) -> None:
         self._layer_caches.clear()
@@ -201,6 +203,5 @@ def create_dsa_kv_backend(vllm_config) -> DSAKVBackend:
         return KVIODSAKVBackend(
             model_id=int(vllm_config.cache_config.dsa_kvio_model_id),
             pd_flag=int(vllm_config.cache_config.dsa_kvio_pd_flag),
-            max_model_len=int(vllm_config.model_config.max_model_len),
         )
     raise ValueError(f"Unsupported DSA KV backend: {backend_name}")

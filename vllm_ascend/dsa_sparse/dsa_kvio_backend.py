@@ -26,15 +26,14 @@ class _KVIOCacheRegion:
     cache: torch.Tensor
     token_bytes: int
     block_bytes: int
-    storage_base: int
 
 
 class KVIODSAKVBackend(DSAKVBackend):
     """Move MLA nope/rope data through the ``rdma_kv_ops`` AIV API.
 
     KVIO registers each layer's nope and rope cache as two local NPU regions.
-    Remote storage is addressed per integer request id; within that request,
-    every registered region owns a contiguous ``max_model_len`` token range.
+    Each integer request id identifies one complete block for one physical
+    layer. The remote object stores the nope block followed by the rope block.
     """
 
     def __init__(
@@ -42,7 +41,6 @@ class KVIODSAKVBackend(DSAKVBackend):
         *,
         model_id: int,
         pd_flag: int,
-        max_model_len: int,
         ops_module: ModuleType | None = None,
         tensor_ops: Any | None = None,
     ) -> None:
@@ -53,7 +51,6 @@ class KVIODSAKVBackend(DSAKVBackend):
             torch.ops._C_ascend if tensor_ops is None else tensor_ops)
         self._model_id = int(model_id)
         self._pd_flag = int(pd_flag)
-        self._max_model_len = int(max_model_len)
         self._registered_caches: dict[
             int, tuple[int, torch.Tensor, torch.Tensor]] = {}
         self._regions: dict[int, tuple[_KVIOCacheRegion,
@@ -70,19 +67,6 @@ class KVIODSAKVBackend(DSAKVBackend):
     @staticmethod
     def _tensor_bytes(tensor: torch.Tensor) -> int:
         return int(tensor.numel()) * int(tensor.element_size())
-
-    @staticmethod
-    def _check(operation: str, error_code) -> None:
-        if torch.is_tensor(error_code):
-            if int(error_code.numel()) != 1:
-                raise RuntimeError(
-                    f"KVIO {operation} returned a non-scalar error code")
-            error_code = int(error_code.detach().cpu().reshape(-1)[0])
-        else:
-            error_code = int(error_code)
-        if error_code != 0:
-            raise RuntimeError(
-                f"KVIO {operation} failed with error code {error_code}")
 
     @staticmethod
     def _interleave(first: torch.Tensor,
@@ -104,7 +88,7 @@ class KVIODSAKVBackend(DSAKVBackend):
                 or self._pd_flag_tensor is None):
             raise RuntimeError("KVIO tensor controls are not initialized")
         io_nums = cache_ids.new_full((1,), int(cache_ids.numel()))
-        error_code = self._tensor_ops.npu_get_put_batch(
+        self._tensor_ops.npu_get_put_batch(
             self._task_id_tensor,
             self._model_id_tensor,
             pd_flag,
@@ -116,11 +100,7 @@ class KVIODSAKVBackend(DSAKVBackend):
             storage_offsets,
             block_lengths,
         )
-        self._check("npu_get_put_batch", error_code)
-        self._check(
-            "npu_send_wait",
-            self._tensor_ops.npu_send_wait(self._task_id_tensor, io_nums),
-        )
+        self._tensor_ops.npu_send_wait(self._task_id_tensor, io_nums)
         self._task_id_tensor.add_(1)
 
     def register_layer_cache(
@@ -146,7 +126,6 @@ class KVIODSAKVBackend(DSAKVBackend):
 
         cache_addresses: list[int] = []
         cache_lengths: list[int] = []
-        storage_base = 0
         cache_device: torch.device | None = None
         for layer_id in sorted(self._registered_caches):
             block_size, nopek_cache, ropek_cache = self._registered_caches[
@@ -168,19 +147,17 @@ class KVIODSAKVBackend(DSAKVBackend):
                         cache=cache,
                         token_bytes=token_bytes,
                         block_bytes=block_bytes,
-                        storage_base=storage_base,
                     ))
                 cache_addresses.append(int(cache.data_ptr()))
                 cache_lengths.append(cache_bytes)
-                storage_base += self._max_model_len * token_bytes
             self._regions[layer_id] = (layer_regions[0], layer_regions[1])
 
         if cache_device is None:
             raise RuntimeError("KVIO requires at least one registered cache")
-        self._check(
-            "aiv_init",
-            self._ops.aiv_init(cache_addresses, cache_lengths),
-        )
+        error_code = int(self._ops.aiv_init(cache_addresses, cache_lengths))
+        if error_code != 0:
+            raise RuntimeError(
+                f"KVIO aiv_init failed with error code {error_code}")
         tensor_kwargs = {"dtype": torch.long, "device": cache_device}
         self._task_id_tensor = torch.ones((1,), **tensor_kwargs)
         self._model_id_tensor = torch.full(
@@ -209,20 +186,16 @@ class KVIODSAKVBackend(DSAKVBackend):
         *,
         layer_id: int,
         storage_request_ids: torch.Tensor,
-        logical_block_indices: torch.Tensor,
         source_block_ids: torch.Tensor,
     ) -> None:
         nopek_region, ropek_region = self._regions[int(layer_id)]
         device = nopek_region.cache.device
         storage_request_ids = storage_request_ids.to(
             device=device, dtype=torch.long).reshape(-1).contiguous()
-        logical_block_indices = logical_block_indices.to(
-            device=device, dtype=torch.long).reshape(-1).contiguous()
         source_block_ids = source_block_ids.to(
             device=device, dtype=torch.long).reshape(-1).contiguous()
         block_count = int(storage_request_ids.numel())
-        if (int(logical_block_indices.numel()) != block_count
-                or int(source_block_ids.numel()) != block_count):
+        if int(source_block_ids.numel()) != block_count:
             raise ValueError(
                 "KVIO block descriptor tensors must have equal size")
         if block_count == 0:
@@ -238,10 +211,8 @@ class KVIODSAKVBackend(DSAKVBackend):
             source_block_ids * ropek_region.block_bytes,
         )
         storage_offsets = self._interleave(
-            logical_block_indices * nopek_region.block_bytes
-            + nopek_region.storage_base,
-            logical_block_indices * ropek_region.block_bytes
-            + ropek_region.storage_base,
+            torch.zeros_like(storage_request_ids),
+            torch.full_like(storage_request_ids, nopek_region.block_bytes),
         )
         block_lengths = self._interleave(
             torch.full_like(storage_request_ids, nopek_region.block_bytes),
@@ -272,40 +243,24 @@ class KVIODSAKVBackend(DSAKVBackend):
         *,
         layer_id: int,
         storage_request_ids: torch.Tensor,
-        token_positions: torch.Tensor,
-        destination_slots: torch.Tensor,
-        load_mask: torch.Tensor,
-        destination_block_table: torch.Tensor,
+        token_offsets_in_block: torch.Tensor,
+        destination_physical_slots: torch.Tensor,
     ) -> None:
         nopek_region, ropek_region = self._regions[int(layer_id)]
-        request_count = int(storage_request_ids.numel())
-        if request_count != int(load_mask.shape[0]):
-            raise ValueError(
-                "KVIO storage request ids must align with lookup rows")
-        row_indices, token_indices = load_mask.to(
-            dtype=torch.bool).nonzero(as_tuple=True)
-        if int(row_indices.numel()) == 0:
-            return
-
-        slots = destination_slots[row_indices,
-                                  token_indices].to(dtype=torch.long)
-        logical_blocks = torch.div(
-            slots, nopek_region.block_bytes // nopek_region.token_bytes,
-            rounding_mode="floor")
-        block_offsets = torch.remainder(
-            slots, nopek_region.block_bytes // nopek_region.token_bytes)
-        physical_blocks = destination_block_table[
-            row_indices, logical_blocks].to(dtype=torch.long)
-        physical_slots = (
-            physical_blocks
-            * (nopek_region.block_bytes // nopek_region.token_bytes)
-            + block_offsets)
         device = nopek_region.cache.device
         request_ids = storage_request_ids.to(
-            device=device, dtype=torch.long).reshape(-1).index_select(
-                0, row_indices).contiguous()
-        token_positions = token_positions[
-            row_indices, token_indices].to(dtype=torch.long).contiguous()
+            device=device, dtype=torch.long).reshape(-1).contiguous()
+        token_offsets = token_offsets_in_block.to(
+            device=device, dtype=torch.long).reshape(-1).contiguous()
+        physical_slots = destination_physical_slots.to(
+            device=device, dtype=torch.long).reshape(-1).contiguous()
+        token_count = int(request_ids.numel())
+        if (int(token_offsets.numel()) != token_count
+                or int(physical_slots.numel()) != token_count):
+            raise ValueError(
+                "KVIO token descriptor tensors must have equal size")
+        if token_count == 0:
+            return
         cache_ids = self._interleave(
             torch.full_like(request_ids, nopek_region.cache_id),
             torch.full_like(request_ids, ropek_region.cache_id),
@@ -316,14 +271,13 @@ class KVIODSAKVBackend(DSAKVBackend):
             physical_slots * ropek_region.token_bytes,
         )
         storage_offsets = self._interleave(
-            token_positions * nopek_region.token_bytes
-            + nopek_region.storage_base,
-            token_positions * ropek_region.token_bytes
-            + ropek_region.storage_base,
+            token_offsets * nopek_region.token_bytes,
+            nopek_region.block_bytes
+            + token_offsets * ropek_region.token_bytes,
         )
         block_lengths = self._interleave(
-            torch.full_like(token_positions, nopek_region.token_bytes),
-            torch.full_like(token_positions, ropek_region.token_bytes),
+            torch.full_like(token_offsets, nopek_region.token_bytes),
+            torch.full_like(token_offsets, ropek_region.token_bytes),
         )
         if self._get_opcode_tensor is None:
             raise RuntimeError("KVIO GET opcode tensor is not initialized")
@@ -339,9 +293,6 @@ class KVIODSAKVBackend(DSAKVBackend):
         logger.debug(
             "DSA KVIO get completed: layer=%d, transfers=%d",
             int(layer_id), int(cache_ids.numel()))
-
-    def release_request(self, *, request_id, request_pool_idx: int) -> None:
-        return
 
     def close(self) -> None:
         if not self._initialized:
