@@ -1162,6 +1162,56 @@ class KVCacheRecvingThread(threading.Thread):
                 layer_name_to_idx[layer_name] = layer_idx
         return layer_name_to_idx
 
+    @classmethod
+    def _get_missing_remote_layer_names(
+        cls,
+        local_kv_group2layeridx: dict[
+            int,
+            tuple[dict[str, Any], list[int]],
+        ],
+        remote_kv_group2layeridx: dict[
+            int,
+            tuple[dict[str, Any], list[int]],
+        ],
+    ) -> list[str] | None:
+        """Validate name-based P/D layer compatibility.
+
+        DSA Sparse intentionally exposes Main+Indexer layers on P and only
+        Indexer layers on D.  Therefore the serialized dictionaries need not
+        be equal; every D-local layer must instead have a stable-name match on
+        P.  ``None`` preserves the legacy equality warning for metadata that
+        predates serialized layer names.
+        """
+
+        for remote_group_spec, _ in remote_kv_group2layeridx.values():
+            if remote_group_spec.get("layer_names") is None:
+                return None
+        remote_layer_name_to_idx = cls._build_remote_layer_name_to_idx(
+            remote_kv_group2layeridx,
+        )
+
+        local_layer_names: set[str] = set()
+        for local_group_idx, (
+            local_group_spec,
+            local_layer_indices,
+        ) in local_kv_group2layeridx.items():
+            layer_names = local_group_spec.get("layer_names")
+            if layer_names is None:
+                return None
+            if len(layer_names) != len(local_layer_indices):
+                raise RuntimeError(
+                    "Mooncake local KV group metadata has inconsistent "
+                    "layer names and indices: "
+                    f"group_idx={local_group_idx}, "
+                    f"layer_names={layer_names}, "
+                    f"layer_indices={local_layer_indices}."
+                )
+            local_layer_names.update(layer_names)
+
+        return sorted(
+            local_layer_names - remote_layer_name_to_idx.keys()
+        )
+
     @staticmethod
     def _resolve_remote_layer_idx(
         remote_layer_name_to_idx: dict[str, int],
@@ -1490,11 +1540,46 @@ class KVCacheRecvingThread(threading.Thread):
                 f"Conflict engine id {engine_id} with local engine id {self.local_engine_id}."
             )
             if agent_meta.kv_group2layeridx != self.kv_group2layeridx:
-                logger.warning(
-                    "Remote kv_group2layeridx is inconsistent with local. remote=%s, local=%s. ",
-                    agent_meta.kv_group2layeridx,
-                    self.kv_group2layeridx,
+                additional_config = getattr(
+                    self.vllm_config,
+                    "additional_config",
+                    None,
                 )
+                dsa_sparse_enabled = (
+                    isinstance(additional_config, dict)
+                    and "dsa_sparse_config" in additional_config
+                )
+                missing_layer_names = (
+                    self._get_missing_remote_layer_names(
+                        self.kv_group2layeridx,
+                        agent_meta.kv_group2layeridx,
+                    )
+                    if dsa_sparse_enabled
+                    else None
+                )
+                if missing_layer_names:
+                    raise RuntimeError(
+                        "Mooncake remote KV metadata is missing DSA Sparse "
+                        "Decode layers: "
+                        f"remote_engine_id={engine_id!r}, "
+                        f"remote_handshake_port={remote_handshake_port}, "
+                        f"missing_layer_names={missing_layer_names}."
+                    )
+                if missing_layer_names is None:
+                    logger.warning(
+                        "Remote kv_group2layeridx is inconsistent with "
+                        "local. remote=%s, local=%s. ",
+                        agent_meta.kv_group2layeridx,
+                        self.kv_group2layeridx,
+                    )
+                else:
+                    logger.debug(
+                        "Mooncake DSA Sparse P/D KV metadata is compatible "
+                        "by layer name although physical layouts differ. "
+                        "remote_engine_id=%s remote_handshake_port=%s",
+                        engine_id,
+                        remote_handshake_port,
+                    )
             with self.remote_metadata_lock:
                 self.remote_kv_group2layeridx[engine_id][remote_handshake_port] = agent_meta.kv_group2layeridx
                 self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr

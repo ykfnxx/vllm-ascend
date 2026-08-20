@@ -68,8 +68,8 @@ Options:
   --prompt-tokens N            Repeated input token count. Default: 2333
   --prompt-token-id ID         Repeated vocabulary token ID. Default: 100
   --max-tokens N               Decode token count. Default: 1
-  --mtp-speculative-tokens N   Enable Decode-side MTP with N draft tokens.
-                               Valid range: 1-15. Default: 0 (disabled)
+  --mtp-speculative-tokens N   Enable P/D MTP: Prefill uses 1 draft token and
+                               Decode uses N. Range: 1-15. Default: 0
   --max-model-len N            Model context limit. Default: 4096
   --gpu-memory-utilization F   Per-engine NPU memory fraction. Default: 0.50
   --startup-timeout SEC        Per-service startup timeout. Default: 900
@@ -323,9 +323,17 @@ COMMON_NETWORK_ENV=(
 
 DECODE_PROBE_ENV=()
 DECODE_PROFILER_ARGS=()
+PREFILL_SPECULATIVE_ARGS=()
 DECODE_SPECULATIVE_ARGS=()
 if ((MTP_SPECULATIVE_TOKENS > 0)); then
+    # Mooncake's MTP P/D contract keeps one draft layer on Prefill and lets
+    # Decode choose its speculative width.  The draft KV layer must exist in
+    # both engines even though this probe mocks payload movement.
+    PREFILL_SPECULATIVE_CONFIG='{"method":"mtp","num_speculative_tokens":1}'
     DECODE_SPECULATIVE_CONFIG="{\"method\":\"mtp\",\"num_speculative_tokens\":$MTP_SPECULATIVE_TOKENS}"
+    PREFILL_SPECULATIVE_ARGS+=(
+        --speculative-config "$PREFILL_SPECULATIVE_CONFIG"
+    )
     DECODE_SPECULATIVE_ARGS+=(
         --speculative-config "$DECODE_SPECULATIVE_CONFIG"
     )
@@ -390,6 +398,7 @@ env \
     --compilation-config '{"cudagraph_mode":"NONE"}' \
     --additional-config "$PREFILL_DSA_CONFIG" \
     --kv-transfer-config "$PREFILL_KV_CONFIG" \
+    "${PREFILL_SPECULATIVE_ARGS[@]}" \
     >"$PREFILL_LOG" 2>&1 &
 PREFILL_PID=$!
 CHILD_PIDS+=("$PREFILL_PID")

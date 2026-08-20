@@ -955,6 +955,51 @@ class TestCoreFunctionality(unittest.TestCase):
         self.assertEqual(call_args[3], [2 * 1024, 2 * 256])
         mock_get_meta.assert_not_called()
 
+    def test_dsa_sparse_metadata_allows_prefill_only_main_layers(self):
+        indexer_layer = "model.layers.0.self_attn.indexer.k_cache"
+        main_layer = "model.layers.0.self_attn.attn"
+        draft_layer = "model.layers.2.self_attn.attn"
+        local = {
+            0: (
+                {"layer_names": [indexer_layer, draft_layer]},
+                [0, 1],
+            ),
+        }
+        remote = {
+            0: ({"layer_names": [indexer_layer]}, [0]),
+            1: (
+                {"layer_names": [main_layer, draft_layer]},
+                [1, 2],
+            ),
+        }
+
+        missing = self.thread._get_missing_remote_layer_names(
+            local,
+            remote,
+        )
+
+        self.assertEqual(missing, [])
+
+    def test_dsa_sparse_metadata_reports_missing_mtp_draft_layer(self):
+        indexer_layer = "model.layers.0.self_attn.indexer.k_cache"
+        draft_layer = "model.layers.2.self_attn.attn"
+        local = {
+            0: (
+                {"layer_names": [indexer_layer, draft_layer]},
+                [0, 1],
+            ),
+        }
+        remote = {
+            0: ({"layer_names": [indexer_layer]}, [0]),
+        }
+
+        missing = self.thread._get_missing_remote_layer_names(
+            local,
+            remote,
+        )
+
+        self.assertEqual(missing, [draft_layer])
+
     @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
     def test_transfer_kv_cache_dsa_sparse_mock_skips_payload(self, mock_get_meta):
         self.thread.kv_caches_base_addr["remote_engine"] = {6666: [[0x3000]]}
