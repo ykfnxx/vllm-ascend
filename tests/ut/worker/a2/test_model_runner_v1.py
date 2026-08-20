@@ -237,6 +237,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             kv_lora_rank=512,
             qk_rope_head_dim=64,
             index_head_dim=128,
+            num_hidden_layers=1,
         )
         runner.vllm_config.cache_config.cache_dtype = "auto"
 
@@ -263,6 +264,80 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertIsInstance(
             runner._dsa_sparse_main_specs[main_layer_name],
             AscendMLAAttentionSpec,
+        )
+
+    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_dsa_sparse_decode_keeps_mtp_draft_in_scheduler_spec(
+        self,
+        mock_get_layers,
+        _mock_has_ec_transfer,
+    ):
+        runner = self._build_runner()
+        runner.use_sparse = True
+        runner.block_size = 128
+        runner.kv_cache_dtype = torch.bfloat16
+        runner.ascend_config = MagicMock()
+        runner.ascend_config.dsa_sparse_config = SimpleNamespace(
+            kv_role="kv_consumer",
+        )
+        runner.model_config.hf_text_config = SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            num_hidden_layers=1,
+        )
+        runner.vllm_config.cache_config.cache_dtype = "auto"
+
+        target_layer_name = "model.layers.0.self_attn.attn"
+        draft_layer_name = "model.layers.1.self_attn.attn"
+
+        def make_mla_module():
+            module = MLAAttention.__new__(MLAAttention)
+            torch.nn.Module.__init__(module)
+            module.impl = SimpleNamespace(enable_sparse_sfa_c8=False)
+            return module
+
+        mock_get_layers.return_value = {
+            target_layer_name: make_mla_module(),
+            draft_layer_name: make_mla_module(),
+        }
+
+        scheduler_specs = runner.get_kv_cache_spec()
+
+        self.assertEqual(set(scheduler_specs), {draft_layer_name})
+        self.assertEqual(
+            set(runner._dsa_sparse_main_specs),
+            {target_layer_name},
+        )
+        self.assertIsInstance(
+            scheduler_specs[draft_layer_name],
+            AscendMLAAttentionSpec,
+        )
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_dsa_sparse_ordered_layers_excludes_mtp_draft(
+        self,
+        mock_get_layers,
+    ):
+        runner = self._build_runner()
+        target_layer_name = "model.layers.0.self_attn.attn"
+        draft_layer_name = "model.layers.1.self_attn.attn"
+        target_module = MLAAttention.__new__(MLAAttention)
+        draft_module = MLAAttention.__new__(MLAAttention)
+        runner._dsa_sparse_main_specs = {
+            target_layer_name: MagicMock(),
+        }
+        mock_get_layers.return_value = {
+            draft_layer_name: draft_module,
+            target_layer_name: target_module,
+        }
+
+        ordered_layers = runner._get_dsa_sparse_ordered_layers()
+
+        self.assertEqual(
+            ordered_layers,
+            [(target_layer_name, target_module)],
         )
 
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
@@ -347,6 +422,10 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             "model.layers.2.self_attn.attn": layer_2,
             "model.layers.0.self_attn.attn": layer_0,
             "model.layers.1.self_attn.attn": layer_1,
+        }
+        runner._dsa_sparse_main_specs = {
+            layer_name: MagicMock()
+            for layer_name in mock_get_layers.return_value
         }
 
         fixed_hbm_bytes = runner.get_dsa_sparse_fixed_hbm_bytes()

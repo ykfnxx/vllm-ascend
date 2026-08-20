@@ -674,7 +674,10 @@ class NPUModelRunner(GPUModelRunner):
         )
         ordered_layers: list[tuple[int, str, MLAAttention]] = []
         for layer_name, attn_module in attn_layers.items():
-            if isinstance(attn_module, MLAAttention):
+            if (
+                isinstance(attn_module, MLAAttention)
+                and layer_name in self._dsa_sparse_main_specs
+            ):
                 ordered_layers.append(
                     (extract_layer_index(layer_name), layer_name, attn_module)
                 )
@@ -683,6 +686,33 @@ class NPUModelRunner(GPUModelRunner):
             (layer_name, attn_module)
             for _, layer_name, attn_module in ordered_layers
         ]
+
+    def _is_dsa_sparse_target_layer(
+        self,
+        layer_name: str,
+    ) -> bool:
+        """Return whether an MLA layer belongs to the target GLM model.
+
+        MTP registers its draft attention after the target layer range.  The
+        draft layer keeps the ordinary scheduler-managed KV cache and must not
+        acquire a DSA Hot Cache coordinator or participate in the P/D TopK
+        handoff.
+        """
+
+        num_target_layers = getattr(
+            self.model_config.hf_text_config,
+            "num_hidden_layers",
+            None,
+        )
+        if (
+            isinstance(num_target_layers, bool)
+            or not isinstance(num_target_layers, int)
+            or num_target_layers <= 0
+        ):
+            raise ValueError(
+                "DSA Sparse requires a positive target num_hidden_layers."
+            )
+        return extract_layer_index(layer_name) < num_target_layers
 
     def _get_dsa_sparse_main_layouts_and_cohort_count(
         self,
@@ -5380,7 +5410,10 @@ class NPUModelRunner(GPUModelRunner):
                         cache_dtype_str=self.vllm_config.cache_config.cache_dtype,
                         cache_sparse_sfa_c8=impl.enable_sparse_sfa_c8,
                     )
-                    if use_dsa_sparse_main:
+                    if (
+                        use_dsa_sparse_main
+                        and self._is_dsa_sparse_target_layer(layer_name)
+                    ):
                         main_specs[layer_name] = main_spec
                     else:
                         kv_cache_spec[layer_name] = main_spec
