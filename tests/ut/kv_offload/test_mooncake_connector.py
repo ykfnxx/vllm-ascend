@@ -955,6 +955,81 @@ class TestCoreFunctionality(unittest.TestCase):
         self.assertEqual(call_args[3], [2 * 1024, 2 * 256])
         mock_get_meta.assert_not_called()
 
+    @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
+    def test_transfer_dsa_sparse_split_groups_use_independent_block_ids(self, mock_get_meta):
+        """Indexer and MTP draft groups must not share staged block ids."""
+        indexer_layer = "model.layers.0.self_attn.indexer.k_cache"
+        draft_layer = "model.layers.1.self_attn.attn"
+        req = dict(self.test_req)
+        req["local_block_ids"] = ([1], [7])
+        req["remote_block_ids"] = ([2], [8])
+        req["group_pulls"] = [
+            GroupPull(group_id=0, remote_tp_offset=0, num_group_pulls=1),
+            GroupPull(group_id=1, remote_tp_offset=0, num_group_pulls=1),
+        ]
+        self.thread.kv_group2layeridx = {
+            0: (
+                {
+                    "kv_cache_spec_type": "AscendSFAIndexerCacheSpec",
+                    "kv_cache_group_id": 0,
+                    "layer_names": [indexer_layer],
+                },
+                [0],
+            ),
+            1: (
+                {
+                    "kv_cache_spec_type": "AscendMLAAttentionSpec",
+                    "kv_cache_group_id": 0,
+                    "layer_names": [draft_layer],
+                },
+                [1],
+            ),
+        }
+        self.thread.group_compress_ratios = {0: 1, 1: 1}
+        self.thread.remote_kv_group2layeridx["remote_engine"][6666] = {
+            0: (
+                {
+                    "kv_cache_spec_type": "AscendSFAIndexerCacheSpec",
+                    "kv_cache_group_id": 0,
+                    "layer_names": [indexer_layer],
+                },
+                [0],
+            ),
+            1: (
+                {
+                    "kv_cache_spec_type": "AscendMLAAttentionSpec",
+                    "kv_cache_group_id": 0,
+                    "layer_names": [draft_layer],
+                },
+                [1],
+            ),
+        }
+        self.thread.kv_caches_base_addr["remote_engine"] = {
+            6666: [[0x3000], [0x4000]],
+        }
+        self.thread.remote_block_stride_per_addr["remote_engine"][6666] = [
+            [1024],
+            [2048],
+        ]
+
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config"
+        ) as mock_config:
+            mock_config.return_value.enable_kv_nz = False
+            self.thread._transfer_kv_cache_all_groups(req)
+
+        call_args, _ = self.engine.batch_transfer_sync_read.call_args
+        self.assertEqual(
+            call_args[1],
+            [0x1000 + 1 * 1024, 0x2000 + 7 * 2048],
+        )
+        self.assertEqual(
+            call_args[2],
+            [0x3000 + 2 * 1024, 0x4000 + 8 * 2048],
+        )
+        self.assertEqual(call_args[3], [1024, 2048])
+        mock_get_meta.assert_not_called()
+
     def test_dsa_sparse_metadata_allows_prefill_only_main_layers(self):
         indexer_layer = "model.layers.0.self_attn.indexer.k_cache"
         main_layer = "model.layers.0.self_attn.attn"
@@ -3035,7 +3110,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                     expected_finishes={0: 2, 1: 1},
                 )
 
-    def test_hybrid_no_cp_uses_kv_cache_group_ids_for_split_transfer_groups(self):
+    def test_hybrid_no_cp_keeps_split_transfer_group_block_ids(self):
         with patch.object(
             self.vllm_config.kv_transfer_config,
             "get_from_extra_config",
@@ -3066,7 +3141,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         worker.handshake_port = worker.side_channel_port + worker.tp_rank
         worker.local_remote_block_port_mapping = {}
         worker.remote_port_send_num = {}
-        worker.block_size_scale = [[1], [1], [1]]
+        worker.block_size_scale = [[2], [1], [1]]
         worker.kv_group2layeridx = {
             0: (
                 {
@@ -3112,8 +3187,26 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         ports, local_ids, remote_ids = worker._get_kv_split_metadata("req_hybrid_split", cast(ReqMeta, meta))
 
         self.assertEqual(len(ports), 1)
-        self.assertEqual(local_ids, [([70, 71, 72, 73], [80, 81, 82, 83])])
-        self.assertEqual(remote_ids, [([50, 51, 52, 53], [60, 61, 62, 63])])
+        self.assertEqual(
+            local_ids,
+            [
+                (
+                    [140, 141, 142, 143, 144, 145, 146, 147],
+                    [70, 71, 72, 73],
+                    [80, 81, 82, 83],
+                ),
+            ],
+        )
+        self.assertEqual(
+            remote_ids,
+            [
+                (
+                    [100, 101, 102, 103, 104, 105, 106, 107],
+                    [50, 51, 52, 53],
+                    [60, 61, 62, 63],
+                ),
+            ],
+        )
 
     def test_get_tp_num_need_pulls(self):
         worker = MooncakeConnectorWorker(self.vllm_config, self.engine_id, MockKVCacheConfig())
