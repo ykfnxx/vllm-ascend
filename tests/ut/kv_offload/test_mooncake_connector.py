@@ -384,6 +384,78 @@ class TestMooncakeTransferGroups(unittest.TestCase):
         self.assertEqual(kv_group2layeridx[0][0]["kv_cache_spec"]["num_kv_heads"], 1)
         self.assertEqual(kv_group2layeridx[1][0]["kv_cache_spec"]["num_kv_heads"], 1)
 
+    def test_dsa_sparse_prefill_exposes_only_indexer_and_mtp_to_mooncake(self):
+        indexer_layer = "model.layers.0.self_attn.indexer.k_cache"
+        main_layer = "model.layers.0.self_attn.attn"
+        draft_layer = "model.layers.2.self_attn.attn"
+        indexer_spec = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            head_size_v=128,
+            dtype=torch.float16,
+        )
+        main_spec = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.float16,
+        )
+        draft_spec = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.float16,
+        )
+        layer_specs = {
+            indexer_layer: indexer_spec,
+            main_layer: main_spec,
+            draft_layer: draft_spec,
+        }
+
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.vllm_config = MockVllmConfig()
+        worker.vllm_config.model_config.get_total_num_kv_heads = MagicMock(
+            return_value=4
+        )
+        worker.dsa_sparse_config = types.SimpleNamespace(
+            kv_role="kv_producer"
+        )
+        worker.total_layers = 2
+        worker.kv_cache_config = MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(
+                    layer_names=list(layer_specs),
+                    kv_cache_spec=UniformTypeKVCacheSpecs(
+                        block_size=16,
+                        kv_cache_specs=layer_specs,
+                    ),
+                )
+            ]
+        )
+
+        transfer_layer_names = (
+            worker._get_dsa_sparse_transfer_layer_names()
+        )
+        kv_group2layeridx = worker._build_kv_group2layeridx(
+            transfer_layer_names
+        )
+
+        self.assertEqual(
+            transfer_layer_names,
+            {indexer_layer, draft_layer},
+        )
+        serialized_layer_names = {
+            layer_name
+            for group_spec, _ in kv_group2layeridx.values()
+            for layer_name in group_spec["layer_names"]
+        }
+        self.assertEqual(
+            serialized_layer_names,
+            {indexer_layer, draft_layer},
+        )
+        self.assertNotIn(main_layer, serialized_layer_names)
+
     def test_build_kv_group2layeridx_splits_equal_local_heads_by_total_heads(self):
         shared_local_spec = FullAttentionSpec(
             block_size=16,

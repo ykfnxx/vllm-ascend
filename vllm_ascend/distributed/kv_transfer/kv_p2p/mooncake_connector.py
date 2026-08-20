@@ -2603,7 +2603,54 @@ class MooncakeConnectorWorker:
             model_config = speculative_config.draft_model_config
         return model_config.get_total_num_kv_heads()
 
-    def _build_kv_group2layeridx(self) -> dict[int, tuple[dict[str, Any], list[int]]]:
+    def _get_dsa_sparse_transfer_layer_names(
+        self,
+    ) -> set[str] | None:
+        """Return the cache layers DSA Sparse should expose to Mooncake.
+
+        Decode owns target-model Main KV in its Hot Cache, so Mooncake must
+        only move scheduler-managed payloads that exist on both P and D:
+        Indexer cache and, when enabled, the MTP draft cache.  Prefill still
+        owns and uses its target Main tensors; excluding them here only removes
+        them from Mooncake registration and handshake metadata.
+
+        ``None`` means that the ordinary, unfiltered Mooncake layout applies.
+        """
+
+        if getattr(self.dsa_sparse_config, "kv_role", None) != "kv_producer":
+            return None
+
+        from vllm.v1.worker.utils import extract_layer_index
+
+        num_attn_module = (
+            2
+            if self.vllm_config.model_config.hf_text_config.model_type
+            == "longcat_flash"
+            else 1
+        )
+        transfer_layer_names: set[str] = set()
+        for group_spec in self.kv_cache_config.kv_cache_groups:
+            for layer_name in group_spec.layer_names:
+                layer_spec = group_spec.kv_cache_spec
+                if isinstance(layer_spec, UniformTypeKVCacheSpecs):
+                    layer_spec = layer_spec.kv_cache_specs[layer_name]
+
+                is_target_main = False
+                if isinstance(layer_spec, MLAAttentionSpec) and "mtp" not in layer_name:
+                    layer_idx = extract_layer_index(
+                        layer_name,
+                        num_attn_module,
+                    )
+                    is_target_main = layer_idx < self.total_layers
+                if not is_target_main:
+                    transfer_layer_names.add(layer_name)
+
+        return transfer_layer_names
+
+    def _build_kv_group2layeridx(
+        self,
+        transfer_layer_names: set[str] | None = None,
+    ) -> dict[int, tuple[dict[str, Any], list[int]]]:
         from vllm.v1.worker.utils import extract_layer_index
 
         kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]] = {}
@@ -2619,12 +2666,17 @@ class MooncakeConnectorWorker:
             # an eagle layer and assign a new layer id starting from total_layers.
             assigned_indices: set[int] = set()
             for layer_name in group_spec.layer_names:
+                if transfer_layer_names is not None and layer_name not in transfer_layer_names:
+                    continue
                 if "mtp" in layer_name:
                     layer_idx = next_mtp_layer_idx
                     next_mtp_layer_idx += 1
                 else:
                     layer_idx = extract_layer_index(layer_name, num_attn_module)
-                    if assigned_indices and layer_idx < min(assigned_indices) or layer_idx in assigned_indices:
+                    if (
+                        assigned_indices
+                        and layer_idx < min(assigned_indices)
+                    ) or layer_idx in assigned_indices:
                         layer_idx = next_mtp_layer_idx
                         next_mtp_layer_idx += 1
                 assigned_indices.add(layer_idx)
@@ -2707,6 +2759,8 @@ class MooncakeConnectorWorker:
             shared_addrs: list[int] = []
             has_mtp = False
             for layer_name in kv_cache_tensor.shared_by:
+                if layer_name not in kv_caches:
+                    continue
                 has_mtp = has_mtp or "mtp" in layer_name
                 layer_spec = self._get_layer_spec(layer_name)
                 conv_padding = max(conv_padding, self._get_mamba_conv_padding(layer_spec))
@@ -2733,6 +2787,8 @@ class MooncakeConnectorWorker:
         for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
             shared_addrs: list[int] = []
             for layer_name in kv_cache_tensor.shared_by:
+                if layer_name not in kv_caches:
+                    continue
                 for single_kv_cache in self._as_kv_cache_tuple(kv_caches[layer_name]):
                     shared_addrs.append(single_kv_cache.data_ptr())
 
@@ -2764,10 +2820,29 @@ class MooncakeConnectorWorker:
 
         self.num_blocks = self.kv_cache_config.num_blocks
         logger.info("num_blocks: %s", self.num_blocks)
-        self.kv_caches = kv_caches
+        transfer_layer_names = self._get_dsa_sparse_transfer_layer_names()
+        if transfer_layer_names is None:
+            transfer_kv_caches = kv_caches
+        else:
+            transfer_kv_caches = {
+                layer_name: kv_cache
+                for layer_name, kv_cache in kv_caches.items()
+                if layer_name in transfer_layer_names
+            }
+            excluded_layer_names = sorted(
+                set(kv_caches) - set(transfer_kv_caches)
+            )
+            logger.info(
+                "DSA Sparse Prefill excludes target Main caches from "
+                "Mooncake payload registration: excluded_layers=%s",
+                excluded_layer_names,
+            )
+        self.kv_caches = transfer_kv_caches
         # Maps each KV cache group to its serialized group spec and physical
         # layer indices: {group_id: (group_spec, [layer_idx0, layer_idx1, ...])}.
-        self.kv_group2layeridx = self._build_kv_group2layeridx()
+        self.kv_group2layeridx = self._build_kv_group2layeridx(
+            transfer_layer_names,
+        )
         self._is_hma_required = self._is_hma_required or self._requires_group_aware_attention_transfer()
         has_mamba_group = self._has_mamba_group()
         layer_name_to_idx = {
@@ -2794,7 +2869,7 @@ class MooncakeConnectorWorker:
 
         # TODO: For DSV4 use_compress, metadata/transfer can be optimized by
         # aggregating layer views that share the same raw KVCacheTensor.
-        for layer_name, kv_cache_tuple in kv_caches.items():
+        for layer_name, kv_cache_tuple in transfer_kv_caches.items():
             layer_idx = layer_name_to_idx[layer_name]
             for single_kv_cache in self._as_kv_cache_tuple(kv_cache_tuple):
                 tensor_num_blocks = single_kv_cache.shape[0]
@@ -2807,16 +2882,22 @@ class MooncakeConnectorWorker:
                 self.kv_caches_base_addr[layer_idx].append(single_kv_cache.data_ptr())
 
         if has_mamba_group:
-            ptrs, lengths = self._get_registered_kv_tensor_buffers(kv_caches)
+            ptrs, lengths = self._get_registered_kv_tensor_buffers(
+                transfer_kv_caches
+            )
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
         elif self.use_hybrid:
-            ptrs, lengths = self._get_registered_kv_tensor_buffers_hybrid(kv_caches)
+            ptrs, lengths = self._get_registered_kv_tensor_buffers_hybrid(
+                transfer_kv_caches
+            )
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
         else:
             # For normal attention / sparse-c8 KV cache, keep metadata at the
             # logical tensor level but merge registration ranges by underlying
             # storage to avoid exceeding the HCCL per-process region limit.
-            register_regions = collect_storage_merged_register_regions(kv_caches)
+            register_regions = collect_storage_merged_register_regions(
+                transfer_kv_caches
+            )
 
         validate_register_region_count(register_regions)
         global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
