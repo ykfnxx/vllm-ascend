@@ -23,6 +23,9 @@ from vllm_ascend.attention.indexer import (
 )
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
+from vllm_ascend.worker.dsa_sparse_external_main import (
+    add_dsa_sparse_main_metadata,
+)
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -338,6 +341,92 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(
             ordered_layers,
             [(target_layer_name, target_module)],
+        )
+
+    def test_dsa_sparse_main_metadata_preserves_mtp_draft_spec(self):
+        block_size = 128
+        indexer_layer_name = "model.layers.0.self_attn.indexer.k_cache"
+        draft_layer_name = "model.layers.1.self_attn.attn"
+        target_layer_name = "model.layers.0.self_attn.attn"
+        indexer_spec = AscendSFAIndexerCacheSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+        draft_spec = AscendMLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+        )
+        target_spec = AscendMLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+        )
+        scheduler_specs = {
+            indexer_layer_name: indexer_spec,
+            draft_layer_name: draft_spec,
+        }
+        cache_tensors = [
+            KVCacheTensor(
+                size=indexer_spec.page_size_bytes * 2,
+                shared_by=[indexer_layer_name],
+            ),
+            KVCacheTensor(
+                size=draft_spec.page_size_bytes * 2,
+                shared_by=[draft_layer_name],
+            ),
+        ]
+        kv_cache_config = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=cache_tensors,
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=list(scheduler_specs),
+                    kv_cache_spec=UniformTypeKVCacheSpecs(
+                        block_size=block_size,
+                        kv_cache_specs=scheduler_specs,
+                    ),
+                ),
+            ],
+        )
+
+        group_id = add_dsa_sparse_main_metadata(
+            kv_cache_config,
+            {target_layer_name: target_spec},
+        )
+
+        self.assertEqual(group_id, 0)
+        projected_group = kv_cache_config.kv_cache_groups[0]
+        self.assertEqual(
+            set(projected_group.layer_names),
+            {
+                indexer_layer_name,
+                draft_layer_name,
+                target_layer_name,
+            },
+        )
+        self.assertIsInstance(
+            projected_group.kv_cache_spec,
+            UniformTypeKVCacheSpecs,
+        )
+        self.assertEqual(
+            projected_group.kv_cache_spec.kv_cache_specs,
+            {
+                indexer_layer_name: indexer_spec,
+                draft_layer_name: draft_spec,
+                target_layer_name: target_spec,
+            },
+        )
+        self.assertIs(kv_cache_config.kv_cache_tensors, cache_tensors)
+        self.assertEqual(
+            [tensor.shared_by for tensor in kv_cache_config.kv_cache_tensors],
+            [[indexer_layer_name], [draft_layer_name]],
         )
 
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
