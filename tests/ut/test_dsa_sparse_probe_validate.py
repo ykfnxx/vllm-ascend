@@ -187,7 +187,7 @@ def _write_mtp_fixture(
                     "hot_block_table_shape": [1, 81],
                 },
                 {
-                    "event": "accepted_store_mock",
+                    "event": "accepted_tail_commit",
                     "target_step_id": 0,
                     "layer": layer,
                     "cohort": "layer-0",
@@ -302,7 +302,7 @@ def test_validate_rejects_old_lookup_event_shape(
         )
 
 
-def test_validate_accepts_mtp_batch_lookup_and_accepted_only_store(
+def test_validate_accepts_mtp_batch_lookup_and_accepted_tail_commit(
     tmp_path: Path,
 ):
     decode_log, response_json, profile_dir = _write_mtp_fixture(tmp_path)
@@ -321,11 +321,11 @@ def test_validate_accepts_mtp_batch_lookup_and_accepted_only_store(
         "lookup_update_done": 1,
         "history_load_mock": 2,
         "hot_cache_sfa_done": 2,
-        "accepted_store_mock": 2,
+        "accepted_tail_commit": 2,
     }
 
 
-def test_validate_rejects_mtp_store_beyond_query_prefix(
+def test_validate_rejects_mtp_commit_beyond_query_prefix(
     tmp_path: Path,
 ):
     decode_log, response_json, profile_dir = _write_mtp_fixture(
