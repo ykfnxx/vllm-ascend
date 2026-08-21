@@ -1104,8 +1104,9 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         runner = self._build_runner()
         leader = runner._dsa_sparse_leader_coordinators[0]
 
-        runner._admit_dsa_sparse_request("request-a")
-        runner._admit_dsa_sparse_request("request-b")
+        runner._ensure_dsa_sparse_request_admitted("request-a")
+        runner._ensure_dsa_sparse_request_admitted("request-a")
+        runner._ensure_dsa_sparse_request_admitted("request-b")
 
         self.assertEqual(
             runner.dsa_sparse_req_to_pool_entry,
@@ -1129,7 +1130,7 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         "vllm_ascend.worker.model_runner_v1.GPUModelRunner._update_states",
         return_value="deferred-correction",
     )
-    def test_update_states_applies_direct_request_lifecycle(
+    def test_update_states_applies_direct_and_connector_request_lifecycle(
         self,
         mock_upstream_update,
     ):
@@ -1137,6 +1138,13 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         runner.use_async_scheduling = False
         runner._release_dsa_sparse_request = MagicMock()
         runner._admit_dsa_sparse_request = MagicMock()
+        handoff = DSASparsePDHandoff(
+            remote_request_id="prefill-loading",
+            stored_token_count=259,
+            block_size=128,
+            layer_topk_by_rank={0: {"layer.0": list(range(2048))}},
+            partial_tail_blocks_by_rank={0: {"layer.0": 2}},
+        )
         scheduler_output = SimpleNamespace(
             scheduled_cached_reqs=SimpleNamespace(
                 req_ids=[],
@@ -1148,7 +1156,13 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
             recomputed_reqs=[SimpleNamespace(request_id="recomputed")],
             scheduled_new_reqs=[SimpleNamespace(req_id="new")],
             num_scheduled_tokens={},
-            kv_connector_metadata=None,
+            kv_connector_metadata=SimpleNamespace(
+                requests={
+                    "loading": SimpleNamespace(
+                        dsa_sparse_handoff=handoff,
+                    )
+                }
+            ),
         )
 
         result = runner._update_states(scheduler_output)
@@ -1161,7 +1175,11 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         )
         self.assertEqual(
             runner._admit_dsa_sparse_request.call_args_list,
-            [call("new", None), call("resumed", None)],
+            [
+                call("loading", handoff),
+                call("new", None),
+                call("resumed", None),
+            ],
         )
 
     @patch("vllm_ascend.worker.model_runner_v1.get_tp_group")

@@ -891,6 +891,15 @@ class NPUModelRunner(GPUModelRunner):
             self.dsa_sparse_free_pool_entries.appendleft(pool_entry)
             raise
 
+    def _ensure_dsa_sparse_request_admitted(
+        self,
+        request_id: str,
+        handoff: DSASparsePDHandoff | None = None,
+    ) -> None:
+        if request_id in self.dsa_sparse_req_to_pool_entry:
+            return
+        self._admit_dsa_sparse_request(request_id, handoff)
+
     def _initialize_dsa_sparse_request_from_handoff(
         self,
         request_id: str,
@@ -1327,13 +1336,31 @@ class NPUModelRunner(GPUModelRunner):
             for request_id in retiring_req_ids:
                 self._release_dsa_sparse_request(request_id)
 
+            connector_metadata = getattr(
+                scheduler_output, "kv_connector_metadata", None
+            )
+            connector_requests = getattr(
+                connector_metadata, "requests", None
+            )
+            if isinstance(connector_requests, dict):
+                # Async remote loads can run in a no-forward step, before the
+                # request appears in scheduled_new_reqs. The Decode row must
+                # already exist when Mooncake resolves the partial-tail target.
+                for request_id in connector_requests:
+                    handoff = self._dsa_sparse_pd_handoffs.get(request_id)
+                    if handoff is not None:
+                        self._ensure_dsa_sparse_request_admitted(
+                            request_id,
+                            handoff,
+                        )
+
             for request in scheduler_output.scheduled_new_reqs:
-                self._admit_dsa_sparse_request(
+                self._ensure_dsa_sparse_request_admitted(
                     request.req_id,
                     self._dsa_sparse_pd_handoffs.get(request.req_id),
                 )
             for request_id in req_data.resumed_req_ids:
-                self._admit_dsa_sparse_request(
+                self._ensure_dsa_sparse_request_admitted(
                     request_id,
                     self._dsa_sparse_pd_handoffs.get(request_id),
                 )
