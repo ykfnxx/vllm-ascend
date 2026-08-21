@@ -66,12 +66,22 @@ def _queries(
     query_index = []
     lookup_mask = []
     for request in range(requests):
+        resident_hit = request % RESIDENT_SLOT_COUNT
+        initial_previous_hit = (
+            resident_hit + 1
+        ) % RESIDENT_SLOT_COUNT
         for query in range(queries_per_request):
             miss_token = 9000 + request * 64 + query
             previous_miss = (
-                miss_token - 1 if query > 0 else request
+                miss_token - 1 if query > 0 else initial_previous_hit
             )
-            active = [request, miss_token, previous_miss, -1]
+            active = [resident_hit, miss_token, previous_miss, -1]
+            valid_active = [token for token in active if token >= 0]
+            if len(valid_active) != len(set(valid_active)):
+                raise AssertionError(
+                    "correctness workload contains duplicate active tokens: "
+                    f"request={request}, query={query}, tokens={active}"
+                )
             query_index.append(
                 active + [INVALID_INDEX] * (QUERY_WIDTH - len(active))
             )
