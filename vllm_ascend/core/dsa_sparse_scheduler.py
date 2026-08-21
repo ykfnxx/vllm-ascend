@@ -37,6 +37,20 @@ def attach_dsa_sparse_block_hashes(
         list(scheduler.requests[request_id].block_hashes) for request_id in cached_requests.req_ids
     ]
 
+    connector_metadata = getattr(scheduler_output, "kv_connector_metadata", None)
+    connector_requests = getattr(connector_metadata, "requests", None)
+    # Async KV loads are emitted before their requests enter a model batch.
+    # Carry the Decode scheduler hashes in that load-only SchedulerOutput.
+    scheduler_output.dsa_sparse_connector_block_hashes = {
+        request_id: list(scheduler.requests[request_id].block_hashes)
+        for request_id, request_metadata in (
+            connector_requests.items()
+            if isinstance(connector_requests, dict)
+            else ()
+        )
+        if getattr(request_metadata, "dsa_sparse_handoff", None) is not None
+    }
+
     candidate_hashes: dict[str, list[bytes | int]] = {}
     for request_id, speculative_tokens in scheduler_output.scheduled_spec_decode_tokens.items():
         if not speculative_tokens:

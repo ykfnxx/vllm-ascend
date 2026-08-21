@@ -1412,12 +1412,29 @@ class NPUModelRunner(GPUModelRunner):
                 )
             }
         )
+        connector_block_hashes = getattr(
+            scheduler_output,
+            "dsa_sparse_connector_block_hashes",
+            {},
+        )
+        if not isinstance(connector_block_hashes, dict):
+            raise TypeError(
+                "DSA Sparse connector block hashes must be request-aligned"
+            )
+        committed_by_request.update(
+            {
+                request_id: list(block_hashes)
+                for request_id, block_hashes in connector_block_hashes.items()
+            }
+        )
         candidate_by_request = getattr(
             scheduler_output,
             "dsa_candidate_block_hashes",
             {},
         )
-        for request_id in scheduler_output.num_scheduled_tokens:
+        request_ids = set(scheduler_output.num_scheduled_tokens)
+        request_ids.update(connector_block_hashes)
+        for request_id in request_ids:
             committed = list(committed_by_request.get(request_id, ()))
             candidates = list(candidate_by_request.get(request_id, ()))
             self._dsa_sparse_committed_block_hashes[request_id] = committed

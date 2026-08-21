@@ -1090,6 +1090,8 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         runner._dsa_sparse_coordinators = (("layer.0", leader),)
         runner._dsa_sparse_leader_by_layer = {"layer.0": leader}
         runner._dsa_sparse_pd_handoffs = {}
+        runner._dsa_sparse_committed_block_hashes = {}
+        runner._dsa_sparse_candidate_block_hashes = {}
         runner._dsa_sparse_main_specs = {
             "layer.0": object(),
             "layer.1": object(),
@@ -1156,6 +1158,9 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
             recomputed_reqs=[SimpleNamespace(request_id="recomputed")],
             scheduled_new_reqs=[SimpleNamespace(req_id="new")],
             num_scheduled_tokens={},
+            dsa_sparse_connector_block_hashes={
+                "loading": [b"block-0", b"block-1"],
+            },
             kv_connector_metadata=SimpleNamespace(
                 requests={
                     "loading": SimpleNamespace(
@@ -1180,6 +1185,10 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
                 call("new", None),
                 call("resumed", None),
             ],
+        )
+        self.assertEqual(
+            runner._dsa_sparse_committed_block_hashes["loading"],
+            [b"block-0", b"block-1"],
         )
 
     @patch("vllm_ascend.worker.model_runner_v1.get_tp_group")
