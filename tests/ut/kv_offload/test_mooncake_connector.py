@@ -3357,6 +3357,8 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         worker.kv_send_thread = None
         worker.kv_recv_thread = MagicMock()
         worker._prefill_tp_size = 4
+        worker.tp_size = 4
+        worker._dsa_sparse_request_rows = {}
         worker.remote_port_send_num = {"remote_engine": {31001: {"num": 1, "host": "localhost"}}}
         worker._get_sfa_replicate_k_block_ids = MagicMock(return_value=(([40],), ([20],)))
         worker._get_kv_split_metadata = MagicMock(
@@ -3386,6 +3388,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
             local_block_ids=([10],),
             remote_block_ids=([30],),
             num_computed_tokens=0,
+            dsa_sparse_handoff=None,
         )
         metadata = types.SimpleNamespace(reqs_in_batch=["req"], requests={"req": meta})
 
@@ -3399,6 +3402,51 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertEqual(add_request_calls[1].kwargs["remote_handshake_port"], 31003)
         self.assertIsNone(add_request_calls[1].kwargs["local_block_ids_replicate_k"])
         self.assertIsNone(add_request_calls[1].kwargs["remote_block_ids_replicate_k"])
+
+    def test_start_load_kv_mock_skip_does_not_require_partial_tail_row(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.kv_send_thread = None
+        worker.kv_recv_thread = MagicMock()
+        worker._prefill_tp_size = 1
+        worker.tp_size = 1
+        worker.tp_rank = 0
+        worker._dsa_sparse_request_rows = {}
+        worker.remote_port_send_num = {}
+        worker._get_sfa_replicate_k_block_ids = MagicMock(return_value=(tuple(), tuple()))
+        worker._get_kv_split_metadata = MagicMock(
+            return_value=(
+                [[31000]],
+                [([10],)],
+                [([30],)],
+            )
+        )
+        worker._get_group_pulls_metadata = MagicMock(return_value=[[[]]])
+        worker._get_remote_host_info_by_port = MagicMock(return_value=("localhost", "remote_engine"))
+        handoff = types.SimpleNamespace(stored_token_count=259, block_size=128)
+        meta = types.SimpleNamespace(
+            remote_request_id="remote_req",
+            remote_engine_id="remote_engine",
+            remote_host="localhost",
+            remote_port=31000,
+            remote_pcp_size=1,
+            remote_dcp_size=1,
+            remote_ptp_size=1,
+            remote_multi_nodes_meta_mapping={},
+            remote_block_size=128,
+            local_block_ids=([10],),
+            remote_block_ids=([30],),
+            num_computed_tokens=0,
+            dsa_sparse_handoff=handoff,
+        )
+        metadata = types.SimpleNamespace(reqs_in_batch=[], requests={"req": meta})
+
+        with patch.dict(os.environ, {"VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE": "1"}):
+            worker.start_load_kv(cast(MooncakeConnectorMetadata, metadata))
+
+        worker.kv_recv_thread.add_request.assert_called_once()
+        call_kwargs = worker.kv_recv_thread.add_request.call_args.kwargs
+        self.assertIsNone(call_kwargs["dsa_sparse_handoff"])
+        self.assertIsNone(call_kwargs["dsa_sparse_pool_entry"])
 
     def test_get_kv_split_metadata_dp1_remote_port_send_num_uses_absolute_ports(self):
         self.vllm_config.kv_transfer_config.kv_port = 30000

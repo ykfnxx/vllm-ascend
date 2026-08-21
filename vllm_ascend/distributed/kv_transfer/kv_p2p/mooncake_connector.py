@@ -3984,6 +3984,7 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
+        skip_payload = ascend_envs.VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE
         for req_id in metadata.reqs_in_batch:
             if self.kv_send_thread is not None:
                 self.kv_send_thread.task_tracker.add_req_to_process(req_id)
@@ -4009,14 +4010,15 @@ class MooncakeConnectorWorker:
                 if dsa_sparse_handoff is not None
                 else 0
             )
-            if tail_valid_count and prefill_tp_size != self.tp_size:
+            transfer_partial_tail = bool(tail_valid_count) and not skip_payload
+            if transfer_partial_tail and prefill_tp_size != self.tp_size:
                 raise RuntimeError(
                     "DSA Sparse partial-tail handoff currently requires equal Prefill and Decode TP sizes"
                 )
             dsa_sparse_pool_entry = self._dsa_sparse_request_rows.get(req_id)
-            if tail_valid_count and dsa_sparse_pool_entry is None:
+            if transfer_partial_tail and dsa_sparse_pool_entry is None:
                 raise RuntimeError("DSA Sparse partial-tail handoff has no Decode request row")
-            dsa_sparse_tail_port = meta.remote_port + self.tp_rank if tail_valid_count else None
+            dsa_sparse_tail_port = meta.remote_port + self.tp_rank if transfer_partial_tail else None
             dsa_sparse_tail_submitted = False
             (
                 local_block_ids_replicate_k,
@@ -4093,7 +4095,7 @@ class MooncakeConnectorWorker:
                     )
                     dsa_sparse_tail_submitted |= transfer_dsa_sparse_tail
 
-            if tail_valid_count and not dsa_sparse_tail_submitted:
+            if transfer_partial_tail and not dsa_sparse_tail_submitted:
                 raise RuntimeError("DSA Sparse partial-tail source TP port was not selected")
 
         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size == 1:
