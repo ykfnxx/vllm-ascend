@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
+import os
 from dataclasses import dataclass
 from typing import Literal
 
@@ -13,6 +14,7 @@ from vllm_ascend.dsa_sparse_constants import (
 
 DSASparseKVRole = Literal["kv_producer", "kv_consumer"]
 DSA_SPARSE_MOCK_IO_BACKEND = "mock"
+DSA_SPARSE_KVIO_BACKEND = "kvio"
 DSA_SPARSE_MAX_VERIFY_TOKENS_PER_REQUEST = 16
 
 
@@ -25,6 +27,7 @@ class DSASparseConfig:
     index_topk: int
     speculative_method: str | None
     max_verify_tokens_per_request: int
+    kvio_model_id: int
 
     @property
     def is_producer(self) -> bool:
@@ -59,19 +62,28 @@ def load_dsa_sparse_config(vllm_config: object) -> DSASparseConfig | None:
     if not isinstance(raw_config, dict):
         raise TypeError("dsa_sparse_config must be a dictionary.")
 
-    allowed_keys = {"io_backend"}
+    allowed_keys = {"io_backend", "kvio_model_id"}
     unknown_keys = sorted(set(raw_config) - allowed_keys)
     if unknown_keys:
         raise ValueError(f"Unknown dsa_sparse_config fields: {unknown_keys}.")
 
-    io_backend = raw_config.get("io_backend")
+    io_backend = raw_config.get("io_backend", DSA_SPARSE_MOCK_IO_BACKEND)
     if not isinstance(io_backend, str) or not io_backend.strip():
         raise ValueError("dsa_sparse_config.io_backend must be a non-empty string.")
-    if io_backend != DSA_SPARSE_MOCK_IO_BACKEND:
+    if io_backend not in {
+        DSA_SPARSE_MOCK_IO_BACKEND,
+        DSA_SPARSE_KVIO_BACKEND,
+    }:
+        raise ValueError("dsa_sparse_config.io_backend must be 'mock' or 'kvio'.")
+    if io_backend == DSA_SPARSE_KVIO_BACKEND and os.getenv("PYTHONHASHSEED") is None:
         raise ValueError(
-            "The current DSA Sparse Graph-out milestone supports only "
-            "io_backend='mock'; no concrete I/O backend is implemented."
+            "DSA Sparse KVIO requires PYTHONHASHSEED to be set to the same fixed value on Prefill and Decode workers."
         )
+    kvio_model_id = raw_config.get("kvio_model_id", 0)
+    if isinstance(kvio_model_id, bool) or not isinstance(kvio_model_id, int):
+        raise ValueError("dsa_sparse_config.kvio_model_id must be an integer.")
+    if kvio_model_id < 0:
+        raise ValueError("dsa_sparse_config.kvio_model_id must be non-negative.")
 
     model_config = getattr(vllm_config, "model_config", None)
     if model_config is None:
@@ -97,23 +109,13 @@ def load_dsa_sparse_config(vllm_config: object) -> DSASparseConfig | None:
     _require_parallel_size(parallel_config, "decode_context_parallel_size")
     _require_parallel_size(parallel_config, "prefill_context_parallel_size")
 
-    speculative_method, max_verify_tokens_per_request = (
-        _get_supported_speculative_config(vllm_config)
-    )
+    speculative_method, max_verify_tokens_per_request = _get_supported_speculative_config(vllm_config)
     index_topk = _get_index_topk(model_config)
     if index_topk != DSA_SPARSE_QUERY_WIDTH:
-        raise ValueError(
-            f"DSA Sparse requires index_topk={DSA_SPARSE_QUERY_WIDTH}, "
-            f"got {index_topk}."
-        )
+        raise ValueError(f"DSA Sparse requires index_topk={DSA_SPARSE_QUERY_WIDTH}, got {index_topk}.")
     max_model_len = getattr(model_config, "max_model_len", None)
-    if (
-        not isinstance(max_model_len, int)
-        or not 0 < max_model_len <= DSA_SPARSE_INDEX_CAPACITY
-    ):
-        raise ValueError(
-            "DSA Sparse max_model_len must fit the 128K ASU index."
-        )
+    if not isinstance(max_model_len, int) or not 0 < max_model_len <= DSA_SPARSE_INDEX_CAPACITY:
+        raise ValueError("DSA Sparse max_model_len must fit the 128K ASU index.")
     cache_config = getattr(vllm_config, "cache_config", None)
     block_size = getattr(cache_config, "block_size", None)
     if (
@@ -122,9 +124,7 @@ def load_dsa_sparse_config(vllm_config: object) -> DSASparseConfig | None:
         or DSA_SPARSE_RESIDENT_SLOT_COUNT % block_size
         or DSA_SPARSE_FREE_SLOT_COUNT % block_size
     ):
-        raise ValueError(
-            "DSA Sparse block_size must divide the 8K resident and 2K free regions."
-        )
+        raise ValueError("DSA Sparse block_size must divide the 8K resident and 2K free regions.")
 
     return DSASparseConfig(
         io_backend=io_backend,
@@ -132,6 +132,7 @@ def load_dsa_sparse_config(vllm_config: object) -> DSASparseConfig | None:
         index_topk=index_topk,
         speculative_method=speculative_method,
         max_verify_tokens_per_request=max_verify_tokens_per_request,
+        kvio_model_id=kvio_model_id,
     )
 
 
@@ -161,31 +162,22 @@ def _get_supported_speculative_config(
     speculative_config = getattr(vllm_config, "speculative_config", None)
     if speculative_config is None:
         return None, 1
-    num_speculative_tokens = (
-        getattr(speculative_config, "num_speculative_tokens", 0)
-    )
+    num_speculative_tokens = getattr(speculative_config, "num_speculative_tokens", 0)
     if isinstance(num_speculative_tokens, bool) or not isinstance(
         num_speculative_tokens,
         int,
     ):
         raise ValueError("num_speculative_tokens must be an integer for DSA Sparse.")
     if num_speculative_tokens < 0:
-        raise ValueError(
-            "num_speculative_tokens must not be negative for DSA Sparse."
-        )
+        raise ValueError("num_speculative_tokens must not be negative for DSA Sparse.")
     if num_speculative_tokens == 0:
         return None, 1
 
     speculative_method = getattr(speculative_config, "method", None)
     if speculative_method != "mtp":
-        raise ValueError(
-            "DSA Sparse supports speculative decoding only with method='mtp'."
-        )
+        raise ValueError("DSA Sparse supports speculative decoding only with method='mtp'.")
     max_verify_tokens_per_request = num_speculative_tokens + 1
-    if (
-        max_verify_tokens_per_request
-        > DSA_SPARSE_MAX_VERIFY_TOKENS_PER_REQUEST
-    ):
+    if max_verify_tokens_per_request > DSA_SPARSE_MAX_VERIFY_TOKENS_PER_REQUEST:
         raise ValueError(
             "DSA Sparse MTP requires num_speculative_tokens + 1 <= "
             f"{DSA_SPARSE_MAX_VERIFY_TOKENS_PER_REQUEST}, got "

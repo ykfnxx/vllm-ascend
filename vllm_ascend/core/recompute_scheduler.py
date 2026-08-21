@@ -50,6 +50,8 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
+from vllm_ascend.core.dsa_sparse_scheduler import attach_dsa_sparse_block_hashes
+
 
 @dataclass
 class RecomputeSchedulerConfig(SchedulerConfig):
@@ -818,6 +820,8 @@ class RecomputeScheduler(Scheduler):
         if self.ec_connector is not None:
             ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(scheduler_output)
             scheduler_output.ec_connector_metadata = ec_meta
+
+        attach_dsa_sparse_block_hashes(self, scheduler_output)
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)

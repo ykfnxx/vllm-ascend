@@ -59,8 +59,9 @@ patch("vllm.distributed.parallel_state._DCP", _mock_dcp_group).start()
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
     DSA_SPARSE_PD_HANDOFF_KEY,
-    DSASparsePDWorkerMetadata,
     MAX_REQUESTS_PER_PEER_HANDLER,
+    DSASparsePDHandoff,
+    DSASparsePDWorkerMetadata,
     GroupPull,
     KVCacheRecvingThread,
     KVCacheSendingThread,
@@ -415,12 +416,8 @@ class TestMooncakeTransferGroups(unittest.TestCase):
 
         worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
         worker.vllm_config = MockVllmConfig()
-        worker.vllm_config.model_config.get_total_num_kv_heads = MagicMock(
-            return_value=4
-        )
-        worker.dsa_sparse_config = types.SimpleNamespace(
-            kv_role="kv_producer"
-        )
+        worker.vllm_config.model_config.get_total_num_kv_heads = MagicMock(return_value=4)
+        worker.dsa_sparse_config = types.SimpleNamespace(kv_role="kv_producer")
         worker.total_layers = 2
         worker.kv_cache_config = MockKVCacheConfig(
             kv_cache_groups=[
@@ -434,21 +431,15 @@ class TestMooncakeTransferGroups(unittest.TestCase):
             ]
         )
 
-        transfer_layer_names = (
-            worker._get_dsa_sparse_transfer_layer_names()
-        )
-        kv_group2layeridx = worker._build_kv_group2layeridx(
-            transfer_layer_names
-        )
+        transfer_layer_names = worker._get_dsa_sparse_transfer_layer_names()
+        kv_group2layeridx = worker._build_kv_group2layeridx(transfer_layer_names)
 
         self.assertEqual(
             transfer_layer_names,
             {indexer_layer, draft_layer},
         )
         serialized_layer_names = {
-            layer_name
-            for group_spec, _ in kv_group2layeridx.values()
-            for layer_name in group_spec["layer_names"]
+            layer_name for group_spec, _ in kv_group2layeridx.values() for layer_name in group_spec["layer_names"]
         }
         self.assertEqual(
             serialized_layer_names,
@@ -982,6 +973,80 @@ class TestCoreFunctionality(unittest.TestCase):
         self.assertEqual(len(call_args[1]), len(call_args[3]))
         mock_get_meta.assert_not_called()
 
+    def test_dsa_sparse_partial_tail_uses_valid_prefix_only(self):
+        layer_name = "model.layers.0.self_attn.attn"
+        self.thread.dsa_sparse_aux_regions = {
+            layer_name: [
+                {
+                    "base_addr": 0x1000,
+                    "block_stride": 1024,
+                    "token_bytes": 8,
+                    "blocks_per_request": 82,
+                    "tail_block_offset": 80,
+                },
+                {
+                    "base_addr": 0x2000,
+                    "block_stride": 256,
+                    "token_bytes": 2,
+                    "blocks_per_request": 82,
+                    "tail_block_offset": 80,
+                },
+            ]
+        }
+        remote_regions = {
+            layer_name: [
+                {
+                    "base_addr": 0x3000,
+                    "block_stride": 1024,
+                    "token_bytes": 8,
+                    "blocks_per_request": 0,
+                    "tail_block_offset": 0,
+                },
+                {
+                    "base_addr": 0x4000,
+                    "block_stride": 256,
+                    "token_bytes": 2,
+                    "blocks_per_request": 0,
+                    "tail_block_offset": 0,
+                },
+            ]
+        }
+        handoff = DSASparsePDHandoff(
+            remote_request_id="req1",
+            stored_token_count=259,
+            block_size=128,
+            layer_topk_by_rank={0: {layer_name: list(range(DSA_SPARSE_QUERY_WIDTH))}},
+            partial_tail_blocks_by_rank={0: {layer_name: 7}},
+        )
+        local_addresses = []
+        remote_addresses = []
+        lengths = []
+
+        self.thread._append_dsa_sparse_partial_tail_transfer_meta(
+            req_meta={
+                "dsa_sparse_handoff": handoff,
+                "dsa_sparse_pool_entry": 2,
+            },
+            remote_aux_regions=remote_regions,
+            local_addresses=local_addresses,
+            remote_addresses=remote_addresses,
+            lengths=lengths,
+        )
+
+        destination_block = 2 * 82 + 80
+        self.assertEqual(
+            local_addresses,
+            [
+                0x1000 + destination_block * 1024,
+                0x2000 + destination_block * 256,
+            ],
+        )
+        self.assertEqual(
+            remote_addresses,
+            [0x3000 + 7 * 1024, 0x4000 + 7 * 256],
+        )
+        self.assertEqual(lengths, [3 * 8, 3 * 2])
+
     @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
     def test_transfer_dsa_sparse_indexer_uses_remote_layer_name_mapping(self, mock_get_meta):
         """D's Indexer layer may have a different physical index than P's."""
@@ -1084,9 +1149,7 @@ class TestCoreFunctionality(unittest.TestCase):
             [2048],
         ]
 
-        with patch(
-            "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config"
-        ) as mock_config:
+        with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config") as mock_config:
             mock_config.return_value.enable_kv_nz = False
             self.thread._transfer_kv_cache_all_groups(req)
 
@@ -1895,9 +1958,7 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         self.assertIsNone(params)
 
     def test_dsa_topk_is_consumed_before_finish_and_added_to_handoff(self):
-        self.scheduler.dsa_sparse_config = types.SimpleNamespace(
-            kv_role="kv_producer"
-        )
+        self.scheduler.dsa_sparse_config = types.SimpleNamespace(kv_role="kv_producer")
         self.scheduler.tp_size = 1
         topk = list(range(DSA_SPARSE_QUERY_WIDTH))
         output = types.SimpleNamespace(
@@ -1912,9 +1973,7 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
             )
         )
 
-        self.scheduler.update_dsa_sparse_before_request_finish(
-            output
-        )
+        self.scheduler.update_dsa_sparse_before_request_finish(output)
         request = self._make_remote_decode_request(128)
         _delay_free, params = self.scheduler.request_finished(
             request,
@@ -1927,9 +1986,7 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         self.assertEqual(handoff["remote_request_id"], "req1")
         self.assertEqual(handoff["stored_token_count"], 128)
         self.assertEqual(
-            handoff["layer_topk_by_rank"]["0"][
-                "model.layers.0.self_attn"
-            ],
+            handoff["layer_topk_by_rank"]["0"]["model.layers.0.self_attn"],
             topk,
         )
 
@@ -3479,12 +3536,8 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
             worker._get_sfa_replicate_k_block_ids(cast(ReqMeta, meta))
 
     def test_dsa_worker_captures_layer_topk_as_control_metadata(self):
-        worker = MooncakeConnectorWorker.__new__(
-            MooncakeConnectorWorker
-        )
-        worker.dsa_sparse_config = types.SimpleNamespace(
-            kv_role="kv_producer"
-        )
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.dsa_sparse_config = types.SimpleNamespace(kv_role="kv_producer")
         worker.tp_rank = 2
         worker._dsa_sparse_layer_topk_by_request = {}
         topk = list(range(DSA_SPARSE_QUERY_WIDTH))
@@ -3492,11 +3545,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         producer_context.layer_topk.return_value = {
             "request-a": topk,
         }
-        metadata = {
-            "layer.0": types.SimpleNamespace(
-                dsa_sparse_producer_context=producer_context
-            )
-        }
+        metadata = {"layer.0": types.SimpleNamespace(dsa_sparse_producer_context=producer_context)}
 
         worker.capture_dsa_sparse_layer_topk(
             "layer.0",
@@ -3509,9 +3558,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
             DSASparsePDWorkerMetadata,
         )
         self.assertEqual(
-            worker_metadata.request_layer_topk_by_rank[
-                "request-a"
-            ][2]["layer.0"],
+            worker_metadata.request_layer_topk_by_rank["request-a"][2]["layer.0"],
             topk,
         )
         self.assertIsNone(worker.build_connector_worker_meta())

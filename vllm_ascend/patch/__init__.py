@@ -1071,6 +1071,7 @@
 # ** 31. File: platform/patch_dsa_sparse_pd.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.core.sched.scheduler.Scheduler.update_from_output`
+#   2. `vllm.v1.core.sched.scheduler.Scheduler.schedule`
 #    Why:
 #       vLLM invokes connector request teardown before it delivers worker
 #       metadata. DSA Sparse needs final-Prefill TopK metadata while building
@@ -1079,8 +1080,14 @@
 #       Let connectors pre-consume DSA Sparse worker metadata before the
 #       original scheduler output loop. Mooncake removes only the consumed DSA
 #       metadata so the normal later connector update remains a no-op for it.
+#       Keep the schedule patch as a thin P-side bridge that invokes the normal
+#       DSA Sparse scheduler helper. The helper attaches committed block hashes
+#       to new/cached request messages and MTP candidate hashes to
+#       SchedulerOutput for persistent Main-KV keys. RecomputeScheduler invokes
+#       the helper directly and does not depend on this patch module.
 #    Related PR (if no, explain why):
 #       No, this is an eager DSA Sparse development path.
 #    Future Plan:
-#       Remove this patch once upstream exposes a connector metadata hook before
-#       `request_finished`.
+#       Remove the update patch once upstream exposes a connector metadata hook
+#       before `request_finished`. Remove the schedule patch once upstream
+#       SchedulerOutput exposes request block hashes.

@@ -20,17 +20,17 @@ from vllm_ascend.dsa_sparse_constants import DSA_SPARSE_QUERY_WIDTH
 
 
 def _make_handoff() -> DSASparsePDHandoff:
+    layer_name = "model.layers.0.self_attn"
     return DSASparsePDHandoff(
         remote_request_id="prefill-request",
         stored_token_count=4097,
         block_size=128,
         layer_topk_by_rank={
             0: {
-                "model.layers.0.self_attn": list(
-                    range(DSA_SPARSE_QUERY_WIDTH)
-                ),
+                layer_name: list(range(DSA_SPARSE_QUERY_WIDTH)),
             },
         },
+        partial_tail_blocks_by_rank={0: {layer_name: 32}},
     )
 
 
@@ -45,16 +45,15 @@ def test_resident_selection_preserves_topk_order_and_excludes_dense_tail():
     assert resident == [255, 7, 3, 128, 200, 0]
 
 
-def test_mtp_resident_selection_includes_the_partial_prompt_tail():
+def test_mtp_resident_selection_excludes_the_partial_prompt_tail():
     resident = build_dsa_sparse_resident_token_ids(
         topk_token_ids=[258, 257, 255],
         stored_token_count=259,
         block_size=128,
         resident_token_count=4,
-        include_partial_tail=True,
     )
 
-    assert resident == [258, 257, 255, 0]
+    assert resident == [255, 0, 1, 2]
 
 
 def test_pd_handoff_round_trips_through_transfer_params():
@@ -67,9 +66,7 @@ def test_pd_handoff_round_trips_through_transfer_params():
 
 def test_pd_handoff_rejects_non_integer_topk_ids():
     raw_handoff = _make_handoff().to_dict()
-    raw_handoff["layer_topk_by_rank"]["0"][
-        "model.layers.0.self_attn"
-    ] = [True] * DSA_SPARSE_QUERY_WIDTH
+    raw_handoff["layer_topk_by_rank"]["0"]["model.layers.0.self_attn"] = [True] * DSA_SPARSE_QUERY_WIDTH
 
     with pytest.raises(TypeError, match="token IDs"):
         DSASparsePDHandoff.from_dict(raw_handoff)
@@ -100,9 +97,7 @@ def test_producer_execution_captures_only_final_prefill_rows_and_detaches():
             main_cache,
             block_table,
         )
-        assert context.layer_topk(layer_name) == {
-            "request-b": topk[4].reshape(-1).tolist()
-        }
+        assert context.layer_topk(layer_name) == {"request-b": topk[4].reshape(-1).tolist()}
 
     assert metadata.dsa_sparse_producer_context is None
 
@@ -118,17 +113,16 @@ def test_producer_execution_rejects_incomplete_topk_rows():
         layer_metadata={layer_name: metadata},
     )
 
-    with execution as context:
-        with pytest.raises(ValueError, match="do not cover"):
-            context.publish_layer(
-                layer_name,
-                torch.zeros(
-                    (1, 1, DSA_SPARSE_QUERY_WIDTH),
-                    dtype=torch.int32,
-                ),
-                (torch.empty((1, 128, 1, 1)),),
-                torch.zeros((1, 1), dtype=torch.int32),
-            )
+    with execution as context, pytest.raises(ValueError, match="do not cover"):
+        context.publish_layer(
+            layer_name,
+            torch.zeros(
+                (1, 1, DSA_SPARSE_QUERY_WIDTH),
+                dtype=torch.int32,
+            ),
+            (torch.empty((1, 128, 1, 1)),),
+            torch.zeros((1, 1), dtype=torch.int32),
+        )
 
 
 def test_pd_handoff_trace_logs_full_handoff_and_stable_hashes():
@@ -156,6 +150,4 @@ def test_pd_handoff_trace_logs_full_handoff_and_stable_hashes():
     assert payload["event"] == "handoff_send"
     assert payload["handoff"] == handoff.to_dict()
     assert payload["handoff_sha256"]
-    assert payload["layer_topk_sha256_by_rank"]["0"][
-        "model.layers.0.self_attn"
-    ]
+    assert payload["layer_topk_sha256_by_rank"]["0"]["model.layers.0.self_attn"]

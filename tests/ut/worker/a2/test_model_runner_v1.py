@@ -512,10 +512,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             "model.layers.0.self_attn.attn": layer_0,
             "model.layers.1.self_attn.attn": layer_1,
         }
-        runner._dsa_sparse_main_specs = {
-            layer_name: MagicMock()
-            for layer_name in mock_get_layers.return_value
-        }
+        runner._dsa_sparse_main_specs = {layer_name: MagicMock() for layer_name in mock_get_layers.return_value}
 
         fixed_hbm_bytes = runner.get_dsa_sparse_fixed_hbm_bytes()
 
@@ -544,13 +541,9 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         )
         module.kv_lora_rank = 512
         module.qk_rope_head_dim = 64
-        runner._get_dsa_sparse_ordered_layers = MagicMock(
-            return_value=[("model.layers.0.self_attn.attn", module)]
-        )
+        runner._get_dsa_sparse_ordered_layers = MagicMock(return_value=[("model.layers.0.self_attn.attn", module)])
 
-        layouts, cohort_count = (
-            runner._get_dsa_sparse_main_layouts_and_cohort_count()
-        )
+        layouts, cohort_count = runner._get_dsa_sparse_main_layouts_and_cohort_count()
 
         self.assertEqual(
             layouts,
@@ -1095,17 +1088,13 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         leader.request_row_stride = 10368
         runner._dsa_sparse_leader_coordinators = (leader,)
         runner._dsa_sparse_coordinators = (("layer.0", leader),)
-        runner._dsa_sparse_leader_by_layer = {
-            "layer.0": leader
-        }
+        runner._dsa_sparse_leader_by_layer = {"layer.0": leader}
         runner._dsa_sparse_pd_handoffs = {}
         runner._dsa_sparse_main_specs = {
             "layer.0": object(),
             "layer.1": object(),
         }
-        runner.input_batch = SimpleNamespace(
-            req_ids=["request-a", "request-b", None]
-        )
+        runner.input_batch = SimpleNamespace(req_ids=["request-a", "request-b", None])
         runner.attn_state = AscendAttentionState.DecodeOnly
         runner.device = torch.device("cpu")
         runner.block_size = 128
@@ -1155,8 +1144,11 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
                 resumed_req_ids=["resumed"],
             ),
             finished_req_ids={"finished"},
-            preempted_req_ids={"preempted"},
+            preempted_req_ids=set(),
+            recomputed_reqs=[SimpleNamespace(request_id="recomputed")],
             scheduled_new_reqs=[SimpleNamespace(req_id="new")],
+            num_scheduled_tokens={},
+            kv_connector_metadata=None,
         )
 
         result = runner._update_states(scheduler_output)
@@ -1164,11 +1156,8 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         self.assertEqual(result, "deferred-correction")
         mock_upstream_update.assert_called_once_with(scheduler_output)
         self.assertEqual(
-            set(
-                call_args.args[0]
-                for call_args in runner._release_dsa_sparse_request.call_args_list
-            ),
-            {"finished", "preempted"},
+            set(call_args.args[0] for call_args in runner._release_dsa_sparse_request.call_args_list),
+            {"finished", "recomputed"},
         )
         self.assertEqual(
             runner._admit_dsa_sparse_request.call_args_list,
@@ -1184,14 +1173,13 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         mock_get_tp_group.return_value.rank_in_group = 0
         leader = runner._dsa_sparse_leader_coordinators[0]
         topk = [255, 7, 3, 128, 200]
-        topk.extend(
-            range(len(topk), 2048)
-        )
+        topk.extend(range(len(topk), 2048))
         handoff = DSASparsePDHandoff(
             remote_request_id="prefill-request",
             stored_token_count=259,
             block_size=128,
             layer_topk_by_rank={0: {"layer.0": topk}},
+            partial_tail_blocks_by_rank={0: {"layer.0": 2}},
         )
 
         runner._admit_dsa_sparse_request("request-a", handoff)
@@ -1223,15 +1211,9 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
             ("layer.1", follower),
         )
         events = []
-        leader.load_initial_resident.side_effect = (
-            lambda **kwargs: events.append(("load", kwargs["layer_name"]))
-        )
-        follower.load_initial_resident.side_effect = (
-            lambda **kwargs: events.append(("load", kwargs["layer_name"]))
-        )
-        leader.initialize_request.side_effect = (
-            lambda *_args: events.append(("initialize", "layer.0"))
-        )
+        leader.load_initial_resident.side_effect = lambda **kwargs: events.append(("load", kwargs["layer_name"]))
+        follower.load_initial_resident.side_effect = lambda **kwargs: events.append(("load", kwargs["layer_name"]))
+        leader.initialize_request.side_effect = lambda *_args: events.append(("initialize", "layer.0"))
         topk = list(range(2048))
         handoff = DSASparsePDHandoff(
             remote_request_id="prefill-request",
@@ -1241,6 +1223,12 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
                 0: {
                     "layer.0": topk,
                     "layer.1": topk,
+                }
+            },
+            partial_tail_blocks_by_rank={
+                0: {
+                    "layer.0": 2,
+                    "layer.1": 2,
                 }
             },
         )
@@ -1295,9 +1283,7 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
                 ("layer.1", follower_layer),
             ]
         )
-        runner._get_attention_kv_cache_dims = MagicMock(
-            return_value=(6, 2)
-        )
+        runner._get_attention_kv_cache_dims = MagicMock(return_value=(6, 2))
         runner._dsa_sparse_main_specs = {
             layer_name: AscendMLAAttentionSpec(
                 block_size=128,
