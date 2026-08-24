@@ -57,6 +57,13 @@ patch(
 ).start()
 patch("vllm.distributed.parallel_state._DCP", _mock_dcp_group).start()
 
+from vllm_ascend.attention.dsa_sparse_shm import (  # noqa: E402
+    DSASparseSharedMemoryPayload,
+    DSASparseSharedMemoryPlane,
+)
+from vllm_ascend.core.kv_cache_interface import (  # noqa: E402
+    AscendSFAIndexerCacheSpec,
+)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
     DSA_SPARSE_PD_HANDOFF_KEY,
     MAX_REQUESTS_PER_PEER_HANDLER,
@@ -89,6 +96,47 @@ for _k, _v in _saved_modules.items():
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
+
+
+def make_indexer_shared_memory_payload(
+    suffix: str,
+) -> DSASparseSharedMemoryPayload:
+    return DSASparseSharedMemoryPayload(
+        name=f"vllm_ascend_dsa_sparse_{suffix}",
+        size=2,
+        cache_kind="indexer",
+        cache_layer_name="model.layers.0.self_attn.indexer.k_cache",
+        cache_planes=(
+            DSASparseSharedMemoryPlane(
+                offset=0,
+                nbytes=2,
+                dtype="bfloat16",
+                shape=(1, 1, 1),
+            ),
+        ),
+        tail_planes=(),
+    )
+
+
+def make_mtp_shared_memory_payload(
+    suffix: str,
+    layer_name: str = "model.layers.1.self_attn",
+) -> DSASparseSharedMemoryPayload:
+    return DSASparseSharedMemoryPayload(
+        name=f"vllm_ascend_dsa_sparse_mtp_{suffix}",
+        size=2,
+        cache_kind="mtp_draft",
+        cache_layer_name=layer_name,
+        cache_planes=(
+            DSASparseSharedMemoryPlane(
+                offset=0,
+                nbytes=2,
+                dtype="bfloat16",
+                shape=(1, 1, 1),
+            ),
+        ),
+        tail_planes=(),
+    )
 
 
 def make_agent_metadata(**overrides: Any) -> MooncakeAgentMetadata:
@@ -385,15 +433,14 @@ class TestMooncakeTransferGroups(unittest.TestCase):
         self.assertEqual(kv_group2layeridx[0][0]["kv_cache_spec"]["num_kv_heads"], 1)
         self.assertEqual(kv_group2layeridx[1][0]["kv_cache_spec"]["num_kv_heads"], 1)
 
-    def test_dsa_sparse_prefill_exposes_only_indexer_and_mtp_to_mooncake(self):
+    def test_dsa_sparse_excludes_payload_layers_from_mooncake(self):
         indexer_layer = "model.layers.0.self_attn.indexer.k_cache"
         main_layer = "model.layers.0.self_attn.attn"
         draft_layer = "model.layers.2.self_attn.attn"
-        indexer_spec = FullAttentionSpec(
+        indexer_spec = AscendSFAIndexerCacheSpec(
             block_size=16,
             num_kv_heads=1,
             head_size=128,
-            head_size_v=128,
             dtype=torch.float16,
         )
         main_spec = MLAAttentionSpec(
@@ -417,6 +464,9 @@ class TestMooncakeTransferGroups(unittest.TestCase):
         worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
         worker.vllm_config = MockVllmConfig()
         worker.vllm_config.model_config.get_total_num_kv_heads = MagicMock(return_value=4)
+        worker.vllm_config.speculative_config = types.SimpleNamespace(
+            method="mtp",
+        )
         worker.dsa_sparse_config = types.SimpleNamespace(kv_role="kv_producer")
         worker.total_layers = 2
         worker.kv_cache_config = MockKVCacheConfig(
@@ -436,16 +486,18 @@ class TestMooncakeTransferGroups(unittest.TestCase):
 
         self.assertEqual(
             transfer_layer_names,
-            {indexer_layer, draft_layer},
+            set(),
         )
         serialized_layer_names = {
             layer_name for group_spec, _ in kv_group2layeridx.values() for layer_name in group_spec["layer_names"]
         }
         self.assertEqual(
             serialized_layer_names,
-            {indexer_layer, draft_layer},
+            set(),
         )
         self.assertNotIn(main_layer, serialized_layer_names)
+        self.assertNotIn(indexer_layer, serialized_layer_names)
+        self.assertNotIn(draft_layer, serialized_layer_names)
 
     def test_build_kv_group2layeridx_splits_equal_local_heads_by_total_heads(self):
         shared_local_spec = FullAttentionSpec(
@@ -973,79 +1025,36 @@ class TestCoreFunctionality(unittest.TestCase):
         self.assertEqual(len(call_args[1]), len(call_args[3]))
         mock_get_meta.assert_not_called()
 
-    def test_dsa_sparse_partial_tail_uses_valid_prefix_only(self):
-        layer_name = "model.layers.0.self_attn.attn"
-        self.thread.dsa_sparse_aux_regions = {
-            layer_name: [
-                {
-                    "base_addr": 0x1000,
-                    "block_stride": 1024,
-                    "token_bytes": 8,
-                    "blocks_per_request": 82,
-                    "tail_block_offset": 80,
-                },
-                {
-                    "base_addr": 0x2000,
-                    "block_stride": 256,
-                    "token_bytes": 2,
-                    "blocks_per_request": 82,
-                    "tail_block_offset": 80,
-                },
-            ]
-        }
-        remote_regions = {
-            layer_name: [
-                {
-                    "base_addr": 0x3000,
-                    "block_stride": 1024,
-                    "token_bytes": 8,
-                    "blocks_per_request": 0,
-                    "tail_block_offset": 0,
-                },
-                {
-                    "base_addr": 0x4000,
-                    "block_stride": 256,
-                    "token_bytes": 2,
-                    "blocks_per_request": 0,
-                    "tail_block_offset": 0,
-                },
-            ]
-        }
-        handoff = DSASparsePDHandoff(
+    @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
+    def test_dsa_sparse_handoff_skips_mooncake_data_plane(
+        self,
+        mock_get_meta,
+    ):
+        req = dict(self.test_req)
+        req["dsa_sparse_handoff"] = DSASparsePDHandoff(
             remote_request_id="req1",
-            stored_token_count=259,
-            block_size=128,
-            layer_topk_by_rank={0: {layer_name: list(range(DSA_SPARSE_QUERY_WIDTH))}},
-            partial_tail_blocks_by_rank={0: {layer_name: 7}},
-        )
-        local_addresses = []
-        remote_addresses = []
-        lengths = []
-
-        self.thread._append_dsa_sparse_partial_tail_transfer_meta(
-            req_meta={
-                "dsa_sparse_handoff": handoff,
-                "dsa_sparse_pool_entry": 2,
+            stored_token_count=16,
+            block_size=16,
+            layer_topk_by_rank={
+                0: {
+                    "model.layers.0.self_attn": list(
+                        range(DSA_SPARSE_QUERY_WIDTH)
+                    )
+                }
             },
-            remote_aux_regions=remote_regions,
-            local_addresses=local_addresses,
-            remote_addresses=remote_addresses,
-            lengths=lengths,
+            shared_memory_payloads_by_rank={
+                0: {
+                    "model.layers.0.self_attn": (
+                        make_indexer_shared_memory_payload("skip-transfer")
+                    )
+                }
+            },
         )
 
-        destination_block = 2 * 82 + 80
-        self.assertEqual(
-            local_addresses,
-            [
-                0x1000 + destination_block * 1024,
-                0x2000 + destination_block * 256,
-            ],
-        )
-        self.assertEqual(
-            remote_addresses,
-            [0x3000 + 7 * 1024, 0x4000 + 7 * 256],
-        )
-        self.assertEqual(lengths, [3 * 8, 3 * 2])
+        self.thread._transfer_kv_cache_all_groups(req)
+
+        mock_get_meta.assert_not_called()
+        self.engine.batch_transfer_sync_read.assert_not_called()
 
     @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
     def test_transfer_dsa_sparse_indexer_uses_remote_layer_name_mapping(self, mock_get_meta):
@@ -1958,9 +1967,14 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         self.assertIsNone(params)
 
     def test_dsa_topk_is_consumed_before_finish_and_added_to_handoff(self):
-        self.scheduler.dsa_sparse_config = types.SimpleNamespace(kv_role="kv_producer")
+        self.scheduler.dsa_sparse_config = types.SimpleNamespace(
+            kv_role="kv_producer",
+            uses_mtp=True,
+        )
         self.scheduler.tp_size = 1
         topk = list(range(DSA_SPARSE_QUERY_WIDTH))
+        payload = make_indexer_shared_memory_payload("req1")
+        mtp_payload = make_mtp_shared_memory_payload("req1")
         output = types.SimpleNamespace(
             kv_connector_worker_meta=DSASparsePDWorkerMetadata(
                 {
@@ -1969,7 +1983,15 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
                             "model.layers.0.self_attn": topk,
                         },
                     },
-                }
+                },
+                {
+                    "req1": {
+                        0: {
+                            "model.layers.0.self_attn": payload,
+                            "model.layers.1.self_attn": mtp_payload,
+                        }
+                    }
+                },
             )
         )
 
@@ -1988,6 +2010,17 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         self.assertEqual(
             handoff["layer_topk_by_rank"]["0"]["model.layers.0.self_attn"],
             topk,
+        )
+        self.assertEqual(
+            handoff["shared_memory_payloads_by_rank"]["0"][
+                "model.layers.0.self_attn"
+            ],
+            payload.to_dict(),
+        )
+        self.assertEqual(
+            handoff["shared_memory_payloads_by_rank"]["0"]
+            ["model.layers.1.self_attn"],
+            mtp_payload.to_dict(),
         )
 
     def test_get_transfer_block_ids_trims_attention_mtp_blocks(self):
@@ -3403,7 +3436,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         self.assertIsNone(add_request_calls[1].kwargs["local_block_ids_replicate_k"])
         self.assertIsNone(add_request_calls[1].kwargs["remote_block_ids_replicate_k"])
 
-    def test_start_load_kv_mock_skip_does_not_require_partial_tail_row(self):
+    def test_start_load_kv_does_not_route_partial_tail_through_mooncake(self):
         worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
         worker.kv_send_thread = None
         worker.kv_recv_thread = MagicMock()
@@ -3440,13 +3473,11 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         )
         metadata = types.SimpleNamespace(reqs_in_batch=[], requests={"req": meta})
 
-        with patch.dict(os.environ, {"VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE": "1"}):
-            worker.start_load_kv(cast(MooncakeConnectorMetadata, metadata))
+        worker.start_load_kv(cast(MooncakeConnectorMetadata, metadata))
 
-        worker.kv_recv_thread.add_request.assert_called_once()
-        call_kwargs = worker.kv_recv_thread.add_request.call_args.kwargs
-        self.assertIsNone(call_kwargs["dsa_sparse_handoff"])
-        self.assertIsNone(call_kwargs["dsa_sparse_pool_entry"])
+        kwargs = worker.kv_recv_thread.add_request.call_args.kwargs
+        self.assertIs(kwargs["dsa_sparse_handoff"], handoff)
+        self.assertNotIn("dsa_sparse_pool_entry", kwargs)
 
     def test_get_kv_split_metadata_dp1_remote_port_send_num_uses_absolute_ports(self):
         self.vllm_config.kv_transfer_config.kv_port = 30000
@@ -3586,12 +3617,19 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
     def test_dsa_worker_captures_layer_topk_as_control_metadata(self):
         worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
         worker.dsa_sparse_config = types.SimpleNamespace(kv_role="kv_producer")
+        worker.vllm_config = MockVllmConfig()
+        worker.total_layers = 1
         worker.tp_rank = 2
         worker._dsa_sparse_layer_topk_by_request = {}
+        worker._dsa_sparse_shared_memory_payloads_by_request = {}
         topk = list(range(DSA_SPARSE_QUERY_WIDTH))
         producer_context = MagicMock()
         producer_context.layer_topk.return_value = {
             "request-a": topk,
+        }
+        payload = make_indexer_shared_memory_payload("worker")
+        producer_context.layer_shared_memory_payloads.return_value = {
+            "request-a": payload,
         }
         metadata = {"layer.0": types.SimpleNamespace(dsa_sparse_producer_context=producer_context)}
 
@@ -3609,7 +3647,69 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
             worker_metadata.request_layer_topk_by_rank["request-a"][2]["layer.0"],
             topk,
         )
+        self.assertEqual(
+            worker_metadata.request_shared_memory_payloads_by_rank
+            ["request-a"][2]["layer.0"],
+            payload,
+        )
         self.assertIsNone(worker.build_connector_worker_meta())
+
+    def test_dsa_worker_captures_mtp_draft_as_shared_memory_payload(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.dsa_sparse_config = types.SimpleNamespace(kv_role="kv_producer")
+        worker.vllm_config = MockVllmConfig()
+        worker.vllm_config.speculative_config = types.SimpleNamespace(
+            method="mtp",
+        )
+        worker.total_layers = 1
+        worker.tp_rank = 0
+        worker._dsa_sparse_layer_topk_by_request = {
+            "request-a": {"model.layers.0.self_attn": list(range(DSA_SPARSE_QUERY_WIDTH))}
+        }
+        worker._dsa_sparse_shared_memory_payloads_by_request = {}
+        producer_context = MagicMock()
+        draft_payload = make_mtp_shared_memory_payload("worker")
+        producer_context.layer_shared_memory_payloads.return_value = {
+            "request-a": draft_payload,
+        }
+        worker._dsa_sparse_active_producer_context = producer_context
+        draft_cache = torch.zeros((2, 16, 1, 8), dtype=torch.bfloat16)
+        block_tables = torch.tensor([[1]], dtype=torch.int32)
+        metadata = {
+            "model.layers.1.self_attn": types.SimpleNamespace(
+                block_tables=block_tables,
+            ),
+        }
+
+        worker.capture_dsa_sparse_layer_topk(
+            "model.layers.1.self_attn",
+            metadata,
+            (draft_cache,),
+        )
+        latest_draft_cache = torch.ones_like(draft_cache)
+        latest_block_tables = torch.tensor([[0]], dtype=torch.int32)
+        metadata["model.layers.1.self_attn"].block_tables = (
+            latest_block_tables
+        )
+        worker.capture_dsa_sparse_layer_topk(
+            "model.layers.1.self_attn",
+            metadata,
+            (latest_draft_cache,),
+        )
+
+        producer_context.publish_mtp_draft_layer.assert_not_called()
+        worker_metadata = worker.build_connector_worker_meta()
+        producer_context.publish_mtp_draft_layer.assert_called_once_with(
+            "model.layers.1.self_attn",
+            (latest_draft_cache,),
+            latest_block_tables,
+        )
+        producer_context.layer_topk.assert_not_called()
+        self.assertEqual(
+            worker_metadata.request_shared_memory_payloads_by_rank
+            ["request-a"][0]["model.layers.1.self_attn"],
+            draft_payload,
+        )
 
 
 if __name__ == "__main__":

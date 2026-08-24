@@ -2183,6 +2183,16 @@ class AscendSFAImpl(MLAAttentionImpl):
                 topk_indices,
                 tuple(main_kv_cache),
                 attn_metadata.block_table,
+                (
+                    self.indexer.k_cache.prefix
+                    if self.has_indexer
+                    else None
+                ),
+                (
+                    tuple(self.indexer.k_cache.kv_cache)
+                    if self.has_indexer
+                    else ()
+                ),
             )
 
         if dsa_sparse_coordinator is None:

@@ -23,7 +23,7 @@ import sys
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
@@ -116,6 +116,9 @@ from vllm_ascend.attention.dsa_sparse_pd import (
     DSASparseProducerExecution,
     begin_dsa_sparse_producer_execution,
     build_dsa_sparse_resident_token_ids,
+)
+from vllm_ascend.attention.dsa_sparse_shm import (
+    DSASparseSharedMemoryStore,
 )
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
@@ -377,6 +380,21 @@ class NPUModelRunner(GPUModelRunner):
         ] = {}
         self._dsa_sparse_pd_handoffs: dict[str, DSASparsePDHandoff] = {}
         self._dsa_sparse_backend: DSASparseKVBackend | None = None
+        self._dsa_sparse_indexer_group_id: int | None = None
+        self._dsa_sparse_indexer_caches: dict[
+            str,
+            tuple[torch.Tensor, ...],
+        ] = {}
+        self._dsa_sparse_mtp_draft_caches: dict[
+            str,
+            tuple[torch.Tensor, ...],
+        ] = {}
+        self._dsa_sparse_shared_memory_store = (
+            DSASparseSharedMemoryStore()
+        )
+        self._dsa_sparse_pending_producer_execution: (
+            DSASparseProducerExecution | None
+        ) = None
         self._dsa_sparse_storage_key_encoder = DSASparseStorageKeyEncoder()
         self._dsa_sparse_committed_block_hashes: dict[
             str, list[bytes | int]
@@ -957,6 +975,13 @@ class NPUModelRunner(GPUModelRunner):
                 resident_token_ids=resident_token_ids,
             )
 
+        self._load_dsa_sparse_shared_memory_payloads(
+            request_id=request_id,
+            pool_entry=pool_entry,
+            handoff=handoff,
+            rank=rank,
+        )
+
         for coordinator in self._dsa_sparse_leader_coordinators:
             resident_token_ids = resident_by_leader[id(coordinator)]
             coordinator.initialize_request(pool_entry, resident_token_ids)
@@ -969,7 +994,240 @@ class NPUModelRunner(GPUModelRunner):
             tp_rank=rank,
         )
 
+    @staticmethod
+    def _expand_dsa_sparse_physical_block_ids(
+        logical_block_ids: torch.Tensor,
+        block_scale: int,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        logical = logical_block_ids.to(
+            device=device,
+            dtype=torch.int64,
+        ).reshape(-1)
+        offsets = torch.arange(
+            block_scale,
+            dtype=torch.int64,
+            device=device,
+        )
+        return (
+            logical[:, None] * block_scale + offsets[None, :]
+        ).reshape(-1)
+
+    def _load_dsa_sparse_shared_memory_payloads(
+        self,
+        *,
+        request_id: str,
+        pool_entry: int,
+        handoff: DSASparsePDHandoff,
+        rank: int,
+    ) -> None:
+        """Load Indexer, MTP draft, and partial Main Tail, then unlink SHM."""
+
+        try:
+            layer_payloads = handoff.shared_memory_payloads_by_rank[rank]
+        except KeyError as error:
+            raise RuntimeError(
+                "DSA Sparse shared-memory handoff has no payloads for Decode "
+                f"rank {rank}: request={request_id!r}."
+            ) from error
+
+        group_id = self._dsa_sparse_indexer_group_id
+        if group_id is None:
+            raise RuntimeError(
+                "DSA Sparse Decode has no Indexer cache group for shared-memory load"
+            )
+        try:
+            request_row = self.input_batch.req_id_to_index[request_id]
+        except KeyError as error:
+            raise RuntimeError(
+                "DSA Sparse shared-memory load has no Decode request row: "
+                f"request={request_id!r}."
+            ) from error
+
+        block_count = math.ceil(
+            handoff.stored_token_count / handoff.block_size
+        )
+        block_table = self.input_batch.block_table[
+            group_id
+        ].get_cpu_tensor()
+        if block_count > block_table.shape[1]:
+            raise RuntimeError(
+                "DSA Sparse shared-memory Indexer blocks exceed the local "
+                f"block table: request={request_id!r}, blocks={block_count}, "
+                f"capacity={block_table.shape[1]}."
+            )
+        destination_block_ids = block_table[
+            request_row,
+            :block_count,
+        ].to(dtype=torch.int64)
+        expected_mtp_layers = set(self._dsa_sparse_mtp_draft_caches)
+        actual_mtp_layers = {
+            payload.cache_layer_name
+            for payload in layer_payloads.values()
+            if payload.cache_kind == "mtp_draft"
+        }
+        if actual_mtp_layers != expected_mtp_layers:
+            raise RuntimeError(
+                "DSA Sparse shared-memory MTP draft layers do not match "
+                "Decode: "
+                f"expected={sorted(expected_mtp_layers)}, "
+                f"actual={sorted(actual_mtp_layers)}."
+            )
+        coordinators = dict(self._dsa_sparse_coordinators)
+        readers = []
+
+        with ExitStack() as stack:
+            for layer_name, payload in layer_payloads.items():
+                reader = stack.enter_context(
+                    self._dsa_sparse_shared_memory_store.open(payload)
+                )
+                readers.append(reader)
+
+                if payload.cache_kind == "indexer":
+                    destination_cache = self._dsa_sparse_indexer_caches
+                    cache_label = "Indexer"
+                elif payload.cache_kind == "mtp_draft":
+                    destination_cache = self._dsa_sparse_mtp_draft_caches
+                    cache_label = "MTP draft"
+                else:
+                    raise RuntimeError(
+                        "DSA Sparse shared-memory handoff has an unsupported "
+                        f"cache kind: {payload.cache_kind!r}."
+                    )
+                try:
+                    destination_planes = destination_cache[
+                        payload.cache_layer_name
+                    ]
+                except KeyError as error:
+                    raise RuntimeError(
+                        "DSA Sparse shared-memory handoff references an "
+                        f"unknown Decode {cache_label} layer: "
+                        f"{payload.cache_layer_name!r}."
+                    ) from error
+                if len(destination_planes) != len(payload.cache_planes):
+                    raise RuntimeError(
+                        f"DSA Sparse shared-memory {cache_label} plane count "
+                        "does not match Decode."
+                    )
+                for plane_descriptor, destination in zip(
+                    payload.cache_planes,
+                    destination_planes,
+                ):
+                    if destination.dtype != plane_descriptor.torch_dtype:
+                        raise RuntimeError(
+                            f"DSA Sparse shared-memory {cache_label} dtype "
+                            "does not match Decode."
+                        )
+                    if destination.shape[0] % self.kv_cache_config.num_blocks:
+                        raise RuntimeError(
+                            f"DSA Sparse Decode {cache_label} physical blocks "
+                            "do not divide by scheduler blocks."
+                        )
+                    local_block_scale = (
+                        int(destination.shape[0])
+                        // self.kv_cache_config.num_blocks
+                    )
+                    if local_block_scale != plane_descriptor.block_scale:
+                        raise RuntimeError(
+                            f"DSA Sparse shared-memory {cache_label} block "
+                            "scale does not match Decode."
+                        )
+                    expected_shape = (
+                        block_count * local_block_scale,
+                        *destination.shape[1:],
+                    )
+                    if plane_descriptor.shape != expected_shape:
+                        raise RuntimeError(
+                            f"DSA Sparse shared-memory {cache_label} shape "
+                            "does not match Decode."
+                        )
+                    source = reader.tensor(plane_descriptor)
+                    destination_ids = (
+                        self._expand_dsa_sparse_physical_block_ids(
+                            destination_block_ids,
+                            local_block_scale,
+                            device=destination.device,
+                        )
+                    )
+                    device_source = source.to(device=destination.device)
+                    destination.index_copy_(
+                        0,
+                        destination_ids,
+                        device_source,
+                    )
+                    del source, device_source, destination_ids
+
+                if payload.tail_planes:
+                    try:
+                        coordinator = coordinators[layer_name]
+                    except KeyError as error:
+                        raise RuntimeError(
+                            "DSA Sparse shared-memory handoff references an "
+                            f"unknown Main layer: {layer_name!r}."
+                        ) from error
+                    destination_planes = coordinator.hot_main_cache
+                    if len(destination_planes) != len(payload.tail_planes):
+                        raise RuntimeError(
+                            "DSA Sparse shared-memory Main Tail plane count "
+                            "does not match Decode."
+                        )
+                    tail_valid_count = (
+                        handoff.stored_token_count % handoff.block_size
+                    )
+                    destination_tail_block = (
+                        pool_entry * coordinator.hot_blocks_per_request
+                        + coordinator.tail_base // self.block_size
+                    )
+                    for plane_descriptor, destination in zip(
+                        payload.tail_planes,
+                        destination_planes,
+                    ):
+                        expected_shape = (
+                            tail_valid_count,
+                            *destination.shape[2:],
+                        )
+                        if (
+                            destination.dtype
+                            != plane_descriptor.torch_dtype
+                            or plane_descriptor.shape != expected_shape
+                        ):
+                            raise RuntimeError(
+                                "DSA Sparse shared-memory Main Tail layout "
+                                "does not match Decode."
+                            )
+                        source = reader.tensor(plane_descriptor)
+                        destination[
+                            destination_tail_block,
+                            :tail_valid_count,
+                        ].copy_(source.to(device=destination.device))
+                        del source
+
+            # H2D copies may be enqueued asynchronously. Keep every mmap alive
+            # until the device has consumed it, then unlink all bundles as one
+            # successful request-scoped consume boundary.
+            self._sync_device()
+            for reader in readers:
+                reader.unlink()
+                if dsa_sparse_probe.is_enabled():
+                    dsa_sparse_probe.emit(
+                        "shared_memory_consume",
+                        role="D",
+                        request_id=request_id,
+                        object_name=reader.payload.name,
+                        payload_bytes=reader.payload.size,
+                        tp_rank=rank,
+                    )
+
     def _release_dsa_sparse_request(self, request_id: str) -> None:
+        handoff = self._dsa_sparse_pd_handoffs.get(request_id)
+        if handoff is not None:
+            rank = get_tp_group().rank_in_group
+            for payload in handoff.shared_memory_payloads_by_rank.get(
+                rank,
+                {},
+            ).values():
+                self._dsa_sparse_shared_memory_store.unlink(payload)
         pool_entry = self.dsa_sparse_req_to_pool_entry.pop(request_id, None)
         if pool_entry is None:
             return
@@ -1183,7 +1441,56 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 for request_id in request_ids
             },
+            shared_memory_store=self._dsa_sparse_shared_memory_store,
+            defer_completion=config.uses_mtp,
         )
+
+    def _complete_dsa_sparse_producer_execution(
+        self,
+        *,
+        successful: bool,
+        original_error: BaseException | None = None,
+    ) -> None:
+        execution = self._dsa_sparse_pending_producer_execution
+        if execution is None:
+            return
+        self._dsa_sparse_pending_producer_execution = None
+        cleanup_errors: list[BaseException] = []
+        if not successful and has_kv_transfer_group():
+            connector = get_kv_transfer_group()
+            abort_capture = getattr(
+                connector,
+                "abort_dsa_sparse_capture",
+                None,
+            )
+            if callable(abort_capture):
+                try:
+                    abort_capture()
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+        try:
+            if successful:
+                execution.finish()
+            else:
+                execution.abort()
+        except BaseException as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            if original_error is not None and hasattr(original_error, "add_note"):
+                for cleanup_error in cleanup_errors:
+                    original_error.add_note(
+                        "DSA Sparse P deferred capture cleanup also failed: "
+                        f"{cleanup_error!r}"
+                    )
+                return
+            if len(cleanup_errors) == 1:
+                raise cleanup_errors[0]
+            combined_error = RuntimeError(
+                "DSA Sparse P deferred capture cleanup failed."
+            )
+            for cleanup_error in cleanup_errors:
+                combined_error.add_note(repr(cleanup_error))
+            raise combined_error
 
     def _init_device_properties(self) -> None:
         self.num_sms = None
@@ -1344,9 +1651,9 @@ class NPUModelRunner(GPUModelRunner):
                 connector_metadata, "requests", None
             )
             if isinstance(connector_requests, dict):
-                # Async remote loads can run in a no-forward step, before the
-                # request appears in scheduled_new_reqs. The Decode row must
-                # already exist when Mooncake resolves the partial-tail target.
+                # Async connector loads can run in a no-forward step, before
+                # the request appears in scheduled_new_reqs. Admit early so
+                # KVIO and shared-memory initialization have a Decode row.
                 for request_id in connector_requests:
                     handoff = self._dsa_sparse_pd_handoffs.get(request_id)
                     if handoff is not None:
@@ -3037,6 +3344,20 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+        if (
+            isinstance(
+                dsa_sparse_producer_execution,
+                DSASparseProducerExecution,
+            )
+            and dsa_sparse_producer_execution.is_pending
+        ):
+            if self._dsa_sparse_pending_producer_execution is not None:
+                raise RuntimeError(
+                    "DSA Sparse P has an unfinished deferred capture."
+                )
+            self._dsa_sparse_pending_producer_execution = (
+                dsa_sparse_producer_execution
+            )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -3221,32 +3542,43 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
         )
 
-        with record_function_or_nullcontext("draft_token"):
-            if self.speculative_config:
-                use_padded_batch = (
-                    self.speculative_config
-                    and (
-                        self.speculative_config.use_eagle()
-                        or self.speculative_config.uses_draft_model()
-                        or self.speculative_config.uses_extract_hidden_states()
-                        or self.speculative_config.use_ngram_gpu()
+        try:
+            with record_function_or_nullcontext("draft_token"):
+                if self.speculative_config:
+                    use_padded_batch = (
+                        self.speculative_config
+                        and (
+                            self.speculative_config.use_eagle()
+                            or self.speculative_config.uses_draft_model()
+                            or self.speculative_config.uses_extract_hidden_states()
+                            or self.speculative_config.use_ngram_gpu()
+                        )
+                        and not self.speculative_config.disable_padded_drafter_batch
                     )
-                    and not self.speculative_config.disable_padded_drafter_batch
-                )
-                if use_padded_batch:
-                    # EAGLE speculative decoding can use the GPU sampled tokens
-                    # as inputs, and does not need to wait for bookkeeping to finish.
-                    propose_draft_token_ids(sampler_output.sampled_token_ids)
-                if self.speculative_config and not use_padded_batch:
-                    # ngram and other speculative decoding methods use the sampled
-                    # tokens on the CPU, so they are run after bookkeeping.
-                    propose_draft_token_ids(valid_sampled_token_ids)
+                    if use_padded_batch:
+                        # EAGLE speculative decoding can use the GPU sampled tokens
+                        # as inputs, and does not need to wait for bookkeeping to finish.
+                        propose_draft_token_ids(sampler_output.sampled_token_ids)
+                    if self.speculative_config and not use_padded_batch:
+                        # ngram and other speculative decoding methods use the sampled
+                        # tokens on the CPU, so they are run after bookkeeping.
+                        propose_draft_token_ids(valid_sampled_token_ids)
 
-            # vLLM v0.18 defers KV connector finalization during target-model
-            # forward when speculative decoding is enabled. Finalize here after
-            # draft model runs so KV pool save/put can complete.
-            if self.speculative_config is not None:
-                self.finalize_kv_connector()
+                # vLLM v0.18 defers KV connector finalization during target-model
+                # forward when speculative decoding is enabled. Finalize here after
+                # draft model runs so KV pool save/put can complete.
+                if self.speculative_config is not None:
+                    self.finalize_kv_connector()
+        except BaseException as error:
+            self._complete_dsa_sparse_producer_execution(
+                successful=False,
+                original_error=error,
+            )
+            raise
+        else:
+            self._complete_dsa_sparse_producer_execution(
+                successful=True,
+            )
 
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
@@ -4564,13 +4896,14 @@ class NPUModelRunner(GPUModelRunner):
             cache size of each layer
         """
         kv_cache_config = deepcopy(kv_cache_config)
+        self._dsa_sparse_indexer_group_id = None
         if self._uses_dsa_sparse_main_cache():
             main_specs = self._dsa_sparse_main_specs
             assert main_specs, (
                 "DSA Sparse Decode Main specs are unavailable. "
                 "get_kv_cache_spec() must run before initialize_kv_cache()."
             )
-            add_dsa_sparse_main_metadata(
+            self._dsa_sparse_indexer_group_id = add_dsa_sparse_main_metadata(
                 kv_cache_config,
                 main_specs,
             )
@@ -4591,9 +4924,45 @@ class NPUModelRunner(GPUModelRunner):
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
         config = self.ascend_config.dsa_sparse_config
-        dsa_sparse_layer_caches: dict[
-            str, tuple[torch.Tensor, ...]
-        ] = {}
+        self._dsa_sparse_indexer_caches = {}
+        self._dsa_sparse_mtp_draft_caches = {}
+        if (
+            config is not None
+            and getattr(config, "kv_role", None) == "kv_consumer"
+        ):
+            layer_specs = self._get_layer_kv_cache_specs(kv_cache_config)
+            self._dsa_sparse_indexer_caches = {
+                layer_name: (
+                    (cache,)
+                    if isinstance(cache, torch.Tensor)
+                    else tuple(cache)
+                )
+                for layer_name, cache in kv_caches.items()
+                if isinstance(
+                    layer_specs.get(layer_name),
+                    AscendSFAIndexerCacheSpec,
+                )
+            }
+            if getattr(config, "uses_mtp", False):
+                self._dsa_sparse_mtp_draft_caches = {
+                    layer_name: (
+                        (cache,)
+                        if isinstance(cache, torch.Tensor)
+                        else tuple(cache)
+                    )
+                    for layer_name, cache in kv_caches.items()
+                    if isinstance(
+                        layer_specs.get(layer_name),
+                        AscendMLAAttentionSpec,
+                    )
+                    and layer_name not in self._dsa_sparse_main_specs
+                }
+                if len(self._dsa_sparse_mtp_draft_caches) != 1:
+                    raise RuntimeError(
+                        "DSA Sparse Decode with MTP requires exactly one "
+                        "scheduler-managed draft cache layer, got "
+                        f"{sorted(self._dsa_sparse_mtp_draft_caches)}."
+                    )
         if config is not None:
             self._dsa_sparse_backend = create_dsa_sparse_backend(config)
         self._initialize_dsa_sparse_coordinators()
@@ -4615,7 +4984,6 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     layer_caches.append((layer_name, cache_planes))
             for layer_name, cache_planes in layer_caches:
-                dsa_sparse_layer_caches[layer_name] = cache_planes
                 self._dsa_sparse_backend.register_layer_cache(
                     layer_id=extract_layer_index(layer_name),
                     block_size=self.block_size,
@@ -4641,31 +5009,6 @@ class NPUModelRunner(GPUModelRunner):
 
         if has_kv_transfer_group():
             kv_transfer_group = get_kv_transfer_group()
-            if config is not None:
-                register_aux = getattr(
-                    kv_transfer_group,
-                    "register_dsa_sparse_aux_caches",
-                    None,
-                )
-                if not callable(register_aux):
-                    raise RuntimeError(
-                        "DSA Sparse P/D requires Mooncake auxiliary cache "
-                        "registration"
-                    )
-                tail_layouts = (
-                    {
-                        layer_name: (
-                            coordinator.hot_blocks_per_request,
-                            coordinator.tail_base // self.block_size,
-                        )
-                        for layer_name, coordinator in (
-                            self._dsa_sparse_coordinators
-                        )
-                    }
-                    if config.is_consumer
-                    else {}
-                )
-                register_aux(dsa_sparse_layer_caches, tail_layouts)
             kv_transfer_group.register_kv_caches(kv_caches)
 
         if self.model_config.enable_return_routed_experts:

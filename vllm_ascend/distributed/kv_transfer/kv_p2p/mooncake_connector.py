@@ -62,7 +62,15 @@ from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.attention.dsa_sparse_pd import (
     DSA_SPARSE_PD_HANDOFF_KEY,
     DSASparsePDHandoff,
+    DSASparseProducerAttentionContext,
+    DSASparseSharedMemoryPayload,
     get_dsa_sparse_pd_handoff,
+)
+from vllm_ascend.attention.dsa_sparse_shm import (
+    DSASparseSharedMemoryStore,
+)
+from vllm_ascend.core.kv_cache_interface import (
+    AscendSFAIndexerCacheSpec,
 )
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
@@ -145,7 +153,10 @@ class DSASparsePDWorkerMetadata(KVConnectorWorkerMetadata):
         str,
         dict[int, dict[str, list[int]]],
     ]
-    request_partial_tail_blocks_by_rank: dict[str, dict[int, dict[str, int]]] = field(default_factory=dict)
+    request_shared_memory_payloads_by_rank: dict[
+        str,
+        dict[int, dict[str, DSASparseSharedMemoryPayload]],
+    ] = field(default_factory=dict)
 
     def aggregate(
         self,
@@ -171,16 +182,24 @@ class DSASparsePDWorkerMetadata(KVConnectorWorkerMetadata):
                             f"layer={layer_name!r}."
                         )
                     layers[layer_name] = normalized
-        for request_id, incoming_by_rank in other.request_partial_tail_blocks_by_rank.items():
-            by_rank = self.request_partial_tail_blocks_by_rank.setdefault(request_id, {})
+        for (
+            request_id,
+            incoming_by_rank,
+        ) in other.request_shared_memory_payloads_by_rank.items():
+            by_rank = self.request_shared_memory_payloads_by_rank.setdefault(
+                request_id,
+                {},
+            )
             for rank, incoming_layers in incoming_by_rank.items():
                 layers = by_rank.setdefault(int(rank), {})
-                for layer_name, incoming_block_id in incoming_layers.items():
-                    block_id = int(incoming_block_id)
+                for layer_name, incoming_payload in incoming_layers.items():
                     current = layers.get(layer_name)
-                    if current is not None and current != block_id:
-                        raise RuntimeError("DSA Sparse P workers produced conflicting partial-tail metadata.")
-                    layers[layer_name] = block_id
+                    if current is not None and current != incoming_payload:
+                        raise RuntimeError(
+                            "DSA Sparse P workers produced conflicting "
+                            "shared-memory metadata."
+                        )
+                    layers[layer_name] = incoming_payload
         return self
 
 
@@ -810,60 +829,23 @@ class KVCacheRecvingThread(threading.Thread):
                     remote_host_ = remote_port_send_num[remote_port]["host"]
                     self._send_done_recv_signal(request_id, remote_host_, remote_port, remote_port_send_num)
 
-    def _append_dsa_sparse_partial_tail_transfer_meta(
-        self,
-        *,
-        req_meta: dict[str, Any],
-        remote_aux_regions: dict[str, list[dict[str, int]]],
-        local_addresses: list[int],
-        remote_addresses: list[int],
-        lengths: list[int],
-    ) -> None:
-        handoff = req_meta.get("dsa_sparse_handoff")
-        if handoff is None:
-            return
-        if not isinstance(handoff, DSASparsePDHandoff):
-            raise TypeError("DSA Sparse partial-tail handoff is invalid")
-        tail_valid_count = handoff.stored_token_count % handoff.block_size
-        if tail_valid_count == 0:
-            return
-        pool_entry = req_meta.get("dsa_sparse_pool_entry")
-        if pool_entry is None:
-            raise RuntimeError("DSA Sparse partial-tail transfer has no Decode request row")
-        try:
-            source_blocks = handoff.partial_tail_blocks_by_rank[self.tp_rank]
-        except KeyError as error:
-            raise RuntimeError("DSA Sparse partial-tail handoff has no matching TP rank") from error
-
-        for layer_name, source_block_id in source_blocks.items():
-            try:
-                local_planes = self.dsa_sparse_aux_regions[layer_name]
-                remote_planes = remote_aux_regions[layer_name]
-            except KeyError as error:
-                raise RuntimeError(f"Mooncake DSA Sparse auxiliary metadata is missing layer {layer_name!r}") from error
-            if len(local_planes) != 2 or len(remote_planes) != 2:
-                raise RuntimeError("DSA Sparse partial-tail transfer requires two planes")
-            for local_plane, remote_plane in zip(local_planes, remote_planes):
-                local_token_bytes = local_plane["token_bytes"]
-                remote_token_bytes = remote_plane["token_bytes"]
-                if local_token_bytes != remote_token_bytes:
-                    raise RuntimeError("DSA Sparse partial-tail token sizes do not match")
-                blocks_per_request = local_plane["blocks_per_request"]
-                tail_block_offset = local_plane["tail_block_offset"]
-                if blocks_per_request <= 0 or tail_block_offset < 0:
-                    raise RuntimeError("DSA Sparse Decode tail layout is invalid")
-                destination_block_id = int(pool_entry) * blocks_per_request + tail_block_offset
-                if destination_block_id >= local_plane.get("num_blocks", destination_block_id + 1):
-                    raise RuntimeError("DSA Sparse partial-tail destination block is out of range")
-                if int(source_block_id) >= remote_plane.get("num_blocks", int(source_block_id) + 1):
-                    raise RuntimeError("DSA Sparse partial-tail source block is out of range")
-                local_addresses.append(local_plane["base_addr"] + destination_block_id * local_plane["block_stride"])
-                remote_addresses.append(remote_plane["base_addr"] + int(source_block_id) * remote_plane["block_stride"])
-                lengths.append(tail_valid_count * local_token_bytes)
-
     def _transfer_kv_cache_all_groups(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request."""
         remote_request_id = req_meta["remote_request_id"]
+        dsa_sparse_handoff = req_meta.get("dsa_sparse_handoff")
+        if dsa_sparse_handoff is not None:
+            if not isinstance(dsa_sparse_handoff, DSASparsePDHandoff):
+                raise TypeError(
+                    "Mooncake received an invalid DSA Sparse P/D handoff."
+                )
+            # DSA Sparse payloads have already moved through KVIO or /dev/shm.
+            # Keep this task only so the normal completion signal releases P's
+            # delayed scheduler blocks; do not touch the Mooncake data plane.
+            logger.debug(
+                "Skipping Mooncake payload transfer for DSA Sparse request %s.",
+                remote_request_id,
+            )
+            return
         local_block_ids: BlockIds = req_meta["local_block_ids"]
         remote_block_ids: BlockIds = req_meta["remote_block_ids"]
         local_block_ids_replicate_k: BlockIds = req_meta.get("local_block_ids_replicate_k", tuple())
@@ -873,11 +855,10 @@ class KVCacheRecvingThread(threading.Thread):
         remote_engine_id = req_meta["remote_engine_id"]
         remote_host = req_meta["remote_host"]
         remote_handshake_port = req_meta["remote_handshake_port"]
-        has_dsa_sparse_partial_tail = req_meta.get("dsa_sparse_handoff") is not None
         # Full prefix cache hit: do not need to read remote blocks, just notify
         # P worker that we have the blocks we need.
         num_local_blocks = sum(len(group_block_ids) for group_block_ids in local_block_ids)
-        if num_local_blocks == 0 and not has_replicate_k_blocks and not has_dsa_sparse_partial_tail:
+        if num_local_blocks == 0 and not has_replicate_k_blocks:
             return
 
         # Check if we have the remote metadata cached.
@@ -894,9 +875,6 @@ class KVCacheRecvingThread(threading.Thread):
             remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
             remote_block_stride_per_addr = self.remote_block_stride_per_addr[remote_engine_id][remote_handshake_port]
             remote_kv_group2layeridx = self.remote_kv_group2layeridx[remote_engine_id][remote_handshake_port]
-            remote_dsa_sparse_aux_regions = self.remote_dsa_sparse_aux_regions.get(remote_engine_id, {}).get(
-                remote_handshake_port, {}
-            )
         remote_layer_name_to_idx = self._build_remote_layer_name_to_idx(remote_kv_group2layeridx)
         session_id = f"{remote_host}:{remote_transfer_port}"
 
@@ -1084,14 +1062,6 @@ class KVCacheRecvingThread(threading.Thread):
                         session_id,
                     )
 
-        self._append_dsa_sparse_partial_tail_transfer_meta(
-            req_meta=req_meta,
-            remote_aux_regions=remote_dsa_sparse_aux_regions,
-            local_addresses=src_list,
-            remote_addresses=dst_list,
-            lengths=length_list,
-        )
-
         if not src_list:
             return
 
@@ -1205,10 +1175,8 @@ class KVCacheRecvingThread(threading.Thread):
         """Build the remote physical layer index map from handshake metadata.
 
         P and D may expose different physical layer indices for the same model
-        layer. This happens for DSA Sparse because target Main is runner-owned
-        on D, while Indexer and any MTP draft cache remain scheduler-managed.
-        The serialized layer names are stable across the two workers, so they
-        are the authoritative mapping for the remote address arrays.
+        layer. The serialized layer names are stable across the two workers,
+        so they are the authoritative mapping for the remote address arrays.
 
         Older or hand-written test metadata may not include ``layer_names``.
         Returning an empty map preserves the historical index-based behavior
@@ -1251,12 +1219,11 @@ class KVCacheRecvingThread(threading.Thread):
     ) -> list[str] | None:
         """Validate name-based P/D layer compatibility.
 
-        DSA Sparse intentionally exposes different scheduler-visible layouts:
-        target Main is not registered by D's scheduler, while Indexer and any
-        MTP draft cache remain registered. Therefore the serialized
-        dictionaries need not be equal; every D-local layer must instead have
-        a stable-name match on P. ``None`` preserves the legacy equality
-        warning for metadata that predates serialized layer names.
+        DSA Sparse can intentionally expose a filtered payload layout.
+        Therefore the serialized dictionaries need not be equal; every
+        D-local transfer layer must instead have a stable-name match on P.
+        ``None`` preserves the legacy equality warning for metadata that
+        predates serialized layer names.
         """
 
         for remote_group_spec, _ in remote_kv_group2layeridx.values():
@@ -1867,6 +1834,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.set_dsa_sparse_request_rows(request_rows)
 
+    def abort_dsa_sparse_capture(self) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.abort_dsa_sparse_capture()
+
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
@@ -1887,14 +1858,23 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         pass
 
     def save_kv_layer(
-        self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
     ) -> None:
-        """Capture DSA control metadata; payload remains connector-owned."""
+        """Capture DSA control metadata and shared-memory payloads."""
 
         assert self.connector_worker is not None
         self.connector_worker.capture_dsa_sparse_layer_topk(
             layer_name,
             attn_metadata,
+            (
+                tuple(kv_layer)
+                if isinstance(kv_layer, (list, tuple))
+                else (kv_layer,)
+            ),
         )
 
     def build_connector_worker_meta(
@@ -1982,7 +1962,13 @@ class MooncakeConnectorScheduler:
             str,
             dict[int, dict[str, list[int]]],
         ] = {}
-        self._dsa_sparse_partial_tail_blocks_by_request: dict[str, dict[int, dict[str, int]]] = {}
+        self._dsa_sparse_shared_memory_payloads_by_request: dict[
+            str,
+            dict[int, dict[str, DSASparseSharedMemoryPayload]],
+        ] = {}
+        self._dsa_sparse_shared_memory_store = (
+            DSASparseSharedMemoryStore()
+        )
 
         # master-slave meta information for cross-nodes
         self.multi_nodes_meta_mapping: dict[str, dict[str, Any]] = {}
@@ -2245,6 +2231,15 @@ class MooncakeConnectorScheduler:
                     request.request_id,
                     None,
                 )
+                abandoned_payloads = (
+                    self._dsa_sparse_shared_memory_payloads_by_request.pop(
+                        request.request_id,
+                        {},
+                    )
+                )
+                for layer_payloads in abandoned_payloads.values():
+                    for payload in layer_payloads.values():
+                        self._dsa_sparse_shared_memory_store.unlink(payload)
             return False, None
 
         prompt_token_count = len(request.prompt_token_ids)
@@ -2314,7 +2309,7 @@ class MooncakeConnectorScheduler:
             return
         accumulator = DSASparsePDWorkerMetadata(
             self._dsa_sparse_topk_by_request,
-            self._dsa_sparse_partial_tail_blocks_by_request,
+            self._dsa_sparse_shared_memory_payloads_by_request,
         )
         accumulator.aggregate(metadata)
 
@@ -2328,33 +2323,98 @@ class MooncakeConnectorScheduler:
                 request.request_id,
                 None,
             )
+            abandoned_payloads = (
+                self._dsa_sparse_shared_memory_payloads_by_request.pop(
+                    request.request_id,
+                    {},
+                )
+            )
+            for layer_payloads in abandoned_payloads.values():
+                for payload in layer_payloads.values():
+                    self._dsa_sparse_shared_memory_store.unlink(payload)
             return None
         try:
             layer_topk_by_rank = self._dsa_sparse_topk_by_request.pop(request.request_id)
         except KeyError as error:
+            abandoned_payloads = (
+                self._dsa_sparse_shared_memory_payloads_by_request.pop(
+                    request.request_id,
+                    {},
+                )
+            )
+            for layer_payloads in abandoned_payloads.values():
+                for payload in layer_payloads.values():
+                    self._dsa_sparse_shared_memory_store.unlink(payload)
             raise RuntimeError(
                 f"DSA Sparse P request finished without final-Prefill TopK metadata: request={request.request_id!r}."
             ) from error
-        partial_tail_blocks_by_rank = self._dsa_sparse_partial_tail_blocks_by_request.pop(request.request_id, {})
-        expected_ranks = set(range(self.tp_size))
-        actual_ranks = set(layer_topk_by_rank)
-        if actual_ranks != expected_ranks:
-            raise RuntimeError(
-                "DSA Sparse P/D TopK ranks are incomplete: "
-                f"request={request.request_id!r}, "
-                f"expected={sorted(expected_ranks)}, "
-                f"actual={sorted(actual_ranks)}."
+        shared_memory_payloads_by_rank = (
+            self._dsa_sparse_shared_memory_payloads_by_request.pop(
+                request.request_id,
+                {},
             )
-        layer_sets = {frozenset(layer_topk) for layer_topk in layer_topk_by_rank.values()}
-        if len(layer_sets) != 1:
-            raise RuntimeError(f"DSA Sparse P/D ranks captured different layer sets: request={request.request_id!r}.")
-        return DSASparsePDHandoff(
-            remote_request_id=request.request_id,
-            stored_token_count=request.num_prompt_tokens,
-            block_size=self.block_size,
-            layer_topk_by_rank=layer_topk_by_rank,
-            partial_tail_blocks_by_rank=partial_tail_blocks_by_rank,
         )
+        try:
+            expected_ranks = set(range(self.tp_size))
+            actual_ranks = set(layer_topk_by_rank)
+            if actual_ranks != expected_ranks:
+                raise RuntimeError(
+                    "DSA Sparse P/D TopK ranks are incomplete: "
+                    f"request={request.request_id!r}, "
+                    f"expected={sorted(expected_ranks)}, "
+                    f"actual={sorted(actual_ranks)}."
+                )
+            layer_sets = {
+                frozenset(layer_topk)
+                for layer_topk in layer_topk_by_rank.values()
+            }
+            if len(layer_sets) != 1:
+                raise RuntimeError(
+                    "DSA Sparse P/D ranks captured different layer sets: "
+                    f"request={request.request_id!r}."
+                )
+            mtp_layer_sets = {
+                frozenset(
+                    layer_name
+                    for layer_name, payload in (
+                        shared_memory_payloads_by_rank.get(rank, {})
+                    ).items()
+                    if payload.cache_kind == "mtp_draft"
+                )
+                for rank in expected_ranks
+            }
+            if getattr(config, "uses_mtp", False):
+                if (
+                    len(mtp_layer_sets) != 1
+                    or not mtp_layer_sets
+                    or len(next(iter(mtp_layer_sets))) != 1
+                ):
+                    raise RuntimeError(
+                        "DSA Sparse P/D MTP draft shared-memory payloads are "
+                        f"incomplete: request={request.request_id!r}, "
+                        f"layers={sorted(map(sorted, mtp_layer_sets))}."
+                    )
+            elif any(mtp_layer_sets):
+                raise RuntimeError(
+                    "DSA Sparse P/D captured an unexpected MTP draft payload: "
+                    f"request={request.request_id!r}."
+                )
+            return DSASparsePDHandoff(
+                remote_request_id=request.request_id,
+                stored_token_count=request.num_prompt_tokens,
+                block_size=self.block_size,
+                layer_topk_by_rank=layer_topk_by_rank,
+                shared_memory_payloads_by_rank=(
+                    shared_memory_payloads_by_rank
+                ),
+            )
+        except BaseException:
+            for layer_payloads in (
+                shared_memory_payloads_by_rank.values()
+            ):
+                for payload in layer_payloads.values():
+                    self._dsa_sparse_shared_memory_store.unlink(payload)
+            raise
 
     def _port_offset_from_handshake_metadata(
         self,
@@ -2496,10 +2556,24 @@ class MooncakeConnectorWorker:
             str,
             dict[str, list[int]],
         ] = {}
-        self._dsa_sparse_partial_tail_blocks_by_request: dict[str, dict[str, int]] = {}
+        self._dsa_sparse_shared_memory_payloads_by_request: dict[
+            str,
+            dict[str, DSASparseSharedMemoryPayload],
+        ] = {}
         self._dsa_sparse_aux_caches: dict[str, tuple[torch.Tensor, ...]] = {}
         self._dsa_sparse_tail_layouts: dict[str, tuple[int, int]] = {}
         self._dsa_sparse_request_rows: dict[str, int] = {}
+        self._dsa_sparse_active_producer_context: (
+            DSASparseProducerAttentionContext | None
+        ) = None
+        self._dsa_sparse_pending_mtp_draft_layers: dict[
+            str,
+            tuple[
+                DSASparseProducerAttentionContext,
+                tuple[torch.Tensor, ...],
+                torch.Tensor,
+            ],
+        ] = {}
 
     def register_dsa_sparse_aux_caches(
         self,
@@ -2522,20 +2596,95 @@ class MooncakeConnectorWorker:
         self,
         layer_name: str,
         attn_metadata: "AttentionMetadata",
+        cache: tuple[torch.Tensor, ...] = (),
     ) -> None:
         config = self.dsa_sparse_config
         if getattr(config, "kv_role", None) != "kv_producer":
             return
         layer_metadata = attn_metadata.get(layer_name) if isinstance(attn_metadata, Mapping) else attn_metadata
+        is_mtp_draft = self._is_dsa_sparse_mtp_draft_layer(layer_name)
         producer_context = getattr(
             layer_metadata,
             "dsa_sparse_producer_context",
             None,
         )
+        if (
+            producer_context is None
+            and is_mtp_draft
+            and isinstance(attn_metadata, Mapping)
+        ):
+            for metadata in attn_metadata.values():
+                producer_context = getattr(
+                    metadata,
+                    "dsa_sparse_producer_context",
+                    None,
+                )
+                if producer_context is not None:
+                    break
+        if producer_context is None and is_mtp_draft:
+            producer_context = getattr(
+                self,
+                "_dsa_sparse_active_producer_context",
+                None,
+            )
         if producer_context is None:
             return
-        request_topk = producer_context.layer_topk(layer_name)
-        partial_tail_blocks = producer_context.layer_partial_tail_blocks(layer_name)
+        if is_mtp_draft:
+            block_tables = getattr(layer_metadata, "block_tables", None)
+            if block_tables is None:
+                raise RuntimeError(
+                    "DSA Sparse P MTP draft publication has no block table: "
+                    f"layer={layer_name!r}."
+                )
+            if not cache:
+                raise RuntimeError(
+                    "DSA Sparse P MTP draft publication has no cache planes: "
+                    f"layer={layer_name!r}."
+                )
+            pending_mtp_layers = getattr(
+                self,
+                "_dsa_sparse_pending_mtp_draft_layers",
+                None,
+            )
+            if pending_mtp_layers is None:
+                pending_mtp_layers = {}
+                self._dsa_sparse_pending_mtp_draft_layers = (
+                    pending_mtp_layers
+                )
+            current = pending_mtp_layers.get(layer_name)
+            if current is not None and current[0] is not producer_context:
+                raise RuntimeError(
+                    "DSA Sparse P worker captured one MTP draft layer from "
+                    "different producer contexts."
+                )
+            # The MTP layer can execute several speculative steps. Retain the
+            # latest live cache/table references and snapshot them exactly once
+            # when the deferred connector is finalized after drafting.
+            pending_mtp_layers[layer_name] = (
+                producer_context,
+                cache,
+                block_tables,
+            )
+            return
+        else:
+            active_context = getattr(
+                self,
+                "_dsa_sparse_active_producer_context",
+                None,
+            )
+            if (
+                active_context is not None
+                and active_context is not producer_context
+            ):
+                raise RuntimeError(
+                    "DSA Sparse P worker observed overlapping producer "
+                    "capture contexts."
+                )
+            self._dsa_sparse_active_producer_context = producer_context
+            request_topk = producer_context.layer_topk(layer_name)
+        shared_memory_payloads = producer_context.layer_shared_memory_payloads(
+            layer_name
+        )
         for request_id, token_ids in request_topk.items():
             layers = self._dsa_sparse_layer_topk_by_request.setdefault(
                 request_id,
@@ -2548,29 +2697,73 @@ class MooncakeConnectorWorker:
                     f"DSA Sparse P worker captured conflicting TopK: request={request_id!r}, layer={layer_name!r}."
                 )
             layers[layer_name] = normalized
-        for request_id, block_id in partial_tail_blocks.items():
-            layers = self._dsa_sparse_partial_tail_blocks_by_request.setdefault(request_id, {})
-            layers[layer_name] = int(block_id)
+        for request_id, payload in shared_memory_payloads.items():
+            layers = self._dsa_sparse_shared_memory_payloads_by_request.setdefault(
+                request_id,
+                {},
+            )
+            layers[layer_name] = payload
 
     def build_connector_worker_meta(
         self,
     ) -> KVConnectorWorkerMetadata | None:
         if not self._dsa_sparse_layer_topk_by_request:
             return None
+        pending_mtp_layers = getattr(
+            self,
+            "_dsa_sparse_pending_mtp_draft_layers",
+            {},
+        )
+        try:
+            for layer_name, (
+                producer_context,
+                cache,
+                block_tables,
+            ) in pending_mtp_layers.items():
+                producer_context.publish_mtp_draft_layer(
+                    layer_name,
+                    cache,
+                    block_tables,
+                )
+                for request_id, payload in (
+                    producer_context.layer_shared_memory_payloads(
+                        layer_name
+                    ).items()
+                ):
+                    layers = self._dsa_sparse_shared_memory_payloads_by_request.setdefault(
+                        request_id,
+                        {},
+                    )
+                    layers[layer_name] = payload
+        except BaseException:
+            self._reset_dsa_sparse_capture_metadata()
+            raise
         request_layer_topk = self._dsa_sparse_layer_topk_by_request
-        request_partial_tail_blocks = self._dsa_sparse_partial_tail_blocks_by_request
-        self._dsa_sparse_layer_topk_by_request = {}
-        self._dsa_sparse_partial_tail_blocks_by_request = {}
+        request_shared_memory_payloads = (
+            self._dsa_sparse_shared_memory_payloads_by_request
+        )
+        self._reset_dsa_sparse_capture_metadata()
         return DSASparsePDWorkerMetadata(
             {
                 request_id: {self.tp_rank: {layer_name: list(token_ids) for layer_name, token_ids in layers.items()}}
                 for request_id, layers in request_layer_topk.items()
             },
             {
-                request_id: {self.tp_rank: {layer_name: int(block_id) for layer_name, block_id in layers.items()}}
-                for request_id, layers in request_partial_tail_blocks.items()
+                request_id: {self.tp_rank: dict(layers)}
+                for request_id, layers in (
+                    request_shared_memory_payloads.items()
+                )
             },
         )
+
+    def _reset_dsa_sparse_capture_metadata(self) -> None:
+        self._dsa_sparse_layer_topk_by_request = {}
+        self._dsa_sparse_shared_memory_payloads_by_request = {}
+        self._dsa_sparse_active_producer_context = None
+        self._dsa_sparse_pending_mtp_draft_layers = {}
+
+    def abort_dsa_sparse_capture(self) -> None:
+        self._reset_dsa_sparse_capture_metadata()
 
     def _get_prefill_decode_size(self, vllm_config: VllmConfig):
         # get prefill tp and dp size from extra config
@@ -2692,22 +2885,23 @@ class MooncakeConnectorWorker:
     ) -> set[str] | None:
         """Return the cache layers DSA Sparse should expose to Mooncake.
 
-        Decode owns target-model Main KV in its Hot Cache, so Mooncake must
-        only move scheduler-managed payloads that exist on both P and D:
-        Indexer cache and, when enabled, the MTP draft cache.  Prefill still
-        owns and uses its target Main tensors; excluding them here only removes
-        them from Mooncake registration and handshake metadata.
+        Target Main history remains KVIO-owned, while Indexer and the partial
+        Main Tail and MTP draft use the single-host shared-memory handoff.
+        Mooncake remains only as the P/D control and completion channel.
 
         ``None`` means that the ordinary, unfiltered Mooncake layout applies.
         """
 
-        if getattr(self.dsa_sparse_config, "kv_role", None) != "kv_producer":
+        if getattr(self.dsa_sparse_config, "kv_role", None) not in {
+            "kv_producer",
+            "kv_consumer",
+        }:
             return None
 
         from vllm.v1.worker.utils import extract_layer_index
 
         num_attn_module = 2 if self.vllm_config.model_config.hf_text_config.model_type == "longcat_flash" else 1
-        transfer_layer_names: set[str] = set()
+        unsupported_layer_names: list[str] = []
         for group_spec in self.kv_cache_config.kv_cache_groups:
             for layer_name in group_spec.layer_names:
                 layer_spec = group_spec.kv_cache_spec
@@ -2715,16 +2909,66 @@ class MooncakeConnectorWorker:
                     layer_spec = layer_spec.kv_cache_specs[layer_name]
 
                 is_target_main = False
-                if isinstance(layer_spec, MLAAttentionSpec) and "mtp" not in layer_name:
+                if isinstance(layer_spec, MLAAttentionSpec):
                     layer_idx = extract_layer_index(
                         layer_name,
                         num_attn_module,
                     )
                     is_target_main = layer_idx < self.total_layers
-                if not is_target_main:
-                    transfer_layer_names.add(layer_name)
+                is_indexer = isinstance(
+                    layer_spec,
+                    AscendSFAIndexerCacheSpec,
+                )
+                is_mtp_draft = (
+                    isinstance(layer_spec, MLAAttentionSpec)
+                    and self._is_dsa_sparse_mtp_draft_layer(layer_name)
+                )
+                if not (
+                    is_target_main
+                    or is_indexer
+                    or is_mtp_draft
+                ):
+                    unsupported_layer_names.append(layer_name)
 
-        return transfer_layer_names
+        if unsupported_layer_names:
+            raise RuntimeError(
+                "DSA Sparse control-only Mooncake path found unsupported KV "
+                f"payload layers: {sorted(unsupported_layer_names)}."
+            )
+        return set()
+
+    def _is_dsa_sparse_mtp_draft_layer(
+        self,
+        layer_name: str,
+    ) -> bool:
+        if getattr(self.dsa_sparse_config, "kv_role", None) not in {
+            "kv_producer",
+            "kv_consumer",
+        }:
+            return False
+        speculative_config = self.vllm_config.speculative_config
+        if (
+            speculative_config is None
+            or getattr(speculative_config, "method", None) != "mtp"
+        ):
+            return False
+
+        from vllm.v1.worker.utils import extract_layer_index
+
+        num_attn_module = (
+            2
+            if self.vllm_config.model_config.hf_text_config.model_type
+            == "longcat_flash"
+            else 1
+        )
+        try:
+            layer_index = extract_layer_index(
+                layer_name,
+                num_attn_module,
+            )
+        except (AssertionError, ValueError):
+            return False
+        return layer_index >= self.total_layers
 
     def _build_kv_group2layeridx(
         self,
@@ -2905,7 +3149,8 @@ class MooncakeConnectorWorker:
             }
             excluded_layer_names = sorted(set(kv_caches) - set(transfer_kv_caches))
             logger.info(
-                "DSA Sparse Prefill excludes target Main caches from Mooncake payload registration: excluded_layers=%s",
+                "DSA Sparse excludes shared-memory/KVIO-owned caches from "
+                "Mooncake payload registration: excluded_layers=%s",
                 excluded_layer_names,
             )
         self.kv_caches = transfer_kv_caches
@@ -3913,6 +4158,18 @@ class MooncakeConnectorWorker:
         self,
         meta: ReqMeta,
     ) -> tuple[BlockIds, BlockIds]:
+        if getattr(
+            getattr(self, "dsa_sparse_config", None),
+            "kv_role",
+            None,
+        ) in {
+            "kv_producer",
+            "kv_consumer",
+        }:
+            # DSA Sparse carries every Indexer plane in the rank-local shared
+            # memory payload. Do not stage a second Mooncake transfer for the
+            # same cache.
+            return tuple(), tuple()
         if not self.enable_sfa_dcp_replicated_indexer:
             return tuple(), tuple()
         if meta.num_external_tokens <= 0 or not meta.remote_block_ids or not meta.local_block_ids:
@@ -3984,7 +4241,6 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
-        skip_payload = ascend_envs.VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE
         for req_id in metadata.reqs_in_batch:
             if self.kv_send_thread is not None:
                 self.kv_send_thread.task_tracker.add_req_to_process(req_id)
@@ -4004,22 +4260,6 @@ class MooncakeConnectorWorker:
 
             remote_req_id = meta.remote_request_id
             prefill_tp_size: int = meta.remote_ptp_size if meta.remote_ptp_size is not None else self._prefill_tp_size
-            dsa_sparse_handoff = meta.dsa_sparse_handoff
-            tail_valid_count = (
-                dsa_sparse_handoff.stored_token_count % dsa_sparse_handoff.block_size
-                if dsa_sparse_handoff is not None
-                else 0
-            )
-            transfer_partial_tail = bool(tail_valid_count) and not skip_payload
-            if transfer_partial_tail and prefill_tp_size != self.tp_size:
-                raise RuntimeError(
-                    "DSA Sparse partial-tail handoff currently requires equal Prefill and Decode TP sizes"
-                )
-            dsa_sparse_pool_entry = self._dsa_sparse_request_rows.get(req_id)
-            if transfer_partial_tail and dsa_sparse_pool_entry is None:
-                raise RuntimeError("DSA Sparse partial-tail handoff has no Decode request row")
-            dsa_sparse_tail_port = meta.remote_port + self.tp_rank if transfer_partial_tail else None
-            dsa_sparse_tail_submitted = False
             (
                 local_block_ids_replicate_k,
                 remote_block_ids_replicate_k,
@@ -4069,9 +4309,6 @@ class MooncakeConnectorWorker:
                         if replicate_k_transfer_port is not None and remote_handshake_port == replicate_k_transfer_port
                         else None
                     )
-                    transfer_dsa_sparse_tail = (
-                        dsa_sparse_tail_port is not None and remote_handshake_port == dsa_sparse_tail_port
-                    )
                     self.kv_recv_thread.add_request(
                         request_id=req_id,
                         remote_request_id=remote_req_id,
@@ -4090,13 +4327,8 @@ class MooncakeConnectorWorker:
                         remote_block_size=meta.remote_block_size,
                         local_block_ids_replicate_k=local_block_ids_replicate_k_for_port,
                         remote_block_ids_replicate_k=remote_block_ids_replicate_k_for_port,
-                        dsa_sparse_handoff=(dsa_sparse_handoff if transfer_dsa_sparse_tail else None),
-                        dsa_sparse_pool_entry=(dsa_sparse_pool_entry if transfer_dsa_sparse_tail else None),
+                        dsa_sparse_handoff=meta.dsa_sparse_handoff,
                     )
-                    dsa_sparse_tail_submitted |= transfer_dsa_sparse_tail
-
-            if transfer_partial_tail and not dsa_sparse_tail_submitted:
-                raise RuntimeError("DSA Sparse partial-tail source TP port was not selected")
 
         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size == 1:
             for req_id, delay_start_time in metadata.requests_to_send.items():

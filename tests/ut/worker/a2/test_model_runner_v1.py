@@ -1,5 +1,7 @@
 import unittest
 from collections import deque
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -17,6 +19,11 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.dsa_sparse_pd import DSASparsePDHandoff
+from vllm_ascend.attention.dsa_sparse_shm import (
+    DSASparseSharedMemoryPayload,
+    DSASparseSharedMemoryPlane,
+    DSASparseSharedMemoryStore,
+)
 from vllm_ascend.attention.indexer import (
     AscendSFAIndexerBackend,
     AscendSFAIndexerMetadataBuilder,
@@ -27,6 +34,33 @@ from vllm_ascend.worker.dsa_sparse_external_main import (
     add_dsa_sparse_main_metadata,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+
+def _fake_shared_memory_payload(
+    suffix: str,
+) -> DSASparseSharedMemoryPayload:
+    return DSASparseSharedMemoryPayload(
+        name=f"vllm_ascend_dsa_sparse_{suffix}",
+        size=8,
+        cache_kind="indexer",
+        cache_layer_name=f"indexer.{suffix}",
+        cache_planes=(
+            DSASparseSharedMemoryPlane(
+                offset=0,
+                nbytes=2,
+                dtype="bfloat16",
+                shape=(1, 1, 1),
+            ),
+        ),
+        tail_planes=(
+            DSASparseSharedMemoryPlane(
+                offset=2,
+                nbytes=6,
+                dtype="bfloat16",
+                shape=(3, 1, 1),
+            ),
+        ),
+    )
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
@@ -51,6 +85,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner.c8_k_scale_cache_dtype = torch.float32
         runner.ascend_config = SimpleNamespace(dsa_sparse_config=None)
         runner._dsa_sparse_main_specs = {}
+        runner._dsa_sparse_mtp_draft_caches = {}
         backend = MagicMock()
         backend.get_kv_cache_shape.side_effect = lambda num_blocks, block_size, num_kv_heads, head_size: (
             2,
@@ -1090,6 +1125,7 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         runner._dsa_sparse_coordinators = (("layer.0", leader),)
         runner._dsa_sparse_leader_by_layer = {"layer.0": leader}
         runner._dsa_sparse_pd_handoffs = {}
+        runner._load_dsa_sparse_shared_memory_payloads = MagicMock()
         runner._dsa_sparse_committed_block_hashes = {}
         runner._dsa_sparse_candidate_block_hashes = {}
         runner._dsa_sparse_main_specs = {
@@ -1145,7 +1181,9 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
             stored_token_count=259,
             block_size=128,
             layer_topk_by_rank={0: {"layer.0": list(range(2048))}},
-            partial_tail_blocks_by_rank={0: {"layer.0": 2}},
+            shared_memory_payloads_by_rank={
+                0: {"layer.0": _fake_shared_memory_payload("loading")}
+            },
         )
         scheduler_output = SimpleNamespace(
             scheduled_cached_reqs=SimpleNamespace(
@@ -1206,7 +1244,9 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
             stored_token_count=259,
             block_size=128,
             layer_topk_by_rank={0: {"layer.0": topk}},
-            partial_tail_blocks_by_rank={0: {"layer.0": 2}},
+            shared_memory_payloads_by_rank={
+                0: {"layer.0": _fake_shared_memory_payload("request")}
+            },
         )
 
         runner._admit_dsa_sparse_request("request-a", handoff)
@@ -1252,10 +1292,10 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
                     "layer.1": topk,
                 }
             },
-            partial_tail_blocks_by_rank={
+            shared_memory_payloads_by_rank={
                 0: {
-                    "layer.0": 2,
-                    "layer.1": 2,
+                    "layer.0": _fake_shared_memory_payload("layer0"),
+                    "layer.1": _fake_shared_memory_payload("layer1"),
                 }
             },
         )
@@ -1270,6 +1310,143 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
                 ("initialize", "layer.0"),
             ],
         )
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_tp_group")
+    def test_shared_memory_load_restores_indexer_mtp_and_tail_then_unlinks(
+        self,
+        mock_get_tp_group,
+    ):
+        runner = self._build_runner()
+        mock_get_tp_group.return_value.rank_in_group = 0
+        runner._dsa_sparse_indexer_group_id = 0
+        runner.block_size = 2
+        runner.kv_cache_config = SimpleNamespace(num_blocks=4)
+        destination_indexer = torch.zeros(
+            (4, 2, 1, 3),
+            dtype=torch.bfloat16,
+        )
+        destination_main = torch.zeros(
+            (4, 2, 1, 2),
+            dtype=torch.bfloat16,
+        )
+        destination_mtp = torch.zeros(
+            (4, 2, 1, 4),
+            dtype=torch.bfloat16,
+        )
+        runner._dsa_sparse_indexer_caches = {
+            "model.layers.0.self_attn.indexer.k_cache": (
+                destination_indexer,
+            )
+        }
+        draft_layer_name = "model.layers.1.self_attn.attn"
+        runner._dsa_sparse_mtp_draft_caches = {
+            draft_layer_name: (destination_mtp,),
+        }
+        coordinator = runner._dsa_sparse_coordinators[0][1]
+        coordinator.hot_main_cache = (destination_main,)
+        coordinator.hot_blocks_per_request = 4
+        coordinator.tail_base = 4
+        runner.input_batch = SimpleNamespace(
+            req_id_to_index={"request-a": 0},
+            block_table=[
+                SimpleNamespace(
+                    get_cpu_tensor=lambda: torch.tensor(
+                        [[3, 1]],
+                        dtype=torch.int32,
+                    )
+                )
+            ],
+        )
+
+        source_indexer = torch.arange(
+            4 * 2 * 3,
+            dtype=torch.bfloat16,
+        ).reshape(4, 2, 1, 3)
+        source_main = torch.arange(
+            4 * 2 * 2,
+            dtype=torch.bfloat16,
+        ).reshape(4, 2, 1, 2)
+        source_mtp = torch.arange(
+            4 * 2 * 4,
+            dtype=torch.bfloat16,
+        ).reshape(4, 2, 1, 4)
+        with TemporaryDirectory() as shared_memory_root:
+            store = DSASparseSharedMemoryStore(shared_memory_root)
+            runner._dsa_sparse_shared_memory_store = store
+            payload = store.publish(
+                cache_kind="indexer",
+                cache_layer_name=(
+                    "model.layers.0.self_attn.indexer.k_cache"
+                ),
+                cache=(source_indexer,),
+                cache_block_ids=torch.tensor([2, 0]),
+                logical_num_blocks=4,
+                main_cache=(source_main,),
+                main_tail_block_id=0,
+                tail_valid_count=1,
+            )
+            self.assertIsNotNone(payload)
+            assert payload is not None
+            draft_payload = store.publish(
+                cache_kind="mtp_draft",
+                cache_layer_name=draft_layer_name,
+                cache=(source_mtp,),
+                cache_block_ids=torch.tensor([0, 2]),
+                logical_num_blocks=4,
+            )
+            self.assertIsNotNone(draft_payload)
+            assert draft_payload is not None
+            payload_path = Path(shared_memory_root) / payload.name
+            draft_payload_path = (
+                Path(shared_memory_root) / draft_payload.name
+            )
+            runner._sync_device = MagicMock(
+                side_effect=lambda: (
+                    self.assertTrue(payload_path.exists()),
+                    self.assertTrue(draft_payload_path.exists()),
+                )
+            )
+            handoff = DSASparsePDHandoff(
+                remote_request_id="prefill-request",
+                stored_token_count=3,
+                block_size=2,
+                layer_topk_by_rank={
+                    0: {"layer.0": list(range(2048))}
+                },
+                shared_memory_payloads_by_rank={
+                    0: {
+                        "layer.0": payload,
+                        draft_layer_name: draft_payload,
+                    }
+                },
+            )
+
+            NPUModelRunner._load_dsa_sparse_shared_memory_payloads(
+                runner,
+                request_id="request-a",
+                pool_entry=0,
+                handoff=handoff,
+                rank=0,
+            )
+
+            self.assertTrue(
+                torch.equal(destination_indexer[3], source_indexer[2])
+            )
+            self.assertTrue(
+                torch.equal(destination_indexer[1], source_indexer[0])
+            )
+            self.assertTrue(
+                torch.equal(destination_main[2, :1], source_main[0, :1])
+            )
+            self.assertTrue(
+                torch.equal(destination_mtp[3], source_mtp[0])
+            )
+            self.assertTrue(
+                torch.equal(destination_mtp[1], source_mtp[2])
+            )
+            runner._sync_device.assert_called_once()
+            self.assertFalse(payload_path.exists())
+            self.assertFalse(draft_payload_path.exists())
 
     def test_metadata_contains_only_the_shared_pool_entry_tensor(self):
         runner = self._build_runner()
