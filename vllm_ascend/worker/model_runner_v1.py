@@ -817,6 +817,7 @@ class NPUModelRunner(GPUModelRunner):
                 layer_id=extract_layer_index(layer_name),
                 backend=self._dsa_sparse_backend,
                 storage_key_encoder=self._dsa_sparse_storage_key_encoder,
+                align_cache_for_kv_transfer=self.vllm_config.kv_transfer_config is not None,
             )
             if not impl.skip_topk:
                 leader = coordinator

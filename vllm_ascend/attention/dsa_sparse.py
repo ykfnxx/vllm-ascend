@@ -16,6 +16,7 @@ from vllm_ascend.dsa_sparse_backend import (
 from vllm_ascend.dsa_sparse_constants import (
     DSA_SPARSE_FREE_HEAD_STRIDE,
     DSA_SPARSE_INDEX_CAPACITY,
+    DSA_SPARSE_KV_TRANSFER_ALIGNMENT,
     DSA_SPARSE_LOOKUP_SLOT_COUNT,
     DSA_SPARSE_RESIDENT_SLOT_COUNT,
 )
@@ -44,6 +45,7 @@ class DSASparseCoordinator:
         layer_id: int = 0,
         backend: DSASparseKVBackend | None = None,
         storage_key_encoder: DSASparseStorageKeyEncoder | None = None,
+        align_cache_for_kv_transfer: bool = False,
     ) -> None:
         if block_size <= 0:
             raise ValueError("DSA Sparse block_size must be positive.")
@@ -76,10 +78,11 @@ class DSASparseCoordinator:
         self.hot_blocks_per_request = self.hot_stride // block_size
         total_hot_blocks = max_num_seqs * self.hot_blocks_per_request
         self.hot_main_cache = tuple(
-            torch.empty(
+            self._allocate_hot_cache_plane(
                 (total_hot_blocks, block_size, *row_shape),
                 dtype=dtype,
                 device=device,
+                align_for_kv_transfer=align_cache_for_kv_transfer,
             )
             for dtype, row_shape in plane_layouts
         )
@@ -139,6 +142,35 @@ class DSASparseCoordinator:
         )
         self._committed_block_counts = [0] * max_num_seqs
         self._put_logical_blocks: list[set[int]] = [set() for _ in range(max_num_seqs)]
+
+    @staticmethod
+    def _allocate_hot_cache_plane(
+        shape: tuple[int, ...],
+        *,
+        dtype: torch.dtype,
+        device: torch.device | str,
+        align_for_kv_transfer: bool,
+    ) -> torch.Tensor:
+        if not align_for_kv_transfer:
+            return torch.empty(shape, dtype=dtype, device=device)
+
+        alignment = DSA_SPARSE_KV_TRANSFER_ALIGNMENT
+        element_size = torch.empty((), dtype=dtype).element_size()
+        assert alignment % element_size == 0
+        numel = 1
+        for dimension in shape:
+            numel *= dimension
+        raw = torch.empty(
+            numel + alignment // element_size,
+            dtype=dtype,
+            device=device,
+        )
+        offset_bytes = (-raw.data_ptr()) % alignment
+        assert offset_bytes % element_size == 0
+        offset = offset_bytes // element_size
+        cache = raw[offset : offset + numel].view(shape)
+        assert cache.data_ptr() % alignment == 0
+        return cache
 
     def initialize_request(
         self,

@@ -15,6 +15,7 @@ from vllm_ascend.dsa_sparse_constants import (
     DSA_SPARSE_FREE_HEAD_STRIDE,
     DSA_SPARSE_FREE_SLOT_COUNT,
     DSA_SPARSE_INDEX_CAPACITY,
+    DSA_SPARSE_KV_TRANSFER_ALIGNMENT,
     DSA_SPARSE_LOOKUP_SLOT_COUNT,
     DSA_SPARSE_QUERY_WIDTH,
 )
@@ -63,6 +64,24 @@ def test_coordinator_owns_per_layer_hot_cache_and_leader_lookup_state():
     assert follower.slot_to_index is None
     assert follower.free_slots is None
     assert follower.free_head is None
+
+
+def test_hot_main_cache_honors_kv_transfer_alignment():
+    coordinator = DSASparseCoordinator(
+        max_num_seqs=1,
+        block_size=128,
+        plane_layouts=(
+            (torch.bfloat16, (1, 16)),
+            (torch.bfloat16, (1, 4)),
+        ),
+        device="cpu",
+        align_cache_for_kv_transfer=True,
+    )
+
+    assert len(coordinator.hot_main_cache) == 2
+    for cache in coordinator.hot_main_cache:
+        assert cache.is_contiguous()
+        assert cache.data_ptr() % DSA_SPARSE_KV_TRANSFER_ALIGNMENT == 0
 
 
 def test_mtp_coordinator_rejects_an_empty_verify_region():
