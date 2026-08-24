@@ -118,7 +118,9 @@ from vllm_ascend.attention.dsa_sparse_pd import (
     build_dsa_sparse_resident_token_ids,
 )
 from vllm_ascend.attention.dsa_sparse_shm import (
+    DSASparseSharedMemoryPayload,
     DSASparseSharedMemoryStore,
+    dsa_sparse_shared_memory_tensors_sha256,
 )
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
@@ -876,6 +878,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         request_id: str,
         handoff: DSASparsePDHandoff | None = None,
+        shared_memory_block_ids: list[int] | None = None,
     ) -> None:
         assert request_id not in self.dsa_sparse_req_to_pool_entry
         pool_entry = self.dsa_sparse_free_pool_entries.popleft()
@@ -900,6 +903,7 @@ class NPUModelRunner(GPUModelRunner):
                     request_id,
                     pool_entry,
                     handoff,
+                    shared_memory_block_ids,
                 )
         except BaseException:
             for coordinator in self._dsa_sparse_leader_coordinators:
@@ -914,16 +918,25 @@ class NPUModelRunner(GPUModelRunner):
         self,
         request_id: str,
         handoff: DSASparsePDHandoff | None = None,
+        shared_memory_block_ids: list[int] | None = None,
     ) -> None:
         if request_id in self.dsa_sparse_req_to_pool_entry:
             return
-        self._admit_dsa_sparse_request(request_id, handoff)
+        if shared_memory_block_ids is None:
+            self._admit_dsa_sparse_request(request_id, handoff)
+        else:
+            self._admit_dsa_sparse_request(
+                request_id,
+                handoff,
+                shared_memory_block_ids,
+            )
 
     def _initialize_dsa_sparse_request_from_handoff(
         self,
         request_id: str,
         pool_entry: int,
         handoff: DSASparsePDHandoff,
+        shared_memory_block_ids: list[int] | None = None,
     ) -> None:
         if handoff.block_size != self.block_size:
             raise ValueError(
@@ -980,6 +993,7 @@ class NPUModelRunner(GPUModelRunner):
             pool_entry=pool_entry,
             handoff=handoff,
             rank=rank,
+            destination_block_ids=shared_memory_block_ids,
         )
 
         for coordinator in self._dsa_sparse_leader_coordinators:
@@ -1021,6 +1035,7 @@ class NPUModelRunner(GPUModelRunner):
         pool_entry: int,
         handoff: DSASparsePDHandoff,
         rank: int,
+        destination_block_ids: list[int] | None = None,
     ) -> None:
         """Load Indexer, MTP draft, and partial Main Tail, then unlink SHM."""
 
@@ -1037,30 +1052,44 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError(
                 "DSA Sparse Decode has no Indexer cache group for shared-memory load"
             )
-        try:
-            request_row = self.input_batch.req_id_to_index[request_id]
-        except KeyError as error:
-            raise RuntimeError(
-                "DSA Sparse shared-memory load has no Decode request row: "
-                f"request={request_id!r}."
-            ) from error
-
         block_count = math.ceil(
             handoff.stored_token_count / handoff.block_size
         )
-        block_table = self.input_batch.block_table[
-            group_id
-        ].get_cpu_tensor()
-        if block_count > block_table.shape[1]:
-            raise RuntimeError(
-                "DSA Sparse shared-memory Indexer blocks exceed the local "
-                f"block table: request={request_id!r}, blocks={block_count}, "
-                f"capacity={block_table.shape[1]}."
+        if destination_block_ids is None:
+            try:
+                request_row = self.input_batch.req_id_to_index[request_id]
+            except KeyError as error:
+                raise RuntimeError(
+                    "DSA Sparse shared-memory load has neither connector "
+                    "block ids nor a Decode request row: "
+                    f"request={request_id!r}."
+                ) from error
+
+            block_table = self.input_batch.block_table[
+                group_id
+            ].get_cpu_tensor()
+            if block_count > block_table.shape[1]:
+                raise RuntimeError(
+                    "DSA Sparse shared-memory Indexer blocks exceed the local "
+                    f"block table: request={request_id!r}, blocks={block_count}, "
+                    f"capacity={block_table.shape[1]}."
+                )
+            destination_block_ids_tensor = block_table[
+                request_row,
+                :block_count,
+            ].to(dtype=torch.int64)
+        else:
+            if len(destination_block_ids) < block_count:
+                raise RuntimeError(
+                    "DSA Sparse shared-memory connector block ids do not "
+                    "cover the stored prefix: "
+                    f"request={request_id!r}, blocks={block_count}, "
+                    f"available={len(destination_block_ids)}."
+                )
+            destination_block_ids_tensor = torch.tensor(
+                destination_block_ids[:block_count],
+                dtype=torch.int64,
             )
-        destination_block_ids = block_table[
-            request_row,
-            :block_count,
-        ].to(dtype=torch.int64)
         expected_mtp_layers = set(self._dsa_sparse_mtp_draft_caches)
         actual_mtp_layers = {
             payload.cache_layer_name
@@ -1076,9 +1105,23 @@ class NPUModelRunner(GPUModelRunner):
             )
         coordinators = dict(self._dsa_sparse_coordinators)
         readers = []
+        content_checks: list[
+            tuple[
+                str,
+                DSASparseSharedMemoryPayload,
+                list[tuple[torch.Tensor, torch.Tensor]],
+                list[tuple[torch.Tensor, int, int]],
+            ]
+        ] = []
 
         with ExitStack() as stack:
             for layer_name, payload in layer_payloads.items():
+                cache_destinations: list[
+                    tuple[torch.Tensor, torch.Tensor]
+                ] = []
+                tail_destinations: list[
+                    tuple[torch.Tensor, int, int]
+                ] = []
                 reader = stack.enter_context(
                     self._dsa_sparse_shared_memory_store.open(payload)
                 )
@@ -1145,7 +1188,7 @@ class NPUModelRunner(GPUModelRunner):
                     source = reader.tensor(plane_descriptor)
                     destination_ids = (
                         self._expand_dsa_sparse_physical_block_ids(
-                            destination_block_ids,
+                            destination_block_ids_tensor,
                             local_block_scale,
                             device=destination.device,
                         )
@@ -1156,7 +1199,11 @@ class NPUModelRunner(GPUModelRunner):
                         destination_ids,
                         device_source,
                     )
-                    del source, device_source, destination_ids
+                    if dsa_sparse_probe.is_enabled():
+                        cache_destinations.append(
+                            (destination, destination_ids)
+                        )
+                    del source, device_source
 
                 if payload.tail_planes:
                     try:
@@ -1201,12 +1248,84 @@ class NPUModelRunner(GPUModelRunner):
                             destination_tail_block,
                             :tail_valid_count,
                         ].copy_(source.to(device=destination.device))
+                        if dsa_sparse_probe.is_enabled():
+                            tail_destinations.append(
+                                (
+                                    destination,
+                                    destination_tail_block,
+                                    tail_valid_count,
+                                )
+                            )
                         del source
+
+                if dsa_sparse_probe.is_enabled():
+                    content_checks.append(
+                        (
+                            layer_name,
+                            payload,
+                            cache_destinations,
+                            tail_destinations,
+                        )
+                    )
 
             # H2D copies may be enqueued asynchronously. Keep every mmap alive
             # until the device has consumed it, then unlink all bundles as one
             # successful request-scoped consume boundary.
             self._sync_device()
+            for (
+                layer_name,
+                payload,
+                cache_destinations,
+                tail_destinations,
+            ) in content_checks:
+                if payload.content_sha256 is None:
+                    raise RuntimeError(
+                        "DSA Sparse shared-memory probe payload has no "
+                        f"checksum: object={payload.name!r}."
+                    )
+                destination_tensors = [
+                    destination.index_select(0, destination_ids)
+                    for destination, destination_ids in cache_destinations
+                ]
+                destination_tensors.extend(
+                    destination[
+                        destination_tail_block,
+                        :tail_valid_count,
+                    ]
+                    for (
+                        destination,
+                        destination_tail_block,
+                        tail_valid_count,
+                    ) in tail_destinations
+                )
+                actual_sha256 = (
+                    dsa_sparse_shared_memory_tensors_sha256(
+                        destination_tensors
+                    )
+                )
+                if actual_sha256 != payload.content_sha256:
+                    raise RuntimeError(
+                        "DSA Sparse shared-memory destination checksum "
+                        "mismatch: "
+                        f"request={request_id!r}, layer={layer_name!r}, "
+                        f"object={payload.name!r}, "
+                        f"expected={payload.content_sha256}, "
+                        f"actual={actual_sha256}."
+                    )
+                dsa_sparse_probe.emit(
+                    "shared_memory_content_verified",
+                    role="D",
+                    request_id=request_id,
+                    layer=layer_name,
+                    cache_layer_name=payload.cache_layer_name,
+                    cache_kind=payload.cache_kind,
+                    object_name=payload.name,
+                    payload_bytes=payload.size,
+                    content_sha256=actual_sha256,
+                    cache_plane_count=len(payload.cache_planes),
+                    tail_plane_count=len(payload.tail_planes),
+                    tp_rank=rank,
+                )
             for reader in readers:
                 reader.unlink()
                 if dsa_sparse_probe.is_enabled():
@@ -1216,6 +1335,10 @@ class NPUModelRunner(GPUModelRunner):
                         request_id=request_id,
                         object_name=reader.payload.name,
                         payload_bytes=reader.payload.size,
+                        cache_kind=reader.payload.cache_kind,
+                        content_sha256=(
+                            reader.payload.content_sha256
+                        ),
                         tp_rank=rank,
                     )
 
@@ -1652,14 +1775,38 @@ class NPUModelRunner(GPUModelRunner):
             )
             if isinstance(connector_requests, dict):
                 # Async connector loads can run in a no-forward step, before
-                # the request appears in scheduled_new_reqs. Admit early so
-                # KVIO and shared-memory initialization have a Decode row.
-                for request_id in connector_requests:
+                # the request appears in scheduled_new_reqs. Its scheduler
+                # blocks already exist in ReqMeta even though input_batch has
+                # no request row yet, so use those blocks for SHM restore.
+                for request_id, request_metadata in (
+                    connector_requests.items()
+                ):
                     handoff = self._dsa_sparse_pd_handoffs.get(request_id)
                     if handoff is not None:
+                        group_id = self._dsa_sparse_indexer_group_id
+                        assert group_id is not None
+                        grouped_block_ids = getattr(
+                            request_metadata,
+                            "local_full_block_ids",
+                            None,
+                        ) or getattr(
+                            request_metadata,
+                            "local_block_ids",
+                            None,
+                        )
+                        if (
+                            grouped_block_ids is None
+                            or group_id >= len(grouped_block_ids)
+                        ):
+                            raise RuntimeError(
+                                "DSA Sparse connector metadata has no local "
+                                "Indexer blocks for shared-memory load: "
+                                f"request={request_id!r}, group={group_id}."
+                            )
                         self._ensure_dsa_sparse_request_admitted(
                             request_id,
                             handoff,
+                            list(grouped_block_ids[group_id]),
                         )
 
             for request in scheduler_output.scheduled_new_reqs:

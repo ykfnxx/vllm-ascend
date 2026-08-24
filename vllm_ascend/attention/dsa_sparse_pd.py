@@ -26,7 +26,7 @@ from vllm_ascend.dsa_sparse_constants import (
 )
 
 DSA_SPARSE_PD_HANDOFF_KEY = "dsa_sparse_pd_handoff"
-DSA_SPARSE_PD_PROTOCOL_VERSION = 4
+DSA_SPARSE_PD_PROTOCOL_VERSION = 5
 
 
 def build_dsa_sparse_resident_token_ids(
@@ -502,6 +502,9 @@ class DSASparseProducerBatchContext:
                     main_cache=main_cache,
                     main_tail_block_id=main_tail_block_id,
                     tail_valid_count=tail_valid_count,
+                    compute_content_sha256=(
+                        dsa_sparse_probe.is_enabled()
+                    ),
                 )
                 layer_shared_memory_payloads[request_id] = payload
                 self._owned_shared_memory_payloads.append(payload)
@@ -513,6 +516,7 @@ class DSASparseProducerBatchContext:
                         layer=layer_name,
                         object_name=payload.name,
                         payload_bytes=payload.size,
+                        content_sha256=payload.content_sha256,
                         cache_kind=payload.cache_kind,
                         cache_plane_count=len(payload.cache_planes),
                         tail_plane_count=len(payload.tail_planes),
@@ -581,6 +585,7 @@ class DSASparseProducerBatchContext:
                 cache=cache,
                 cache_block_ids=source_block_ids,
                 logical_num_blocks=int(cache[0].shape[0]),
+                compute_content_sha256=dsa_sparse_probe.is_enabled(),
             )
             layer_payloads[request_id] = payload
             self._owned_shared_memory_payloads.append(payload)
@@ -592,6 +597,7 @@ class DSASparseProducerBatchContext:
                     layer=layer_name,
                     object_name=payload.name,
                     payload_bytes=payload.size,
+                    content_sha256=payload.content_sha256,
                     cache_kind=payload.cache_kind,
                     cache_plane_count=len(payload.cache_planes),
                     tail_plane_count=0,

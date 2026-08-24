@@ -5,11 +5,14 @@
 # This script exercises:
 #   - two isolated vLLM engines (Prefill TP1 + Decode TP1);
 #   - the standard P/D proxy and kv_transfer_params handoff;
+#   - bit-exact Indexer, partial Main Tail, and optional MTP Draft delivery
+#     through request-scoped /dev/shm payloads;
 #   - the single-query or MTP batch DSA Sparse lookup/update operator;
 #   - per-layer Hot Cache Sparse Flash Attention.
 #
-# Payload movement remains mocked. This script validates control flow and
-# operator execution, not Main/history/newest payload correctness.
+# Full-block Main history movement remains mocked because KVIO is not part of
+# this probe. Shared-memory payload bytes and their Decode cache destinations
+# are validated with SHA-256 before each /dev/shm object is released.
 #
 # Example:
 #   bash examples/dsa_sparse_pd_mock_probe.sh \
@@ -17,8 +20,8 @@
 #     --ifname eth0
 #
 # Use --max-tokens 2 to deliberately exercise more than one Decode step. A
-# failure or unstable result there is expected until the real DSA I/O provider
-# and P/D bridge are implemented.
+# failure or unstable result there is expected until the real Main KV I/O
+# provider is implemented.
 
 set -Eeuo pipefail
 
@@ -78,11 +81,12 @@ Options:
                                plus every per-layer Hot Cache SFA call.
   -h, --help                   Show this help.
 
-Without --verify-path, success only proves process isolation and P/D routing.
-With --verify-path, success also proves that each Decode step called the
+Every run verifies the P/D handoff, exact shared-memory Indexer/Tail/MTP
+payload bytes, their Decode cache destinations, and post-consume unlink.
+With --verify-path, success additionally proves that each Decode step called the
 single-query or MTP batch lookup/update operator once per cohort, performed
 Hot Cache SFA once per physical layer, and committed only the accepted MTP
-prefix to the mock backend. Payload movement remains mocked.
+prefix to the mock backend. Full-block Main history movement remains mocked.
 EOF
 }
 
@@ -318,13 +322,14 @@ COMMON_NETWORK_ENV=(
     "OMP_PROC_BIND=false"
     "OMP_NUM_THREADS=1"
     "VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE=1"
+    "VLLM_ASCEND_DSA_SPARSE_RUNTIME_PROBE=1"
     "VLLM_ASCEND_DSA_SPARSE_PD_TRACE=1"
 )
 
-DECODE_PROBE_ENV=()
 DECODE_PROFILER_ARGS=()
 PREFILL_SPECULATIVE_ARGS=()
 DECODE_SPECULATIVE_ARGS=()
+SHM_VALIDATOR_ARGS=()
 if ((MTP_SPECULATIVE_TOKENS > 0)); then
     # Mooncake's MTP P/D contract keeps one draft layer on Prefill and lets
     # Decode choose its speculative width.  The draft KV layer must exist in
@@ -337,6 +342,7 @@ if ((MTP_SPECULATIVE_TOKENS > 0)); then
     DECODE_SPECULATIVE_ARGS+=(
         --speculative-config "$DECODE_SPECULATIVE_CONFIG"
     )
+    SHM_VALIDATOR_ARGS+=(--require-mtp)
 fi
 if [[ "$VERIFY_PATH" == "1" ]]; then
     if [[ -d "$DECODE_PROFILE_DIR" ]] \
@@ -350,9 +356,6 @@ if [[ "$VERIFY_PATH" == "1" ]]; then
         exit 2
     fi
     mkdir -p "$DECODE_PROFILE_DIR"
-    DECODE_PROBE_ENV+=(
-        "VLLM_ASCEND_DSA_SPARSE_RUNTIME_PROBE=1"
-    )
     DECODE_PROFILER_CONFIG="$(
         python3 - "$DECODE_PROFILE_DIR" <<'PY'
 import json
@@ -406,7 +409,6 @@ CHILD_PIDS+=("$PREFILL_PID")
 echo "Starting Decode on physical NPU $DECODE_DEVICE..."
 env \
     "${COMMON_NETWORK_ENV[@]}" \
-    "${DECODE_PROBE_ENV[@]}" \
     "ASCEND_RT_VISIBLE_DEVICES=$DECODE_DEVICE" \
     vllm serve "$MODEL" \
     --host 0.0.0.0 \
@@ -520,6 +522,13 @@ fi
 echo "P/D request completed with HTTP $HTTP_CODE."
 python3 -m json.tool "$RESPONSE_JSON" 2>/dev/null || cat "$RESPONSE_JSON"
 
+echo "Validating P/D shared-memory payload contents and release..."
+python3 "$SCRIPT_DIR/dsa_sparse_pd_shm_validate.py" \
+    --prefill-log "$PREFILL_LOG" \
+    --decode-log "$DECODE_LOG" \
+    --shared-memory-root /dev/shm \
+    "${SHM_VALIDATOR_ARGS[@]}"
+
 if [[ "$VERIFY_PATH" == "1" ]]; then
     echo "Analyzing Decode operator profile..."
     python3 - "$DECODE_PROFILE_DIR" <<'PY'
@@ -558,18 +567,22 @@ fi
 echo
 if [[ "$VERIFY_PATH" == "1" ]]; then
     if ((MTP_SPECULATIVE_TOKENS > 0)); then
-        echo "PASS: P/D routing, MTP batch lookup/update, accepted-only" \
-            "mock store, and per-layer Hot Cache SFA completed."
+        echo "PASS: bit-exact shared-memory Indexer/Tail/MTP delivery," \
+            "MTP batch lookup/update, accepted-only mock store, and" \
+            "per-layer Hot Cache SFA completed."
     else
-        echo "PASS: P/D routing, single-query lookup/update, and per-layer Hot Cache SFA completed."
+        echo "PASS: bit-exact shared-memory Indexer/Tail delivery," \
+            "single-query lookup/update, and per-layer Hot Cache SFA completed."
     fi
 else
-    echo "PASS: process isolation and P/D routing completed."
+    echo "PASS: P/D routing and bit-exact shared-memory Indexer/Tail/MTP" \
+        "delivery completed; all request-scoped objects were released."
     echo "Run again with --verify-path to verify the custom-op and Hot Cache path."
 fi
-echo "NOT VALIDATED: Main/history/newest payload transfer or model accuracy."
+echo "NOT VALIDATED: full-block Main history KVIO, later miss/newest Main KV" \
+    "movement, multi-step numerical correctness, or model accuracy."
 echo "Inspect Decode logs with:"
-echo "  grep -Ein 'DSA_SPARSE_PROBE|dsa_sparse|lookup_update|mock|error|traceback' '$DECODE_LOG'"
+echo "  grep -Ein 'shared_memory|DSA_SPARSE_PROBE|dsa_sparse|lookup_update|mock|error|traceback' '$DECODE_LOG'"
 echo "Inspect P/D TopK handoff logs with:"
 echo "  grep -E 'DSA_SPARSE_PD .*handoff_(send|receive)' '$PREFILL_LOG' '$DECODE_LOG'"
 echo "Compare the handoff_sha256 and layer_topk_sha256_by_rank fields between P and D."

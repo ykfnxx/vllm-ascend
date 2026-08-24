@@ -31,6 +31,7 @@ def _make_handoff() -> DSASparsePDHandoff:
         size=4,
         cache_kind="indexer",
         cache_layer_name="model.layers.0.self_attn.indexer.k_cache",
+        content_sha256="0" * 64,
         cache_planes=(
             DSASparseSharedMemoryPlane(
                 offset=0,

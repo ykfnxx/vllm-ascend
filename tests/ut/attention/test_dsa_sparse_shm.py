@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
+from dataclasses import replace
+
+import pytest
 import torch
 
 from vllm_ascend.attention.dsa_sparse_shm import (
@@ -28,11 +31,16 @@ def test_shared_memory_round_trip_and_unlink(tmp_path):
         main_cache=(main,),
         main_tail_block_id=2,
         tail_valid_count=1,
+        compute_content_sha256=True,
     )
 
     assert payload is not None
     assert (tmp_path / payload.name).exists()
     assert payload.cache_kind == "indexer"
+    assert len(payload.content_sha256) == 64
+    assert payload.to_dict()["content_sha256"] == (
+        payload.content_sha256
+    )
     assert len(payload.cache_planes) == 1
     assert len(payload.tail_planes) == 1
 
@@ -47,6 +55,31 @@ def test_shared_memory_round_trip_and_unlink(tmp_path):
     # Reader tensors own CPU copies and remain valid after the mmap closes.
     assert torch.equal(indexer_source, indexer.index_select(0, torch.tensor([2, 0])))
     assert torch.equal(tail_source, main[2, :1])
+
+
+def test_shared_memory_rejects_corrupted_payload(tmp_path):
+    store = DSASparseSharedMemoryStore(tmp_path)
+    cache = torch.arange(8, dtype=torch.bfloat16).reshape(2, 2, 1, 2)
+    payload = store.publish(
+        cache_kind="indexer",
+        cache_layer_name="model.layers.0.self_attn.indexer.k_cache",
+        cache=(cache,),
+        cache_block_ids=torch.tensor([1], dtype=torch.int64),
+        logical_num_blocks=2,
+        compute_content_sha256=True,
+    )
+    payload_path = tmp_path / payload.name
+    with payload_path.open("r+b") as payload_file:
+        first_byte = payload_file.read(1)
+        payload_file.seek(0)
+        payload_file.write(bytes((first_byte[0] ^ 0xFF,)))
+
+    with pytest.raises(RuntimeError, match="checksum mismatch"):
+        store.open(payload)
+
+    store.unlink(payload)
+    with pytest.raises(ValueError, match="SHA-256"):
+        replace(payload, content_sha256="invalid")
 
 
 def test_shared_memory_preserves_two_plane_c8_layout(tmp_path):
@@ -68,6 +101,7 @@ def test_shared_memory_preserves_two_plane_c8_layout(tmp_path):
     )
 
     assert payload is not None
+    assert payload.content_sha256 is None
     assert [plane.dtype for plane in payload.cache_planes] == [
         "float8_e4m3fn",
         "float32",

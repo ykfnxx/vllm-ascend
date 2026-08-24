@@ -106,6 +106,7 @@ def make_indexer_shared_memory_payload(
         size=2,
         cache_kind="indexer",
         cache_layer_name="model.layers.0.self_attn.indexer.k_cache",
+        content_sha256="0" * 64,
         cache_planes=(
             DSASparseSharedMemoryPlane(
                 offset=0,
@@ -127,6 +128,7 @@ def make_mtp_shared_memory_payload(
         size=2,
         cache_kind="mtp_draft",
         cache_layer_name=layer_name,
+        content_sha256="0" * 64,
         cache_planes=(
             DSASparseSharedMemoryPlane(
                 offset=0,

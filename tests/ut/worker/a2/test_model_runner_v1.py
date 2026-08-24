@@ -44,6 +44,7 @@ def _fake_shared_memory_payload(
         size=8,
         cache_kind="indexer",
         cache_layer_name=f"indexer.{suffix}",
+        content_sha256="0" * 64,
         cache_planes=(
             DSASparseSharedMemoryPlane(
                 offset=0,
@@ -1128,6 +1129,7 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         runner._load_dsa_sparse_shared_memory_payloads = MagicMock()
         runner._dsa_sparse_committed_block_hashes = {}
         runner._dsa_sparse_candidate_block_hashes = {}
+        runner._dsa_sparse_indexer_group_id = 0
         runner._dsa_sparse_main_specs = {
             "layer.0": object(),
             "layer.1": object(),
@@ -1203,6 +1205,8 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
                 requests={
                     "loading": SimpleNamespace(
                         dsa_sparse_handoff=handoff,
+                        local_block_ids=([7, 8, 9],),
+                        local_full_block_ids=([17, 18, 19],),
                     )
                 }
             ),
@@ -1219,7 +1223,7 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         self.assertEqual(
             runner._admit_dsa_sparse_request.call_args_list,
             [
-                call("loading", handoff),
+                call("loading", handoff, [17, 18, 19]),
                 call("new", None),
                 call("resumed", None),
             ],
@@ -1312,7 +1316,7 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         )
 
     @patch("vllm_ascend.worker.model_runner_v1.get_tp_group")
-    def test_shared_memory_load_restores_indexer_mtp_and_tail_then_unlinks(
+    def test_connector_only_shm_load_uses_req_meta_blocks_then_unlinks(
         self,
         mock_get_tp_group,
     ):
@@ -1347,7 +1351,7 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         coordinator.hot_blocks_per_request = 4
         coordinator.tail_base = 4
         runner.input_batch = SimpleNamespace(
-            req_id_to_index={"request-a": 0},
+            req_id_to_index={},
             block_table=[
                 SimpleNamespace(
                     get_cpu_tensor=lambda: torch.tensor(
@@ -1384,6 +1388,7 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
                 main_cache=(source_main,),
                 main_tail_block_id=0,
                 tail_valid_count=1,
+                compute_content_sha256=True,
             )
             self.assertIsNotNone(payload)
             assert payload is not None
@@ -1393,6 +1398,7 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
                 cache=(source_mtp,),
                 cache_block_ids=torch.tensor([0, 2]),
                 logical_num_blocks=4,
+                compute_content_sha256=True,
             )
             self.assertIsNotNone(draft_payload)
             assert draft_payload is not None
@@ -1421,13 +1427,25 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
                 },
             )
 
-            NPUModelRunner._load_dsa_sparse_shared_memory_payloads(
-                runner,
-                request_id="request-a",
-                pool_entry=0,
-                handoff=handoff,
-                rank=0,
-            )
+            with (
+                patch(
+                    "vllm_ascend.worker.model_runner_v1."
+                    "dsa_sparse_probe.is_enabled",
+                    return_value=True,
+                ),
+                patch(
+                    "vllm_ascend.worker.model_runner_v1."
+                    "dsa_sparse_probe.emit"
+                ) as mock_probe_emit,
+            ):
+                NPUModelRunner._load_dsa_sparse_shared_memory_payloads(
+                    runner,
+                    request_id="request-a",
+                    pool_entry=0,
+                    handoff=handoff,
+                    rank=0,
+                    destination_block_ids=[3, 1],
+                )
 
             self.assertTrue(
                 torch.equal(destination_indexer[3], source_indexer[2])
@@ -1447,6 +1465,22 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
             runner._sync_device.assert_called_once()
             self.assertFalse(payload_path.exists())
             self.assertFalse(draft_payload_path.exists())
+            verified_events = [
+                call
+                for call in mock_probe_emit.call_args_list
+                if call.args[0] == "shared_memory_content_verified"
+            ]
+            self.assertEqual(len(verified_events), 2)
+            self.assertEqual(
+                {
+                    call.kwargs["content_sha256"]
+                    for call in verified_events
+                },
+                {
+                    payload.content_sha256,
+                    draft_payload.content_sha256,
+                },
+            )
 
     def test_metadata_contains_only_the_shared_pool_entry_tensor(self):
         runner = self._build_runner()

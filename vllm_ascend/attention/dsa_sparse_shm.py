@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 import mmap
 import os
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -113,6 +115,7 @@ class DSASparseSharedMemoryPayload:
     size: int
     cache_kind: str
     cache_layer_name: str
+    content_sha256: str | None
     cache_planes: tuple[DSASparseSharedMemoryPlane, ...]
     tail_planes: tuple[DSASparseSharedMemoryPlane, ...]
 
@@ -125,6 +128,16 @@ class DSASparseSharedMemoryPayload:
             raise ValueError(f"DSA Sparse shared-memory cache kind is invalid: {self.cache_kind!r}")
         if not self.cache_layer_name or not self.cache_planes:
             raise ValueError("DSA Sparse shared-memory cache layer and planes are required")
+        if self.content_sha256 is not None and (
+            len(self.content_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.content_sha256
+            )
+        ):
+            raise ValueError(
+                "DSA Sparse shared-memory payload SHA-256 is invalid"
+            )
         if self.tail_planes and self.cache_kind != "indexer":
             raise ValueError("Only an Indexer payload may bundle a Main Tail")
         for plane in (*self.cache_planes, *self.tail_planes):
@@ -137,6 +150,7 @@ class DSASparseSharedMemoryPayload:
             "size": self.size,
             "cache_kind": self.cache_kind,
             "cache_layer_name": self.cache_layer_name,
+            "content_sha256": self.content_sha256,
             "cache_planes": [plane.to_dict() for plane in self.cache_planes],
             "tail_planes": [plane.to_dict() for plane in self.tail_planes],
         }
@@ -149,6 +163,7 @@ class DSASparseSharedMemoryPayload:
         size = raw.get("size")
         cache_kind = raw.get("cache_kind")
         cache_layer_name = raw.get("cache_layer_name")
+        content_sha256 = raw.get("content_sha256")
         if not isinstance(name, str):
             raise TypeError("DSA Sparse shared-memory payload name must be a string")
         if isinstance(size, bool) or not isinstance(size, int):
@@ -157,6 +172,13 @@ class DSASparseSharedMemoryPayload:
             raise TypeError("DSA Sparse shared-memory cache kind must be a string")
         if not isinstance(cache_layer_name, str):
             raise TypeError("DSA Sparse shared-memory cache layer name must be a string")
+        if content_sha256 is not None and not isinstance(
+            content_sha256,
+            str,
+        ):
+            raise TypeError(
+                "DSA Sparse shared-memory payload SHA-256 must be a string"
+            )
         raw_cache_planes = raw.get("cache_planes", ())
         raw_tail_planes = raw.get("tail_planes", ())
         if not isinstance(raw_cache_planes, (list, tuple)) or not isinstance(raw_tail_planes, (list, tuple)):
@@ -166,6 +188,7 @@ class DSASparseSharedMemoryPayload:
             size=size,
             cache_kind=cache_kind,
             cache_layer_name=cache_layer_name,
+            content_sha256=content_sha256,
             cache_planes=tuple(DSASparseSharedMemoryPlane.from_dict(plane) for plane in raw_cache_planes),
             tail_planes=tuple(DSASparseSharedMemoryPlane.from_dict(plane) for plane in raw_tail_planes),
         )
@@ -195,6 +218,16 @@ class DSASparseSharedMemoryReader:
             payload.size,
             access=mmap.ACCESS_WRITE,
         )
+        if payload.content_sha256 is not None:
+            actual_sha256 = hashlib.sha256(self._mapping).hexdigest()
+            if actual_sha256 != payload.content_sha256:
+                self.close()
+                raise RuntimeError(
+                    "DSA Sparse shared-memory payload checksum mismatch: "
+                    f"object={payload.name!r}, "
+                    f"expected={payload.content_sha256}, "
+                    f"actual={actual_sha256}."
+                )
 
     def tensor(self, plane: DSASparseSharedMemoryPlane) -> torch.Tensor:
         # Detach the returned tensor from the mmap. This lets exception paths
@@ -256,6 +289,7 @@ class DSASparseSharedMemoryStore:
         main_cache: tuple[torch.Tensor, ...] = (),
         main_tail_block_id: int | None = None,
         tail_valid_count: int = 0,
+        compute_content_sha256: bool = False,
     ) -> DSASparseSharedMemoryPayload:
         tensors: list[tuple[str, torch.Tensor, int]] = []
         if not cache:
@@ -294,6 +328,9 @@ class DSASparseSharedMemoryStore:
         os.fchmod(file_descriptor, 0o600)
         cache_planes: list[DSASparseSharedMemoryPlane] = []
         tail_planes: list[DSASparseSharedMemoryPlane] = []
+        content_hasher = (
+            hashlib.sha256() if compute_content_sha256 else None
+        )
         try:
             os.ftruncate(file_descriptor, total_size)
             with mmap.mmap(file_descriptor, total_size, access=mmap.ACCESS_WRITE) as mapping:
@@ -307,7 +344,10 @@ class DSASparseSharedMemoryStore:
                         ) from error
                     byte_tensor = tensor.view(torch.uint8).reshape(-1)
                     nbytes = byte_tensor.numel()
-                    mapping[offset : offset + nbytes] = byte_tensor.numpy().tobytes()
+                    serialized = byte_tensor.numpy().tobytes()
+                    mapping[offset : offset + nbytes] = serialized
+                    if content_hasher is not None:
+                        content_hasher.update(serialized)
                     plane = DSASparseSharedMemoryPlane(
                         offset=offset,
                         nbytes=nbytes,
@@ -332,6 +372,11 @@ class DSASparseSharedMemoryStore:
             size=total_size,
             cache_kind=cache_kind,
             cache_layer_name=cache_layer_name,
+            content_sha256=(
+                content_hasher.hexdigest()
+                if content_hasher is not None
+                else None
+            ),
             cache_planes=tuple(cache_planes),
             tail_planes=tuple(tail_planes),
         )
@@ -346,6 +391,20 @@ class DSASparseSharedMemoryStore:
         (self.root / payload.name).unlink(missing_ok=True)
 
 
+def dsa_sparse_shared_memory_tensors_sha256(
+    tensors: Iterable[torch.Tensor],
+) -> str:
+    """Hash tensors using the same compact byte order as shared memory."""
+
+    content_hasher = hashlib.sha256()
+    for tensor in tensors:
+        compact = tensor.detach().to(device="cpu").contiguous()
+        content_hasher.update(
+            compact.view(torch.uint8).reshape(-1).numpy().tobytes()
+        )
+    return content_hasher.hexdigest()
+
+
 __all__ = [
     "DSA_SPARSE_SHARED_MEMORY_PREFIX",
     "DSA_SPARSE_SHARED_MEMORY_CACHE_KINDS",
@@ -353,4 +412,5 @@ __all__ = [
     "DSASparseSharedMemoryPlane",
     "DSASparseSharedMemoryReader",
     "DSASparseSharedMemoryStore",
+    "dsa_sparse_shared_memory_tensors_sha256",
 ]
