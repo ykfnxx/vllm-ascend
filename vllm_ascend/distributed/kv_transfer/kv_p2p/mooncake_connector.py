@@ -637,6 +637,7 @@ class KVCacheRecvingThread(threading.Thread):
         remote_port_send_num: dict[int, RemotePortInfo] | None = None,
         num_computed_tokens: int = 0,
         all_task_done: bool = False,
+        report_finished_recving: bool = True,
         local_block_ids_replicate_k: BlockIds | None = None,
         remote_block_ids_replicate_k: BlockIds | None = None,
         dsa_sparse_handoff: DSASparsePDHandoff | None = None,
@@ -659,6 +660,7 @@ class KVCacheRecvingThread(threading.Thread):
             "num_computed_tokens": num_computed_tokens,
             "remote_port_send_num": remote_port_send_num,
             "all_task_done": all_task_done,
+            "report_finished_recving": report_finished_recving,
             "remote_block_size": remote_block_size,
             "dsa_sparse_handoff": dsa_sparse_handoff,
             "dsa_sparse_pool_entry": dsa_sparse_pool_entry,
@@ -755,6 +757,8 @@ class KVCacheRecvingThread(threading.Thread):
             self.executor.submit(self._handle_peer_requests, peer_key)
 
     def _mark_request_task_submitted(self, req_meta: dict[str, Any]) -> None:
+        if not req_meta.get("report_finished_recving", True):
+            return
         request_id = req_meta["request_id"]
         with self.request_task_counts_lock:
             self.request_task_counts[request_id] += 1
@@ -800,7 +804,9 @@ class KVCacheRecvingThread(threading.Thread):
                     self._mark_failed_recv_request(request_id, req_meta["local_block_ids"])
                     logger.exception("Failed to transfer KV cache for request %s: %s", remote_request_id, e)
         finally:
-            if self._mark_request_task_done(request_id, all_task_done):
+            if req_meta.get("report_finished_recving", True) and self._mark_request_task_done(
+                request_id, all_task_done
+            ):
                 self.task_tracker.update_done_task_count(request_id)
                 with self.proc_not_transfer_request_lock:
                     self.proc_not_transfer_request.pop(remote_request_id, None)
@@ -4337,10 +4343,28 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
+        dsa_sparse_control_only_requests = {
+            req_id
+            for req_id, meta in metadata.requests.items()
+            if meta.dsa_sparse_handoff is not None
+        }
+        if self.kv_recv_thread is not None:
+            # ModelRunner has already loaded and verified every request-scoped
+            # /dev/shm payload before entering this connector boundary. Make
+            # that completion visible in the same connector-only engine step;
+            # otherwise the scheduler can remain WAITING_FOR_REMOTE_KVS while
+            # the no-payload Mooncake task only exists to release P's blocks.
+            for req_id in dsa_sparse_control_only_requests:
+                self.kv_recv_thread.task_tracker.add_not_transfer_request(
+                    req_id
+                )
         for req_id in metadata.reqs_in_batch:
             if self.kv_send_thread is not None:
                 self.kv_send_thread.task_tracker.add_req_to_process(req_id)
-            if self.kv_recv_thread is not None:
+            if (
+                self.kv_recv_thread is not None
+                and req_id not in dsa_sparse_control_only_requests
+            ):
                 self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
 
         for req_id, meta in metadata.requests.items():
@@ -4420,6 +4444,7 @@ class MooncakeConnectorWorker:
                             pcp_dcp_rank == len(remote_handshake_port_list) - 1
                             and remote_tp_offset == len(remote_ports) - 1
                         ),
+                        report_finished_recving=req_id not in dsa_sparse_control_only_requests,
                         remote_block_size=meta.remote_block_size,
                         local_block_ids_replicate_k=local_block_ids_replicate_k_for_port,
                         remote_block_ids_replicate_k=remote_block_ids_replicate_k_for_port,
