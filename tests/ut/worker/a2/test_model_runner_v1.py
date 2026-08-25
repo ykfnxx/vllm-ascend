@@ -171,14 +171,25 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             "model.layers.1.self_attn": (draft_cache,),
         }
         runner.drafter = SimpleNamespace(kv_cache_gid=1)
+        runner.kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(), SimpleNamespace()],
+        )
         draft_block_table = torch.tensor([[1]], dtype=torch.int32)
+
+        class IndexOnlyMultiGroupBlockTable:
+            def __init__(self):
+                self.block_tables = [
+                    SimpleNamespace(),
+                    SimpleNamespace(
+                        get_device_tensor=lambda: draft_block_table,
+                    ),
+                ]
+
+            def __getitem__(self, index):
+                return self.block_tables[index]
+
         runner.input_batch = SimpleNamespace(
-            block_table=[
-                SimpleNamespace(),
-                SimpleNamespace(
-                    get_device_tensor=lambda: draft_block_table,
-                ),
-            ],
+            block_table=IndexOnlyMultiGroupBlockTable(),
         )
         connector = MagicMock()
         mock_get_kv_transfer_group.return_value = connector

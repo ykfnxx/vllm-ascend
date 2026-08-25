@@ -1634,11 +1634,12 @@ class NPUModelRunner(GPUModelRunner):
         if self.drafter is None:
             raise RuntimeError("DSA Sparse P MTP capture has no drafter.")
         kv_cache_gid = getattr(self.drafter, "kv_cache_gid", None)
+        kv_cache_group_count = len(self.kv_cache_config.kv_cache_groups)
         if (
             isinstance(kv_cache_gid, bool)
             or not isinstance(kv_cache_gid, int)
             or kv_cache_gid < 0
-            or kv_cache_gid >= len(self.input_batch.block_table)
+            or kv_cache_gid >= kv_cache_group_count
         ):
             raise RuntimeError(
                 "DSA Sparse P MTP capture has an invalid draft KV cache "
