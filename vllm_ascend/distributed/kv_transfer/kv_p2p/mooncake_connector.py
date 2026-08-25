@@ -1834,6 +1834,19 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.set_dsa_sparse_request_rows(request_rows)
 
+    def capture_dsa_sparse_mtp_draft_layers(
+        self,
+        caches: Mapping[str, tuple[torch.Tensor, ...]],
+        block_table: torch.Tensor,
+    ) -> None:
+        """Capture the final live MTP cache/table before deferred finalize."""
+
+        assert self.connector_worker is not None
+        self.connector_worker.capture_dsa_sparse_mtp_draft_layers(
+            caches,
+            block_table,
+        )
+
     def abort_dsa_sparse_capture(self) -> None:
         assert self.connector_worker is not None
         self.connector_worker.abort_dsa_sparse_capture()
@@ -2592,6 +2605,81 @@ class MooncakeConnectorWorker:
             str(request_id): int(pool_entry) for request_id, pool_entry in request_rows.items()
         }
 
+    def _capture_dsa_sparse_mtp_draft_layer(
+        self,
+        layer_name: str,
+        producer_context: DSASparseProducerAttentionContext,
+        cache: tuple[torch.Tensor, ...],
+        block_table: torch.Tensor,
+    ) -> None:
+        if not cache:
+            raise RuntimeError(
+                "DSA Sparse P MTP draft publication has no cache planes: "
+                f"layer={layer_name!r}."
+            )
+        pending_mtp_layers = getattr(
+            self,
+            "_dsa_sparse_pending_mtp_draft_layers",
+            None,
+        )
+        if pending_mtp_layers is None:
+            pending_mtp_layers = {}
+            self._dsa_sparse_pending_mtp_draft_layers = pending_mtp_layers
+        current = pending_mtp_layers.get(layer_name)
+        if current is not None and current[0] is not producer_context:
+            raise RuntimeError(
+                "DSA Sparse P worker captured one MTP draft layer from "
+                "different producer contexts."
+            )
+        # The MTP layer can execute several speculative steps. Retain the
+        # latest live cache/table references and snapshot them exactly once
+        # when the deferred connector is finalized after drafting.
+        pending_mtp_layers[layer_name] = (
+            producer_context,
+            cache,
+            block_table,
+        )
+
+    def capture_dsa_sparse_mtp_draft_layers(
+        self,
+        caches: Mapping[str, tuple[torch.Tensor, ...]],
+        block_table: torch.Tensor,
+    ) -> None:
+        """Fallback capture from ModelRunner after the MTP draft finishes.
+
+        Some draft-model attention paths do not invoke the generic connector
+        save hook.  The runner still owns the scheduler-managed draft caches
+        and block table, so capture their final live references immediately
+        before deferred connector finalization.
+        """
+
+        config = self.dsa_sparse_config
+        if getattr(config, "kv_role", None) != "kv_producer":
+            return
+        producer_context = self._dsa_sparse_active_producer_context
+        if producer_context is None:
+            raise RuntimeError(
+                "DSA Sparse P MTP draft fallback has no active producer "
+                "context."
+            )
+        if block_table.ndim != 2:
+            raise RuntimeError(
+                "DSA Sparse P MTP draft fallback requires a two-dimensional "
+                f"block table, got shape={tuple(block_table.shape)}."
+            )
+        for layer_name, cache in caches.items():
+            if not self._is_dsa_sparse_mtp_draft_layer(layer_name):
+                raise RuntimeError(
+                    "DSA Sparse P MTP draft fallback received a non-draft "
+                    f"cache layer: {layer_name!r}."
+                )
+            self._capture_dsa_sparse_mtp_draft_layer(
+                layer_name,
+                producer_context,
+                tuple(cache),
+                block_table,
+            )
+
     def capture_dsa_sparse_layer_topk(
         self,
         layer_name: str,
@@ -2632,35 +2720,14 @@ class MooncakeConnectorWorker:
         if is_mtp_draft:
             block_tables = getattr(layer_metadata, "block_tables", None)
             if block_tables is None:
+                block_tables = getattr(layer_metadata, "block_table", None)
+            if block_tables is None:
                 raise RuntimeError(
                     "DSA Sparse P MTP draft publication has no block table: "
                     f"layer={layer_name!r}."
                 )
-            if not cache:
-                raise RuntimeError(
-                    "DSA Sparse P MTP draft publication has no cache planes: "
-                    f"layer={layer_name!r}."
-                )
-            pending_mtp_layers = getattr(
-                self,
-                "_dsa_sparse_pending_mtp_draft_layers",
-                None,
-            )
-            if pending_mtp_layers is None:
-                pending_mtp_layers = {}
-                self._dsa_sparse_pending_mtp_draft_layers = (
-                    pending_mtp_layers
-                )
-            current = pending_mtp_layers.get(layer_name)
-            if current is not None and current[0] is not producer_context:
-                raise RuntimeError(
-                    "DSA Sparse P worker captured one MTP draft layer from "
-                    "different producer contexts."
-                )
-            # The MTP layer can execute several speculative steps. Retain the
-            # latest live cache/table references and snapshot them exactly once
-            # when the deferred connector is finalized after drafting.
-            pending_mtp_layers[layer_name] = (
+            self._capture_dsa_sparse_mtp_draft_layer(
+                layer_name,
                 producer_context,
                 cache,
                 block_tables,

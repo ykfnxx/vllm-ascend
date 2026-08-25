@@ -148,6 +148,48 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
 
+    @patch("vllm_ascend.worker.model_runner_v1.get_kv_transfer_group")
+    @patch(
+        "vllm_ascend.worker.model_runner_v1.has_kv_transfer_group",
+        return_value=True,
+    )
+    def test_prefill_captures_mtp_draft_cache_before_finalize(
+        self,
+        _mock_has_kv_transfer_group,
+        mock_get_kv_transfer_group,
+    ):
+        runner = self._build_runner()
+        runner.ascend_config = SimpleNamespace(
+            dsa_sparse_config=SimpleNamespace(
+                is_producer=True,
+                uses_mtp=True,
+            ),
+        )
+        runner._dsa_sparse_pending_producer_execution = MagicMock()
+        draft_cache = torch.ones((2, 16, 1, 8), dtype=torch.bfloat16)
+        runner._dsa_sparse_mtp_draft_caches = {
+            "model.layers.1.self_attn": (draft_cache,),
+        }
+        runner.drafter = SimpleNamespace(kv_cache_gid=1)
+        draft_block_table = torch.tensor([[1]], dtype=torch.int32)
+        runner.input_batch = SimpleNamespace(
+            block_table=[
+                SimpleNamespace(),
+                SimpleNamespace(
+                    get_device_tensor=lambda: draft_block_table,
+                ),
+            ],
+        )
+        connector = MagicMock()
+        mock_get_kv_transfer_group.return_value = connector
+
+        runner._capture_dsa_sparse_mtp_draft_layers()
+
+        connector.capture_dsa_sparse_mtp_draft_layers.assert_called_once_with(
+            runner._dsa_sparse_mtp_draft_caches,
+            draft_block_table,
+        )
+
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
     def test_sparse_layer_without_indexer_allocates_only_mla_kv_cache(

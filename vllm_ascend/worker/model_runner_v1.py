@@ -1615,6 +1615,58 @@ class NPUModelRunner(GPUModelRunner):
                 combined_error.add_note(repr(cleanup_error))
             raise combined_error
 
+    def _capture_dsa_sparse_mtp_draft_layers(self) -> None:
+        """Capture final P-side MTP draft KV before connector finalization."""
+
+        config = self.ascend_config.dsa_sparse_config
+        if (
+            config is None
+            or not config.is_producer
+            or not config.uses_mtp
+            or self._dsa_sparse_pending_producer_execution is None
+        ):
+            return
+        if len(self._dsa_sparse_mtp_draft_caches) != 1:
+            raise RuntimeError(
+                "DSA Sparse P MTP capture requires exactly one draft cache "
+                f"layer, got {sorted(self._dsa_sparse_mtp_draft_caches)}."
+            )
+        if self.drafter is None:
+            raise RuntimeError("DSA Sparse P MTP capture has no drafter.")
+        kv_cache_gid = getattr(self.drafter, "kv_cache_gid", None)
+        if (
+            isinstance(kv_cache_gid, bool)
+            or not isinstance(kv_cache_gid, int)
+            or kv_cache_gid < 0
+            or kv_cache_gid >= len(self.input_batch.block_table)
+        ):
+            raise RuntimeError(
+                "DSA Sparse P MTP capture has an invalid draft KV cache "
+                f"group: {kv_cache_gid!r}."
+            )
+        if not has_kv_transfer_group():
+            raise RuntimeError(
+                "DSA Sparse P MTP capture requires a KV connector."
+            )
+        connector = get_kv_transfer_group()
+        capture = getattr(
+            connector,
+            "capture_dsa_sparse_mtp_draft_layers",
+            None,
+        )
+        if not callable(capture):
+            raise RuntimeError(
+                "DSA Sparse P MTP shared-memory handoff requires a "
+                "compatible KV connector."
+            )
+        block_table = self.input_batch.block_table[
+            kv_cache_gid
+        ].get_device_tensor()
+        capture(
+            self._dsa_sparse_mtp_draft_caches,
+            block_table,
+        )
+
     def _init_device_properties(self) -> None:
         self.num_sms = None
 
@@ -3715,6 +3767,7 @@ class NPUModelRunner(GPUModelRunner):
                 # forward when speculative decoding is enabled. Finalize here after
                 # draft model runs so KV pool save/put can complete.
                 if self.speculative_config is not None:
+                    self._capture_dsa_sparse_mtp_draft_layers()
                     self.finalize_kv_connector()
         except BaseException as error:
             self._complete_dsa_sparse_producer_execution(
@@ -5073,24 +5126,30 @@ class NPUModelRunner(GPUModelRunner):
         config = self.ascend_config.dsa_sparse_config
         self._dsa_sparse_indexer_caches = {}
         self._dsa_sparse_mtp_draft_caches = {}
-        if (
+        is_dsa_sparse_consumer = (
             config is not None
             and getattr(config, "kv_role", None) == "kv_consumer"
-        ):
+        )
+        uses_dsa_sparse_mtp = (
+            config is not None
+            and getattr(config, "uses_mtp", False)
+        )
+        if is_dsa_sparse_consumer or uses_dsa_sparse_mtp:
             layer_specs = self._get_layer_kv_cache_specs(kv_cache_config)
-            self._dsa_sparse_indexer_caches = {
-                layer_name: (
-                    (cache,)
-                    if isinstance(cache, torch.Tensor)
-                    else tuple(cache)
-                )
-                for layer_name, cache in kv_caches.items()
-                if isinstance(
-                    layer_specs.get(layer_name),
-                    AscendSFAIndexerCacheSpec,
-                )
-            }
-            if getattr(config, "uses_mtp", False):
+            if is_dsa_sparse_consumer:
+                self._dsa_sparse_indexer_caches = {
+                    layer_name: (
+                        (cache,)
+                        if isinstance(cache, torch.Tensor)
+                        else tuple(cache)
+                    )
+                    for layer_name, cache in kv_caches.items()
+                    if isinstance(
+                        layer_specs.get(layer_name),
+                        AscendSFAIndexerCacheSpec,
+                    )
+                }
+            if uses_dsa_sparse_mtp:
                 self._dsa_sparse_mtp_draft_caches = {
                     layer_name: (
                         (cache,)
@@ -5102,11 +5161,11 @@ class NPUModelRunner(GPUModelRunner):
                         layer_specs.get(layer_name),
                         AscendMLAAttentionSpec,
                     )
-                    and layer_name not in self._dsa_sparse_main_specs
+                    and not self._is_dsa_sparse_target_layer(layer_name)
                 }
                 if len(self._dsa_sparse_mtp_draft_caches) != 1:
                     raise RuntimeError(
-                        "DSA Sparse Decode with MTP requires exactly one "
+                        "DSA Sparse P/D with MTP requires exactly one "
                         "scheduler-managed draft cache layer, got "
                         f"{sorted(self._dsa_sparse_mtp_draft_caches)}."
                     )

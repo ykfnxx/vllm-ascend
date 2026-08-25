@@ -3713,6 +3713,67 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
             draft_payload,
         )
 
+    def test_dsa_worker_fallback_captures_mtp_draft_after_forward(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.dsa_sparse_config = types.SimpleNamespace(
+            kv_role="kv_producer",
+        )
+        worker.vllm_config = MockVllmConfig()
+        worker.vllm_config.speculative_config = types.SimpleNamespace(
+            method="mtp",
+        )
+        worker.total_layers = 1
+        producer_context = MagicMock()
+        worker._dsa_sparse_active_producer_context = producer_context
+        worker._dsa_sparse_pending_mtp_draft_layers = {}
+        draft_cache = torch.ones((2, 16, 1, 8), dtype=torch.bfloat16)
+        block_table = torch.tensor([[0]], dtype=torch.int32)
+
+        worker.capture_dsa_sparse_mtp_draft_layers(
+            {"model.layers.1.self_attn": (draft_cache,)},
+            block_table,
+        )
+
+        captured = worker._dsa_sparse_pending_mtp_draft_layers[
+            "model.layers.1.self_attn"
+        ]
+        self.assertIs(captured[0], producer_context)
+        self.assertIs(captured[1][0], draft_cache)
+        self.assertIs(captured[2], block_table)
+
+    def test_dsa_worker_accepts_singular_mtp_block_table_metadata(self):
+        worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+        worker.dsa_sparse_config = types.SimpleNamespace(
+            kv_role="kv_producer",
+        )
+        worker.vllm_config = MockVllmConfig()
+        worker.vllm_config.speculative_config = types.SimpleNamespace(
+            method="mtp",
+        )
+        worker.total_layers = 1
+        worker._dsa_sparse_pending_mtp_draft_layers = {}
+        producer_context = MagicMock()
+        worker._dsa_sparse_active_producer_context = producer_context
+        draft_cache = torch.ones((2, 16, 1, 8), dtype=torch.bfloat16)
+        block_table = torch.tensor([[0]], dtype=torch.int32)
+
+        worker.capture_dsa_sparse_layer_topk(
+            "model.layers.1.self_attn",
+            {
+                "model.layers.1.self_attn": types.SimpleNamespace(
+                    block_table=block_table,
+                ),
+            },
+            (draft_cache,),
+        )
+
+        captured = worker._dsa_sparse_pending_mtp_draft_layers[
+            "model.layers.1.self_attn"
+        ]
+        self.assertIs(captured[0], producer_context)
+        self.assertIs(captured[1][0], draft_cache)
+        self.assertIs(captured[2], block_table)
+
 
 if __name__ == "__main__":
     unittest.main()
