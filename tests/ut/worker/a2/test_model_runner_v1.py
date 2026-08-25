@@ -165,7 +165,10 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
                 uses_mtp=True,
             ),
         )
-        runner._dsa_sparse_pending_producer_execution = MagicMock()
+        producer_context = MagicMock()
+        runner._dsa_sparse_pending_producer_execution = SimpleNamespace(
+            context=producer_context,
+        )
         draft_cache = torch.ones((2, 16, 1, 8), dtype=torch.bfloat16)
         runner._dsa_sparse_mtp_draft_caches = {
             "model.layers.1.self_attn": (draft_cache,),
@@ -193,12 +196,20 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         )
         connector = MagicMock()
         mock_get_kv_transfer_group.return_value = connector
+        worker_metadata = MagicMock()
+        kv_connector_output = SimpleNamespace(
+            kv_connector_worker_meta=worker_metadata,
+        )
 
-        runner._capture_dsa_sparse_mtp_draft_layers()
+        runner._capture_dsa_sparse_mtp_draft_layers(
+            kv_connector_output,
+        )
 
         connector.capture_dsa_sparse_mtp_draft_layers.assert_called_once_with(
             runner._dsa_sparse_mtp_draft_caches,
             draft_block_table,
+            producer_context,
+            worker_metadata,
         )
 
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)

@@ -3723,23 +3723,46 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
             method="mtp",
         )
         worker.total_layers = 1
+        worker.tp_rank = 0
         producer_context = MagicMock()
-        worker._dsa_sparse_active_producer_context = producer_context
+        worker._dsa_sparse_active_producer_context = None
         worker._dsa_sparse_pending_mtp_draft_layers = {}
         draft_cache = torch.ones((2, 16, 1, 8), dtype=torch.bfloat16)
         block_table = torch.tensor([[0]], dtype=torch.int32)
+        draft_payload = make_mtp_shared_memory_payload("fallback")
+        producer_context.layer_shared_memory_payloads.return_value = {
+            "request-a": draft_payload,
+        }
+        worker_metadata = DSASparsePDWorkerMetadata(
+            {
+                "request-a": {
+                    0: {
+                        "model.layers.0.self_attn": list(
+                            range(DSA_SPARSE_QUERY_WIDTH)
+                        ),
+                    },
+                },
+            },
+        )
 
         worker.capture_dsa_sparse_mtp_draft_layers(
             {"model.layers.1.self_attn": (draft_cache,)},
             block_table,
+            producer_context,
+            worker_metadata,
         )
 
-        captured = worker._dsa_sparse_pending_mtp_draft_layers[
-            "model.layers.1.self_attn"
-        ]
-        self.assertIs(captured[0], producer_context)
-        self.assertIs(captured[1][0], draft_cache)
-        self.assertIs(captured[2], block_table)
+        producer_context.publish_mtp_draft_layer.assert_called_once_with(
+            "model.layers.1.self_attn",
+            (draft_cache,),
+            block_table,
+        )
+        self.assertEqual(
+            worker_metadata.request_shared_memory_payloads_by_rank[
+                "request-a"
+            ][0]["model.layers.1.self_attn"],
+            draft_payload,
+        )
 
     def test_dsa_worker_accepts_singular_mtp_block_table_metadata(self):
         worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)

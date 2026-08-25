@@ -1838,13 +1838,17 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         self,
         caches: Mapping[str, tuple[torch.Tensor, ...]],
         block_table: torch.Tensor,
+        producer_context: DSASparseProducerAttentionContext,
+        worker_metadata: KVConnectorWorkerMetadata | None,
     ) -> None:
-        """Capture the final live MTP cache/table before deferred finalize."""
+        """Append final MTP payloads to the already-built worker metadata."""
 
         assert self.connector_worker is not None
         self.connector_worker.capture_dsa_sparse_mtp_draft_layers(
             caches,
             block_table,
+            producer_context,
+            worker_metadata,
         )
 
     def abort_dsa_sparse_capture(self) -> None:
@@ -2644,23 +2648,24 @@ class MooncakeConnectorWorker:
         self,
         caches: Mapping[str, tuple[torch.Tensor, ...]],
         block_table: torch.Tensor,
+        producer_context: DSASparseProducerAttentionContext,
+        worker_metadata: KVConnectorWorkerMetadata | None,
     ) -> None:
-        """Fallback capture from ModelRunner after the MTP draft finishes.
+        """Append MTP payloads after the deferred draft model finishes.
 
-        Some draft-model attention paths do not invoke the generic connector
-        save hook.  The runner still owns the scheduler-managed draft caches
-        and block table, so capture their final live references immediately
-        before deferred connector finalization.
+        Target worker metadata is built when the target forward context exits,
+        even when connector finalization is deferred. ModelRunner therefore
+        passes the execution-owned producer context and that already-built
+        metadata so this method can append the MTP payload to the same output.
         """
 
         config = self.dsa_sparse_config
         if getattr(config, "kv_role", None) != "kv_producer":
             return
-        producer_context = self._dsa_sparse_active_producer_context
-        if producer_context is None:
+        if not isinstance(worker_metadata, DSASparsePDWorkerMetadata):
             raise RuntimeError(
-                "DSA Sparse P MTP draft fallback has no active producer "
-                "context."
+                "DSA Sparse P MTP draft fallback has no previously built "
+                "target worker metadata."
             )
         if block_table.ndim != 2:
             raise RuntimeError(
@@ -2673,12 +2678,36 @@ class MooncakeConnectorWorker:
                     "DSA Sparse P MTP draft fallback received a non-draft "
                     f"cache layer: {layer_name!r}."
                 )
-            self._capture_dsa_sparse_mtp_draft_layer(
+            producer_context.publish_mtp_draft_layer(
                 layer_name,
-                producer_context,
                 tuple(cache),
                 block_table,
             )
+            for request_id, payload in (
+                producer_context.layer_shared_memory_payloads(
+                    layer_name
+                ).items()
+            ):
+                payloads_by_rank = (
+                    worker_metadata.request_shared_memory_payloads_by_rank
+                )
+                by_rank = payloads_by_rank.setdefault(request_id, {})
+                layers = by_rank.setdefault(self.tp_rank, {})
+                current = layers.get(layer_name)
+                if current is not None and current != payload:
+                    raise RuntimeError(
+                        "DSA Sparse P MTP draft fallback produced "
+                        "conflicting shared-memory metadata."
+                    )
+                layers[layer_name] = payload
+            pending_mtp_layers = getattr(
+                self,
+                "_dsa_sparse_pending_mtp_draft_layers",
+                {},
+            )
+            pending = pending_mtp_layers.get(layer_name)
+            if pending is not None and pending[0] is producer_context:
+                pending_mtp_layers.pop(layer_name)
 
     def capture_dsa_sparse_layer_topk(
         self,

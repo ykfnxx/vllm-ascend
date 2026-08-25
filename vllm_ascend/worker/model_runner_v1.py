@@ -76,6 +76,7 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     ECConnectorOutput,
+    KVConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
@@ -1615,15 +1616,19 @@ class NPUModelRunner(GPUModelRunner):
                 combined_error.add_note(repr(cleanup_error))
             raise combined_error
 
-    def _capture_dsa_sparse_mtp_draft_layers(self) -> None:
+    def _capture_dsa_sparse_mtp_draft_layers(
+        self,
+        kv_connector_output: KVConnectorOutput | None,
+    ) -> None:
         """Capture final P-side MTP draft KV before connector finalization."""
 
         config = self.ascend_config.dsa_sparse_config
+        execution = self._dsa_sparse_pending_producer_execution
         if (
             config is None
             or not config.is_producer
             or not config.uses_mtp
-            or self._dsa_sparse_pending_producer_execution is None
+            or execution is None
         ):
             return
         if len(self._dsa_sparse_mtp_draft_caches) != 1:
@@ -1649,6 +1654,10 @@ class NPUModelRunner(GPUModelRunner):
             raise RuntimeError(
                 "DSA Sparse P MTP capture requires a KV connector."
             )
+        if kv_connector_output is None:
+            raise RuntimeError(
+                "DSA Sparse P MTP capture has no deferred connector output."
+            )
         connector = get_kv_transfer_group()
         capture = getattr(
             connector,
@@ -1666,6 +1675,8 @@ class NPUModelRunner(GPUModelRunner):
         capture(
             self._dsa_sparse_mtp_draft_caches,
             block_table,
+            execution.context,
+            kv_connector_output.kv_connector_worker_meta,
         )
 
     def _init_device_properties(self) -> None:
@@ -3768,7 +3779,9 @@ class NPUModelRunner(GPUModelRunner):
                 # forward when speculative decoding is enabled. Finalize here after
                 # draft model runs so KV pool save/put can complete.
                 if self.speculative_config is not None:
-                    self._capture_dsa_sparse_mtp_draft_layers()
+                    self._capture_dsa_sparse_mtp_draft_layers(
+                        kv_connector_output
+                    )
                     self.finalize_kv_connector()
         except BaseException as error:
             self._complete_dsa_sparse_producer_execution(
