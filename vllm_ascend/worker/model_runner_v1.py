@@ -4649,7 +4649,7 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 if not callable(register_aux):
                     raise RuntimeError(
-                        "DSA Sparse P/D requires Mooncake auxiliary cache "
+                        "DSA Sparse P/D requires KV connector auxiliary cache "
                         "registration"
                     )
                 tail_layouts = (

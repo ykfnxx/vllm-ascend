@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# Launch a same-node 1P1D DSA Sparse probe on two Ascend NPUs.
+# Launch a same-node DSA Sparse P/D probe on Ascend NPUs.
 #
 # This script exercises:
-#   - two isolated vLLM engines (Prefill TP1 + Decode TP1);
+#   - two isolated vLLM engines with equal Prefill/Decode TP sizes;
 #   - the standard P/D proxy and kv_transfer_params handoff;
 #   - the single-query or MTP batch DSA Sparse lookup/update operator;
 #   - per-layer Hot Cache Sparse Flash Attention.
 #
-# Payload movement remains mocked. This script validates control flow and
-# operator execution, not Main/history/newest payload correctness.
+# By default Mooncake payload movement remains mocked. ``--local-shm`` moves
+# scheduler-managed Indexer/MTP KV and the DSA partial tail through /dev/shm.
 #
 # Example:
 #   bash examples/dsa_sparse_pd_mock_probe.sh \
@@ -44,13 +44,16 @@ STARTUP_TIMEOUT="900"
 GPU_MEMORY_UTILIZATION="0.50"
 LOG_DIR=""
 VERIFY_PATH="0"
+USE_LOCAL_SHM="0"
+LOCAL_SHM_DIR="/dev/shm/vllm-ascend-local-kv"
+LOCAL_SHM_NAMESPACE="dsa-sparse-pd-$PPID-$$"
 
 usage() {
     cat <<'EOF'
 Usage:
-  dsa_sparse_pd_mock_probe.sh --host-ip IP --ifname NIC [options]
+  dsa_sparse_pd_mock_probe.sh [--host-ip IP --ifname NIC] [options]
 
-Required:
+Required for Mooncake-mock mode and local-shm TP greater than one:
   --host-ip IP                 Local IP used by Mooncake/HCCL.
   --ifname NIC                 Network interface owning --host-ip.
 
@@ -58,8 +61,8 @@ Options:
   --model MODEL                Model path or Hugging Face ID.
                                Default: tiny-random/glm-moe-dsa
   --served-model-name NAME     OpenAI API model name. Default: glm-moe-dsa
-  --prefill-device ID          Prefill physical NPU ID. Default: 0
-  --decode-device ID           Decode physical NPU ID. Default: 1
+  --prefill-device IDS         Prefill NPU IDs, comma-separated for TP. Default: 0
+  --decode-device IDS          Decode NPU IDs, comma-separated for TP. Default: 1
   --prefill-http-port PORT     Prefill HTTP port. Default: 18100
   --decode-http-port PORT      Decode HTTP port. Default: 18200
   --proxy-http-port PORT       Proxy HTTP port. Default: 18000
@@ -74,6 +77,10 @@ Options:
   --gpu-memory-utilization F   Per-engine NPU memory fraction. Default: 0.50
   --startup-timeout SEC        Per-service startup timeout. Default: 900
   --log-dir DIR                Keep logs in DIR. Default: a new /tmp directory
+  --local-shm                  Use LocalShmConnector instead of mocked Mooncake.
+                               Requires equal P/D TP and one shared container.
+  --local-shm-dir DIR          Shared-memory root. Default:
+                               /dev/shm/vllm-ascend-local-kv
   --verify-path                Profile Decode and verify the lookup op
                                plus every per-layer Hot Cache SFA call.
   -h, --help                   Show this help.
@@ -82,7 +89,8 @@ Without --verify-path, success only proves process isolation and P/D routing.
 With --verify-path, success also proves that each Decode step called the
 single-query or MTP batch lookup/update operator once per cohort, performed
 Hot Cache SFA once per physical layer, and committed only the accepted MTP
-prefix to the mock backend. Payload movement remains mocked.
+prefix to the mock backend. Payload movement remains mocked unless
+--local-shm is specified.
 EOF
 }
 
@@ -195,6 +203,15 @@ while (($# > 0)); do
             VERIFY_PATH="1"
             shift
             ;;
+        --local-shm)
+            USE_LOCAL_SHM="1"
+            shift
+            ;;
+        --local-shm-dir)
+            require_value "$@"
+            LOCAL_SHM_DIR="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -207,12 +224,6 @@ while (($# > 0)); do
     esac
 done
 
-if [[ -z "$HOST_IP" || -z "$IFNAME" ]]; then
-    echo "--host-ip and --ifname are required." >&2
-    usage >&2
-    exit 2
-fi
-
 for command_name in vllm python3 curl; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         echo "Required command not found: $command_name" >&2
@@ -220,8 +231,33 @@ for command_name in vllm python3 curl; do
     fi
 done
 
-if [[ "$PREFILL_DEVICE" == "$DECODE_DEVICE" ]]; then
-    echo "Prefill and Decode must use different physical NPU IDs." >&2
+IFS=',' read -r -a PREFILL_DEVICES <<<"$PREFILL_DEVICE"
+IFS=',' read -r -a DECODE_DEVICES <<<"$DECODE_DEVICE"
+TP_SIZE="${#PREFILL_DEVICES[@]}"
+if ((TP_SIZE == 0 || ${#DECODE_DEVICES[@]} != TP_SIZE)); then
+    echo "Prefill and Decode device lists must have the same non-zero length." >&2
+    exit 2
+fi
+if [[ "$USE_LOCAL_SHM" != "1" || "$TP_SIZE" -gt 1 ]]; then
+    if [[ -z "$HOST_IP" || -z "$IFNAME" ]]; then
+        echo "--host-ip and --ifname are required for this connector/TP configuration." >&2
+        usage >&2
+        exit 2
+    fi
+else
+    HOST_IP="${HOST_IP:-127.0.0.1}"
+    IFNAME="${IFNAME:-lo}"
+fi
+for prefill_id in "${PREFILL_DEVICES[@]}"; do
+    for decode_id in "${DECODE_DEVICES[@]}"; do
+        if [[ "$prefill_id" == "$decode_id" ]]; then
+            echo "Prefill and Decode must use disjoint physical NPU IDs." >&2
+            exit 2
+        fi
+    done
+done
+if [[ "$PREFILL_DEVICE" == *,* && "$USE_LOCAL_SHM" != "1" ]]; then
+    echo "This probe supports multi-TP payload transfer only with --local-shm." >&2
     exit 2
 fi
 
@@ -317,9 +353,13 @@ COMMON_NETWORK_ENV=(
     "HCCL_SOCKET_IFNAME=$IFNAME"
     "OMP_PROC_BIND=false"
     "OMP_NUM_THREADS=1"
-    "VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE=1"
     "VLLM_ASCEND_DSA_SPARSE_PD_TRACE=1"
 )
+if [[ "$USE_LOCAL_SHM" == "1" ]]; then
+    COMMON_NETWORK_ENV+=("VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE=0")
+else
+    COMMON_NETWORK_ENV+=("VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE=1")
+fi
 
 DECODE_PROBE_ENV=()
 DECODE_PROFILER_ARGS=()
@@ -376,8 +416,15 @@ fi
 
 PREFILL_DSA_CONFIG="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_sparse_config\":{\"io_backend\":\"mock\"}}"
 DECODE_DSA_CONFIG="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_sparse_config\":{\"io_backend\":\"mock\"}}"
-PREFILL_KV_CONFIG="{\"kv_connector\":\"MooncakeConnectorV1\",\"kv_role\":\"kv_producer\",\"kv_port\":$PREFILL_KV_PORT,\"engine_id\":\"0\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"prefill\":{\"dp_size\":1,\"tp_size\":1},\"decode\":{\"dp_size\":1,\"tp_size\":1}}}"
-DECODE_KV_CONFIG="{\"kv_connector\":\"MooncakeConnectorV1\",\"kv_role\":\"kv_consumer\",\"kv_port\":$DECODE_KV_PORT,\"engine_id\":\"1\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"prefill\":{\"dp_size\":1,\"tp_size\":1},\"decode\":{\"dp_size\":1,\"tp_size\":1}}}"
+if [[ "$USE_LOCAL_SHM" == "1" ]]; then
+    KV_CONNECTOR="LocalShmConnector"
+    CONNECTOR_EXTRA="{\"prefill\":{\"dp_size\":1,\"tp_size\":$TP_SIZE},\"decode\":{\"dp_size\":1,\"tp_size\":$TP_SIZE},\"shm_dir\":\"$LOCAL_SHM_DIR\",\"shm_namespace\":\"$LOCAL_SHM_NAMESPACE\"}"
+else
+    KV_CONNECTOR="MooncakeConnectorV1"
+    CONNECTOR_EXTRA="{\"prefill\":{\"dp_size\":1,\"tp_size\":1},\"decode\":{\"dp_size\":1,\"tp_size\":1}}"
+fi
+PREFILL_KV_CONFIG="{\"kv_connector\":\"$KV_CONNECTOR\",\"kv_role\":\"kv_producer\",\"kv_port\":$PREFILL_KV_PORT,\"engine_id\":\"0\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":$CONNECTOR_EXTRA}"
+DECODE_KV_CONFIG="{\"kv_connector\":\"$KV_CONNECTOR\",\"kv_role\":\"kv_consumer\",\"kv_port\":$DECODE_KV_PORT,\"engine_id\":\"1\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":$CONNECTOR_EXTRA}"
 
 echo "Starting Prefill on physical NPU $PREFILL_DEVICE..."
 env \
@@ -387,7 +434,7 @@ env \
     --host 0.0.0.0 \
     --port "$PREFILL_HTTP_PORT" \
     --served-model-name "$SERVED_MODEL_NAME" \
-    --tensor-parallel-size 1 \
+    --tensor-parallel-size "$TP_SIZE" \
     --max-model-len "$MAX_MODEL_LEN" \
     --max-num-seqs 1 \
     --max-num-batched-tokens "$MAX_MODEL_LEN" \
@@ -412,7 +459,7 @@ env \
     --host 0.0.0.0 \
     --port "$DECODE_HTTP_PORT" \
     --served-model-name "$SERVED_MODEL_NAME" \
-    --tensor-parallel-size 1 \
+    --tensor-parallel-size "$TP_SIZE" \
     --max-model-len "$MAX_MODEL_LEN" \
     --max-num-seqs 1 \
     --max-num-batched-tokens "$MAX_MODEL_LEN" \
@@ -567,7 +614,12 @@ else
     echo "PASS: process isolation and P/D routing completed."
     echo "Run again with --verify-path to verify the custom-op and Hot Cache path."
 fi
-echo "NOT VALIDATED: Main/history/newest payload transfer or model accuracy."
+if [[ "$USE_LOCAL_SHM" == "1" ]]; then
+    echo "LOCAL SHM: Indexer/MTP KV and the Target Main partial tail were transferred rank-to-rank."
+    echo "NOT VALIDATED: full Target Main history payload or model accuracy."
+else
+    echo "NOT VALIDATED: Main/history/newest payload transfer or model accuracy."
+fi
 echo "Inspect Decode logs with:"
 echo "  grep -Ein 'DSA_SPARSE_PROBE|dsa_sparse|lookup_update|mock|error|traceback' '$DECODE_LOG'"
 echo "Inspect P/D TopK handoff logs with:"
