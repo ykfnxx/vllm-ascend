@@ -61,6 +61,7 @@ from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
+from vllm_ascend.dsa_offload.config import reserve_fixed_memory
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
 from vllm_ascend.utils import (
@@ -550,7 +551,10 @@ class NPUWorker(WorkerBase):
                 GiB(self.init_snapshot.free_memory),
                 GiB(kv_cache_memory_bytes),
             )
-            return kv_cache_memory_bytes
+            return reserve_fixed_memory(
+                kv_cache_memory_bytes,
+                self.model_runner.get_dsa_offload_fixed_memory_bytes(),
+            )
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -594,7 +598,10 @@ class NPUWorker(WorkerBase):
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
         )
 
-        return int(self.available_kv_cache_memory_bytes)
+        return reserve_fixed_memory(
+            int(self.available_kv_cache_memory_bytes),
+            self.model_runner.get_dsa_offload_fixed_memory_bytes(),
+        )
 
     def log_memory_stats(self) -> None:
         """Profiles the torch reserved memory, torch allocated memory in execute_model()."""
@@ -916,6 +923,7 @@ class NPUWorker(WorkerBase):
             context = nullcontext()  # type: ignore
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
+            self.model_runner.validate_dsa_offload_cache()
 
             # Restrict to mamba and full attn hybrid models (e.g. Qwen3.x).
             #

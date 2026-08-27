@@ -198,6 +198,28 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
 )
+from vllm_ascend.dsa_offload.config import load_dsa_offload_config
+from vllm_ascend.dsa_offload.hot_cache import (
+    HotCacheLayout,
+    HotCacheState,
+    commit_decode_tail,
+    commit_mtp_tail,
+    fixed_memory_bytes,
+    resize_target_tensors,
+    validate_target_tensors,
+)
+from vllm_ascend.dsa_offload.io import create_io_backend
+from vllm_ascend.dsa_offload.lookup import (
+    build_dsa_offload_batch,
+    clear_lookup_row,
+    create_lookup_states,
+    scan_index_cache_cohorts,
+)
+from vllm_ascend.dsa_offload.pd import (
+    PrefillPublishState,
+    admit_from_handoff,
+    validate_handoff,
+)
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
@@ -337,6 +359,17 @@ class NPUModelRunner(GPUModelRunner):
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
+        self.dsa_offload_config = load_dsa_offload_config(vllm_config)
+        self._dsa_offload_main_specs: dict[str, AscendMLAAttentionSpec] = {}
+        self._dsa_offload_cohorts = ()
+        self._dsa_offload_layout: HotCacheLayout | None = None
+        self._dsa_offload_hot_cache: HotCacheState | None = None
+        self._dsa_offload_lookup_states = {}
+        self._dsa_offload_io = None
+        self._dsa_offload_handoffs = {}
+        self._dsa_offload_committed_hashes: dict[str, list[bytes]] = {}
+        self._dsa_offload_candidate_hashes: dict[str, list[bytes]] = {}
+        self._dsa_offload_batch = None
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -710,6 +743,272 @@ class NPUModelRunner(GPUModelRunner):
             return self.model.unwrap()
         return self.model
 
+    def get_dsa_offload_fixed_memory_bytes(self) -> int:
+        config = self.dsa_offload_config
+        if config is None or not config.is_consumer:
+            return 0
+        layout = HotCacheLayout(
+            block_size=self.block_size,
+            max_num_seqs=self.max_num_reqs,
+            max_verify_tokens_per_request=(
+                config.max_verify_tokens_per_request
+            ),
+        )
+        return fixed_memory_bytes(
+            layout,
+            tuple(self._dsa_offload_main_specs.values()),
+            len(self._dsa_offload_cohorts),
+        )
+
+    def validate_dsa_offload_cache(self) -> None:
+        if self.dsa_offload_config is None:
+            return
+        validate_target_tensors(
+            self.kv_cache_config,
+            self._dsa_offload_main_specs,
+            self._dsa_offload_layout,
+            self.dsa_offload_config.kv_role,
+        )
+
+    def shutdown(self) -> None:
+        if self._dsa_offload_io is not None:
+            self._dsa_offload_io.close()
+        self._dsa_offload_io = None
+        self._dsa_offload_hot_cache = None
+        self._dsa_offload_lookup_states = {}
+        self._dsa_offload_handoffs = {}
+        self._dsa_offload_committed_hashes = {}
+        self._dsa_offload_candidate_hashes = {}
+        self._dsa_offload_batch = None
+        super().shutdown()
+
+    def _initialize_dsa_offload(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> None:
+        config = self.dsa_offload_config
+        if config is None:
+            return
+        layout = self._dsa_offload_layout
+        assert layout is not None
+        layer_caches = {
+            layer_name: tuple(kv_caches[layer_name])
+            for layer_name in self._dsa_offload_main_specs
+        }
+        io_backend = create_io_backend(
+            config.io_backend,
+            config.kvio_model_id,
+        )
+        for cohort in self._dsa_offload_cohorts:
+            for layer_name, layer_id in zip(
+                cohort.layer_names,
+                cohort.layer_ids,
+            ):
+                cache_planes = layer_caches[layer_name]
+                if config.is_producer:
+                    io_backend.register_put_cache(
+                        layer_id=layer_id,
+                        block_size=self.block_size,
+                        cache_planes=cache_planes,
+                    )
+                if config.is_consumer:
+                    io_backend.register_get_cache(
+                        layer_id=layer_id,
+                        block_size=self.block_size,
+                        cache_planes=cache_planes,
+                    )
+                    if not config.is_producer:
+                        io_backend.register_put_cache(
+                            layer_id=layer_id,
+                            block_size=self.block_size,
+                            cache_planes=cache_planes,
+                        )
+        io_backend.finalize_registration()
+        self._dsa_offload_io = io_backend
+        if config.is_consumer:
+            self._dsa_offload_hot_cache = HotCacheState(
+                layout,
+                layer_caches,
+            )
+            self._dsa_offload_lookup_states = create_lookup_states(
+                self._dsa_offload_cohorts,
+                self.max_num_reqs,
+                self.device,
+            )
+
+    def _record_dsa_offload_metadata(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        for request_data in scheduler_output.scheduled_new_reqs:
+            self._dsa_offload_committed_hashes[request_data.req_id] = list(
+                request_data.block_hashes
+            )
+        cached = scheduler_output.scheduled_cached_reqs
+        for request_id, block_hashes in zip(
+            cached.req_ids,
+            cached.block_hashes,
+        ):
+            self._dsa_offload_committed_hashes[request_id] = list(
+                block_hashes
+            )
+        self._dsa_offload_committed_hashes.update(
+            scheduler_output.dsa_offload_connector_block_hashes
+        )
+        self._dsa_offload_candidate_hashes = (
+            scheduler_output.dsa_offload_candidate_block_hashes
+        )
+
+        connector_requests = scheduler_output.kv_connector_metadata.requests
+        for request_id, metadata in connector_requests.items():
+            if metadata.dsa_offload_handoff is not None:
+                self._dsa_offload_handoffs[request_id] = (
+                    metadata.dsa_offload_handoff
+                )
+
+    def _admit_dsa_offload_requests(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        hot_cache = self._dsa_offload_hot_cache
+        if hot_cache is None:
+            return
+
+        connector_requests = scheduler_output.kv_connector_metadata.requests
+        layer_ids = {
+            layer_name: layer_id
+            for cohort in self._dsa_offload_cohorts
+            for layer_name, layer_id in zip(
+                cohort.layer_names,
+                cohort.layer_ids,
+            )
+        }
+        for request_id, metadata in connector_requests.items():
+            handoff = metadata.dsa_offload_handoff
+            if handoff is not None:
+                validate_handoff(
+                    handoff,
+                    get_tp_group().world_size,
+                    tuple(layer_ids),
+                    self.block_size,
+                )
+            if handoff is not None and request_id not in hot_cache.request_to_row:
+                hot_cache.admit(request_id)
+
+        get_kv_transfer_group().set_dsa_offload_request_rows(
+            hot_cache.request_to_row
+        )
+        scheduled_request_ids = [
+            request.req_id for request in scheduler_output.scheduled_new_reqs
+        ]
+        scheduled_request_ids.extend(
+            scheduler_output.scheduled_cached_reqs.req_ids
+        )
+        for request_id in scheduled_request_ids:
+            if (
+                request_id in hot_cache.request_to_row
+                and request_id not in hot_cache.ready_requests
+            ):
+                admit_from_handoff(
+                    request_id=request_id,
+                    handoff=self._dsa_offload_handoffs[request_id],
+                    tp_rank=get_tp_group().rank_in_group,
+                    hot_cache=hot_cache,
+                    cohorts=self._dsa_offload_cohorts,
+                    lookup_states=self._dsa_offload_lookup_states,
+                    layer_ids=layer_ids,
+                    committed_block_hashes=(
+                        self._dsa_offload_committed_hashes[request_id]
+                    ),
+                    io_backend=self._dsa_offload_io,
+                )
+
+    def _release_dsa_offload_requests(
+        self,
+        finished_request_ids: set[str],
+    ) -> None:
+        hot_cache = self._dsa_offload_hot_cache
+        for request_id in finished_request_ids:
+            if hot_cache is not None and request_id in hot_cache.request_to_row:
+                row_id = hot_cache.request_to_row[request_id]
+                clear_lookup_row(self._dsa_offload_lookup_states, row_id)
+                hot_cache.release(request_id)
+            self._dsa_offload_handoffs.pop(request_id, None)
+            self._dsa_offload_committed_hashes.pop(request_id, None)
+
+    def _make_dsa_offload_batch(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: np.ndarray,
+        total_num_scheduled_tokens: int,
+    ):
+        config = self.dsa_offload_config
+        if config is None:
+            return None
+        layout = self._dsa_offload_layout
+        assert layout is not None
+        request_ids = self.input_batch.req_ids
+        query_counts = num_scheduled_tokens[: len(request_ids)].tolist()
+        prefill_state = None
+        if config.is_producer:
+            computed = self.input_batch.num_computed_tokens_cpu[
+                : len(request_ids)
+            ]
+            prompt = self.input_batch.num_prompt_tokens[: len(request_ids)]
+            stored = computed + num_scheduled_tokens[: len(request_ids)]
+            hot_requests = (
+                self._dsa_offload_hot_cache.request_to_row
+                if self._dsa_offload_hot_cache is not None
+                else {}
+            )
+            prefill_state = PrefillPublishState(
+                request_ids=tuple(request_ids),
+                scheduled_token_counts=tuple(query_counts),
+                stored_token_counts=tuple(stored.tolist()),
+                publish_requests=tuple(
+                    request_id not in hot_requests
+                    and computed[index] < prompt[index] <= stored[index]
+                    for index, request_id in enumerate(request_ids)
+                ),
+                committed_block_hashes=(
+                    self._dsa_offload_committed_hashes
+                ),
+                io_backend=self._dsa_offload_io,
+                tp_rank=get_tp_group().rank_in_group,
+            )
+        return build_dsa_offload_batch(
+            layout=layout,
+            hot_cache=self._dsa_offload_hot_cache,
+            io_backend=self._dsa_offload_io,
+            cohorts=self._dsa_offload_cohorts,
+            lookup_states=self._dsa_offload_lookup_states,
+            request_ids=request_ids,
+            query_counts=query_counts,
+            query_positions=self.positions[:total_num_scheduled_tokens],
+            is_mtp=bool(
+                scheduler_output.scheduled_spec_decode_tokens
+            ),
+            committed_block_hashes=self._dsa_offload_committed_hashes,
+            candidate_block_hashes=self._dsa_offload_candidate_hashes,
+            prefill_state=prefill_state,
+        )
+
+    def _attach_dsa_offload_batch(
+        self,
+        attn_metadata: PerLayerAttnMetadata,
+        batch: object,
+    ) -> None:
+        metadata_groups = (
+            attn_metadata if isinstance(attn_metadata, list) else [attn_metadata]
+        )
+        for metadata in metadata_groups:
+            for layer_name in self._dsa_offload_main_specs:
+                metadata[layer_name].dsa_offload_batch = batch
+        self._dsa_offload_batch = batch
+        get_kv_transfer_group().set_dsa_offload_publish_state(
+            batch.prefill_state
+        )
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         # Temporary rewind guard for KV-load-failure recompute.
         # This can be removed after the upstream fix is merged.
@@ -725,7 +1024,21 @@ class NPUModelRunner(GPUModelRunner):
                 if num_computed_tokens < req_state.num_computed_tokens:
                     req_state.prev_num_draft_len = 0
 
-        return super()._update_states(scheduler_output)
+        if self.dsa_offload_config is not None:
+            self._record_dsa_offload_metadata(scheduler_output)
+            hot_cache = self._dsa_offload_hot_cache
+            if hot_cache is not None:
+                hot_cache.fail_on_preemption(
+                    scheduler_output.preempted_req_ids
+                )
+            self._admit_dsa_offload_requests(scheduler_output)
+
+        deferred = super()._update_states(scheduler_output)
+        if self.dsa_offload_config is not None:
+            self._release_dsa_offload_requests(
+                scheduler_output.finished_req_ids
+            )
+        return deferred
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
@@ -2225,6 +2538,16 @@ class NPUModelRunner(GPUModelRunner):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
+                if self.dsa_offload_config is not None:
+                    dsa_offload_batch = self._make_dsa_offload_batch(
+                        scheduler_output,
+                        num_scheduled_tokens_np,
+                        total_num_scheduled_tokens,
+                    )
+                    self._attach_dsa_offload_batch(
+                        attn_metadata,
+                        dsa_offload_batch,
+                    )
 
                 self._sanitize_placeholder_input_ids_for_forward(
                     scheduler_output,
@@ -2299,6 +2622,13 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            if (
+                self.dsa_offload_config is not None
+                and self.dsa_offload_config.is_consumer
+            ):
+                get_kv_transfer_group().wait_for_dsa_offload_load(
+                    set(self.input_batch.req_ids)
+                )
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
             hidden_states = self._model_forward(
@@ -2440,6 +2770,43 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        if self._dsa_offload_batch is not None:
+            if self._dsa_offload_batch.is_mtp:
+                num_reqs = len(self._dsa_offload_batch.request_ids)
+                sampled_token_ids = sampler_output.sampled_token_ids[:num_reqs]
+                accepted_token_counts = (
+                    (
+                        (sampled_token_ids != -1)
+                        & (sampled_token_ids < self.input_batch.vocab_size)
+                    )
+                    .sum(dim=-1)
+                    .to(torch.int32)
+                )
+                accepted_token_counts.masked_fill_(
+                    self.discard_request_mask.gpu[:num_reqs],
+                    0,
+                )
+                query_lengths = torch.tensor(
+                    [
+                        end - begin
+                        for begin, end in self._dsa_offload_batch.query_ranges
+                    ],
+                    dtype=torch.int32,
+                    device=accepted_token_counts.device,
+                )
+                commit_mtp_tail(
+                    self._dsa_offload_batch,
+                    torch.minimum(
+                        accepted_token_counts,
+                        query_lengths,
+                    )
+                    .to("cpu")
+                    .tolist(),
+                )
+            else:
+                commit_decode_tail(self._dsa_offload_batch)
+            self._dsa_offload_batch = None
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -3830,6 +4197,26 @@ class NPUModelRunner(GPUModelRunner):
             cache size of each layer
         """
         kv_cache_config = deepcopy(kv_cache_config)
+        if self.dsa_offload_config is not None:
+            hot_block_base = (
+                kv_cache_config.num_blocks
+                if self.dsa_offload_config.kv_role == "kv_both"
+                else 0
+            )
+            self._dsa_offload_layout = HotCacheLayout(
+                block_size=self.block_size,
+                max_num_seqs=self.max_num_reqs,
+                max_verify_tokens_per_request=(
+                    self.dsa_offload_config.max_verify_tokens_per_request
+                ),
+                hot_block_base=hot_block_base,
+            )
+            resize_target_tensors(
+                kv_cache_config,
+                self._dsa_offload_main_specs,
+                self._dsa_offload_layout,
+                self.dsa_offload_config.kv_role,
+            )
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
         self._mamba_copy_bufs = None
@@ -3862,8 +4249,24 @@ class NPUModelRunner(GPUModelRunner):
                 self.kernel_block_sizes, list) else self.kernel_block_sizes)
             self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
+        self._initialize_dsa_offload(kv_caches)
         if has_kv_transfer_group():
-            get_kv_transfer_group().register_kv_caches(kv_caches)
+            connector = get_kv_transfer_group()
+            if self.dsa_offload_config is not None:
+                target_caches = {
+                    layer_name: tuple(kv_caches[layer_name])
+                    for layer_name in self._dsa_offload_main_specs
+                }
+                connector.register_dsa_offload_aux_caches(
+                    target_caches,
+                    self._dsa_offload_layout,
+                )
+                kv_caches = {
+                    layer_name: cache
+                    for layer_name, cache in kv_caches.items()
+                    if layer_name not in self._dsa_offload_main_specs
+                }
+            connector.register_kv_caches(kv_caches)
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
@@ -4475,7 +4878,12 @@ class NPUModelRunner(GPUModelRunner):
                     # different memory capacities, `num_blocks` can be different on
                     # different GPUs, and `kv_cache_config.num_blocks` is set to
                     # the min of all `num_blocks`. Verify it here.
-                    assert num_blocks >= kv_cache_config.num_blocks
+                    if not (
+                        self.dsa_offload_config is not None
+                        and self.dsa_offload_config.kv_role == "kv_consumer"
+                        and layer_name in self._dsa_offload_main_specs
+                    ):
+                        assert num_blocks >= kv_cache_config.num_blocks
 
                     if hasattr(attn_backend, "get_supported_kernel_block_sizes") and self.use_hybrid_blocks:
                         block_size = attn_backend.get_supported_kernel_block_sizes()[0]
@@ -4921,6 +5329,35 @@ class NPUModelRunner(GPUModelRunner):
             for layer_name in attn_layer_names:
                 if kv_cache_spec[layer_name].page_size_bytes < mamba_page_size_padded:  # type: ignore[attr-defined]
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
+
+        if self.dsa_offload_config is not None:
+            from vllm.model_executor.models.utils import extract_layer_index
+
+            target_layer_count = self.model_config.hf_text_config.num_hidden_layers
+            target_layers = sorted(
+                (
+                    extract_layer_index(layer_name),
+                    layer_name,
+                    attn_module,
+                )
+                for layer_name, attn_module in attn_layers.items()
+                if isinstance(attn_module, MLAAttention)
+                and extract_layer_index(layer_name) < target_layer_count
+            )
+            self._dsa_offload_main_specs = {
+                layer_name: kv_cache_spec[layer_name]
+                for _, layer_name, _ in target_layers
+            }
+            self._dsa_offload_cohorts = scan_index_cache_cohorts(
+                tuple(
+                    (
+                        layer_name,
+                        attn_module.impl.skip_topk,
+                        layer_index,
+                    )
+                    for layer_index, layer_name, attn_module in target_layers
+                )
+            )
 
         return kv_cache_spec
 

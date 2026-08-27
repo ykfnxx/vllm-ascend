@@ -68,6 +68,17 @@ from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
 )
+from vllm_ascend.dsa_offload.hot_cache import HotCacheLayout
+from vllm_ascend.dsa_offload.pd import (
+    DSA_OFFLOAD_PD_HANDOFF_KEY,
+    DSAOffloadPDHandoff,
+    DSAOffloadWorkerMetadata,
+    PrefillPublishState,
+    append_partial_tail_transfer,
+    build_handoff,
+    handoff_from_transfer_params,
+    make_aux_regions,
+)
 from vllm_ascend.utils import enable_custom_op, enable_sfa_dcp_replicated_indexer
 
 # isort: off
@@ -105,6 +116,7 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     block_strides: list[list[int]]
     local_ip: str = ""
     handshake_port: int = 0
+    dsa_offload_aux_regions: dict[str, list[dict[str, int]]] = msgspec.field(default_factory=dict)
 
 
 @dataclass
@@ -125,6 +137,7 @@ class ReqMeta:
     num_prompt_blocks: int
     remote_block_size: int
     local_full_block_ids: BlockIds = tuple()
+    dsa_offload_handoff: DSAOffloadPDHandoff | None = None
 
 
 @dataclass(frozen=True)
@@ -168,6 +181,7 @@ class KVCacheTaskTracker:
         super().__init__()
 
         self.done_task_lock = threading.Lock()
+        self.done_task_condition = threading.Condition(self.done_task_lock)
         self.finished_requests: set[str] = set()
         # Only used in prefill node. Tracks requests whose kv blocks freeing is
         # intentionally delayed. Each entry is a tuple of (request_id,
@@ -177,15 +191,17 @@ class KVCacheTaskTracker:
         self.reqs_to_process: set[str] = set()
 
     def add_req_to_process(self, request_id: str):
-        self.reqs_to_process.add(request_id)
+        with self.done_task_condition:
+            self.reqs_to_process.add(request_id)
 
     def add_not_transfer_request(self, request_id: str):
-        with self.done_task_lock:
+        with self.done_task_condition:
             self.finished_requests.add(request_id)
             self.reqs_to_process.discard(request_id)
+            self.done_task_condition.notify_all()
 
     def update_done_task_count(self, request_id: str):
-        with self.done_task_lock:
+        with self.done_task_condition:
             if request_id in self.reqs_to_process:
                 self.finished_requests.add(request_id)
                 self.reqs_to_process.discard(request_id)
@@ -198,6 +214,11 @@ class KVCacheTaskTracker:
                     "Check: Verify request lifecycle and tracking logic.",
                     request_id,
                 )
+            self.done_task_condition.notify_all()
+
+    def wait_for_request(self, request_id: str) -> None:
+        with self.done_task_condition:
+            self.done_task_condition.wait_for(lambda: request_id not in self.reqs_to_process)
 
     def get_and_clear_finished_requests(self) -> set[str]:
         """
@@ -205,7 +226,7 @@ class KVCacheTaskTracker:
         Returns:
             A set of request IDs that have been completed.
         """
-        with self.done_task_lock:
+        with self.done_task_condition:
             finished_requests = self.finished_requests.copy()
             expired_requests = self._retrieve_expired_requests()
             finished_requests.update(expired_requests)
@@ -214,7 +235,7 @@ class KVCacheTaskTracker:
 
     def add_delayed_request(self, request_id: str, delay_start_time: float):
         """Add a delayed free request."""
-        with self.done_task_lock:
+        with self.done_task_condition:
             if request_id in self.reqs_to_process:
                 self.delayed_free_requests[request_id] = delay_start_time
 
@@ -426,6 +447,11 @@ class KVCacheRecvingThread(threading.Thread):
         prefill_pp_layer_partition: str | None = None,
         kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]] | None = None,
         block_size_scale: list[list[int]] | None = None,
+        dsa_offload_aux_regions: dict[
+            str,
+            list[dict[str, int]],
+        ]
+        | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingThread")
         self.tp_rank = tp_rank
@@ -463,6 +489,11 @@ class KVCacheRecvingThread(threading.Thread):
         self.remote_block_size_scale: dict[str, dict[int, list[list[int]]]] = SizedDict()
         self.remote_block_stride_per_addr: dict[str, dict[int, list[list[int]]]] = SizedDict()
         self.remote_kv_group2layeridx: dict[str, dict[int, dict[int, tuple[dict[str, Any], list[int]]]]] = SizedDict()
+        self.dsa_offload_aux_regions = dsa_offload_aux_regions or {}
+        self.remote_dsa_offload_aux_regions: dict[
+            str,
+            dict[int, dict[str, list[dict[str, int]]]],
+        ] = SizedDict()
         self.remote_metadata_lock = threading.Lock()
         # Reformat metadata keyed by request_id then CP shard index. Populated by the
         # last TP-offset pull task for each shard; applied once all pull tasks finish.
@@ -567,6 +598,8 @@ class KVCacheRecvingThread(threading.Thread):
         shard_idx: int = 0,
         local_block_ids_replicate_k: BlockIds | None = None,
         remote_block_ids_replicate_k: BlockIds | None = None,
+        dsa_offload_handoff: DSAOffloadPDHandoff | None = None,
+        dsa_offload_row: int | None = None,
     ):
         """Add a new request to the queue for processing."""
         if remote_port_send_num is None:
@@ -587,6 +620,8 @@ class KVCacheRecvingThread(threading.Thread):
             "all_task_done": all_task_done,
             "shard_idx": shard_idx,
             "remote_block_size": remote_block_size,
+            "dsa_offload_handoff": dsa_offload_handoff,
+            "dsa_offload_row": dsa_offload_row,
         }
         logger.debug("Adding request %s to the queue.Trans info:%s", request_id, trans_info)
         self.request_queue.put(trans_info)
@@ -783,10 +818,12 @@ class KVCacheRecvingThread(threading.Thread):
         remote_engine_id = req_meta["remote_engine_id"]
         remote_host = req_meta["remote_host"]
         remote_handshake_port = req_meta["remote_handshake_port"]
+        handoff = req_meta["dsa_offload_handoff"]
+        has_partial_tail = handoff is not None and handoff.stored_token_count % handoff.block_size != 0
         # Full prefix cache hit: do not need to read remote blocks, just notify
         # P worker that we have the blocks we need.
         num_local_blocks = sum(len(group_block_ids) for group_block_ids in local_block_ids)
-        if num_local_blocks == 0 and not has_replicate_k_blocks:
+        if num_local_blocks == 0 and not has_replicate_k_blocks and not has_partial_tail:
             return
 
         # Check if we have the remote metadata cached.
@@ -802,6 +839,7 @@ class KVCacheRecvingThread(threading.Thread):
             local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
             remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
             remote_block_stride_per_addr = self.remote_block_stride_per_addr[remote_engine_id][remote_handshake_port]
+            remote_aux_regions = self.remote_dsa_offload_aux_regions[remote_engine_id][remote_handshake_port]
         session_id = f"{remote_host}:{remote_transfer_port}"
 
         req_start_time = time.perf_counter()
@@ -948,6 +986,16 @@ class KVCacheRecvingThread(threading.Thread):
                         inner_offset,
                         session_id,
                     )
+        append_partial_tail_transfer(
+            handoff=handoff,
+            tp_rank=self.tp_rank,
+            row_id=req_meta["dsa_offload_row"],
+            local_regions=self.dsa_offload_aux_regions,
+            remote_regions=remote_aux_regions,
+            local_addresses=src_list,
+            remote_addresses=dst_list,
+            lengths=length_list,
+        )
         if not src_list:
             return
 
@@ -1390,6 +1438,9 @@ class KVCacheRecvingThread(threading.Thread):
                 self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
                 self.remote_block_size_scale[engine_id][remote_handshake_port] = agent_meta.block_size_scale
                 self.remote_block_stride_per_addr[engine_id][remote_handshake_port] = agent_meta.block_strides
+                self.remote_dsa_offload_aux_regions[engine_id][remote_handshake_port] = (
+                    agent_meta.dsa_offload_aux_regions
+                )
         except Exception:
             if isinstance(sock, zmq.Socket):  # type: ignore
                 sock.close()
@@ -1502,6 +1553,7 @@ class MooncakeConnectorMetadata(KVConnectorMetadata):
             num_prompt_blocks=kv_transfer_params.get("num_prompt_blocks", 0),
             remote_block_size=kv_transfer_params.get("remote_block_size", 0),
             local_full_block_ids=local_full_block_ids or tuple(),
+            dsa_offload_handoff=handoff_from_transfer_params(kv_transfer_params),
         )
 
 
@@ -1555,12 +1607,51 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
+    def update_dsa_offload_before_request_finish(
+        self,
+        connector_output,
+    ) -> None:
+        assert self.connector_scheduler is not None
+        metadata = connector_output.kv_connector_worker_meta
+        self.connector_scheduler.consume_dsa_offload_metadata(metadata)
+        if isinstance(metadata, DSAOffloadWorkerMetadata):
+            connector_output.kv_connector_worker_meta = None
+
     ############################################################
     # Worker Side Methods
     ############################################################
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
+
+    def register_dsa_offload_aux_caches(
+        self,
+        caches: dict[str, tuple[torch.Tensor, ...]],
+        layout: HotCacheLayout,
+    ) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.register_dsa_offload_aux_caches(
+            caches,
+            layout,
+        )
+
+    def set_dsa_offload_request_rows(
+        self,
+        request_rows: Mapping[str, int],
+    ) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.set_dsa_offload_request_rows(request_rows)
+
+    def set_dsa_offload_publish_state(
+        self,
+        publish_state: PrefillPublishState | None,
+    ) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.dsa_offload_publish_state = publish_state
+
+    def build_connector_worker_meta(self):
+        assert self.connector_worker is not None
+        return self.connector_worker.build_dsa_offload_worker_metadata()
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
@@ -1580,6 +1671,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
     def wait_for_layer_load(self, layer_name: str) -> None:
         """MooncakeConnector does not do layerwise saving."""
         pass
+
+    def wait_for_dsa_offload_load(self, request_ids: set[str]) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.wait_for_dsa_offload_load(request_ids)
 
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
@@ -1673,6 +1768,26 @@ class MooncakeConnectorScheduler:
         self.use_compress = self._model_uses_compress()
         self.group_transfer_info = [self._get_group_transfer_info(group) for group in kv_cache_config.kv_cache_groups]
         self.need_truncate = self.use_compress or any(info.is_state_group for info in self.group_transfer_info)
+        self._dsa_offload_enabled = "dsa_offload" in vllm_config.additional_config
+        self._dsa_offload_topk: dict[
+            str,
+            dict[int, dict[str, list[int]]],
+        ] = {}
+        self._dsa_offload_partial_tails: dict[
+            str,
+            dict[int, dict[str, int]],
+        ] = {}
+
+    def consume_dsa_offload_metadata(self, metadata) -> None:
+        if not isinstance(metadata, DSAOffloadWorkerMetadata):
+            return
+        for request_id, ranks in metadata.request_layer_topk_by_rank.items():
+            self._dsa_offload_topk.setdefault(request_id, {}).update(ranks)
+        for request_id, ranks in metadata.request_partial_tail_blocks_by_rank.items():
+            self._dsa_offload_partial_tails.setdefault(
+                request_id,
+                {},
+            ).update(ranks)
 
     def _model_uses_compress(self) -> bool:
         hf_config = getattr(self.vllm_config.model_config, "hf_config", None)
@@ -1910,7 +2025,7 @@ class MooncakeConnectorScheduler:
             logger.info("Delaying free of %d blocks for request %s", sum(computed_block_lens), request.request_id)
             self._reqs_need_send[request.request_id] = time.time()
 
-        return delay_free_blocks, dict(
+        transfer_params = dict(
             do_remote_prefill=True,
             do_remote_decode=False,
             remote_block_ids=computed_block_ids,
@@ -1926,6 +2041,22 @@ class MooncakeConnectorScheduler:
             num_prompt_blocks=num_prompt_blocks,
             remote_block_size=self.block_size,
         )
+        if self._dsa_offload_enabled:
+            handoff = build_handoff(
+                request_id=request.request_id,
+                stored_token_count=request.num_prompt_tokens,
+                block_size=self.block_size,
+                layer_topk_by_rank=self._dsa_offload_topk.pop(request.request_id),
+                partial_tail_blocks_by_rank=(
+                    self._dsa_offload_partial_tails.pop(
+                        request.request_id,
+                        {},
+                    )
+                ),
+                tp_size=self.tp_size,
+            )
+            transfer_params[DSA_OFFLOAD_PD_HANDOFF_KEY] = handoff.to_dict()
+        return delay_free_blocks, transfer_params
 
     def _port_offset_from_handshake_metadata(
         self,
@@ -2062,6 +2193,51 @@ class MooncakeConnectorWorker:
             self.tp_num_need_pulls = num_d_block_heads // num_p_block_heads
         self.local_remote_block_port_mapping: dict[str, list[list[int]] | None] = {}
         self.remote_port_send_num: dict[str, dict[int, RemotePortInfo]] = {}
+        self._dsa_offload_aux_caches: dict[
+            str,
+            tuple[torch.Tensor, ...],
+        ] = {}
+        self._dsa_offload_aux_regions: dict[
+            str,
+            list[dict[str, int]],
+        ] = {}
+        self._dsa_offload_excluded_layers: set[str] = set()
+        self._dsa_offload_request_rows: dict[str, int] = {}
+        self._dsa_offload_pending_loads: set[str] = set()
+        self.dsa_offload_publish_state: PrefillPublishState | None = None
+
+    def register_dsa_offload_aux_caches(
+        self,
+        caches: dict[str, tuple[torch.Tensor, ...]],
+        layout: HotCacheLayout,
+    ) -> None:
+        self._dsa_offload_aux_caches = caches
+        self._dsa_offload_excluded_layers = set(caches)
+        region_layout = layout if self.kv_role != "kv_producer" else None
+        self._dsa_offload_aux_regions = make_aux_regions(
+            caches,
+            region_layout,
+        )
+
+    def set_dsa_offload_request_rows(
+        self,
+        request_rows: Mapping[str, int],
+    ) -> None:
+        self._dsa_offload_request_rows = dict(request_rows)
+
+    def build_dsa_offload_worker_metadata(
+        self,
+    ) -> DSAOffloadWorkerMetadata | None:
+        publish_state = self.dsa_offload_publish_state
+        self.dsa_offload_publish_state = None
+        return publish_state.worker_metadata() if publish_state is not None else None
+
+    def wait_for_dsa_offload_load(self, request_ids: set[str]) -> None:
+        assert self.kv_recv_thread is not None
+        pending = self._dsa_offload_pending_loads & request_ids
+        for request_id in pending:
+            self.kv_recv_thread.task_tracker.wait_for_request(request_id)
+        self._dsa_offload_pending_loads.difference_update(pending)
 
     def _get_prefill_decode_size(self, vllm_config: VllmConfig):
         # get prefill tp and dp size from extra config
@@ -2194,6 +2370,8 @@ class MooncakeConnectorWorker:
             # an eagle layer and assign a new layer id starting from total_layers.
             assigned_indices: set[int] = set()
             for layer_name in group_spec.layer_names:
+                if layer_name in self._dsa_offload_excluded_layers:
+                    continue
                 if "mtp" in layer_name:
                     layer_idx = next_mtp_layer_idx
                     next_mtp_layer_idx += 1
@@ -2282,6 +2460,8 @@ class MooncakeConnectorWorker:
             shared_addrs: list[int] = []
             has_mtp = False
             for layer_name in kv_cache_tensor.shared_by:
+                if layer_name in self._dsa_offload_excluded_layers:
+                    continue
                 has_mtp = has_mtp or "mtp" in layer_name
                 layer_spec = self._get_layer_spec(layer_name)
                 conv_padding = max(conv_padding, self._get_mamba_conv_padding(layer_spec))
@@ -2308,6 +2488,8 @@ class MooncakeConnectorWorker:
         for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
             shared_addrs: list[int] = []
             for layer_name in kv_cache_tensor.shared_by:
+                if layer_name in self._dsa_offload_excluded_layers:
+                    continue
                 for single_kv_cache in self._as_kv_cache_tuple(kv_caches[layer_name]):
                     shared_addrs.append(single_kv_cache.data_ptr())
 
@@ -2381,7 +2563,13 @@ class MooncakeConnectorWorker:
                 self.block_size_scale[layer_idx].append(block_size_scale)
                 self.kv_caches_base_addr[layer_idx].append(single_kv_cache.data_ptr())
 
-        if has_mamba_group:
+        registration_caches = {
+            **kv_caches,
+            **self._dsa_offload_aux_caches,
+        }
+        if self._dsa_offload_aux_caches:
+            register_regions = collect_storage_merged_register_regions(registration_caches)
+        elif has_mamba_group:
             ptrs, lengths = self._get_registered_kv_tensor_buffers(kv_caches)
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
         elif self.use_hybrid:
@@ -2422,11 +2610,13 @@ class MooncakeConnectorWorker:
             block_strides=self.block_stride_per_addr,
             local_ip=get_ip(),
             handshake_port=self.handshake_port,
+            dsa_offload_aux_regions=self._dsa_offload_aux_regions,
         )
         self.xfer_handshake_metadata = metadata
 
-        ready_event = threading.Event()
-        if self.kv_role == "kv_producer":
+        ready_threads: list[tuple[threading.Event, threading.Thread]] = []
+        if self.kv_role == "kv_producer" or (self.kv_role == "kv_both" and self._dsa_offload_aux_caches):
+            ready_event = threading.Event()
             self.kv_send_thread = KVCacheSendingThread(
                 self.vllm_config,
                 self.tp_rank,
@@ -2440,7 +2630,9 @@ class MooncakeConnectorWorker:
                 self.pcp_rank,
             )
             self.kv_send_thread.start()
-        else:
+            ready_threads.append((ready_event, self.kv_send_thread))
+        if self.kv_role in {"kv_consumer", "kv_both"}:
+            ready_event = threading.Event()
             self.kv_recv_thread = KVCacheRecvingThread(
                 self.tp_rank,
                 self.tp_size,
@@ -2459,29 +2651,30 @@ class MooncakeConnectorWorker:
                 self._prefill_pp_layer_partition,
                 self.kv_group2layeridx,
                 self.block_size_scale,
+                self._dsa_offload_aux_regions,
             )
             self.kv_recv_thread.start()
+            ready_threads.append((ready_event, self.kv_recv_thread))
         start_wait_time = time.time()
-        thread = self.kv_send_thread if self.kv_role == "kv_producer" else self.kv_recv_thread
-        assert thread is not None
-        while not ready_event.is_set():
-            if not thread.is_alive():
-                raise RuntimeError("KV Cache sending/receiving thread failed to start.")
-            if time.time() - start_wait_time > 5 * 60:
-                raise RuntimeError("Timeout waiting for KV Cache thread to be ready.")
-            time.sleep(3)
+        for ready_event, thread in ready_threads:
+            while not ready_event.is_set():
+                if not thread.is_alive():
+                    raise RuntimeError("KV Cache sending/receiving thread failed to start.")
+                if time.time() - start_wait_time > 5 * 60:
+                    raise RuntimeError("Timeout waiting for KV Cache thread to be ready.")
+                time.sleep(3)
 
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_sending = (
             self.kv_send_thread.get_and_clear_finished_requests(  # type: ignore[union-attr]
             )
-            if self.kv_role == "kv_producer"
+            if self.kv_role == "kv_producer" or self._dsa_offload_aux_caches and self.kv_send_thread is not None
             else set()
         )
         done_recving = (
             self.kv_recv_thread.get_and_clear_finished_requests(  # type: ignore[union-attr]
             )
-            if self.kv_role == "kv_consumer"
+            if self.kv_role == "kv_consumer" or self._dsa_offload_aux_caches and self.kv_recv_thread is not None
             else set()
         )
         if self.tp_rank == 0:
@@ -2491,10 +2684,11 @@ class MooncakeConnectorWorker:
                     len(done_sending),
                     len(done_recving),
                 )
+        self._dsa_offload_pending_loads.difference_update(done_recving)
         return done_sending, done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
-        if self.kv_role == "kv_consumer" and self.kv_recv_thread is not None:
+        if self.kv_recv_thread is not None and (self.kv_role == "kv_consumer" or self._dsa_offload_aux_caches):
             return self.kv_recv_thread.get_and_clear_invalid_block_ids()
         return set()
 
@@ -3376,9 +3570,12 @@ class MooncakeConnectorWorker:
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
         for req_id in metadata.reqs_in_batch:
-            if self.kv_send_thread is not None:
+            if self.kv_send_thread is not None and self.kv_recv_thread is not None:
+                thread = self.kv_recv_thread if req_id in metadata.requests else self.kv_send_thread
+                thread.task_tracker.add_req_to_process(req_id)
+            elif self.kv_send_thread is not None:
                 self.kv_send_thread.task_tracker.add_req_to_process(req_id)
-            if self.kv_recv_thread is not None:
+            elif self.kv_recv_thread is not None:
                 self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
 
         for req_id, meta in metadata.requests.items():
@@ -3394,6 +3591,14 @@ class MooncakeConnectorWorker:
 
             remote_req_id = meta.remote_request_id
             prefill_tp_size: int = meta.remote_ptp_size if meta.remote_ptp_size is not None else self._prefill_tp_size
+            handoff = meta.dsa_offload_handoff
+            if handoff is not None:
+                self._dsa_offload_pending_loads.add(req_id)
+            partial_tail_port = (
+                meta.remote_port + self.tp_rank
+                if handoff is not None and handoff.stored_token_count % handoff.block_size != 0
+                else None
+            )
             (
                 local_block_ids_replicate_k,
                 remote_block_ids_replicate_k,
@@ -3443,6 +3648,7 @@ class MooncakeConnectorWorker:
                         if replicate_k_transfer_port is not None and remote_handshake_port == replicate_k_transfer_port
                         else None
                     )
+                    transfer_partial_tail = remote_handshake_port == partial_tail_port
                     self.kv_recv_thread.add_request(
                         request_id=req_id,
                         remote_request_id=remote_req_id,
@@ -3462,6 +3668,8 @@ class MooncakeConnectorWorker:
                         remote_block_size=meta.remote_block_size,
                         local_block_ids_replicate_k=local_block_ids_replicate_k_for_port,
                         remote_block_ids_replicate_k=remote_block_ids_replicate_k_for_port,
+                        dsa_offload_handoff=(handoff if transfer_partial_tail else None),
+                        dsa_offload_row=(self._dsa_offload_request_rows[req_id] if transfer_partial_tail else None),
                     )
 
         if self.kv_send_thread is not None and self.pcp_size * self.dcp_size == 1:

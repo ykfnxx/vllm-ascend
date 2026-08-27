@@ -41,6 +41,11 @@ from vllm_ascend.attention.utils import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.dsa_offload.sfa import (
+    prepare_main_slot_mapping,
+    publish_prefill_layer,
+    resolve_sfa_inputs,
+)
 from vllm_ascend.memcache_comm_fence import (
     record_attention_compute_start,
 )
@@ -245,6 +250,7 @@ class AscendSFAMetadata:
     group_len: torch.Tensor | None = None
     group_key_idx: torch.Tensor | None = None
     group_key_cache_idx: torch.Tensor | None = None
+    dsa_offload_batch: Any | None = None
 
 
 M = TypeVar("M", bound=AscendSFAMetadata)
@@ -1586,7 +1592,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         topk_indices_buffer.copy_(topk_indices_to_cache)
 
     def _execute_sparse_flash_attention_process(
-        self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
+        self,
+        ql_nope,
+        q_pe,
+        kv_cache,
+        topk_indices,
+        attn_metadata,
+        actual_seq_lengths_query,
+        actual_seq_lengths_key,
+        block_table=None,
     ):
         return DeviceOperator.execute_sparse_flash_attention_process(
             self,
@@ -1597,6 +1611,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
+            block_table=block_table,
         )
 
     def _record_dcp_query_gather_context(
@@ -1645,6 +1660,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                         reach_layer_for_shard_weight_series(layer)
             return output.fill_(0)
 
+        main_cache = kv_cache
         kv_cache = self._compose_sfa_kv_cache(kv_cache)
 
         cos = attn_metadata.cos
@@ -1665,6 +1681,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.dcp_context.slot_mapping
             if attn_metadata.dcp_context is not None
             else attn_metadata.slot_mapping
+        )
+        main_slot_mapping = prepare_main_slot_mapping(
+            batch=attn_metadata.dsa_offload_batch,
+            default_slot_mapping=slot_mapping_sfa,
         )
 
         # Inputs and outputs may be padded for CUDA graphs
@@ -1706,7 +1726,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_cache=kv_cache,
                 cos=cos,
                 sin=sin,
-                slot_mapping=slot_mapping,
+                slot_mapping=main_slot_mapping,
                 cache_mode="PA_BSND",
             )
         # run mlapo ops when dsa-cp is disabled, and ensure that num_tokens satisfies the count limitation
@@ -1721,7 +1741,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 kv_cache=kv_cache,
                 cos=cos,
                 sin=sin,
-                slot_mapping=slot_mapping,
+                slot_mapping=main_slot_mapping,
                 num_input_tokens=num_input_tokens,
             )
             if self.has_indexer:
@@ -1767,7 +1787,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert slot_mapping_cp is not None
                 kv_slots = slot_mapping_cp
             else:
-                kv_slots = slot_mapping_sfa
+                kv_slots = main_slot_mapping
             kv_outputs = self.exec_kv(kv_no_split, cos, sin, kv_cache, kv_slots, attn_metadata)
             k_pe, k_nope = kv_outputs[:2]
             knope_scale = kv_outputs[2] if len(kv_outputs) == 3 else None
@@ -1785,7 +1805,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert packed_kv.shape[-1] == packed_head_dim
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[0].view(-1, packed_head_dim),
-                    slot_mapping_sfa.view(-1, 1),
+                    main_slot_mapping.view(-1, 1),
                     packed_kv.view(-1, packed_head_dim),
                 )
 
@@ -1866,7 +1886,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     if self.enable_sparse_sfa_c8:
                         torch_npu.npu_scatter_nd_update_(
                             kv_cache[0].view(-1, fused_kv_no_split.shape[-1]),
-                            slot_mapping_sfa[: attn_metadata.num_actual_tokens].view(-1, 1),
+                            main_slot_mapping[: attn_metadata.num_actual_tokens].view(-1, 1),
                             fused_kv_no_split[: attn_metadata.num_actual_tokens],
                         )
                         k_pe = None
@@ -1886,7 +1906,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                             value=k_pe[: attn_metadata.num_actual_tokens],
                             key_cache=kv_cache[0],
                             value_cache=kv_cache[1],
-                            slot_mapping=slot_mapping_sfa[: attn_metadata.num_actual_tokens],
+                            slot_mapping=main_slot_mapping[: attn_metadata.num_actual_tokens],
                         )
 
             # DCP's prefill path may all-gather only the blocks referenced by
@@ -1972,6 +1992,19 @@ class AscendSFAImpl(MLAAttentionImpl):
             if self.use_index_cache:
                 self._update_indexcache_topk_indices(topk_indices)
 
+        publish_prefill_layer(
+            layer_name=layer_name,
+            semantic_topk=topk_indices,
+            main_cache=main_cache,
+            block_table=attn_metadata.block_table,
+            batch=attn_metadata.dsa_offload_batch,
+        )
+        topk_indices, sfa_block_table = resolve_sfa_inputs(
+            layer_name=layer_name,
+            semantic_topk=topk_indices,
+            default_block_table=attn_metadata.block_table,
+            batch=attn_metadata.dsa_offload_batch,
+        )
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope,
             q_pe,
@@ -1980,6 +2013,7 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
+            block_table=sfa_block_table,
         )
 
         attn_output = self._v_up_proj(attn_output)
