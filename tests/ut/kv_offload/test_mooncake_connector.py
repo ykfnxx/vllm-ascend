@@ -1022,6 +1022,7 @@ class TestCoreFunctionality(unittest.TestCase):
         remote_addresses = []
         lengths = []
 
+        self.thread._validate_dsa_sparse_aux_region_layouts(remote_regions)
         self.thread._append_dsa_sparse_partial_tail_transfer_meta(
             req_meta={
                 "dsa_sparse_handoff": handoff,
@@ -1046,6 +1047,67 @@ class TestCoreFunctionality(unittest.TestCase):
             [0x3000 + 7 * 1024, 0x4000 + 7 * 256],
         )
         self.assertEqual(lengths, [3 * 8, 3 * 2])
+
+    def test_dsa_sparse_partial_tail_supports_one_packed_plane(self):
+        layer_name = "model.layers.0.self_attn.attn"
+        block_stride = 128 * 656
+        self.thread.dsa_sparse_aux_regions = {
+            layer_name: [
+                {
+                    "base_addr": 0x1000,
+                    "block_stride": block_stride,
+                    "token_bytes": 656,
+                    "blocks_per_request": 82,
+                    "tail_block_offset": 80,
+                }
+            ]
+        }
+        remote_regions = {
+            layer_name: [
+                {
+                    "base_addr": 0x3000,
+                    "block_stride": block_stride,
+                    "token_bytes": 656,
+                    "blocks_per_request": 0,
+                    "tail_block_offset": 0,
+                }
+            ]
+        }
+        handoff = DSASparsePDHandoff(
+            remote_request_id="req1",
+            stored_token_count=259,
+            block_size=128,
+            layer_topk_by_rank={
+                0: {layer_name: list(range(DSA_SPARSE_QUERY_WIDTH))}
+            },
+            partial_tail_blocks_by_rank={0: {layer_name: 7}},
+        )
+        local_addresses = []
+        remote_addresses = []
+        lengths = []
+
+        self.thread._validate_dsa_sparse_aux_region_layouts(remote_regions)
+        self.thread._append_dsa_sparse_partial_tail_transfer_meta(
+            req_meta={
+                "dsa_sparse_handoff": handoff,
+                "dsa_sparse_pool_entry": 2,
+            },
+            remote_aux_regions=remote_regions,
+            local_addresses=local_addresses,
+            remote_addresses=remote_addresses,
+            lengths=lengths,
+        )
+
+        destination_block = 2 * 82 + 80
+        self.assertEqual(
+            local_addresses,
+            [0x1000 + destination_block * block_stride],
+        )
+        self.assertEqual(
+            remote_addresses,
+            [0x3000 + 7 * block_stride],
+        )
+        self.assertEqual(lengths, [3 * 656])
 
     @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
     def test_transfer_dsa_sparse_indexer_uses_remote_layer_name_mapping(self, mock_get_meta):
@@ -2464,6 +2526,35 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         worker.register_kv_caches(mla_caches)
         self.assertTrue(worker.use_mla)
         self.assertEqual(len(worker.block_len_per_addr[0]), 2)
+
+    def test_register_dsa_sparse_single_packed_main_plane(self):
+        packed_main = torch.empty((10, 16, 1, 656), dtype=torch.uint8)
+        worker = MooncakeConnectorWorker(
+            self.vllm_config,
+            self.engine_id,
+            MockKVCacheConfig(),
+        )
+        worker.register_dsa_sparse_aux_caches(
+            {"model.layers.0.self_attn.attn": (packed_main,)},
+            {},
+        )
+
+        worker.register_kv_caches(self.kv_caches)
+
+        regions = worker.xfer_handshake_metadata.dsa_sparse_aux_regions
+        self.assertEqual(
+            regions["model.layers.0.self_attn.attn"],
+            [
+                {
+                    "base_addr": packed_main.data_ptr(),
+                    "block_stride": packed_main.stride(0),
+                    "token_bytes": packed_main.stride(1),
+                    "num_blocks": 10,
+                    "blocks_per_request": 0,
+                    "tail_block_offset": 0,
+                }
+            ],
+        )
 
     def test_device_id_selection_with_physical_devices(self):
         # Test with physical devices set

@@ -841,8 +841,10 @@ class KVCacheRecvingThread(threading.Thread):
                 remote_planes = remote_aux_regions[layer_name]
             except KeyError as error:
                 raise RuntimeError(f"Mooncake DSA Sparse auxiliary metadata is missing layer {layer_name!r}") from error
-            if len(local_planes) != 2 or len(remote_planes) != 2:
-                raise RuntimeError("DSA Sparse partial-tail transfer requires two planes")
+            if not local_planes or len(local_planes) != len(remote_planes):
+                raise RuntimeError(
+                    "DSA Sparse partial-tail cache plane layouts do not match"
+                )
             for local_plane, remote_plane in zip(local_planes, remote_planes):
                 local_token_bytes = local_plane["token_bytes"]
                 remote_token_bytes = remote_plane["token_bytes"]
@@ -860,6 +862,36 @@ class KVCacheRecvingThread(threading.Thread):
                 local_addresses.append(local_plane["base_addr"] + destination_block_id * local_plane["block_stride"])
                 remote_addresses.append(remote_plane["base_addr"] + int(source_block_id) * remote_plane["block_stride"])
                 lengths.append(tail_valid_count * local_token_bytes)
+
+    def _validate_dsa_sparse_aux_region_layouts(
+        self,
+        remote_aux_regions: dict[str, list[dict[str, int]]],
+    ) -> None:
+        local_aux_regions = self.dsa_sparse_aux_regions
+        if not local_aux_regions and not remote_aux_regions:
+            return
+        if set(local_aux_regions) != set(remote_aux_regions):
+            raise RuntimeError(
+                "Mooncake DSA Sparse auxiliary cache layers do not match"
+            )
+        for layer_name, local_planes in local_aux_regions.items():
+            remote_planes = remote_aux_regions[layer_name]
+            if not local_planes or len(local_planes) != len(remote_planes):
+                raise RuntimeError(
+                    "Mooncake DSA Sparse auxiliary cache plane layouts do not "
+                    f"match for {layer_name!r}"
+                )
+            for local_plane, remote_plane in zip(local_planes, remote_planes):
+                if (
+                    local_plane["token_bytes"]
+                    != remote_plane["token_bytes"]
+                    or local_plane["block_stride"]
+                    != remote_plane["block_stride"]
+                ):
+                    raise RuntimeError(
+                        "Mooncake DSA Sparse auxiliary cache byte layouts do not "
+                        f"match for {layer_name!r}"
+                    )
 
     def _transfer_kv_cache_all_groups(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request."""
@@ -1650,6 +1682,9 @@ class KVCacheRecvingThread(threading.Thread):
                         engine_id,
                         remote_handshake_port,
                     )
+            self._validate_dsa_sparse_aux_region_layouts(
+                agent_meta.dsa_sparse_aux_regions
+            )
             with self.remote_metadata_lock:
                 self.remote_kv_group2layeridx[engine_id][remote_handshake_port] = agent_meta.kv_group2layeridx
                 self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr
@@ -2911,8 +2946,10 @@ class MooncakeConnectorWorker:
         self.kv_caches = transfer_kv_caches
         dsa_sparse_aux_regions: dict[str, list[dict[str, int]]] = {}
         for layer_name, cache_planes in self._dsa_sparse_aux_caches.items():
-            if len(cache_planes) != 2:
-                raise ValueError("Mooncake DSA Sparse auxiliary cache requires two planes")
+            if not cache_planes:
+                raise ValueError(
+                    "Mooncake DSA Sparse auxiliary cache requires at least one plane"
+                )
             blocks_per_request, tail_block_offset = self._dsa_sparse_tail_layouts.get(layer_name, (0, 0))
             plane_regions: list[dict[str, int]] = []
             for plane in cache_planes:

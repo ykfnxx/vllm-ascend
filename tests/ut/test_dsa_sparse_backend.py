@@ -103,3 +103,61 @@ def test_kvio_registers_two_planes_and_translates_put_get_descriptors():
         [12, 4],
     )
     assert [_values(wait) for wait in ops.waits] == [([1], [2]), ([2], [2])]
+
+
+def test_kvio_translates_one_packed_main_plane():
+    ops = FakeKVIOOps()
+    backend = KVIODSASparseKVBackend(
+        7,
+        ops_module=ops,
+        tensor_ops=ops,
+    )
+    packed_main = torch.zeros((4, 2, 1, 13), dtype=torch.uint8)
+    backend.register_layer_cache(
+        layer_id=3,
+        block_size=2,
+        cache_planes=(packed_main,),
+    )
+    backend.finalize_cache_registration()
+
+    backend.put_blocks(
+        layer_id=3,
+        storage_request_ids=torch.tensor([41], dtype=torch.int64),
+        source_block_ids=torch.tensor([2], dtype=torch.int64),
+    )
+    backend.load_tokens_into(
+        layer_id=3,
+        storage_request_ids=torch.tensor([41], dtype=torch.int64),
+        token_offsets_in_block=torch.tensor([1], dtype=torch.int64),
+        destination_physical_slots=torch.tensor([4], dtype=torch.int64),
+    )
+
+    assert ops.init_args == (
+        [packed_main.data_ptr()],
+        [packed_main.numel() * packed_main.element_size()],
+    )
+    assert _values(ops.calls[0]) == (
+        [1],
+        [7],
+        [1],
+        [1],
+        [0x05],
+        [0],
+        [41],
+        [52],
+        [0],
+        [26],
+    )
+    assert _values(ops.calls[1]) == (
+        [2],
+        [7],
+        [1],
+        [1],
+        [0x06],
+        [0],
+        [41],
+        [52],
+        [13],
+        [13],
+    )
+    assert [_values(wait) for wait in ops.waits] == [([1], [1]), ([2], [1])]

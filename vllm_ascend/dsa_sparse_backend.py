@@ -120,7 +120,7 @@ class MockDSASparseKVBackend(DSASparseKVBackend):
     """Use the production call boundary without external payload storage."""
 
     def __init__(self) -> None:
-        self.layer_caches: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.layer_caches: dict[int, tuple[torch.Tensor, ...]] = {}
         self.put_calls: list[tuple[int, torch.Tensor, torch.Tensor]] = []
         self.load_calls: list[tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
@@ -132,9 +132,9 @@ class MockDSASparseKVBackend(DSASparseKVBackend):
         cache_planes: tuple[torch.Tensor, ...],
     ) -> None:
         del block_size
-        if len(cache_planes) != 2:
-            raise ValueError("DSA Sparse backend requires two Main KV planes")
-        self.layer_caches[int(layer_id)] = (cache_planes[0], cache_planes[1])
+        if not cache_planes:
+            raise ValueError("DSA Sparse backend requires at least one Main KV plane")
+        self.layer_caches[int(layer_id)] = tuple(cache_planes)
 
     def put_blocks(
         self,
@@ -195,7 +195,7 @@ class KVIODSASparseKVBackend(DSASparseKVBackend):
         self._ops = ops_module
         self._tensor_ops = tensor_ops
         self._pending: dict[int, tuple[int, tuple[torch.Tensor, ...]]] = {}
-        self._regions: dict[int, tuple[_KVIORegion, _KVIORegion]] = {}
+        self._regions: dict[int, tuple[_KVIORegion, ...]] = {}
         self._task_id: torch.Tensor | None = None
         self._model_id_tensor: torch.Tensor | None = None
         self._pd_flag: torch.Tensor | None = None
@@ -211,11 +211,11 @@ class KVIODSASparseKVBackend(DSASparseKVBackend):
     ) -> None:
         if self._task_id is not None:
             raise RuntimeError("KVIO cache registration is already finalized")
-        if len(cache_planes) != 2:
-            raise ValueError("DSA Sparse KVIO requires two Main KV planes")
+        if not cache_planes:
+            raise ValueError("DSA Sparse KVIO requires at least one Main KV plane")
         if any(not plane.is_contiguous() for plane in cache_planes):
             raise ValueError("DSA Sparse KVIO cache planes must be contiguous")
-        self._pending[int(layer_id)] = (int(block_size), cache_planes)
+        self._pending[int(layer_id)] = (int(block_size), tuple(cache_planes))
 
     def finalize_cache_registration(self) -> None:
         if self._task_id is not None:
@@ -254,7 +254,7 @@ class KVIODSASparseKVBackend(DSASparseKVBackend):
                 storage_offset += block_bytes
                 addresses.append(plane.data_ptr())
                 lengths.append(plane.numel() * plane.element_size())
-            self._regions[layer_id] = (regions[0], regions[1])
+            self._regions[layer_id] = tuple(regions)
         assert self._ops is not None and device is not None
         error_code = int(self._ops.aiv_init(addresses, lengths))
         if error_code:
@@ -267,8 +267,10 @@ class KVIODSASparseKVBackend(DSASparseKVBackend):
         self._get_opcode = torch.full((1,), _KVIO_GET_OPCODE, **kwargs)
 
     @staticmethod
-    def _interleave(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
-        return torch.stack((first, second), dim=1).reshape(-1).contiguous()
+    def _interleave_regions(values: list[torch.Tensor]) -> torch.Tensor:
+        if not values:
+            raise ValueError("KVIO requires at least one cache region")
+        return torch.stack(values, dim=1).reshape(-1).contiguous()
 
     def _submit(
         self,
@@ -312,27 +314,32 @@ class KVIODSASparseKVBackend(DSASparseKVBackend):
             raise ValueError("KVIO PUT descriptors must have equal size")
         if not request_ids.numel():
             return
-        cache_ids = self._interleave(
-            torch.full_like(request_ids, regions[0].cache_id),
-            torch.full_like(request_ids, regions[1].cache_id),
+        cache_ids = self._interleave_regions(
+            [
+                torch.full_like(request_ids, region.cache_id)
+                for region in regions
+            ]
         )
-        cache_offsets = self._interleave(
-            block_ids * regions[0].block_bytes,
-            block_ids * regions[1].block_bytes,
+        cache_offsets = self._interleave_regions(
+            [block_ids * region.block_bytes for region in regions]
         )
-        storage_offsets = self._interleave(
-            torch.full_like(request_ids, regions[0].storage_offset),
-            torch.full_like(request_ids, regions[1].storage_offset),
+        storage_offsets = self._interleave_regions(
+            [
+                torch.full_like(request_ids, region.storage_offset)
+                for region in regions
+            ]
         )
-        lengths = self._interleave(
-            torch.full_like(request_ids, regions[0].block_bytes),
-            torch.full_like(request_ids, regions[1].block_bytes),
+        lengths = self._interleave_regions(
+            [
+                torch.full_like(request_ids, region.block_bytes)
+                for region in regions
+            ]
         )
         assert self._put_opcode is not None
         self._submit(
             self._put_opcode,
             cache_ids,
-            request_ids.repeat_interleave(2).contiguous(),
+            request_ids.repeat_interleave(len(regions)).contiguous(),
             cache_offsets,
             storage_offsets,
             lengths,
@@ -355,27 +362,32 @@ class KVIODSASparseKVBackend(DSASparseKVBackend):
             raise ValueError("KVIO GET descriptors must have equal size")
         if not request_ids.numel():
             return
-        cache_ids = self._interleave(
-            torch.full_like(request_ids, regions[0].cache_id),
-            torch.full_like(request_ids, regions[1].cache_id),
+        cache_ids = self._interleave_regions(
+            [
+                torch.full_like(request_ids, region.cache_id)
+                for region in regions
+            ]
         )
-        cache_offsets = self._interleave(
-            slots * regions[0].token_bytes,
-            slots * regions[1].token_bytes,
+        cache_offsets = self._interleave_regions(
+            [slots * region.token_bytes for region in regions]
         )
-        storage_offsets = self._interleave(
-            token_offsets * regions[0].token_bytes + regions[0].storage_offset,
-            token_offsets * regions[1].token_bytes + regions[1].storage_offset,
+        storage_offsets = self._interleave_regions(
+            [
+                token_offsets * region.token_bytes + region.storage_offset
+                for region in regions
+            ]
         )
-        lengths = self._interleave(
-            torch.full_like(request_ids, regions[0].token_bytes),
-            torch.full_like(request_ids, regions[1].token_bytes),
+        lengths = self._interleave_regions(
+            [
+                torch.full_like(request_ids, region.token_bytes)
+                for region in regions
+            ]
         )
         assert self._get_opcode is not None
         self._submit(
             self._get_opcode,
             cache_ids,
-            request_ids.repeat_interleave(2).contiguous(),
+            request_ids.repeat_interleave(len(regions)).contiguous(),
             cache_offsets,
             storage_offsets,
             lengths,
