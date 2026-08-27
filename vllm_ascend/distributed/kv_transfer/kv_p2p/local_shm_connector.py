@@ -80,8 +80,11 @@ def _align_up(value: int, alignment: int = _ALIGNMENT) -> int:
 def _cache_planes(cache: Any) -> tuple[torch.Tensor, ...]:
     if isinstance(cache, torch.Tensor):
         return (cache,)
-    if isinstance(cache, (tuple, list)) and all(isinstance(plane, torch.Tensor) for plane in cache):
-        return tuple(cache)
+    if isinstance(cache, (tuple, list)):
+        if not cache:
+            raise ValueError("LocalShmConnector cache requires at least one tensor plane")
+        if all(isinstance(plane, torch.Tensor) for plane in cache):
+            return tuple(cache)
     raise TypeError(f"Unsupported KV cache type: {type(cache).__name__}")
 
 
@@ -537,6 +540,59 @@ class LocalShmConnectorWorker:
         if mismatches:
             raise RuntimeError(f"LocalShmConnector manifest does not match the Decode request: {mismatches}")
 
+    def _validate_payload_plane_layouts(self, manifest: dict[str, Any], meta: ReqMeta) -> None:
+        records = manifest.get("records")
+        if not isinstance(records, list):
+            raise RuntimeError("LocalShmConnector manifest records must be a list")
+
+        expected: dict[tuple[str, str], set[int]] = {}
+        for layer_name, planes in self.kv_caches.items():
+            group_id = self._layer_group_ids[layer_name]
+            if group_id >= len(meta.remote_block_ids):
+                raise IndexError(f"LocalShmConnector group id is out of range: {group_id}")
+            if meta.remote_block_ids[group_id]:
+                expected[("kv", layer_name)] = set(range(len(planes)))
+
+        handoff = meta.dsa_sparse_handoff
+        if handoff is not None and handoff.stored_token_count % handoff.block_size:
+            source_layers = handoff.partial_tail_blocks_by_rank.get(self.tp_rank, {})
+            if set(source_layers) != set(self._dsa_sparse_aux_caches):
+                raise RuntimeError(
+                    "LocalShmConnector partial-tail layers do not match the registered Decode Main caches"
+                )
+            missing_layouts = set(source_layers) - set(self._dsa_sparse_tail_layouts)
+            if missing_layouts:
+                raise RuntimeError(
+                    "LocalShmConnector Decode partial-tail layouts are missing layers: "
+                    f"{sorted(missing_layouts)}"
+                )
+            for layer_name in source_layers:
+                expected[("tail", layer_name)] = set(
+                    range(len(self._dsa_sparse_aux_caches[layer_name]))
+                )
+
+        observed: dict[tuple[str, str], list[int]] = {}
+        for record in records:
+            kind = str(record.get("kind"))
+            layer_name = str(record.get("layer_name"))
+            plane_index = int(record["plane_index"])
+            observed.setdefault((kind, layer_name), []).append(plane_index)
+
+        mismatches = {
+            f"{kind}:{layer_name}": {
+                "published": sorted(observed.get((kind, layer_name), [])),
+                "expected": sorted(expected.get((kind, layer_name), set())),
+            }
+            for kind, layer_name in sorted(set(expected) | set(observed))
+            if sorted(observed.get((kind, layer_name), []))
+            != sorted(expected.get((kind, layer_name), set()))
+        }
+        if mismatches:
+            raise RuntimeError(
+                "LocalShmConnector payload cache plane layouts do not match Decode: "
+                f"{mismatches}"
+            )
+
     def _load_kv_record(self, mapping: mmap.mmap, record: dict[str, Any], meta: ReqMeta) -> None:
         group_id = int(record["group_id"])
         layer_name = str(record["layer_name"])
@@ -561,7 +617,12 @@ class LocalShmConnectorWorker:
         if copy_count < 0:
             raise RuntimeError("LocalShmConnector prefix exceeds the published KV payload")
 
-        plane = self.kv_caches[layer_name][plane_index]
+        planes = self.kv_caches[layer_name]
+        if plane_index < 0 or plane_index >= len(planes):
+            raise IndexError(
+                f"LocalShmConnector Decode cache plane is out of range: {layer_name}[{plane_index}]"
+            )
+        plane = planes[plane_index]
         if str(plane.dtype) != record["dtype"]:
             raise TypeError(f"LocalShmConnector dtype differs for {layer_name!r}")
         if plane.shape[0] % self.num_blocks:
@@ -610,7 +671,13 @@ class LocalShmConnectorWorker:
 
         blocks_per_request, tail_block_offset = self._dsa_sparse_tail_layouts[layer_name]
         destination_block = request_row * blocks_per_request + tail_block_offset
-        plane = self._dsa_sparse_aux_caches[layer_name][plane_index]
+        planes = self._dsa_sparse_aux_caches[layer_name]
+        if plane_index < 0 or plane_index >= len(planes):
+            raise IndexError(
+                "LocalShmConnector Decode Hot Cache plane is out of range: "
+                f"{layer_name}[{plane_index}]"
+            )
+        plane = planes[plane_index]
         if destination_block < 0 or destination_block >= plane.shape[0]:
             raise IndexError(f"LocalShmConnector partial-tail destination is out of range: {layer_name}")
         if str(plane.dtype) != record["dtype"]:
@@ -626,6 +693,7 @@ class LocalShmConnectorWorker:
         data_path, ready_path = self._request_paths(meta.remote_engine_id, meta.remote_request_id)
         manifest = self._wait_for_manifest(ready_path, request_id)
         self._validate_manifest(manifest, meta)
+        self._validate_payload_plane_layouts(manifest, meta)
         data_size = int(manifest["data_size"])
         success = False
         with data_path.open("r+b") as data_file:

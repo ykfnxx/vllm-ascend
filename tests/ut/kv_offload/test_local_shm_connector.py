@@ -13,9 +13,11 @@ fake_engine.TransferEngine = MagicMock()  # type: ignore[attr-defined]
 sys.modules["mooncake.engine"] = fake_engine
 
 from vllm_ascend.attention.dsa_sparse_pd import DSASparsePDHandoff  # noqa: E402
+from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p.local_shm_connector import (  # noqa: E402
     LocalShmConnectorWorker,
     LocalShmSendSpec,
+    _cache_planes,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import ReqMeta  # noqa: E402
 from vllm_ascend.dsa_sparse_constants import DSA_SPARSE_QUERY_WIDTH  # noqa: E402
@@ -37,11 +39,18 @@ def _worker(shm_dir: Path, *, engine_id: str) -> LocalShmConnectorWorker:
     return worker
 
 
-def test_rank_local_mmap_transfers_scheduler_kv_and_partial_tail(tmp_path: Path):
+def test_rank_local_mmap_transfers_scheduler_kv_and_packed_c8_tail(tmp_path: Path):
+    packed_head_dim = get_sfa_qsfa_packed_head_dim(512, 64)
     source_kv = torch.arange(24, dtype=torch.float32).reshape(4, 2, 3)
-    source_main = torch.arange(100, 124, dtype=torch.float32).reshape(4, 2, 3)
+    source_main = (
+        torch.arange(4 * 2 * packed_head_dim, dtype=torch.int64)
+        .remainder(256)
+        .to(torch.uint8)
+        .reshape(4, 2, 1, packed_head_dim)
+        .view(torch.float8_e4m3fn)
+    )
     destination_kv = torch.zeros_like(source_kv)
-    destination_hot = torch.zeros((2, 2, 3), dtype=torch.float32)
+    destination_hot = torch.zeros((2, 2, 1, packed_head_dim), dtype=torch.float8_e4m3fn)
 
     handoff = DSASparsePDHandoff(
         remote_request_id="remote-request",
@@ -87,7 +96,10 @@ def test_rank_local_mmap_transfers_scheduler_kv_and_partial_tail(tmp_path: Path)
 
     torch.testing.assert_close(destination_kv[1], source_kv[2])
     torch.testing.assert_close(destination_kv[3], source_kv[0])
-    torch.testing.assert_close(destination_hot[1, 0], source_main[1, 0])
+    assert torch.equal(
+        destination_hot[1, 0].view(torch.uint8),
+        source_main[1, 0].view(torch.uint8),
+    )
     assert not list(tmp_path.iterdir())
 
 
@@ -109,3 +121,43 @@ def test_manifest_rejects_wrong_tp_rank(tmp_path: Path):
 
     with pytest.raises(RuntimeError, match="tp_rank"):
         consumer._validate_manifest(manifest, meta)
+
+
+def test_payload_plane_validation_rejects_missing_plane(tmp_path: Path):
+    consumer = _worker(tmp_path, engine_id="decode")
+    consumer.kv_caches = {}
+    consumer._dsa_sparse_aux_caches = {
+        "main": (
+            torch.empty((2, 2, 1, 13), dtype=torch.uint8),
+            torch.empty((2, 2, 1), dtype=torch.float32),
+        )
+    }
+    consumer._dsa_sparse_tail_layouts = {"main": (2, 1)}
+    handoff = DSASparsePDHandoff(
+        remote_request_id="remote-request",
+        stored_token_count=3,
+        block_size=2,
+        layer_topk_by_rank={0: {"main": list(range(DSA_SPARSE_QUERY_WIDTH))}},
+        partial_tail_blocks_by_rank={0: {"main": 1}},
+    )
+    meta = types.SimpleNamespace(
+        remote_block_ids=([],),
+        dsa_sparse_handoff=handoff,
+    )
+    manifest = {
+        "records": [
+            {
+                "kind": "tail",
+                "layer_name": "main",
+                "plane_index": 0,
+            }
+        ]
+    }
+
+    with pytest.raises(RuntimeError, match="plane layouts do not match"):
+        consumer._validate_payload_plane_layouts(manifest, meta)
+
+
+def test_cache_planes_rejects_empty_cache():
+    with pytest.raises(ValueError, match="at least one tensor plane"):
+        _cache_planes(())
