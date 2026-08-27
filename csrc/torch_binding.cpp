@@ -49,6 +49,8 @@
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
+#include "attention/dsa_offload/lookup_update/dsa_offload_lookup_update_torch_adpt.h"
+#include "attention/dsa_offload/lookup_update_batch/dsa_offload_lookup_update_batch_torch_adpt.h"
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
 #include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
@@ -2946,6 +2948,41 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "store_kv_block(Tensor key_in, Tensor key_cache_in, Tensor group_len, Tensor group_key_idx,Tensor group_key_cache_idx, int block_size=0) -> ()"
     );
     ops.impl("store_kv_block", torch::kPrivateUse1, &vllm_ascend::store_kv_block);
+
+    ops.def(
+        "dsa_offload_lookup_update("
+            "Tensor(a!) index, "
+            "Tensor(b!) slot_to_index, "
+            "Tensor(c!) free_slots, "
+            "Tensor(d!) free_head, "
+            "Tensor request_rows, "
+            "Tensor query_indices, "
+            "Tensor lookup_mask, "
+            "int req_num"
+        ") -> (Tensor, Tensor)"
+    );
+    ops.impl(
+        "dsa_offload_lookup_update",
+        torch::kPrivateUse1,
+        &vllm_ascend::dsa_offload_lookup_update);
+
+    ops.def(
+        "dsa_offload_lookup_update_batch("
+            "Tensor(a!) index, "
+            "Tensor(b!) slot_to_index, "
+            "Tensor(c!) free_slots, "
+            "Tensor(d!) free_head, "
+            "Tensor request_rows, "
+            "Tensor query_start_loc, "
+            "Tensor query_indices, "
+            "Tensor lookup_mask, "
+            "int req_num"
+        ") -> (Tensor, Tensor)"
+    );
+    ops.impl(
+        "dsa_offload_lookup_update_batch",
+        torch::kPrivateUse1,
+        &vllm_ascend::dsa_offload_lookup_update_batch);
     
     // Fused GDN gating.
     ops.def(
