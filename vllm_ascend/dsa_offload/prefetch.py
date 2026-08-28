@@ -158,6 +158,7 @@ def _prepare_qli(impl: object) -> tuple[bool, torch.Tensor | None]:
 @dataclass(frozen=True)
 class _PredictionTarget:
     impl: object
+    tp_rank: int
     alpha: torch.Tensor
     beta: torch.Tensor
     local_alpha: torch.Tensor
@@ -180,8 +181,10 @@ class _PredictionTarget:
         if packed is None:
             raise RuntimeError("Grouped prefetch requires packed Decode metadata.")
         impl = self.impl
-        if self.qli_enabled:
+        if self.qli_enabled and hidden_states.dtype == torch.bfloat16:
             q_norm = impl.q_a_layernorm
+            if self.qli_norm_bias is None:
+                raise RuntimeError("Prefetch QLI RMSNorm bias was not initialized.")
             rope_width = impl.qk_rope_head_dim // 2
             ranked = source_rows_before_gather is not None and self.alpha.numel() > 1
             query, weights = torch.ops._C_ascend.prefetch_qli_fusion(
@@ -213,7 +216,7 @@ class _PredictionTarget:
                 hidden_states,
                 self.alpha,
                 self.beta,
-                tp_rank=get_tp_group().rank_in_group,
+                tp_rank=self.tp_rank,
                 source_rows_before_gather=source_rows_before_gather,
             ).index_select(0, packed.token_indices).contiguous()
             packed_cos = cos.index_select(0, packed.token_indices).contiguous()
@@ -549,13 +552,25 @@ class GroupedPrefetchRuntime:
                 profile,
                 source_layer_id,
             )
-            weight = target_impl.wk_weights_proj.weight
-            alpha = weight.new_tensor(alpha_values)
-            beta = weight.new_tensor(beta_values)
             tp_rank = get_tp_group().rank_in_group
+            if not 0 <= tp_rank < len(alpha_values):
+                raise RuntimeError(
+                    f"Grouped prefetch TP rank {tp_rank} is outside "
+                    f"coefficient width {len(alpha_values)}."
+                )
+            q_norm = getattr(target_impl, "q_a_layernorm", None)
+            coefficient_weight = getattr(q_norm, "weight", None)
+            if not isinstance(coefficient_weight, torch.Tensor):
+                raise RuntimeError(
+                    f"Grouped prefetch target {target_name!r} has no Q-A "
+                    "layer-normalization weight."
+                )
+            alpha = coefficient_weight.new_tensor(alpha_values)
+            beta = coefficient_weight.new_tensor(beta_values)
             qli_enabled, qli_norm_bias = _prepare_qli(target_impl)
             target = _PredictionTarget(
                 impl=target_impl,
+                tp_rank=tp_rank,
                 alpha=alpha,
                 beta=beta,
                 local_alpha=alpha[tp_rank : tp_rank + 1].contiguous(),

@@ -348,6 +348,9 @@ def make_lookup_plan(
     packed_topk = semantic.index_select(0, packed.token_indices).to(torch.int32)
     packed_positions = packed.query_positions
     query_start_loc = packed.query_start_loc
+    query_lengths = (query_start_loc[1:] - query_start_loc[:-1]).to(
+        torch.int64
+    )
     request_rows = packed.request_rows
     query_request_rows = packed.query_request_rows
     query_batch_indices = packed.query_batch_indices
