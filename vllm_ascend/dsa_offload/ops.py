@@ -53,3 +53,32 @@ def lookup_update_batch(
         lookup_mask,
         request_rows.shape[0],
     )
+
+
+def asu_kv_gather(
+    destination_kv_cache: torch.Tensor,
+    destination_k_rope: torch.Tensor,
+    destination_block_table: torch.Tensor,
+    source_kv_cache: torch.Tensor,
+    source_k_rope: torch.Tensor,
+    source_block_table: torch.Tensor,
+    request_rows: torch.Tensor,
+    token_positions: torch.Tensor,
+    destination_slots: torch.Tensor,
+    miss_mask: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C_ascend.asu_kv_gather(
+        destination_kv_cache,
+        destination_k_rope,
+        destination_block_table,
+        source_kv_cache,
+        source_k_rope,
+        source_block_table,
+        request_rows,
+        token_positions,
+        destination_slots,
+        miss_mask,
+        block_size,
+        request_rows.shape[0],
+    )

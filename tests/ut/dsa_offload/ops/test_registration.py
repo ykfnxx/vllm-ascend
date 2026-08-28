@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[4]
 OPERATOR_NAMES = (
     "dsa_offload_lookup_update",
     "dsa_offload_lookup_update_batch",
+    "asu_kv_gather",
 )
 
 

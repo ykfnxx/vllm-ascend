@@ -51,6 +51,7 @@
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
 #include "attention/dsa_offload_lookup_update/dsa_offload_lookup_update_torch_adpt.h"
 #include "attention/dsa_offload_lookup_update_batch/dsa_offload_lookup_update_batch_torch_adpt.h"
+#include "attention/asu_kv_gather/asu_kv_gather_torch_adpt.h"
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
 #include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
@@ -2983,6 +2984,27 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "dsa_offload_lookup_update_batch",
         torch::kPrivateUse1,
         &vllm_ascend::dsa_offload_lookup_update_batch);
+
+    ops.def(
+        "asu_kv_gather("
+            "Tensor(a!) destination_kv_cache, "
+            "Tensor(b!) destination_k_rope, "
+            "Tensor destination_block_table, "
+            "Tensor source_kv_cache, "
+            "Tensor source_k_rope, "
+            "Tensor source_block_table, "
+            "Tensor req_pool_entries, "
+            "Tensor token_positions, "
+            "Tensor destination_slots, "
+            "Tensor miss_mask, "
+            "int block_size, "
+            "int req_num"
+        ") -> (Tensor(a!), Tensor(b!))"
+    );
+    ops.impl(
+        "asu_kv_gather",
+        torch::kPrivateUse1,
+        &vllm_ascend::asu_kv_gather);
     
     // Fused GDN gating.
     ops.def(

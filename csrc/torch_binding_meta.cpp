@@ -1804,6 +1804,33 @@ std::tuple<at::Tensor, at::Tensor> dsa_offload_lookup_update_batch(
     };
 }
 
+std::tuple<at::Tensor, at::Tensor> asu_kv_gather(
+    at::Tensor& destination_kv_cache,
+    at::Tensor& destination_k_rope,
+    const at::Tensor& destination_block_table,
+    const at::Tensor& source_kv_cache,
+    const at::Tensor& source_k_rope,
+    const at::Tensor& source_block_table,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& token_positions,
+    const at::Tensor& destination_slots,
+    const at::Tensor& miss_mask,
+    int64_t block_size,
+    int64_t req_num)
+{
+    (void)destination_block_table;
+    (void)source_kv_cache;
+    (void)source_k_rope;
+    (void)source_block_table;
+    (void)req_pool_entries;
+    (void)token_positions;
+    (void)destination_slots;
+    (void)miss_mask;
+    (void)block_size;
+    (void)req_num;
+    return {destination_kv_cache, destination_k_rope};
+}
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -1926,6 +1953,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
              &vllm_ascend::meta::dsa_offload_lookup_update);
     ops.impl("dsa_offload_lookup_update_batch",
              &vllm_ascend::meta::dsa_offload_lookup_update_batch);
+    ops.impl("asu_kv_gather",
+             &vllm_ascend::meta::asu_kv_gather);
     // npu_fused_gdn_gating
     ops.impl("npu_fused_gdn_gating", &vllm_ascend::meta::npu_fused_gdn_gating_meta);
 }

@@ -223,6 +223,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "store_kv_block_metadata"
         "dsa_offload_lookup_update"
         "dsa_offload_lookup_update_batch"
+        "asu_kv_gather"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
