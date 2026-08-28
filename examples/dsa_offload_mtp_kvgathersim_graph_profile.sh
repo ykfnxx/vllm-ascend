@@ -163,8 +163,8 @@ PY
 )"
 PREFILL_DSA_CONFIG='{"ascend_compilation_config":{"enable_npugraph_ex":false},"dsa_offload":{"io_backend":"mock"}}'
 DECODE_DSA_CONFIG='{"ascend_compilation_config":{"enable_npugraph_ex":false},"dsa_offload":{"io_backend":"kvgather_sim"}}'
-PREFILL_SPEC_CONFIG='{"method":"mtp","num_speculative_tokens":1}'
-DECODE_SPEC_CONFIG='{"method":"mtp","num_speculative_tokens":1}'
+PREFILL_SPEC_CONFIG='{"method":"deepseek_mtp","num_speculative_tokens":1}'
+DECODE_SPEC_CONFIG='{"method":"deepseek_mtp","num_speculative_tokens":1}'
 DECODE_GRAPH_CONFIG='{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[64,128],"max_cudagraph_capture_size":128}'
 PREFILL_KV_CONFIG="{\"kv_connector\":\"LocalShmConnector\",\"kv_role\":\"kv_producer\",\"kv_port\":$PREFILL_KV_PORT,\"engine_id\":\"dsa-offload-prefill\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"prefill\":{\"dp_size\":1,\"tp_size\":1},\"decode\":{\"dp_size\":1,\"tp_size\":1},\"shm_dir\":\"$LOCAL_SHM_DIR\",\"shm_namespace\":\"$LOCAL_SHM_NAMESPACE\",\"shm_timeout\":$LOCAL_SHM_TIMEOUT}}"
 DECODE_KV_CONFIG="{\"kv_connector\":\"LocalShmConnector\",\"kv_role\":\"kv_consumer\",\"kv_port\":$DECODE_KV_PORT,\"engine_id\":\"dsa-offload-decode\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":{\"prefill\":{\"dp_size\":1,\"tp_size\":1},\"decode\":{\"dp_size\":1,\"tp_size\":1},\"shm_dir\":\"$LOCAL_SHM_DIR\",\"shm_namespace\":\"$LOCAL_SHM_NAMESPACE\",\"shm_timeout\":$LOCAL_SHM_TIMEOUT}}"
