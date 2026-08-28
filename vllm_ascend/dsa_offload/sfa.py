@@ -11,7 +11,9 @@ from . import pd as _pd
 __all__ = [
     "SFAAddressingView",
     "SFAAddressingWorkspace",
+    "maybe_start_group_prefetch",
     "prepare_main_slot_mapping",
+    "prepare_indexer_cache_write",
     "publish_prefill_layer",
     "resolve_sfa_inputs",
 ]
@@ -130,6 +132,59 @@ def prepare_main_slot_mapping(
     return main_slot_mapping
 
 
+def maybe_start_group_prefetch(
+    *,
+    layer_name: str,
+    hidden_states: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    default_block_table: torch.Tensor,
+    batch: _lookup.DSAOffloadBatch | None,
+    source_rows_before_gather: int | None,
+) -> None:
+    if batch is None or batch.prefetch_runtime is None:
+        return
+    batch.prefetch_runtime.start(
+        layer_name=layer_name,
+        hidden_states=hidden_states,
+        cos=cos,
+        sin=sin,
+        batch=batch,
+        block_table=default_block_table,
+        source_rows_before_gather=source_rows_before_gather,
+    )
+
+
+def prepare_indexer_cache_write(
+    *,
+    layer_name: str,
+    key_cache: torch.Tensor,
+    indexer_cache: tuple[torch.Tensor, ...],
+    enable_sparse_li_c8: bool,
+    slot_mapping: torch.Tensor,
+    key: torch.Tensor,
+    block_size: int,
+    batch: _lookup.DSAOffloadBatch | None,
+) -> bool:
+    if batch is None or batch.prefetch_runtime is None:
+        return False
+    runtime = batch.prefetch_runtime
+    if layer_name not in runtime.target_layer_names:
+        return False
+    runtime.wait_for_compute_before_key_write(layer_name)
+    base_count = 2 if enable_sparse_li_c8 else 1
+    if len(indexer_cache) != base_count + 1:
+        return False
+    torch.ops._C_ascend.npu_scatter_nd_update_mean(
+        key_cache.view(-1, key.shape[-1]),
+        slot_mapping.view(-1, 1),
+        key.view(-1, key.shape[-1]).contiguous(),
+        indexer_cache[-1],
+        block_size,
+    )
+    return True
+
+
 def resolve_sfa_inputs(
     *,
     layer_name: str,
@@ -148,6 +203,8 @@ def resolve_sfa_inputs(
     cohort = next(cohort for cohort in batch.cohorts if layer_name in cohort.layer_names)
     plan = batch.lookup_plans.get(cohort.cohort_id)
     if plan is None:
+        if batch.prefetch_runtime is not None:
+            batch.prefetch_runtime.wait_before_exact_lookup(layer_name)
         plan = _lookup.make_lookup_plan(
             semantic_topk=semantic_topk,
             cohort=cohort,
@@ -156,6 +213,8 @@ def resolve_sfa_inputs(
         batch.lookup_plans[cohort.cohort_id] = plan
     layer_id = cohort.layer_ids[cohort.layer_names.index(layer_name)]
     _lookup.load_plan_misses(plan, layer_id, batch)
+    if batch.prefetch_runtime is not None:
+        batch.prefetch_runtime.release_after_exact_load(layer_name)
     workspace = batch.sfa_workspace
     if workspace is None:
         raise RuntimeError("DSA Offload Decode requires a persistent SFA addressing workspace.")
