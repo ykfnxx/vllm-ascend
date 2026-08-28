@@ -158,6 +158,63 @@ writes a manifest and, unless `--no-trace` is used, a parsed
 `tools/dsa_sparse_lookup_update/profiles/<timestamp>/`. The script fails if
 the parsed profile does not contain the custom operator name.
 
+## Roofline profile
+
+Use the dedicated one-shot runner so that the outer msopprof session sees
+exactly one `DsaSparseLookupUpdate` launch. The Roofline path does not call the
+benchmark or start an inner `torch_npu.profiler` session:
+
+```bash
+bash tools/dsa_sparse_lookup_update/profile_roofline.sh \
+  --device npu:2 \
+  --requests 32 \
+  --replay-mode application \
+  --miss-rate 10
+```
+
+The script automatically uses the CANN 9.x `msopprof` executable and falls
+back to the compatible `msprof op` entry point. It collects
+`DsaSparseLookupUpdate` with `--aic-metrics=Roofline` and prints the generated
+`visualize_data.bin` path for import into MindStudio Insight. Use
+`--miss-count` instead of `--miss-rate` when an exact miss count is required.
+The default result root is
+`tools/dsa_sparse_lookup_update/roofline_profiles/`.
+
+The fused operator mutates its index and slot state in place. The default
+`--replay-mode application` reruns the one-shot input initialization for every
+profiler replay. `--replay-mode kernel` can be selected explicitly for
+idempotent workloads such as `--miss-rate 0`; with nonzero misses, later kernel
+replays observe the index state written by earlier replays and no longer
+represent the same workload. The wrapper passes `--warm-up=0` to msopprof by
+default so profiler-internal kernel warm-up does not mutate the target state.
+Use `--profiler-warm-up` only when that behavior is intentional. The existing
+`--warm-up` option controls how many one-shot processes run before profiling;
+these runs are outside msopprof and do not add target launches to the profile.
+
+In application mode, Roofline reruns the application for its bound Default
+metric collection. Every replay reconstructs the same deterministic workload,
+launches the target once, synchronizes, and exits.
+
+Use kernel replay for a read-only all-hit diagnostic:
+
+```bash
+bash tools/dsa_sparse_lookup_update/profile_roofline.sh \
+  --device npu:2 \
+  --requests 32 \
+  --replay-mode kernel \
+  --miss-rate 0
+```
+
+Inspect the complete command without accessing an NPU:
+
+```bash
+bash tools/dsa_sparse_lookup_update/profile_roofline.sh \
+  --device npu:2 \
+  --requests 32 \
+  --miss-count 205 \
+  --dry-run
+```
+
 The single-operator profiler supports the same cache-behavior workloads as the
 matrix profiler:
 

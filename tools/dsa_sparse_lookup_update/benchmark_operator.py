@@ -7,8 +7,10 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import statistics
 import subprocess
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -76,7 +78,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=100)
-    parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help=(
+            "JSON output path; {pid} and {timestamp_ns} are expanded by "
+            "the benchmark process."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -433,7 +442,12 @@ def _device_name(runtime: Runtime) -> str:
 
 def _output_path(requested: Path | None) -> Path:
     if requested is not None:
-        output = requested.expanduser().resolve()
+        output_text = str(requested)
+        output_text = output_text.replace("{pid}", str(os.getpid()))
+        output_text = output_text.replace(
+            "{timestamp_ns}", str(time.time_ns())
+        )
+        output = Path(output_text).expanduser().resolve()
     else:
         timestamp = (
             datetime.now()
