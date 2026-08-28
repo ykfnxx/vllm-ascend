@@ -36,6 +36,7 @@ def make_config(**overrides):
             hf_text_config=SimpleNamespace(model_type="glm_moe_dsa", index_topk=2048),
             max_model_len=128 * 1024,
         ),
+        cache_config=SimpleNamespace(block_size=128),
         kv_transfer_config=TransferConfig(),
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=1,
@@ -91,6 +92,19 @@ def test_io_backend_defaults_to_mock() -> None:
 
     assert config is not None
     assert config.io_backend == "mock"
+
+
+def test_kvgather_sim_and_tail_block_length_are_accepted() -> None:
+    vllm_config = make_config()
+    vllm_config.additional_config["dsa_offload"]["io_backend"] = (
+        "kvgather_sim"
+    )
+    vllm_config.model_config.max_model_len = 128 * 1024 + 128
+
+    config = load_dsa_offload_config(vllm_config)
+
+    assert config is not None
+    assert config.io_backend == "kvgather_sim"
 
 
 @pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])

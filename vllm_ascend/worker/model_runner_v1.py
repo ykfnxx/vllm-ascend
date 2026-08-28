@@ -210,6 +210,7 @@ from vllm_ascend.dsa_offload.hot_cache import (
 )
 from vllm_ascend.dsa_offload.io import create_io_backend
 from vllm_ascend.dsa_offload.lookup import (
+    DSAOffloadBatch,
     build_dsa_offload_batch,
     clear_lookup_row,
     create_lookup_states,
@@ -367,6 +368,7 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_offload_layout: HotCacheLayout | None = None
         self._dsa_offload_hot_cache: HotCacheState | None = None
         self._dsa_offload_sfa_workspace: SFAAddressingWorkspace | None = None
+        self._dsa_offload_graph_request_rows: torch.Tensor | None = None
         self._dsa_offload_lookup_states = {}
         self._dsa_offload_io = None
         self._dsa_offload_handoffs = {}
@@ -779,6 +781,7 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_offload_io = None
         self._dsa_offload_hot_cache = None
         self._dsa_offload_sfa_workspace = None
+        self._dsa_offload_graph_request_rows = None
         self._dsa_offload_lookup_states = {}
         self._dsa_offload_handoffs = {}
         self._dsa_offload_committed_hashes = {}
@@ -802,6 +805,7 @@ class NPUModelRunner(GPUModelRunner):
         io_backend = create_io_backend(
             config.io_backend,
             config.kvio_model_id,
+            layout,
         )
         for cohort in self._dsa_offload_cohorts:
             for layer_name, layer_id in zip(
@@ -854,6 +858,25 @@ class NPUModelRunner(GPUModelRunner):
                 self.max_num_reqs,
                 self.device,
             )
+            if (
+                config.io_backend == "kvgather_sim"
+                and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            ):
+                self._dsa_offload_graph_request_rows = torch.arange(
+                    self.max_num_reqs,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                logger.info(
+                    "DSA_OFFLOAD_KVGATHER_SIM_GRAPH_ACTIVE "
+                    "lookup=dsa_offload_lookup_update_batch "
+                    "gather=asu_kv_gather mtp=%d graph_mode=%s",
+                    int(
+                        self.speculative_config is not None
+                        and self.speculative_config.method == "mtp"
+                    ),
+                    self.compilation_config.cudagraph_mode.name,
+                )
 
     def _record_dsa_offload_metadata(
         self,
@@ -1041,7 +1064,7 @@ class NPUModelRunner(GPUModelRunner):
                 io_backend=self._dsa_offload_io,
                 tp_rank=get_tp_group().rank_in_group,
             )
-        return build_dsa_offload_batch(
+        batch = build_dsa_offload_batch(
             layout=layout,
             hot_cache=self._dsa_offload_hot_cache,
             io_backend=self._dsa_offload_io,
@@ -1057,6 +1080,54 @@ class NPUModelRunner(GPUModelRunner):
             candidate_block_hashes=self._dsa_offload_candidate_hashes,
             prefill_state=prefill_state,
             sfa_workspace=self._dsa_offload_sfa_workspace,
+        )
+        graph_rows = self._dsa_offload_graph_request_rows
+        if graph_rows is not None:
+            graph_rows[: batch.request_rows.shape[0]].copy_(batch.request_rows)
+            batch.request_rows = graph_rows[: batch.request_rows.shape[0]]
+        return batch
+
+    def _make_dsa_offload_graph_batch(
+        self,
+        num_reqs: int,
+        num_scheduled_tokens: np.ndarray,
+        total_num_scheduled_tokens: int,
+    ) -> DSAOffloadBatch:
+        layout = self._dsa_offload_layout
+        hot_cache = self._dsa_offload_hot_cache
+        request_rows = self._dsa_offload_graph_request_rows
+        assert layout is not None
+        assert hot_cache is not None
+        assert request_rows is not None
+        query_ends = tuple(
+            np.cumsum(num_scheduled_tokens[:num_reqs]).tolist()
+        )
+        query_ranges = tuple(zip((0, *query_ends[:-1]), query_ends))
+        request_ids = tuple(f"graph-{index}" for index in range(num_reqs))
+        return DSAOffloadBatch(
+            layout=layout,
+            hot_cache=hot_cache,
+            io_backend=self._dsa_offload_io,
+            cohorts=self._dsa_offload_cohorts,
+            lookup_states=self._dsa_offload_lookup_states,
+            request_ids=request_ids,
+            request_rows=request_rows[:num_reqs],
+            decode_request_indices=tuple(range(num_reqs)),
+            query_ranges=query_ranges,
+            query_positions=self.positions[:total_num_scheduled_tokens],
+            is_mtp=bool(
+                self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+            ),
+            committed_block_hashes={request_id: () for request_id in request_ids},
+            candidate_block_hashes={},
+            sfa_workspace=self._dsa_offload_sfa_workspace,
+            decode_request_indices_tensor=torch.arange(
+                num_reqs,
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            graph_query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
         )
 
     def _attach_dsa_offload_batch(
@@ -3967,6 +4038,21 @@ class NPUModelRunner(GPUModelRunner):
                 for_cudagraph_capture=is_graph_capturing,
                 num_scheduled_tokens_np=num_scheduled_tokens,
             )
+            if self._dsa_offload_graph_request_rows is not None:
+                assert attn_metadata is not None
+                graph_batch = self._make_dsa_offload_graph_batch(
+                    num_reqs,
+                    num_scheduled_tokens,
+                    num_tokens_unpadded,
+                )
+                metadata_groups = (
+                    attn_metadata
+                    if isinstance(attn_metadata, list)
+                    else [attn_metadata]
+                )
+                for metadata in metadata_groups:
+                    for layer_name in self._dsa_offload_main_specs:
+                        metadata[layer_name].dsa_offload_batch = graph_batch
             if not is_graph_capturing:
                 for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
                     blk_table = self.input_batch.block_table[kv_cache_gid]

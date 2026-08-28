@@ -7,6 +7,7 @@ import torch
 
 from vllm_ascend.dsa_offload.hot_cache import HotCacheLayout, HotCacheState
 from vllm_ascend.dsa_offload.lookup import (
+    DSAOffloadBatch,
     IndexCacheCohort,
     LookupPlan,
     build_dsa_offload_batch,
@@ -98,6 +99,37 @@ def test_mtp_verification_writes_staging_without_touching_prefill(spy_io) -> Non
         11,
         batch.layout.global_slot(row, batch.layout.staging_base),
         batch.layout.global_slot(row, batch.layout.staging_base + 1),
+    ]
+
+
+def test_graph_mtp_mapping_uses_runtime_request_rows(spy_io) -> None:
+    layout = HotCacheLayout(4, 2, 2)
+    batch = DSAOffloadBatch(
+        layout=layout,
+        hot_cache=None,
+        io_backend=spy_io,
+        cohorts=(),
+        lookup_states={},
+        request_ids=("first", "second"),
+        request_rows=torch.tensor([1, 0], dtype=torch.int32),
+        decode_request_indices=(0, 1),
+        query_ranges=((0, 2), (2, 3)),
+        query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
+        is_mtp=True,
+        committed_block_hashes={"first": [], "second": []},
+        candidate_block_hashes={},
+        graph_query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
+    )
+
+    mapped = prepare_main_slot_mapping(
+        batch=batch,
+        default_slot_mapping=torch.full((3,), -1, dtype=torch.int64),
+    )
+
+    assert mapped.tolist() == [
+        layout.global_slot(1, layout.staging_base),
+        layout.global_slot(1, layout.staging_base + 1),
+        layout.global_slot(0, layout.staging_base),
     ]
 
 

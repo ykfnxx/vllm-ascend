@@ -3,9 +3,12 @@
 
 import hashlib
 from collections.abc import Sequence
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import torch
+
+if TYPE_CHECKING:
+    from .hot_cache import HotCacheLayout
 
 _STORAGE_KEY_DOMAIN = b"dsa-offload-mla-v1"
 _INT63_MASK = (1 << 63) - 1
@@ -128,11 +131,21 @@ class MockIOBackend:
         return
 
 
-def create_io_backend(io_backend: str, kvio_model_id: int) -> IOBackend:
+def create_io_backend(
+    io_backend: str,
+    kvio_model_id: int,
+    layout: "HotCacheLayout | None" = None,
+) -> IOBackend:
     if io_backend == "mock":
         return MockIOBackend()
     if io_backend == "kvio":
         from .kvio import KVIOBackend
 
         return KVIOBackend(kvio_model_id)
+    if io_backend == "kvgather_sim":
+        if layout is None:
+            raise ValueError("kvgather_sim requires a Hot Cache layout")
+        from .kvgather_sim import KVGatherSimBackend
+
+        return KVGatherSimBackend(layout)
     raise ValueError(f"Unsupported DSA Offload IO backend: {io_backend}")

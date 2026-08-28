@@ -11,7 +11,7 @@ DSAOffloadRole = Literal["kv_producer", "kv_consumer", "kv_both"]
 
 @dataclass(frozen=True)
 class DSAOffloadConfig:
-    io_backend: Literal["kvio", "mock"]
+    io_backend: Literal["kvio", "mock", "kvgather_sim"]
     kvio_model_id: int
     max_verify_tokens_per_request: int
     kv_role: DSAOffloadRole
@@ -39,8 +39,10 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
     if not isinstance(raw_config, dict):
         raise ValueError("additional_config.dsa_offload must be an object.")
     io_backend = raw_config.get("io_backend", "mock")
-    if io_backend not in {"kvio", "mock"}:
-        raise ValueError("dsa_offload.io_backend must be 'kvio' or 'mock'.")
+    if io_backend not in {"kvio", "mock", "kvgather_sim"}:
+        raise ValueError(
+            "dsa_offload.io_backend must be 'kvio', 'mock', or 'kvgather_sim'."
+        )
 
     from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
@@ -55,8 +57,16 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
         raise ValueError("DSA Offload supports only the GLM-5 family.")
     if hf_config.index_topk != QUERY_WIDTH:
         raise ValueError(f"DSA Offload requires index_topk={QUERY_WIDTH}.")
-    if model_config.max_model_len > INDEX_CAPACITY:
-        raise ValueError(f"DSA Offload max_model_len must not exceed {INDEX_CAPACITY}.")
+    cache_config = getattr(vllm_config, "cache_config", None)
+    block_size = getattr(cache_config, "block_size", 0)
+    max_supported_len = INDEX_CAPACITY + (
+        block_size if isinstance(block_size, int) and block_size > 0 else 0
+    )
+    if model_config.max_model_len > max_supported_len:
+        raise ValueError(
+            "DSA Offload max_model_len must fit the index capacity plus one "
+            f"tail block ({max_supported_len})."
+        )
 
     kv_transfer_config = vllm_config.kv_transfer_config
     if kv_transfer_config is None:

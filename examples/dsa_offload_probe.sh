@@ -69,7 +69,7 @@ Core options:
   --connector TYPE            mooncake, local-shm, or none. Default: mooncake
                               local-shm is for split P/D on one host/container;
                               none is for the single-engine both scenario.
-  --io-backend BACKEND        mock or kvio. Default: mock
+  --io-backend BACKEND        mock, kvio, or kvgather_sim. Default: mock
   --kvio-model-id ID          Non-negative KVIO model namespace. Default: 0
   --host-ip IP                Local IP used by Mooncake/HCCL.
   --ifname NIC                Network interface owning --host-ip.
@@ -119,7 +119,8 @@ Validation boundary:
   exercise the partial-tail handoff, but it does not perform capacity-layer
   full-block PUT or token GET. With --connector none it validates local cache
   promotion only at the control-path level. kvio adds real capacity-layer
-  PUT/GET; output accuracy still needs a known-good baseline comparison.
+  PUT/GET. kvgather_sim invokes ASU KV Gather with synthetic zero source
+  blocks. Output accuracy still needs a known-good baseline comparison.
 EOF
 }
 
@@ -320,8 +321,9 @@ if [[ "$SCENARIO" != "pd" && "$SCENARIO" != "both" ]]; then
     echo "--scenario must be 'pd' or 'both'." >&2
     exit 2
 fi
-if [[ "$IO_BACKEND" != "mock" && "$IO_BACKEND" != "kvio" ]]; then
-    echo "--io-backend must be 'mock' or 'kvio'." >&2
+if [[ "$IO_BACKEND" != "mock" && "$IO_BACKEND" != "kvio" && \
+      "$IO_BACKEND" != "kvgather_sim" ]]; then
+    echo "--io-backend must be 'mock', 'kvio', or 'kvgather_sim'." >&2
     exit 2
 fi
 if [[ "$CONNECTOR" != "mooncake" && "$CONNECTOR" != "local-shm" && "$CONNECTOR" != "none" ]]; then
@@ -494,6 +496,8 @@ if io_backend == "kvio":
     rdma_kv_ops = importlib.import_module("rdma_kv_ops")
     if not hasattr(rdma_kv_ops, "aiv_init"):
         raise SystemExit("rdma_kv_ops does not expose aiv_init")
+elif io_backend == "kvgather_sim":
+    required_ops.append("asu_kv_gather")
 
 missing = [name for name in required_ops if not hasattr(namespace, name)]
 if missing:
@@ -1124,10 +1128,22 @@ if io_backend == "kvio":
             ("npugetputbatch", "getputbatch"),
             "Prefill KVIO PUT",
         )
+elif io_backend == "kvgather_sim":
+    require_any(
+        decode_profile,
+        ("asukvgather", "aclnnasukvgather"),
+        f"{decode_name} ASU KV Gather",
+    )
 
 print(
     "PASS: profiler contains DSA lookup/update and Sparse Flash Attention"
-    + (" plus KVIO PUT/GET" if io_backend == "kvio" else "")
+    + (
+        " plus KVIO PUT/GET"
+        if io_backend == "kvio"
+        else " plus ASU KV Gather"
+        if io_backend == "kvgather_sim"
+        else ""
+    )
 )
 PY
 fi
@@ -1137,6 +1153,9 @@ echo "PASS: DSA Offload $SCENARIO scenario completed with connector=$CONNECTOR a
 if [[ "$IO_BACKEND" == "mock" ]]; then
     echo "VALIDATED: config/bootstrap, request lifecycle, lookup, Hot Cache/SFA path, and role-specific control flow."
     echo "NOT VALIDATED: capacity-layer full-block PUT/token GET or output accuracy; rerun with --io-backend kvio."
+elif [[ "$IO_BACKEND" == "kvgather_sim" ]]; then
+    echo "VALIDATED: config/bootstrap, request lifecycle, lookup, Hot Cache/SFA path, and ASU KV Gather execution."
+    echo "NOT VALIDATED: external payload correctness; kvgather_sim uses synthetic zero source blocks."
 else
     echo "VALIDATED: config/bootstrap, request lifecycle, lookup, Hot Cache/SFA path, and KVIO PUT/GET execution."
     echo "STILL NEEDED: compare output tokens with a known-good non-offload baseline for accuracy sign-off."

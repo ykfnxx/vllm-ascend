@@ -112,6 +112,46 @@ def prepare_main_slot_mapping(
         return default_slot_mapping
 
     main_slot_mapping = default_slot_mapping.clone()
+    if batch.graph_query_start_loc is not None:
+        query_lengths = (
+            batch.graph_query_start_loc[1:]
+            - batch.graph_query_start_loc[:-1]
+        ).to(torch.int64)
+        total_queries = batch.query_positions.shape[0]
+        query_rows = torch.repeat_interleave(
+            batch.request_rows,
+            query_lengths,
+            output_size=total_queries,
+        ).to(torch.int64)
+        query_starts = torch.repeat_interleave(
+            batch.graph_query_start_loc[:-1],
+            query_lengths,
+            output_size=total_queries,
+        )
+        if batch.is_mtp:
+            row_offsets = (
+                batch.layout.staging_base
+                + torch.arange(
+                    total_queries,
+                    dtype=torch.int32,
+                    device=main_slot_mapping.device,
+                )
+                - query_starts
+            )
+        else:
+            row_offsets = batch.layout.tail_base + torch.remainder(
+                batch.query_positions,
+                batch.layout.block_size,
+            )
+        row_blocks = (
+            batch.layout.hot_block_base
+            + query_rows * batch.layout.hot_blocks_per_row
+        )
+        main_slot_mapping[:total_queries] = (
+            row_blocks * batch.layout.block_size + row_offsets
+        )
+        return main_slot_mapping
+
     for request_index in batch.decode_request_indices:
         begin, end = batch.query_ranges[request_index]
         row_id = int(batch.request_rows[request_index].item())
