@@ -18,14 +18,13 @@ void AddInt32Input(OpDef& op, const char* name)
         .AutoContiguous();
 }
 
-void AddBoolInput(OpDef& op, const char* name)
+void AddInt32Output(OpDef& op, const char* name)
 {
-    op.Input(name)
+    op.Output(name)
         .ParamType(REQUIRED)
-        .DataType({ge::DT_BOOL})
+        .DataType({ge::DT_INT32})
         .Format({ge::FORMAT_ND})
-        .UnknownShapeFormat({ge::FORMAT_ND})
-        .AutoContiguous();
+        .UnknownShapeFormat({ge::FORMAT_ND});
 }
 
 }  // namespace
@@ -34,22 +33,16 @@ class DsaSparseLookupUpdate : public OpDef {
 public:
     explicit DsaSparseLookupUpdate(const char* name) : OpDef(name)
     {
-        AddInt32Input(*this, "tokenToHot");
-        AddInt32Input(*this, "hotToToken");
-        AddInt32Input(*this, "lruSlots");
-        AddInt32Input(*this, "stateSeatEpoch");
-        AddInt32Input(*this, "rowToCacheSeat");
-        AddInt32Input(*this, "rowSeatEpoch");
-        AddInt32Input(*this, "queryPositions");
-        AddInt32Input(*this, "queryToRow");
-        AddInt32Input(*this, "queryToLane");
-        AddBoolInput(*this, "queryValidMask");
-        AddInt32Input(*this, "validTopkCounts");
-        AddInt32Input(*this, "seqLens");
-        AddInt32Input(*this, "topkPositions");
-        AddInt32Input(*this, "resolvedHotIndices");
-        AddBoolInput(*this, "missMask");
-        AddInt32Input(*this, "workspace");
+        AddInt32Input(*this, "index");
+        AddInt32Input(*this, "slotToIndex");
+        AddInt32Input(*this, "freeSlots");
+        AddInt32Input(*this, "freeHead");
+        AddInt32Input(*this, "reqPoolEntries");
+        AddInt32Input(*this, "queryIndex");
+        AddInt32Input(*this, "lookupMask");
+        AddInt32Output(*this, "slotOut");
+        AddInt32Output(*this, "missOut");
+        this->Attr("req_num").AttrType(REQUIRED).Int();
 
         this->AICore().AddConfig("ascend950");
     }

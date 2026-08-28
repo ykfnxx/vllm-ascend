@@ -11,669 +11,458 @@
 #include "simt_api/common_functions.h"
 #include "simt_api/device_atomic_functions.h"
 #include "simt_api/device_sync_functions.h"
+#include "simt_api/device_warp_functions.h"
 
 namespace DsaSparseLookupUpdate {
 
-__simt_vf__ __launch_bounds__(DSA_SPARSE_SIMT_THREADS) inline void
-DsaSparseLookupUpdateSimt(
-    __gm__ int32_t* token_to_hot,
-    __gm__ int32_t* hot_to_token,
-    __gm__ int32_t* lru_slots,
-    __gm__ int32_t* state_seat_epoch,
-    __gm__ int32_t* row_to_cache_seat,
-    __gm__ int32_t* row_seat_epoch,
-    __gm__ int32_t* query_positions,
-    __gm__ int32_t* query_to_row,
-    __gm__ int32_t* query_to_lane,
-    __gm__ uint8_t* query_valid_mask,
-    __gm__ int32_t* valid_topk_counts,
-    __gm__ int32_t* seq_lens,
-    __gm__ int32_t* topk_positions,
-    __gm__ int32_t* resolved_hot_indices,
-    __gm__ uint8_t* miss_mask,
-    __gm__ int32_t* op_workspace,
-    uint32_t request_row,
-    uint32_t seat_capacity,
-    uint32_t token_position_capacity,
-    uint32_t evictable_slot_count,
-    uint32_t query_capacity,
-    uint32_t query_lane_capacity,
-    uint32_t topk_count,
-    uint32_t workspace_stride)
+constexpr uint32_t kPoolEntryScalar = 0U;
+constexpr uint32_t kFreeHeadScalar = 1U;
+constexpr uint32_t kCursorScalar = 2U;
+constexpr uint32_t kLastVictimScalar = 3U;
+
+__simt_callee__ inline void ProtectSlot(
+    __ubuf__ uint32_t* protected_bits,
+    uint32_t slot)
+{
+    const uint32_t word = slot >> 5U;
+    const uint32_t bit = 1U << (slot & 31U);
+    asc_atomic_or(protected_bits + word, bit);
+}
+
+__simt_callee__ inline bool IsProtectedSlot(
+    __ubuf__ const uint32_t* protected_bits,
+    uint32_t slot)
+{
+    const uint32_t word = slot >> 5U;
+    const uint32_t bit = 1U << (slot & 31U);
+    return (protected_bits[word] & bit) != 0U;
+}
+
+// Return the exclusive prefix for this thread. The final warp total contains
+// the block-wide sum after this function returns.
+__simt_callee__ inline int32_t BlockExclusiveScan(
+    int32_t value,
+    __ubuf__ int32_t* warp_totals)
+{
+    const uint32_t tid = static_cast<uint32_t>(threadIdx.x);
+    const uint32_t lane = tid & (DSA_SPARSE_WARP_SIZE - 1U);
+    const uint32_t warp = tid / DSA_SPARSE_WARP_SIZE;
+
+    int32_t inclusive = value;
+    for (uint32_t delta = 1U;
+         delta < DSA_SPARSE_WARP_SIZE;
+         delta <<= 1U) {
+        const int32_t upstream =
+            asc_shfl_up(inclusive, delta);
+        if (lane >= delta) {
+            inclusive += upstream;
+        }
+    }
+    if (lane == DSA_SPARSE_WARP_SIZE - 1U) {
+        warp_totals[warp] = inclusive;
+    }
+    asc_syncthreads();
+
+    if (warp == 0U) {
+        int32_t warp_inclusive =
+            lane < DSA_SPARSE_WARP_COUNT
+                ? warp_totals[lane]
+                : 0;
+        for (uint32_t delta = 1U;
+             delta < DSA_SPARSE_WARP_SIZE;
+             delta <<= 1U) {
+            const int32_t upstream =
+                asc_shfl_up(warp_inclusive, delta);
+            if (lane >= delta) {
+                warp_inclusive += upstream;
+            }
+        }
+        if (lane < DSA_SPARSE_WARP_COUNT) {
+            warp_totals[lane] = warp_inclusive;
+        }
+    }
+    asc_syncthreads();
+
+    const int32_t warp_prefix =
+        warp == 0U ? 0 : warp_totals[warp - 1U];
+    return warp_prefix + inclusive - value;
+}
+
+__simt_callee__ inline void DsaSparseLookupUpdateOneRequest(
+    __gm__ int32_t* index,
+    __gm__ int32_t* slot_to_index,
+    __gm__ int32_t* free_slots,
+    __gm__ int32_t* free_head,
+    __gm__ int32_t* req_pool_entries,
+    __gm__ int32_t* query_index,
+    __gm__ int32_t* lookup_mask,
+    __gm__ int32_t* slot_out,
+    __gm__ int32_t* miss_out,
+    __ubuf__ uint32_t* shared_scratch,
+    uint32_t req_id,
+    uint32_t pool_capacity,
+    bool reuse_scratch)
 {
     const uint32_t tid = static_cast<uint32_t>(threadIdx.x);
     const uint32_t thread_count =
         static_cast<uint32_t>(blockDim.x);
+    constexpr uint32_t query_chunk =
+        DSA_SPARSE_QUERY_COUNT / DSA_SPARSE_SIMT_THREADS;
+    constexpr uint32_t slot_chunk =
+        DSA_SPARSE_SLOT_COUNT / DSA_SPARSE_SIMT_THREADS;
 
-    __gm__ int32_t* row_workspace =
-        op_workspace +
-        static_cast<uint64_t>(request_row) * workspace_stride;
-    __gm__ int32_t* hit_flags = row_workspace;
-    __gm__ int32_t* hit_slots =
-        hit_flags + evictable_slot_count;
-    __gm__ int32_t* evictable_slots =
-        hit_slots + evictable_slot_count;
-    __gm__ int32_t* thread_hit_counts =
-        evictable_slots + evictable_slot_count;
-    __gm__ int32_t* thread_evict_counts =
-        thread_hit_counts + DSA_SPARSE_SIMT_THREADS;
-    __gm__ int32_t* thread_miss_counts =
-        thread_evict_counts + DSA_SPARSE_SIMT_THREADS;
-    __gm__ int32_t* counters =
-        thread_miss_counts + DSA_SPARSE_SIMT_THREADS;
+    const uint64_t query_base =
+        static_cast<uint64_t>(req_id) * DSA_SPARSE_QUERY_COUNT;
+    const uint32_t query_begin = tid * query_chunk;
 
-    // Build the fixed row/lane -> flat query inverse in the four scalar
-    // workspace cells. This accepts a reordered flat query view without a
-    // separate pack operator. The graph-input contract guarantees at most one
-    // query for each (row, lane).
-    if (tid < DSA_SPARSE_MAX_QUERY_LANES) {
-        counters[tid] = DSA_SPARSE_NOT_FOUND;
+    int32_t query_values[query_chunk];
+    int32_t query_masks[query_chunk];
+    int32_t local_slots[query_chunk];
+    int32_t local_misses[query_chunk];
+#pragma unroll
+    for (uint32_t local_entry = 0U;
+         local_entry < query_chunk;
+         ++local_entry) {
+        const uint64_t offset =
+            query_base + query_begin + local_entry;
+        query_values[local_entry] = query_index[offset];
+        query_masks[local_entry] = lookup_mask[offset];
+        local_slots[local_entry] = DSA_SPARSE_NOT_FOUND;
+        local_misses[local_entry] = 0;
     }
-    asc_threadfence_block();
-    asc_syncthreads();
+
+    __ubuf__ uint32_t* protected_bits = shared_scratch;
+    __ubuf__ int32_t* warp_totals =
+        reinterpret_cast<__ubuf__ int32_t*>(
+            protected_bits + DSA_SPARSE_PROTECTED_WORDS);
+    __ubuf__ int32_t* scalars =
+        warp_totals + DSA_SPARSE_WARP_COUNT;
+
+    for (uint32_t word = tid;
+         word < DSA_SPARSE_PROTECTED_WORDS;
+         word += thread_count) {
+        protected_bits[word] = 0U;
+    }
     if (tid == 0U) {
-        for (uint32_t query = 0; query < query_capacity; ++query) {
-            if (query_to_row[query] !=
-                static_cast<int32_t>(request_row)) {
-                continue;
-            }
-            const int32_t lane = query_to_lane[query];
-            if (lane >= 0 &&
-                lane < static_cast<int32_t>(query_lane_capacity)) {
-                counters[static_cast<uint32_t>(lane)] =
-                    static_cast<int32_t>(query);
-            }
-        }
-    }
-    asc_threadfence_block();
-    asc_syncthreads();
-
-    int32_t row_queries[DSA_SPARSE_MAX_QUERY_LANES];
-    for (uint32_t lane = 0;
-         lane < DSA_SPARSE_MAX_QUERY_LANES;
-         ++lane) {
-        row_queries[lane] = counters[lane];
-    }
-    int32_t ordered_lanes[DSA_SPARSE_MAX_QUERY_LANES];
-    for (uint32_t lane = 0;
-         lane < DSA_SPARSE_MAX_QUERY_LANES;
-         ++lane) {
-        ordered_lanes[lane] = static_cast<int32_t>(lane);
-    }
-    for (uint32_t left = 0;
-         left < query_lane_capacity;
-         ++left) {
-        for (uint32_t right = left + 1U;
-             right < query_lane_capacity;
-             ++right) {
-            const int32_t left_query =
-                row_queries[
-                    static_cast<uint32_t>(ordered_lanes[left])];
-            const int32_t right_query =
-                row_queries[
-                    static_cast<uint32_t>(ordered_lanes[right])];
-            if ((left_query < 0 && right_query >= 0) ||
-                (right_query >= 0 && left_query >= 0 &&
-                 right_query < left_query)) {
-                const int32_t tmp = ordered_lanes[left];
-                ordered_lanes[left] = ordered_lanes[right];
-                ordered_lanes[right] = tmp;
-            }
-        }
-    }
-
-    const uint32_t row_entry_count =
-        query_lane_capacity * topk_count;
-    for (uint32_t entry = tid;
-         entry < row_entry_count;
-         entry += thread_count) {
-        const uint32_t lane = entry / topk_count;
-        const uint32_t rank = entry - lane * topk_count;
-        const int32_t query = row_queries[lane];
-        if (query < 0) {
-            continue;
-        }
-        const uint64_t output_offset =
-            static_cast<uint64_t>(query) * topk_count + rank;
-        resolved_hot_indices[output_offset] =
+        const int32_t pool_entry_value =
+            req_pool_entries[req_id];
+        scalars[kPoolEntryScalar] = pool_entry_value;
+        scalars[kFreeHeadScalar] = 0;
+        scalars[kCursorScalar] = 0;
+        scalars[kLastVictimScalar] =
             DSA_SPARSE_NOT_FOUND;
-        miss_mask[output_offset] = 0U;
+        if (pool_entry_value >= 0 &&
+            pool_entry_value <
+                static_cast<int32_t>(pool_capacity)) {
+            __gm__ int32_t* request_free_head =
+                free_head +
+                static_cast<uint64_t>(pool_entry_value) *
+                    DSA_SPARSE_FREE_HEAD_STRIDE;
+            scalars[kFreeHeadScalar] =
+                request_free_head[0];
+            int32_t cursor = request_free_head[1];
+            if (cursor < 0 ||
+                cursor >= static_cast<int32_t>(
+                              DSA_SPARSE_SLOT_COUNT)) {
+                cursor = 0;
+            }
+            scalars[kCursorScalar] = cursor;
+        }
     }
-    asc_threadfence_block();
     asc_syncthreads();
 
-    const int32_t seat_value =
-        row_to_cache_seat[request_row];
-    if (seat_value < 0 ||
-        seat_value >= static_cast<int32_t>(seat_capacity)) {
+    const int32_t pool_entry_value =
+        scalars[kPoolEntryScalar];
+    if (pool_entry_value < 0 ||
+        pool_entry_value >=
+            static_cast<int32_t>(pool_capacity)) {
+#pragma unroll
+        for (uint32_t local_entry = 0U;
+             local_entry < query_chunk;
+             ++local_entry) {
+            const uint64_t offset =
+                query_base + query_begin + local_entry;
+            slot_out[offset] = local_slots[local_entry];
+            miss_out[offset] = local_misses[local_entry];
+        }
         return;
     }
-    const uint32_t seat = static_cast<uint32_t>(seat_value);
-    __gm__ int32_t* seat_token_to_hot =
-        token_to_hot +
-        static_cast<uint64_t>(seat) * token_position_capacity;
-    __gm__ int32_t* seat_hot_to_token =
-        hot_to_token +
-        static_cast<uint64_t>(seat) * evictable_slot_count;
-    __gm__ int32_t* seat_lru =
-        lru_slots +
-        static_cast<uint64_t>(seat) * evictable_slot_count;
-
-    // A cache seat is reset lazily on the first call made by its new owner.
-    // The lifecycle layer guarantees that active row_to_cache_seat values are
-    // injective, so no other AIV can reset or mutate this seat concurrently.
-    const int32_t expected_epoch =
-        row_seat_epoch[request_row];
-    const bool reset_state =
-        state_seat_epoch[seat] != expected_epoch;
-    if (reset_state) {
-        for (uint32_t token = tid;
-             token < token_position_capacity;
-             token += thread_count) {
-            seat_token_to_hot[token] = DSA_SPARSE_NOT_FOUND;
+    if (scalars[kFreeHeadScalar] != 0) {
+        // This fused operator owns the complete lookup/maintain transaction.
+        // A non-zero entry head means the row was left mid-transaction by a
+        // different producer; fail closed instead of consuming a partial list.
+#pragma unroll
+        for (uint32_t local_entry = 0U;
+             local_entry < query_chunk;
+             ++local_entry) {
+            const uint64_t offset =
+                query_base + query_begin + local_entry;
+            slot_out[offset] = local_slots[local_entry];
+            miss_out[offset] = local_misses[local_entry];
         }
-        for (uint32_t slot = tid;
-             slot < evictable_slot_count;
-             slot += thread_count) {
-            seat_hot_to_token[slot] = DSA_SPARSE_NOT_FOUND;
-            seat_lru[slot] = static_cast<int32_t>(slot);
-        }
-        asc_threadfence_block();
-        asc_syncthreads();
-        if (tid == 0U) {
-            state_seat_epoch[seat] = expected_epoch;
-        }
-        asc_threadfence_block();
-        asc_syncthreads();
+        return;
     }
 
-    const int32_t row_seq_len = seq_lens[request_row];
+    const uint32_t pool_entry =
+        static_cast<uint32_t>(pool_entry_value);
+    __gm__ int32_t* request_index =
+        index +
+        static_cast<uint64_t>(pool_entry) *
+            DSA_SPARSE_INDEX_CAPACITY;
+    __gm__ int32_t* request_slot_to_index =
+        slot_to_index +
+        static_cast<uint64_t>(pool_entry) *
+            DSA_SPARSE_SLOT_COUNT;
+    __gm__ int32_t* request_free_slots =
+        free_slots +
+        static_cast<uint64_t>(pool_entry) *
+            DSA_SPARSE_FREE_SLOT_COUNT;
+    __gm__ int32_t* request_free_head =
+        free_head +
+        static_cast<uint64_t>(pool_entry) *
+            DSA_SPARSE_FREE_HEAD_STRIDE;
 
-    // Current Main-KV positions live in reserved slots for this replay. Remove
-    // an evictable mapping left by an earlier replay before ordinary lookup.
-    for (uint32_t lane = tid;
-         lane < query_lane_capacity;
-         lane += thread_count) {
-        const int32_t query = row_queries[lane];
-        if (query < 0 || query_valid_mask[query] == 0U) {
+    // First pass: return resident hits and mark active misses. The framework
+    // supplies one pool row per request and unique active query positions, so
+    // a missing token has exactly one owner in this invocation. No claim is
+    // installed in the index table and no atomic arbitration is required.
+#pragma unroll
+    for (uint32_t local_entry = 0U;
+         local_entry < query_chunk;
+         ++local_entry) {
+        if (query_masks[local_entry] == 0) {
             continue;
         }
-        const int32_t token = query_positions[query];
-        if (token < 0 || token >= row_seq_len ||
+        const int32_t token = query_values[local_entry];
+        if (token < 0 ||
             token >= static_cast<int32_t>(
-                         token_position_capacity)) {
-            continue;
-        }
-        const int32_t stale_slot =
-            seat_token_to_hot[static_cast<uint32_t>(token)];
-        if (stale_slot >= 0 &&
-            stale_slot <
-                static_cast<int32_t>(evictable_slot_count)) {
-            seat_token_to_hot[static_cast<uint32_t>(token)] =
-                DSA_SPARSE_NOT_FOUND;
-            if (seat_hot_to_token[
-                    static_cast<uint32_t>(stale_slot)] == token) {
-                seat_hot_to_token[
-                    static_cast<uint32_t>(stale_slot)] =
-                    DSA_SPARSE_NOT_FOUND;
-            }
-        }
-    }
-    asc_threadfence_block();
-    asc_syncthreads();
-
-    for (uint32_t slot = tid;
-         slot < evictable_slot_count;
-         slot += thread_count) {
-        hit_flags[slot] = 0;
-    }
-    if (tid < 4U) {
-        counters[tid] = 0;
-    }
-    asc_threadfence_block();
-    asc_syncthreads();
-
-    // Resolve every valid [lane, rank] entry. A missing token temporarily
-    // stores -(minimum_global_flat_entry + 2) in token_to_hot. The CAS loop
-    // monotonically raises the negative value, which deterministically chooses
-    // the smallest q*K+k occurrence independently of SIMT scheduling.
-    for (uint32_t entry = tid;
-         entry < row_entry_count;
-         entry += thread_count) {
-        const uint32_t lane = entry / topk_count;
-        const uint32_t rank = entry - lane * topk_count;
-        const int32_t query = row_queries[lane];
-        const int32_t valid_topk_count =
-            query < 0 ? 0 : valid_topk_counts[query];
-        if (query < 0 || query_valid_mask[query] == 0U ||
-            valid_topk_count <= 0 ||
-            rank >= static_cast<uint32_t>(
-                        valid_topk_count)) {
-            continue;
-        }
-
-        const uint64_t output_offset =
-            static_cast<uint64_t>(query) * topk_count + rank;
-        const int32_t token = topk_positions[output_offset];
-        if (token < 0 || token >= row_seq_len ||
-            token >= static_cast<int32_t>(
-                         token_position_capacity)) {
-            continue;
-        }
-
-        int32_t newest_query = DSA_SPARSE_NOT_FOUND;
-        int32_t newest_lane = DSA_SPARSE_NOT_FOUND;
-        for (uint32_t candidate_lane = 0;
-             candidate_lane < query_lane_capacity;
-             ++candidate_lane) {
-            const int32_t candidate_query =
-                row_queries[candidate_lane];
-            if (candidate_query < 0 ||
-                query_valid_mask[candidate_query] == 0U) {
-                continue;
-            }
-            if (query_positions[candidate_query] == token) {
-                if (newest_query == DSA_SPARSE_NOT_FOUND ||
-                    candidate_query < newest_query) {
-                    newest_query = candidate_query;
-                    newest_lane =
-                        static_cast<int32_t>(candidate_lane);
-                }
-            }
-        }
-        if (newest_lane >= 0) {
-            resolved_hot_indices[output_offset] =
-                static_cast<int32_t>(evictable_slot_count) +
-                newest_lane;
+                         DSA_SPARSE_INDEX_CAPACITY)) {
             continue;
         }
 
         __gm__ int32_t* token_slot =
-            seat_token_to_hot + static_cast<uint32_t>(token);
+            request_index + static_cast<uint32_t>(token);
         int32_t observed = *token_slot;
         if (observed >= 0 &&
             observed <
-                static_cast<int32_t>(evictable_slot_count)) {
-            resolved_hot_indices[output_offset] = observed;
-            hit_flags[static_cast<uint32_t>(observed)] = 1;
+                static_cast<int32_t>(DSA_SPARSE_SLOT_COUNT)) {
+            local_slots[local_entry] = observed;
+            ProtectSlot(
+                protected_bits,
+                static_cast<uint32_t>(observed));
             continue;
         }
 
-        const int32_t global_flat =
-            static_cast<int32_t>(output_offset);
-        const int32_t desired_claim =
-            DSA_SPARSE_CLAIM_BASE - global_flat;
-        while (observed == DSA_SPARSE_NOT_FOUND ||
-               observed <= DSA_SPARSE_CLAIM_BASE) {
-            if (observed <= DSA_SPARSE_CLAIM_BASE) {
-                const int32_t claimed_flat =
-                    DSA_SPARSE_CLAIM_BASE - observed;
-                if (claimed_flat <= global_flat) {
-                    break;
+        local_misses[local_entry] = 1;
+    }
+    // Count misses per contiguous query chunk. BlockExclusiveScan preserves
+    // input order for free-list allocation.
+    int32_t local_miss_count = 0;
+#pragma unroll
+    for (uint32_t local_entry = 0U;
+         local_entry < query_chunk;
+         ++local_entry) {
+        if (local_misses[local_entry] == 0) {
+            continue;
+        }
+        ++local_miss_count;
+    }
+    const int32_t miss_prefix =
+        BlockExclusiveScan(local_miss_count, warp_totals);
+    const int32_t total_misses =
+        warp_totals[DSA_SPARSE_WARP_COUNT - 1U];
+    const int32_t head_start =
+        scalars[kFreeHeadScalar];
+
+    int32_t local_rank = 0;
+#pragma unroll
+    for (uint32_t local_entry = 0U;
+         local_entry < query_chunk;
+         ++local_entry) {
+        if (local_misses[local_entry] == 0) {
+            continue;
+        }
+        const int32_t token = query_values[local_entry];
+
+        const int32_t miss_rank =
+            miss_prefix + local_rank;
+        ++local_rank;
+        const int32_t free_offset = head_start + miss_rank;
+        if (free_offset < 0 ||
+            free_offset >=
+                static_cast<int32_t>(
+                    DSA_SPARSE_FREE_SLOT_COUNT)) {
+            local_misses[local_entry] = 0;
+            continue;
+        }
+        const int32_t slot =
+            request_free_slots[
+                static_cast<uint32_t>(free_offset)];
+        if (slot < 0 ||
+            slot >= static_cast<int32_t>(
+                        DSA_SPARSE_SLOT_COUNT)) {
+            local_misses[local_entry] = 0;
+            continue;
+        }
+        request_slot_to_index[
+            static_cast<uint32_t>(slot)] = token;
+        request_index[
+            static_cast<uint32_t>(token)] = slot;
+        local_slots[local_entry] = slot;
+        local_misses[local_entry] = 1;
+        ProtectSlot(
+            protected_bits,
+            static_cast<uint32_t>(slot));
+    }
+    asc_threadfence_block();
+    asc_syncthreads();
+
+    if (total_misses == 0) {
+        // Only a block that owns another request will reuse protected_bits.
+        // Wait for every thread's final ProtectSlot before clearing it in the
+        // next iteration; no vector-pipeline barrier is required.
+        if (reuse_scratch) {
+            asc_syncthreads();
+        }
+#pragma unroll
+        for (uint32_t local_entry = 0U;
+             local_entry < query_chunk;
+             ++local_entry) {
+            const uint64_t offset =
+                query_base + query_begin + local_entry;
+            slot_out[offset] = local_slots[local_entry];
+            miss_out[offset] = local_misses[local_entry];
+        }
+        return;
+    }
+    // Fused maintain phase. Scan occupied, non-protected slots in circular
+    // cursor order and compact them by per-thread counts. The first M slots
+    // replace the M free-list entries consumed above.
+    const uint32_t scan_begin = tid * slot_chunk;
+    const uint32_t scan_end = scan_begin + slot_chunk;
+    const uint32_t cursor =
+        static_cast<uint32_t>(scalars[kCursorScalar]);
+    int32_t local_victim_count = 0;
+    for (uint32_t position = scan_begin;
+         position < scan_end;
+         ++position) {
+        uint32_t slot = cursor + position;
+        if (slot >= DSA_SPARSE_SLOT_COUNT) {
+            slot -= DSA_SPARSE_SLOT_COUNT;
+        }
+        if (!IsProtectedSlot(protected_bits, slot) &&
+            request_slot_to_index[slot] !=
+                DSA_SPARSE_NOT_FOUND) {
+            ++local_victim_count;
+        }
+    }
+
+    const int32_t victim_prefix =
+        BlockExclusiveScan(local_victim_count, warp_totals);
+    int32_t victim_rank = victim_prefix;
+    if (victim_prefix < total_misses) {
+        for (uint32_t position = scan_begin;
+             position < scan_end;
+             ++position) {
+            uint32_t slot = cursor + position;
+            if (slot >= DSA_SPARSE_SLOT_COUNT) {
+                slot -= DSA_SPARSE_SLOT_COUNT;
+            }
+            if (IsProtectedSlot(protected_bits, slot)) {
+                continue;
+            }
+            const int32_t old_token =
+                request_slot_to_index[slot];
+            if (old_token == DSA_SPARSE_NOT_FOUND) {
+                continue;
+            }
+            if (victim_rank < total_misses) {
+                request_slot_to_index[slot] =
+                    DSA_SPARSE_NOT_FOUND;
+                if (old_token >= 0 &&
+                    old_token <
+                        static_cast<int32_t>(
+                            DSA_SPARSE_INDEX_CAPACITY) &&
+                    request_index[
+                        static_cast<uint32_t>(old_token)] ==
+                        static_cast<int32_t>(slot)) {
+                    request_index[
+                        static_cast<uint32_t>(old_token)] =
+                        DSA_SPARSE_NOT_FOUND;
+                }
+                request_free_slots[
+                    static_cast<uint32_t>(
+                        total_misses - 1 - victim_rank)] =
+                    static_cast<int32_t>(slot);
+                if (victim_rank == total_misses - 1) {
+                    scalars[kLastVictimScalar] =
+                        static_cast<int32_t>(slot);
                 }
             }
-            const int32_t old = asc_atomic_cas(
-                token_slot, observed, desired_claim);
-            if (old == observed) {
-                break;
-            }
-            observed = old;
+            ++victim_rank;
         }
     }
     asc_threadfence_block();
     asc_syncthreads();
 
-    // Only the deterministic minimum flat occurrence owns the payload miss.
-    for (uint32_t entry = tid;
-         entry < row_entry_count;
-         entry += thread_count) {
-        const uint32_t lane = entry / topk_count;
-        const uint32_t rank = entry - lane * topk_count;
-        const int32_t query = row_queries[lane];
-        const int32_t valid_topk_count =
-            query < 0 ? 0 : valid_topk_counts[query];
-        if (query < 0 || query_valid_mask[query] == 0U ||
-            valid_topk_count <= 0 ||
-            rank >= static_cast<uint32_t>(
-                        valid_topk_count)) {
-            continue;
-        }
-        const uint64_t output_offset =
-            static_cast<uint64_t>(query) * topk_count + rank;
-        const int32_t token = topk_positions[output_offset];
-        if (token < 0 || token >= row_seq_len ||
-            token >= static_cast<int32_t>(
-                         token_position_capacity)) {
-            continue;
-        }
-        const int32_t claim =
-            DSA_SPARSE_CLAIM_BASE -
-            static_cast<int32_t>(output_offset);
-        if (seat_token_to_hot[
-                static_cast<uint32_t>(token)] == claim) {
-            miss_mask[output_offset] = 1U;
-        }
-    }
-    asc_threadfence_block();
-    asc_syncthreads();
-
-    // Stable partition of the previous LRU order. All resident selections in
-    // this row-wide T*K union are protected from this call's victims. This
-    // first list preserves old LRU order; victim selection applies the
-    // independent free-before-occupied policy below.
-    const uint32_t lru_chunk =
-        (evictable_slot_count + thread_count - 1U) /
-        thread_count;
-    const uint32_t lru_begin = tid * lru_chunk;
-    uint32_t lru_end = lru_begin + lru_chunk;
-    if (lru_end > evictable_slot_count) {
-        lru_end = evictable_slot_count;
+    if (tid == 0U) {
+        const int32_t last_victim =
+            scalars[kLastVictimScalar];
+        request_free_head[1] =
+            last_victim + 1 >=
+                    static_cast<int32_t>(
+                        DSA_SPARSE_SLOT_COUNT)
+                ? 0
+                : last_victim + 1;
+        request_free_head[0] = 0;
     }
 
-    int32_t local_hits = 0;
-    int32_t local_evictables = 0;
-    for (uint32_t pos = lru_begin; pos < lru_end; ++pos) {
-        const uint32_t slot =
-            static_cast<uint32_t>(seat_lru[pos]);
-        if (hit_flags[slot] != 0) {
-            ++local_hits;
-        } else {
-            ++local_evictables;
-        }
+#pragma unroll
+    for (uint32_t local_entry = 0U;
+         local_entry < query_chunk;
+         ++local_entry) {
+        const uint64_t offset =
+            query_base + query_begin + local_entry;
+        slot_out[offset] = local_slots[local_entry];
+        miss_out[offset] = local_misses[local_entry];
     }
-    thread_hit_counts[tid] = local_hits;
-    thread_evict_counts[tid] = local_evictables;
-    asc_threadfence_block();
-    asc_syncthreads();
+}
 
-    int32_t hit_prefix = 0;
-    int32_t evict_prefix = 0;
-    for (uint32_t other = 0; other < tid; ++other) {
-        hit_prefix += thread_hit_counts[other];
-        evict_prefix += thread_evict_counts[other];
-    }
-    int32_t hit_offset = hit_prefix;
-    int32_t evict_offset = evict_prefix;
-    for (uint32_t pos = lru_begin; pos < lru_end; ++pos) {
-        const int32_t slot = seat_lru[pos];
-        if (hit_flags[static_cast<uint32_t>(slot)] != 0) {
-            hit_slots[hit_offset++] = slot;
-        } else {
-            evictable_slots[evict_offset++] = slot;
-        }
-    }
-    if (tid == thread_count - 1U) {
-        counters[0] = hit_prefix + local_hits;
-        counters[1] = evict_prefix + local_evictables;
-    }
-    asc_threadfence_block();
-    asc_syncthreads();
-
-    const uint32_t hit_count =
-        static_cast<uint32_t>(counters[0]);
-    const uint32_t evictable_count =
-        static_cast<uint32_t>(counters[1]);
-
-    // Victim choice is free-first, while each subgroup preserves old LRU
-    // order. hit_flags is no longer needed as a bitmap after the stable
-    // hit/evictable partition, so reuse its S entries as the candidate list.
-    const uint32_t candidate_chunk =
-        (evictable_count + thread_count - 1U) /
-        thread_count;
-    const uint32_t candidate_begin = tid * candidate_chunk;
-    uint32_t candidate_end =
-        candidate_begin + candidate_chunk;
-    if (candidate_end > evictable_count) {
-        candidate_end = evictable_count;
-    }
-    int32_t local_free = 0;
-    int32_t local_occupied = 0;
-    for (uint32_t pos = candidate_begin;
-         pos < candidate_end;
-         ++pos) {
-        const uint32_t slot =
-            static_cast<uint32_t>(evictable_slots[pos]);
-        if (seat_hot_to_token[slot] ==
-            DSA_SPARSE_NOT_FOUND) {
-            ++local_free;
-        } else {
-            ++local_occupied;
-        }
-    }
-    thread_hit_counts[tid] = local_free;
-    thread_evict_counts[tid] = local_occupied;
-    asc_threadfence_block();
-    asc_syncthreads();
-
-    int32_t free_prefix = 0;
-    int32_t occupied_prefix = 0;
-    int32_t total_free = 0;
-    for (uint32_t other = 0; other < tid; ++other) {
-        free_prefix += thread_hit_counts[other];
-        occupied_prefix += thread_evict_counts[other];
-    }
-    for (uint32_t other = 0;
-         other < thread_count;
-         ++other) {
-        total_free += thread_hit_counts[other];
-    }
-    int32_t free_offset = free_prefix;
-    int32_t occupied_offset =
-        total_free + occupied_prefix;
-    for (uint32_t pos = candidate_begin;
-         pos < candidate_end;
-         ++pos) {
-        const int32_t slot = evictable_slots[pos];
-        if (seat_hot_to_token[
-                static_cast<uint32_t>(slot)] ==
-            DSA_SPARSE_NOT_FOUND) {
-            hit_flags[free_offset++] = slot;
-        } else {
-            hit_flags[occupied_offset++] = slot;
-        }
-    }
-    asc_threadfence_block();
-    asc_syncthreads();
-
-    // Compact canonical misses in global flat [Q,K] order. The four query
-    // lanes are sorted by q while their reserved-slot lane identity remains
-    // unchanged.
-    const uint32_t query_chunk =
-        (row_entry_count + thread_count - 1U) /
-        thread_count;
-    const uint32_t query_begin = tid * query_chunk;
-    uint32_t query_end = query_begin + query_chunk;
-    if (query_end > row_entry_count) {
-        query_end = row_entry_count;
-    }
-
-    int32_t local_misses = 0;
-    for (uint32_t entry = query_begin;
-         entry < query_end;
-         ++entry) {
-        const uint32_t order_index = entry / topk_count;
-        const uint32_t lane = static_cast<uint32_t>(
-            ordered_lanes[order_index]);
-        const uint32_t rank =
-            entry - order_index * topk_count;
-        const int32_t query = row_queries[lane];
-        if (query < 0) {
-            continue;
-        }
-        const uint64_t output_offset =
-            static_cast<uint64_t>(query) * topk_count + rank;
-        if (miss_mask[output_offset] != 0U) {
-            ++local_misses;
-        }
-    }
-    thread_miss_counts[tid] = local_misses;
-    asc_threadfence_block();
-    asc_syncthreads();
-
-    int32_t miss_prefix = 0;
-    for (uint32_t other = 0; other < tid; ++other) {
-        miss_prefix += thread_miss_counts[other];
-    }
-    int32_t miss_offset = miss_prefix;
-    for (uint32_t entry = query_begin;
-         entry < query_end;
-         ++entry) {
-        const uint32_t order_index = entry / topk_count;
-        const uint32_t lane = static_cast<uint32_t>(
-            ordered_lanes[order_index]);
-        const uint32_t rank =
-            entry - order_index * topk_count;
-        const int32_t query = row_queries[lane];
-        if (query < 0) {
-            continue;
-        }
-        const uint64_t output_offset =
-            static_cast<uint64_t>(query) * topk_count + rank;
-        if (miss_mask[output_offset] == 0U) {
-            continue;
-        }
-
-        const uint32_t miss_rank =
-            static_cast<uint32_t>(miss_offset++);
-        const uint32_t victim_slot =
-            static_cast<uint32_t>(hit_flags[miss_rank]);
-        const int32_t victim_token =
-            seat_hot_to_token[victim_slot];
-        if (victim_token >= 0 &&
-            victim_token <
-                static_cast<int32_t>(
-                    token_position_capacity)) {
-            seat_token_to_hot[
-                static_cast<uint32_t>(victim_token)] =
-                DSA_SPARSE_NOT_FOUND;
-        }
-
-        const int32_t token = topk_positions[output_offset];
-        seat_hot_to_token[victim_slot] = token;
-        seat_token_to_hot[static_cast<uint32_t>(token)] =
-            static_cast<int32_t>(victim_slot);
-        resolved_hot_indices[output_offset] =
-            static_cast<int32_t>(victim_slot);
-        hit_slots[hit_count + miss_rank] =
-            static_cast<int32_t>(victim_slot);
-    }
-    if (tid == thread_count - 1U) {
-        counters[2] = miss_prefix + local_misses;
-    }
-    asc_threadfence_block();
-    asc_syncthreads();
-
-    const uint32_t miss_count =
-        static_cast<uint32_t>(counters[2]);
-    const uint32_t stale_count =
-        evictable_count - miss_count;
-
-    // Mark allocated victims, then compact untouched evictables in their
-    // original LRU order. This keeps victim priority (free-first) independent
-    // from the final approximate-LRU stale ordering.
-    for (uint32_t slot = tid;
-         slot < evictable_slot_count;
-         slot += thread_count) {
-        hit_flags[slot] = 0;
-    }
-    asc_threadfence_block();
-    asc_syncthreads();
-    for (uint32_t rank = tid;
-         rank < miss_count;
-         rank += thread_count) {
-        const uint32_t slot = static_cast<uint32_t>(
-            hit_slots[hit_count + rank]);
-        hit_flags[slot] = 1;
-    }
-    asc_threadfence_block();
-    asc_syncthreads();
-
-    const uint32_t stale_chunk =
-        (evictable_count + thread_count - 1U) /
-        thread_count;
-    const uint32_t stale_begin = tid * stale_chunk;
-    uint32_t stale_end = stale_begin + stale_chunk;
-    if (stale_end > evictable_count) {
-        stale_end = evictable_count;
-    }
-    int32_t local_untouched = 0;
-    for (uint32_t pos = stale_begin;
-         pos < stale_end;
-         ++pos) {
-        const uint32_t slot =
-            static_cast<uint32_t>(evictable_slots[pos]);
-        if (hit_flags[slot] == 0) {
-            ++local_untouched;
-        }
-    }
-    thread_evict_counts[tid] = local_untouched;
-    asc_threadfence_block();
-    asc_syncthreads();
-
-    int32_t untouched_prefix = 0;
-    for (uint32_t other = 0; other < tid; ++other) {
-        untouched_prefix += thread_evict_counts[other];
-    }
-    int32_t untouched_offset = untouched_prefix;
-    for (uint32_t pos = stale_begin;
-         pos < stale_end;
-         ++pos) {
-        const int32_t slot = evictable_slots[pos];
-        if (hit_flags[static_cast<uint32_t>(slot)] == 0) {
-            seat_lru[untouched_offset++] = slot;
-        }
-    }
-    asc_threadfence_block();
-    asc_syncthreads();
-
-    // Batch approximate LRU, from LRU to MRU:
-    //   untouched stale + newly allocated + selected resident.
-    for (uint32_t rank = tid;
-         rank < miss_count;
-         rank += thread_count) {
-        seat_lru[stale_count + rank] =
-            hit_slots[hit_count + rank];
-    }
-    for (uint32_t rank = tid;
-         rank < hit_count;
-         rank += thread_count) {
-        seat_lru[stale_count + miss_count + rank] =
-            hit_slots[rank];
-    }
-    asc_threadfence_block();
-    asc_syncthreads();
-
-    // Duplicate followers reuse the canonical occurrence's installed slot.
-    for (uint32_t entry = tid;
-         entry < row_entry_count;
-         entry += thread_count) {
-        const uint32_t lane = entry / topk_count;
-        const uint32_t rank = entry - lane * topk_count;
-        const int32_t query = row_queries[lane];
-        if (query < 0) {
-            continue;
-        }
-        const uint64_t output_offset =
-            static_cast<uint64_t>(query) * topk_count + rank;
-        if (resolved_hot_indices[output_offset] !=
-            DSA_SPARSE_NOT_FOUND) {
-            continue;
-        }
-        const int32_t token = topk_positions[output_offset];
-        const int32_t valid_topk_count =
-            valid_topk_counts[query];
-        if (query_valid_mask[query] != 0U &&
-            valid_topk_count > 0 &&
-            rank < static_cast<uint32_t>(
-                       valid_topk_count) &&
-            token >= 0 && token < row_seq_len &&
-            token <
-                static_cast<int32_t>(
-                    token_position_capacity)) {
-            resolved_hot_indices[output_offset] =
-                seat_token_to_hot[
-                    static_cast<uint32_t>(token)];
-        }
+__simt_vf__ __launch_bounds__(DSA_SPARSE_SIMT_THREADS) inline void
+DsaSparseLookupUpdateSimt(
+    __gm__ int32_t* index,
+    __gm__ int32_t* slot_to_index,
+    __gm__ int32_t* free_slots,
+    __gm__ int32_t* free_head,
+    __gm__ int32_t* req_pool_entries,
+    __gm__ int32_t* query_index,
+    __gm__ int32_t* lookup_mask,
+    __gm__ int32_t* slot_out,
+    __gm__ int32_t* miss_out,
+    __ubuf__ uint32_t* shared_scratch,
+    uint32_t req_num,
+    uint32_t pool_capacity)
+{
+    const uint32_t request_stride =
+        static_cast<uint32_t>(gridDim.x);
+    for (uint32_t req_id =
+             static_cast<uint32_t>(blockIdx.x);
+         req_id < req_num;
+         req_id += request_stride) {
+        DsaSparseLookupUpdateOneRequest(
+            index,
+            slot_to_index,
+            free_slots,
+            free_head,
+            req_pool_entries,
+            query_index,
+            lookup_mask,
+            slot_out,
+            miss_out,
+            shared_scratch,
+            req_id,
+            pool_capacity,
+            req_id + request_stride < req_num);
     }
 }
 

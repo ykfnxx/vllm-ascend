@@ -14,22 +14,16 @@ extern "C" {
 
 __attribute__((visibility("default"))) aclnnStatus
 aclnnDsaSparseLookupUpdateGetWorkspaceSize(
-    const aclTensor* tokenToHot,
-    const aclTensor* hotToToken,
-    const aclTensor* lruSlots,
-    const aclTensor* stateSeatEpoch,
-    const aclTensor* rowToCacheSeat,
-    const aclTensor* rowSeatEpoch,
-    const aclTensor* queryPositions,
-    const aclTensor* queryToRow,
-    const aclTensor* queryToLane,
-    const aclTensor* queryValidMask,
-    const aclTensor* validTopkCounts,
-    const aclTensor* seqLens,
-    const aclTensor* topkPositions,
-    const aclTensor* resolvedHotIndices,
-    const aclTensor* missMask,
-    const aclTensor* opWorkspace,
+    const aclTensor* index,
+    const aclTensor* slotToIndex,
+    const aclTensor* freeSlots,
+    const aclTensor* freeHead,
+    const aclTensor* reqPoolEntries,
+    const aclTensor* queryIndex,
+    const aclTensor* lookupMask,
+    int64_t reqNum,
+    const aclTensor* slotOut,
+    const aclTensor* missOut,
     uint64_t* workspaceSize,
     aclOpExecutor** executor);
 

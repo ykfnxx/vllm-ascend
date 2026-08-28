@@ -58,6 +58,8 @@ patch(
 patch("vllm.distributed.parallel_state._DCP", _mock_dcp_group).start()
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
+    DSA_SPARSE_PD_HANDOFF_KEY,
+    DSASparsePDWorkerMetadata,
     MAX_REQUESTS_PER_PEER_HANDLER,
     GroupPull,
     KVCacheRecvingThread,
@@ -76,6 +78,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # n
     split_if_not_byte_contiguous,
     string_to_int64_hash,
     zmq_ctx,
+)
+from vllm_ascend.dsa_sparse_constants import (  # noqa: E402
+    DSA_SPARSE_QUERY_WIDTH,
 )
 
 for _k, _v in _saved_modules.items():
@@ -906,6 +911,62 @@ class TestCoreFunctionality(unittest.TestCase):
         mock_get_meta.assert_not_called()
 
     @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
+    def test_transfer_dsa_sparse_indexer_uses_remote_layer_name_mapping(self, mock_get_meta):
+        """D's Indexer layer may have a different physical index than P's."""
+        req = dict(self.test_req)
+        self.thread.kv_group2layeridx = {
+            0: (
+                {
+                    "kv_cache_spec_type": "UniformTypeKVCacheSpecs",
+                    "layer_names": ["model.layers.0.self_attn.indexer.k_cache"],
+                },
+                [0],
+            )
+        }
+        self.thread.kv_caches_base_addr["local_engine"][5555] = [[0x1000, 0x1100]]
+        self.thread.block_len_per_addr = [[1024, 256]]
+        self.thread.block_stride_per_addr = [[1024, 256]]
+        self.thread.kv_caches_base_addr["remote_engine"] = {6666: [[0x3000], [0x9000, 0xA000]]}
+        self.thread.remote_block_stride_per_addr["remote_engine"][6666] = [[1024], [4096, 512]]
+        self.thread.remote_kv_group2layeridx["remote_engine"][6666] = {
+            0: (
+                {
+                    "kv_cache_spec_type": "FullAttentionSpec",
+                    "layer_names": ["model.layers.0.self_attn"],
+                },
+                [0],
+            ),
+            1: (
+                {
+                    "kv_cache_spec_type": "AscendSFAIndexerCacheSpec",
+                    "layer_names": ["model.layers.0.self_attn.indexer.k_cache"],
+                },
+                [1],
+            ),
+        }
+
+        with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.get_ascend_config") as mock_config:
+            mock_config.return_value.enable_kv_nz = False
+            self.thread._transfer_kv_cache_all_groups(req)
+
+        call_args, _ = self.engine.batch_transfer_sync_read.call_args
+        self.assertEqual(call_args[1], [0x1000 + 1 * 1024, 0x1100 + 1 * 256])
+        self.assertEqual(call_args[2], [0x9000 + 3 * 4096, 0xA000 + 3 * 512])
+        self.assertEqual(call_args[3], [2 * 1024, 2 * 256])
+        mock_get_meta.assert_not_called()
+
+    @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
+    def test_transfer_kv_cache_dsa_sparse_mock_skips_payload(self, mock_get_meta):
+        self.thread.kv_caches_base_addr["remote_engine"] = {6666: [[0x3000]]}
+        self.thread.remote_block_size_scale["remote_engine"] = {6666: [[1]]}
+
+        with patch.dict(os.environ, {"VLLM_ASCEND_DSA_SPARSE_MOCK_SKIP_MOONCAKE": "1"}):
+            self.thread._transfer_kv_cache_all_groups(self.test_req)
+
+        self.engine.batch_transfer_sync_read.assert_not_called()
+        mock_get_meta.assert_not_called()
+
+    @patch.object(KVCacheRecvingThread, "_get_remote_metadata")
     def test_transfer_groups_contiguous_kernel_blocks(self, mock_get_meta):
         # Kernel-level ids now arrive pre-expanded from _get_kv_split_metadata; the
         # transfer stage only groups contiguous kernels and computes addresses.
@@ -1230,6 +1291,7 @@ class MockRequest:
         self.kv_transfer_params = kv_transfer_params or {}
         self.status = status or "running"
         self.output_token_ids = [101, 102]
+        self.num_prompt_tokens = len(self.prompt_token_ids)
 
 
 class MockKVCacheGroup:
@@ -1639,6 +1701,45 @@ class TestMooncakeConnectorScheduler(unittest.TestCase):
         delay_free, params = self.scheduler.request_finished(request, [1, 2, 3])
         self.assertFalse(delay_free)
         self.assertIsNone(params)
+
+    def test_dsa_topk_is_consumed_before_finish_and_added_to_handoff(self):
+        self.scheduler.dsa_sparse_config = types.SimpleNamespace(
+            kv_role="kv_producer"
+        )
+        self.scheduler.tp_size = 1
+        topk = list(range(DSA_SPARSE_QUERY_WIDTH))
+        output = types.SimpleNamespace(
+            kv_connector_worker_meta=DSASparsePDWorkerMetadata(
+                {
+                    "req1": {
+                        0: {
+                            "model.layers.0.self_attn": topk,
+                        },
+                    },
+                }
+            )
+        )
+
+        self.scheduler.update_dsa_sparse_before_request_finish(
+            output
+        )
+        request = self._make_remote_decode_request(128)
+        _delay_free, params = self.scheduler.request_finished(
+            request,
+            ([1, 2, 3, 4, 5, 6, 7, 8],),
+        )
+
+        self.assertIsNone(output.kv_connector_worker_meta)
+        self.assertIsNotNone(params)
+        handoff = params[DSA_SPARSE_PD_HANDOFF_KEY]
+        self.assertEqual(handoff["remote_request_id"], "req1")
+        self.assertEqual(handoff["stored_token_count"], 128)
+        self.assertEqual(
+            handoff["layer_topk_by_rank"]["0"][
+                "model.layers.0.self_attn"
+            ],
+            topk,
+        )
 
     def test_get_transfer_block_ids_trims_attention_mtp_blocks(self):
         self.scheduler.group_transfer_info = [
@@ -3166,6 +3267,44 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
 
         with self.assertRaises(AssertionError):
             worker._get_sfa_replicate_k_block_ids(cast(ReqMeta, meta))
+
+    def test_dsa_worker_captures_layer_topk_as_control_metadata(self):
+        worker = MooncakeConnectorWorker.__new__(
+            MooncakeConnectorWorker
+        )
+        worker.dsa_sparse_config = types.SimpleNamespace(
+            kv_role="kv_producer"
+        )
+        worker.tp_rank = 2
+        worker._dsa_sparse_layer_topk_by_request = {}
+        topk = list(range(DSA_SPARSE_QUERY_WIDTH))
+        producer_context = MagicMock()
+        producer_context.layer_topk.return_value = {
+            "request-a": topk,
+        }
+        metadata = {
+            "layer.0": types.SimpleNamespace(
+                dsa_sparse_producer_context=producer_context
+            )
+        }
+
+        worker.capture_dsa_sparse_layer_topk(
+            "layer.0",
+            metadata,
+        )
+        worker_metadata = worker.build_connector_worker_meta()
+
+        self.assertIsInstance(
+            worker_metadata,
+            DSASparsePDWorkerMetadata,
+        )
+        self.assertEqual(
+            worker_metadata.request_layer_topk_by_rank[
+                "request-a"
+            ][2]["layer.0"],
+            topk,
+        )
+        self.assertIsNone(worker.build_connector_worker_meta())
 
 
 if __name__ == "__main__":

@@ -8,9 +8,9 @@ from vllm.distributed.parallel_state import GroupCoordinator
 
 from tests.ut.attention.utils import patch_distributed_groups
 from tests.ut.base import TestBase
+from vllm_ascend import dsa_sparse_probe
 from vllm_ascend.ascend_config import init_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.dsa_sparse import DSASparseResolution
 
 if "torch_npu._inductor" not in sys.modules:
     sys.modules["torch_npu._inductor"] = MagicMock()
@@ -143,6 +143,7 @@ class TestAscendSFABytePackedGather(TestBase):
 class TestAscendSFAKVCacheComposition(TestBase):
     def test_compose_returns_main_cache_without_indexer(self):
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.dsa_sparse_coordinator = None
         impl.has_indexer = False
         main_cache = (torch.empty(1), torch.empty(2))
 
@@ -205,6 +206,7 @@ class TestAscendSFAKVCacheComposition(TestBase):
             pass
 
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.dsa_sparse_coordinator = None
         main_cache = (torch.empty(1), torch.empty(2))
         impl._compose_sfa_kv_cache = MagicMock(
             side_effect=CompositionReached,
@@ -215,7 +217,9 @@ class TestAscendSFAKVCacheComposition(TestBase):
                 layer_name="model.layers.0.self_attn.attn",
                 hidden_states=torch.empty(1),
                 kv_cache=main_cache,
-                attn_metadata=object(),
+                attn_metadata=SimpleNamespace(
+                    dsa_sparse_req_pool_entries=None,
+                ),
                 output=torch.empty(1),
             )
 
@@ -223,6 +227,7 @@ class TestAscendSFAKVCacheComposition(TestBase):
 
     def test_hot_cache_adapter_only_replaces_sfa_cache_addressing(self):
         impl = AscendSFAImpl.__new__(AscendSFAImpl)
+        impl.layer_name = "model.layers.0.self_attn.attn"
         ql_nope = torch.empty(2, 4, 8)
         q_pe = torch.empty(2, 4, 2)
         hot_main_cache = (
@@ -231,26 +236,38 @@ class TestAscendSFAKVCacheComposition(TestBase):
         )
         local_indices = torch.zeros((2, 4), dtype=torch.int32)
         hot_block_table = torch.arange(8, dtype=torch.int32).view(2, 4)
-        resolution = DSASparseResolution(
-            hot_main_cache=hot_main_cache,
-            local_sparse_indices=local_indices,
-            hot_block_table=hot_block_table,
-        )
         attn_metadata = SimpleNamespace(
             block_table=torch.full((2, 4), 99, dtype=torch.int32),
         )
         seq_lens = torch.tensor([1, 2], dtype=torch.int32)
         expected = torch.empty_like(ql_nope)
 
-        with patch.object(
-            DeviceOperator,
-            "execute_sparse_flash_attention_process",
-            return_value=expected,
-        ) as mock_sfa:
+        with (
+            patch.object(
+                DeviceOperator,
+                "execute_sparse_flash_attention_process",
+                return_value=expected,
+            ) as mock_sfa,
+            patch.object(
+                dsa_sparse_probe,
+                "is_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                dsa_sparse_probe,
+                "synchronize_device",
+            ) as mock_synchronize,
+            patch.object(
+                dsa_sparse_probe,
+                "emit",
+            ) as mock_probe_emit,
+        ):
             result = impl._execute_dsa_sparse_hot_cache_attention(
                 ql_nope,
                 q_pe,
-                resolution,
+                hot_main_cache,
+                local_indices,
+                hot_block_table,
                 attn_metadata,
                 seq_lens,
                 seq_lens,
@@ -259,8 +276,33 @@ class TestAscendSFAKVCacheComposition(TestBase):
         self.assertIs(result, expected)
         call_args = mock_sfa.call_args
         self.assertIs(call_args.args[3], hot_main_cache)
-        self.assertIs(call_args.args[4], local_indices)
+        self.assertEqual(
+            tuple(call_args.args[4].shape),
+            (2, 1, 4),
+        )
+        self.assertTrue(
+            torch.equal(
+                call_args.args[4].squeeze(1),
+                local_indices,
+            )
+        )
         self.assertIs(call_args.kwargs["block_table"], hot_block_table)
+        mock_synchronize.assert_called_once_with()
+        mock_probe_emit.assert_called_once_with(
+            "hot_cache_sfa_done",
+            layer="model.layers.0.self_attn.attn",
+            hot_cache_ptrs=[
+                plane.data_ptr()
+                for plane in hot_main_cache
+            ],
+            hot_cache_shapes=[
+                list(plane.shape)
+                for plane in hot_main_cache
+            ],
+            sparse_indices_shape=[2, 1, 4],
+            hot_block_table_ptr=hot_block_table.data_ptr(),
+            hot_block_table_shape=[2, 4],
+        )
 
 class TestAscendSFADeviceOperator(TestBase):
     def _make_common_inputs(self):

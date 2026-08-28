@@ -3,71 +3,45 @@
 
 from unittest.mock import patch
 
-from vllm_ascend.attention.dsa_sparse import (
-    DSASparseCacheConfig,
-    DSASparseCohortKey,
-    DSASparsePlan,
-    DSASparsePlanKey,
-    DSASparseResidencyState,
-)
-from vllm_ascend.ops.dsa_sparse import (
-    DSASparseLookupUpdateTorchOperator,
-)
+import torch
+
+from vllm_ascend.ops.dsa_sparse import dsa_sparse_lookup_update
 
 
-@patch(
-    "torch.ops._C_ascend.dsa_sparse_lookup_update",
-    create=True,
-)
-def test_torch_wrapper_forwards_the_frozen_16_tensor_abi(mock_operator):
-    config = DSASparseCacheConfig(
-        max_num_seqs=2,
-        max_model_len=32,
-        block_size=4,
-        device_buffer_size=8,
-        max_query_tokens_per_request=1,
-        index_topk=4,
-    )
-    cohort_key = DSASparseCohortKey(
-        name="target-indexer-0",
-        role="target",
-    )
-    state = DSASparseResidencyState.allocate(
-        config,
-        cohort_key,
-        device="cpu",
-    )
-    plan = DSASparsePlan.allocate(
-        config,
-        DSASparsePlanKey(
-            token_capacity=2,
-            request_capacity=2,
-            query_lane_capacity=1,
-            role="target",
-        ),
-        device="cpu",
-    )
+def test_lookup_wrapper_forwards_the_current_operator_abi():
+    index = torch.empty((4, 16), dtype=torch.int32)
+    slot_to_index = torch.empty((4, 8), dtype=torch.int32)
+    free_slots = torch.empty((4, 2), dtype=torch.int32)
+    free_head = torch.empty((4, 16), dtype=torch.int32)
+    req_pool_entries = torch.tensor([3, 1], dtype=torch.int32)
+    query_index = torch.empty((2, 5), dtype=torch.int32)
+    lookup_mask = torch.empty((2, 5), dtype=torch.int32)
+    slot_out = torch.empty_like(query_index)
+    miss_out = torch.empty_like(query_index)
 
-    DSASparseLookupUpdateTorchOperator().lookup_update(
-        state=state,
-        plan=plan,
-    )
+    with patch(
+        "torch.ops._C_ascend.dsa_sparse_lookup_update",
+        return_value=(slot_out, miss_out),
+    ) as op:
+        result = dsa_sparse_lookup_update(
+            index,
+            slot_to_index,
+            free_slots,
+            free_head,
+            req_pool_entries,
+            query_index,
+            lookup_mask,
+        )
 
-    mock_operator.assert_called_once_with(
-        state.token_to_hot,
-        state.hot_to_token,
-        state.lru_slots,
-        state.state_seat_epoch,
-        plan.row_mapping.row_to_cache_seat,
-        plan.row_mapping.row_seat_epoch,
-        plan.query_positions,
-        plan.query_to_row,
-        plan.query_to_lane,
-        plan.query_valid_mask,
-        plan.valid_topk_counts,
-        plan.seq_lens,
-        plan.topk_positions,
-        plan.resolved_hot_indices,
-        plan.miss_mask,
-        plan.workspace,
+    op.assert_called_once_with(
+        index,
+        slot_to_index,
+        free_slots,
+        free_head,
+        req_pool_entries,
+        query_index,
+        lookup_mask,
+        2,
     )
+    assert result[0] is slot_out
+    assert result[1] is miss_out

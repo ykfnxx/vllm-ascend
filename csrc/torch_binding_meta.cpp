@@ -1756,40 +1756,70 @@ void store_kv_block(
 
 } 
 
-void dsa_sparse_lookup_update(
-    at::Tensor& token_to_hot,
-    at::Tensor& hot_to_token,
-    at::Tensor& lru_slots,
-    at::Tensor& state_seat_epoch,
-    const at::Tensor& row_to_cache_seat,
-    const at::Tensor& row_seat_epoch,
-    const at::Tensor& query_positions,
-    const at::Tensor& query_to_row,
-    const at::Tensor& query_to_lane,
-    const at::Tensor& query_valid_mask,
-    const at::Tensor& valid_topk_counts,
-    const at::Tensor& seq_lens,
-    const at::Tensor& topk_positions,
-    at::Tensor& resolved_hot_indices,
-    at::Tensor& miss_mask,
-    at::Tensor& workspace)
+std::tuple<at::Tensor, at::Tensor> asu_hbm_index_lookup(
+    at::Tensor& index,
+    at::Tensor& slot_to_index,
+    at::Tensor& free_slots,
+    at::Tensor& free_head,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& query_index,
+    const at::Tensor& lookup_mask,
+    int64_t req_num)
 {
-    (void)token_to_hot;
-    (void)hot_to_token;
-    (void)lru_slots;
-    (void)state_seat_epoch;
-    (void)row_to_cache_seat;
-    (void)row_seat_epoch;
-    (void)query_positions;
-    (void)query_to_row;
-    (void)query_to_lane;
-    (void)query_valid_mask;
-    (void)valid_topk_counts;
-    (void)seq_lens;
-    (void)topk_positions;
-    (void)resolved_hot_indices;
-    (void)miss_mask;
-    (void)workspace;
+    (void)index;
+    (void)slot_to_index;
+    (void)free_slots;
+    (void)free_head;
+    (void)req_pool_entries;
+    (void)lookup_mask;
+    (void)req_num;
+    return {
+        at::empty_like(query_index),
+        at::empty_like(query_index),
+    };
+}
+
+void asu_hbm_index_maintain_aicpu(
+    at::Tensor& index,
+    at::Tensor& slot_to_index,
+    at::Tensor& free_slots,
+    at::Tensor& free_head,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& last_query_slots,
+    int64_t req_num,
+    int64_t seed)
+{
+    (void)index;
+    (void)slot_to_index;
+    (void)free_slots;
+    (void)free_head;
+    (void)req_pool_entries;
+    (void)last_query_slots;
+    (void)req_num;
+    (void)seed;
+}
+
+std::tuple<at::Tensor, at::Tensor> dsa_sparse_lookup_update(
+    at::Tensor& index,
+    at::Tensor& slot_to_index,
+    at::Tensor& free_slots,
+    at::Tensor& free_head,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& query_index,
+    const at::Tensor& lookup_mask,
+    int64_t req_num)
+{
+    (void)index;
+    (void)slot_to_index;
+    (void)free_slots;
+    (void)free_head;
+    (void)req_pool_entries;
+    (void)lookup_mask;
+    (void)req_num;
+    return {
+        at::empty_like(query_index),
+        at::empty_like(query_index),
+    };
 }
 
 } // namespace meta
@@ -1910,6 +1940,10 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
      // store_kv_block
     ops.impl("store_kv_block_pre", &vllm_ascend::meta::store_kv_block_metadata);
     ops.impl("store_kv_block", &vllm_ascend::meta::store_kv_block);
+    ops.impl("asu_hbm_index_lookup",
+             &vllm_ascend::meta::asu_hbm_index_lookup);
+    ops.impl("asu_hbm_index_maintain_aicpu",
+             &vllm_ascend::meta::asu_hbm_index_maintain_aicpu);
     ops.impl("dsa_sparse_lookup_update",
              &vllm_ascend::meta::dsa_sparse_lookup_update);
     // npu_fused_gdn_gating
