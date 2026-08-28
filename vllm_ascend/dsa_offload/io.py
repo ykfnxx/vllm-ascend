@@ -69,6 +69,20 @@ def make_storage_ids(
     )
 
 
+def require_block_hashes(
+    block_hashes: Sequence[bytes],
+    required_blocks: int,
+    *,
+    context: str,
+) -> None:
+    available_blocks = len(block_hashes)
+    if available_blocks < required_blocks:
+        raise RuntimeError(
+            f"DSA Offload {context} requires {required_blocks} block hashes, "
+            f"but only {available_blocks} are available."
+        )
+
+
 class MockIOBackend:
     def register_put_cache(
         self,

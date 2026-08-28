@@ -3,6 +3,7 @@
 
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from vllm_ascend.dsa_offload.hot_cache import HotCacheLayout
@@ -115,3 +116,39 @@ def test_lookup_hit_does_not_call_io(spy_io) -> None:
     load_plan_misses(plan, 0, batch)
 
     assert spy_io.get_calls == []
+
+
+def test_lookup_miss_rejects_missing_block_hash(spy_io) -> None:
+    batch = DSAOffloadBatch(
+        layout=HotCacheLayout(4, 1, 1),
+        hot_cache=None,
+        io_backend=spy_io,
+        cohorts=(),
+        lookup_states={},
+        request_ids=("request",),
+        request_rows=torch.tensor([0], dtype=torch.int32),
+        decode_request_indices=(0,),
+        query_ranges=((0, 1),),
+        query_positions=torch.tensor([0]),
+        is_mtp=False,
+        committed_block_hashes={"request": []},
+        candidate_block_hashes={},
+    )
+    plan = LookupPlan(
+        mapped_indices=torch.empty((1, 0), dtype=torch.int32),
+        miss_positions=torch.tensor([5], dtype=torch.int64),
+        miss_logical_blocks=torch.tensor([1], dtype=torch.int64),
+        miss_block_offsets=torch.tensor([1], dtype=torch.int64),
+        miss_destination_slots=torch.tensor([0], dtype=torch.int64),
+        miss_batch_indices=torch.tensor([0], dtype=torch.int32),
+        query_request_rows=torch.tensor([0], dtype=torch.int32),
+        tail_mask=torch.empty((1, 0), dtype=torch.bool),
+        fallback_mask=torch.empty((1, 0), dtype=torch.bool),
+        staging_mask=torch.empty((1, 0), dtype=torch.bool),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"miss load for request request requires 2 block hashes",
+    ):
+        load_plan_misses(plan, 0, batch)

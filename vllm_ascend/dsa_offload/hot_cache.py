@@ -15,7 +15,7 @@ from .constants import (
     REPLACEABLE_SLOTS,
     RESIDENT_SLOTS,
 )
-from .io import make_storage_ids
+from .io import make_storage_ids, require_block_hashes
 
 if TYPE_CHECKING:
     from .lookup import DSAOffloadBatch
@@ -211,8 +211,15 @@ def _put_tail_block(
     for cohort in batch.cohorts:
         for layer_name, layer_id in zip(cohort.layer_names, cohort.layer_ids):
             device = hot_cache.layer_caches[layer_name][0].device
+            block_hashes = batch.block_hashes(request_index)
+            request_id = batch.request_ids[request_index]
+            require_block_hashes(
+                block_hashes,
+                logical_block + 1,
+                context=f"Decode tail commit for request {request_id}",
+            )
             storage_ids = make_storage_ids(
-                [batch.block_hashes(request_index)[logical_block]],
+                [block_hashes[logical_block]],
                 layer_id,
                 device=device,
             )

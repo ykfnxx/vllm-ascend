@@ -9,7 +9,7 @@ import torch
 
 from .constants import QUERY_WIDTH, RESIDENT_SLOTS
 from .hot_cache import HotCacheLayout, HotCacheState
-from .io import IOBackend, make_storage_ids
+from .io import IOBackend, make_storage_ids, require_block_hashes
 from .lookup import (
     IndexCacheCohort,
     clear_lookup_row,
@@ -170,9 +170,15 @@ class PrefillPublishState:
             if should_publish:
                 full_block_count = stored_token_count // block_size
                 if full_block_count:
+                    request_hashes = self.committed_block_hashes[request_id]
+                    require_block_hashes(
+                        request_hashes,
+                        full_block_count,
+                        context=f"Prefill publish for request {request_id}",
+                    )
                     source_block_ids = block_table[request_index, :full_block_count].to(torch.int64)
                     storage_ids = make_storage_ids(
-                        self.committed_block_hashes[request_id][:full_block_count],
+                        request_hashes[:full_block_count],
                         layer_id,
                         device=source_block_ids.device,
                     )
@@ -288,6 +294,12 @@ def _initialize_hot_row(
     committed_block_hashes: Sequence[bytes],
     io_backend: IOBackend,
 ) -> int:
+    full_block_count = stored_token_count // block_size
+    require_block_hashes(
+        committed_block_hashes,
+        full_block_count,
+        context=f"Hot Cache admission for request {request_id}",
+    )
     row_id = hot_cache.request_to_row[request_id]
     clear_lookup_row(lookup_states, row_id)
     residents: dict[str, list[int]] = {}

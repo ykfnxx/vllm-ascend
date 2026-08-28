@@ -113,6 +113,8 @@ Workloads:
   4. kv_both only: overlapping requests to make mixed Prefill/Decode possible.
 
 Validation boundary:
+  Prefix caching stays disabled so repeated prompts exercise DSA Offload rather
+  than vLLM prefix reuse; DSA block hashes are generated independently.
   mock is intentionally the default. With a split P/D connector it can still
   exercise the partial-tail handoff, but it does not perform capacity-layer
   full-block PUT or token GET. With --connector none it validates local cache

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
+import pytest
 import torch
 
 from vllm_ascend.dsa_offload.constants import QUERY_WIDTH
@@ -92,3 +93,30 @@ def test_short_final_prefill_captures_handoff_without_empty_put(spy_io) -> None:
     assert spy_io.put_calls == []
     assert state.layer_topk["layer"]["request"] == semantic_topk[1].tolist()
     assert state.partial_tail_blocks["layer"] == {"request": 7}
+
+
+def test_full_block_publish_rejects_missing_hashes(spy_io) -> None:
+    state = PrefillPublishState(
+        request_ids=("request",),
+        scheduled_token_counts=(4,),
+        stored_token_counts=(4,),
+        publish_requests=(True,),
+        committed_block_hashes={"request": []},
+        io_backend=spy_io,
+        tp_rank=0,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"Prefill publish for request request requires 1 block hashes",
+    ):
+        state.publish_layer(
+            layer_name="layer",
+            layer_id=0,
+            semantic_topk=torch.zeros(
+                (4, QUERY_WIDTH),
+                dtype=torch.int32,
+            ),
+            main_cache=(torch.empty((1, 4, 1)),),
+            block_table=torch.tensor([[7]], dtype=torch.int32),
+        )

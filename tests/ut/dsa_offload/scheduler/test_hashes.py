@@ -69,6 +69,19 @@ def make_request(block_hashes, tokens, hasher=None):
     )
 
 
+def make_fallback_hash_state(module, block_size=2):
+    def block_hasher(request):
+        start = len(request.block_hashes) * block_size
+        hashes = []
+        while start + block_size <= len(request._all_token_ids):
+            block = request._all_token_ids[start : start + block_size]
+            hashes.append(bytes(block))
+            start += block_size
+        return hashes
+
+    return module._DSAOffloadHashState(block_hasher)
+
+
 def test_scheduler_attaches_committed_load_only_and_new_candidate_hashes(
     monkeypatch,
 ) -> None:
@@ -128,6 +141,88 @@ def test_connector_free_scheduler_has_no_remote_handoff_hashes(
     output = module.attach_block_hashes(scheduler, scheduler.output)
 
     assert output.dsa_offload_connector_block_hashes == {}
+
+
+def test_connector_free_scheduler_generates_incremental_dsa_hashes(
+    monkeypatch,
+) -> None:
+    module, Scheduler = load_scheduler_module(monkeypatch)
+    scheduler = Scheduler()
+    scheduler.vllm_config = SimpleNamespace(additional_config={"dsa_offload": {}})
+    request = make_request([], [1, 2, 3])
+    scheduler.requests = {"request": request}
+    scheduler._vllm_ascend_dsa_offload_hash_state = make_fallback_hash_state(
+        module
+    )
+    output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="request")],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        kv_connector_metadata=None,
+        scheduled_spec_decode_tokens={},
+        finished_req_ids=set(),
+    )
+
+    module.attach_block_hashes(scheduler, output)
+
+    assert output.scheduled_new_reqs[0].block_hashes == [bytes([1, 2])]
+    assert request.block_hashes == []
+
+    request._all_token_ids.append(4)
+    request.all_token_ids.append(4)
+    output.scheduled_new_reqs = []
+    output.scheduled_cached_reqs = SimpleNamespace(req_ids=["request"])
+    module.attach_block_hashes(scheduler, output)
+
+    assert output.scheduled_cached_reqs.block_hashes == [
+        [bytes([1, 2]), bytes([3, 4])]
+    ]
+    assert request.block_hashes == []
+
+
+def test_connector_free_mtp_uses_dsa_hash_state(monkeypatch) -> None:
+    module, Scheduler = load_scheduler_module(monkeypatch)
+    scheduler = Scheduler()
+    scheduler.vllm_config = SimpleNamespace(additional_config={"dsa_offload": {}})
+    request = make_request([], [1, 2, 3])
+    scheduler.requests = {"request": request}
+    scheduler._vllm_ascend_dsa_offload_hash_state = make_fallback_hash_state(
+        module
+    )
+    output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="request")],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        kv_connector_metadata=None,
+        scheduled_spec_decode_tokens={"request": [4]},
+        finished_req_ids=set(),
+    )
+
+    module.attach_block_hashes(scheduler, output)
+
+    assert output.scheduled_new_reqs[0].block_hashes == [bytes([1, 2])]
+    assert output.dsa_offload_candidate_block_hashes == {
+        "request": [bytes([3, 4])]
+    }
+
+
+def test_connector_free_hash_state_is_released(monkeypatch) -> None:
+    module, Scheduler = load_scheduler_module(monkeypatch)
+    scheduler = Scheduler()
+    scheduler.vllm_config = SimpleNamespace(additional_config={"dsa_offload": {}})
+    scheduler.requests = {"request": make_request([], [1, 2])}
+    state = make_fallback_hash_state(module)
+    scheduler._vllm_ascend_dsa_offload_hash_state = state
+    output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="request")],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        kv_connector_metadata=None,
+        scheduled_spec_decode_tokens={},
+        finished_req_ids={"request"},
+    )
+
+    module.attach_block_hashes(scheduler, output)
+
+    assert output.scheduled_new_reqs[0].block_hashes == [bytes([1, 2])]
+    assert state.committed_by_request == {}
 
 
 def test_publish_metadata_is_consumed_before_request_finish(monkeypatch) -> None:

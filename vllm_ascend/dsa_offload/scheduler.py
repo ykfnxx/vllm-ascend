@@ -2,13 +2,94 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
 import copy
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Callable
 
 from vllm.v1.utils import ConstantList
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.core.sched.scheduler import Scheduler
+
+
+@dataclass
+class _DSAOffloadHashState:
+    block_hasher: Callable[[Any], list[bytes]]
+    committed_by_request: dict[str, list[bytes]] = field(default_factory=dict)
+
+    def committed_hashes(self, request_id: str, request: Any) -> list[bytes]:
+        committed = self.committed_by_request.setdefault(
+            request_id,
+            list(request.block_hashes),
+        )
+        if request.block_hashes:
+            upstream = list(request.block_hashes)
+            if committed[: len(upstream)] != upstream:
+                raise RuntimeError(
+                    "DSA Offload block hashes diverged from the scheduler "
+                    f"for request {request_id}."
+                )
+            if len(upstream) > len(committed):
+                committed[:] = upstream
+
+        candidate = copy.copy(request)
+        candidate.block_hashes = list(committed)
+        committed.extend(self.block_hasher(candidate))
+        return list(committed)
+
+    def candidate_hashes(
+        self,
+        request_id: str,
+        request: Any,
+        token_ids: list[int],
+    ) -> list[bytes]:
+        committed = self.committed_hashes(request_id, request)
+        candidate = copy.copy(request)
+        candidate._all_token_ids = [*request._all_token_ids, *token_ids]
+        candidate.all_token_ids = ConstantList(candidate._all_token_ids)
+        candidate.block_hashes = committed
+        return list(self.block_hasher(candidate))
+
+    def release(self, request_ids: set[str]) -> None:
+        for request_id in request_ids:
+            self.committed_by_request.pop(request_id, None)
+
+
+def _create_dsa_hash_state(scheduler: "Scheduler") -> _DSAOffloadHashState:
+    from vllm.utils.hashing import get_hash_fn_by_name
+    from vllm.v1.core.kv_cache_utils import (
+        get_request_block_hasher,
+        init_none_hash,
+    )
+
+    caching_hash_fn = get_hash_fn_by_name(
+        scheduler.vllm_config.cache_config.prefix_caching_hash_algo
+    )
+    init_none_hash(caching_hash_fn)
+    return _DSAOffloadHashState(
+        get_request_block_hasher(scheduler.block_size, caching_hash_fn)
+    )
+
+
+def _get_dsa_hash_state(scheduler: "Scheduler") -> _DSAOffloadHashState:
+    state = getattr(scheduler, "_vllm_ascend_dsa_offload_hash_state", None)
+    if state is None:
+        state = _create_dsa_hash_state(scheduler)
+        scheduler._vllm_ascend_dsa_offload_hash_state = state
+    return state
+
+
+def _committed_hashes(
+    scheduler: "Scheduler",
+    request_id: str,
+) -> list[bytes]:
+    request = scheduler.requests[request_id]
+    if request._block_hasher is not None or request.block_hashes:
+        return list(request.block_hashes)
+    return _get_dsa_hash_state(scheduler).committed_hashes(
+        request_id,
+        request,
+    )
 
 
 def dsa_offload_enabled(scheduler: "Scheduler") -> bool:
@@ -24,15 +105,21 @@ def attach_block_hashes(
         return scheduler_output
 
     for request_data in scheduler_output.scheduled_new_reqs:
-        request_data.block_hashes = list(scheduler.requests[request_data.req_id].block_hashes)
+        request_data.block_hashes = _committed_hashes(
+            scheduler,
+            request_data.req_id,
+        )
 
     cached = scheduler_output.scheduled_cached_reqs
-    cached.block_hashes = [list(scheduler.requests[request_id].block_hashes) for request_id in cached.req_ids]
+    cached.block_hashes = [
+        _committed_hashes(scheduler, request_id)
+        for request_id in cached.req_ids
+    ]
 
     connector_metadata = scheduler_output.kv_connector_metadata
     connector_requests = connector_metadata.requests if connector_metadata is not None else {}
     scheduler_output.dsa_offload_connector_block_hashes = {
-        request_id: list(scheduler.requests[request_id].block_hashes)
+        request_id: _committed_hashes(scheduler, request_id)
         for request_id, metadata in connector_requests.items()
         if metadata.dsa_offload_handoff is not None
     }
@@ -45,11 +132,27 @@ def attach_block_hashes(
         candidate = copy.copy(request)
         candidate._all_token_ids = [*request._all_token_ids, *token_ids]
         candidate.all_token_ids = ConstantList(candidate._all_token_ids)
-        candidate.block_hashes = list(request.block_hashes)
         if request._block_hasher is None:
-            raise RuntimeError("DSA Offload MTP requires the scheduler block hasher.")
-        candidate_hashes[request_id] = list(request._block_hasher(candidate))
+            candidate_hashes[request_id] = _get_dsa_hash_state(
+                scheduler
+            ).candidate_hashes(
+                request_id,
+                request,
+                token_ids,
+            )
+        else:
+            candidate.block_hashes = list(request.block_hashes)
+            candidate_hashes[request_id] = list(
+                request._block_hasher(candidate)
+            )
     scheduler_output.dsa_offload_candidate_block_hashes = candidate_hashes
+    state = getattr(
+        scheduler,
+        "_vllm_ascend_dsa_offload_hash_state",
+        None,
+    )
+    if state is not None:
+        state.release(set(getattr(scheduler_output, "finished_req_ids", ())))
     return scheduler_output
 
 

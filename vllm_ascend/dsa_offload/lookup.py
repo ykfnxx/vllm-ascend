@@ -17,7 +17,7 @@ from .constants import (
     RESIDENT_SLOTS,
 )
 from .hot_cache import HotCacheLayout, HotCacheState
-from .io import IOBackend, make_storage_ids
+from .io import IOBackend, make_storage_ids, require_block_hashes
 from .ops import LookupState, lookup_update, lookup_update_batch
 
 if TYPE_CHECKING:
@@ -377,12 +377,24 @@ def load_plan_misses(
     storage_ids = torch.empty_like(plan.miss_logical_blocks)
     for request_index in batch.decode_request_indices:
         request_mask = plan.miss_batch_indices == request_index
+        request_logical_blocks = plan.miss_logical_blocks[request_mask]
+        if request_logical_blocks.numel() == 0:
+            continue
+        request_id = batch.request_ids[request_index]
+        block_hashes = batch.block_hashes(request_index)
+        require_block_hashes(
+            block_hashes,
+            int(request_logical_blocks.max().item()) + 1,
+            context=f"miss load for request {request_id}",
+        )
         request_storage_ids = make_storage_ids(
-            batch.block_hashes(request_index),
+            block_hashes,
             layer_id,
             device=plan.miss_logical_blocks.device,
         )
-        storage_ids[request_mask] = request_storage_ids[plan.miss_logical_blocks[request_mask]]
+        storage_ids[request_mask] = request_storage_ids[
+            request_logical_blocks
+        ]
     batch.io_backend.get_tokens(
         layer_id=layer_id,
         storage_ids=storage_ids,

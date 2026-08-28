@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
+import pytest
 import torch
 
 from vllm_ascend.dsa_offload.hot_cache import (
@@ -70,6 +71,22 @@ def test_decode_put_happens_only_when_tail_becomes_full(spy_io) -> None:
     assert events == ["model", "put"]
     assert spy_io.put_calls[-1]["storage_ids"].tolist() == [make_storage_id(b"block-0", 6)]
     assert spy_io.put_calls[-1]["source_block_ids"].tolist() == [full.layout.tail_block_offset]
+
+
+def test_decode_tail_commit_rejects_missing_block_hash(spy_io) -> None:
+    batch, _ = make_batch(
+        spy_io,
+        position=3,
+        is_mtp=False,
+        committed=[],
+        candidate=[],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"Decode tail commit for request request requires 1 block hashes",
+    ):
+        commit_decode_tail(batch)
 
 
 def test_mtp_commits_only_accepted_prefix_then_puts_candidate_block(spy_io) -> None:

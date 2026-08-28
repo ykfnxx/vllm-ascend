@@ -414,6 +414,10 @@ vllm serve "$MODEL" \
 memory`，优先降低 `--max-num-seqs`，再检查模型权重、TP 和
 `--gpu-memory-utilization` 的容量规划。
 
+`--no-enable-prefix-caching` 只关闭 vLLM 的跨请求前缀复用。DSA Offload 会独立
+生成外存 storage key 所需的 block hash，因此关闭 prefix cache 不会关闭
+offload，也不要求通过 connector 间接启用 block hasher。
+
 ### 4.5 启动 P/D 代理并请求
 
 待 P/D `/health` 均返回成功后启动标准 P/D 代理：
