@@ -28,23 +28,18 @@ def test_budget_covers_persistent_lookup_state_and_hot_cache():
     )
 
     assert breakdown.hot_payload_bytes == 352_512
+    assert breakdown.storage_id_bytes == 32_768
     assert breakdown.lookup_state_bytes_per_cohort == 1_147_008
     assert breakdown.lookup_state_bytes == 2_294_016
-    assert breakdown.core_fixed_tensor_bytes == 2_646_528
-    assert breakdown.fixed_hbm_bytes == 2_646_528
+    assert breakdown.core_fixed_tensor_bytes == 2_679_296
+    assert breakdown.fixed_hbm_bytes == 2_679_296
     assert breakdown.lookup_capacity == 10_240
     assert breakdown.transient_region_span == 128
     assert breakdown.fallback_slot_count == 0
     assert breakdown.verify_staging_capacity == 0
 
 
-def test_mtp_verify_staging_reuses_existing_tail_block():
-    baseline = calculate_dsa_sparse_fixed_hbm_bytes(
-        2,
-        128,
-        ((torch.bfloat16, 2, 3), (torch.uint8, 1, 5)),
-        cohort_count=2,
-    )
+def test_mtp_verify_staging_adds_one_block_beyond_persistent_tail():
     mtp = calculate_dsa_sparse_fixed_hbm_bytes(
         2,
         128,
@@ -54,9 +49,9 @@ def test_mtp_verify_staging_reuses_existing_tail_block():
         uses_mtp=True,
     )
 
-    assert mtp.hot_payload_bytes == baseline.hot_payload_bytes
-    assert mtp.fixed_hbm_bytes == baseline.fixed_hbm_bytes
-    assert mtp.transient_region_span == 128
+    assert mtp.hot_payload_bytes == 356_864
+    assert mtp.fixed_hbm_bytes == 2_683_648
+    assert mtp.transient_region_span == 256
     assert mtp.fallback_slot_count == 1
     assert mtp.verify_staging_capacity == 16
 
@@ -71,8 +66,8 @@ def test_mtp_verify_staging_grows_by_aligned_blocks_only():
         uses_mtp=True,
     )
 
-    assert mtp.transient_region_span == 256
-    assert mtp.hot_payload_bytes == 356_864
+    assert mtp.transient_region_span == 384
+    assert mtp.hot_payload_bytes == 361_216
 
 
 def test_fixed_hbm_calculation_does_not_allocate_tensors(monkeypatch):
@@ -105,11 +100,14 @@ def test_breakdown_is_immutable():
 
 
 def test_reservation_deducts_fixed_hbm_and_reports_source():
-    assert reserve_dsa_sparse_fixed_hbm_bytes(
-        1000,
-        400,
-        source="test",
-    ) == 600
+    assert (
+        reserve_dsa_sparse_fixed_hbm_bytes(
+            1000,
+            400,
+            source="test",
+        )
+        == 600
+    )
     with pytest.raises(ValueError, match="test"):
         reserve_dsa_sparse_fixed_hbm_bytes(
             399,
@@ -119,11 +117,14 @@ def test_reservation_deducts_fixed_hbm_and_reports_source():
 
 
 def test_zero_reservation_preserves_baseline_result():
-    assert reserve_dsa_sparse_fixed_hbm_bytes(
-        -1,
-        0,
-        source="baseline",
-    ) == -1
+    assert (
+        reserve_dsa_sparse_fixed_hbm_bytes(
+            -1,
+            0,
+            source="baseline",
+        )
+        == -1
+    )
 
 
 def test_worker_uses_model_runner_budget_provider_for_decode_consumer():

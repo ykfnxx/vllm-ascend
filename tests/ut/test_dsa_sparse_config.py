@@ -53,9 +53,7 @@ def make_vllm_config(
 
 
 def test_absent_config_keeps_dsa_sparse_disabled():
-    assert load_dsa_sparse_config(
-        SimpleNamespace(additional_config={})
-    ) is None
+    assert load_dsa_sparse_config(SimpleNamespace(additional_config={})) is None
 
 
 def test_config_exposes_only_fixed_lookup_contract_inputs():
@@ -76,11 +74,7 @@ def test_config_exposes_only_fixed_lookup_contract_inputs():
 
 def test_device_buffer_size_is_removed_from_user_configuration():
     with pytest.raises(ValueError, match="Unknown"):
-        load_dsa_sparse_config(
-            make_vllm_config(
-                extra_dsa_fields={"device_buffer_size": 8192}
-            )
-        )
+        load_dsa_sparse_config(make_vllm_config(extra_dsa_fields={"device_buffer_size": 8192}))
 
 
 @pytest.mark.parametrize("role", [None, "kv_both"])
@@ -94,9 +88,27 @@ def test_graph_execution_is_rejected():
         load_dsa_sparse_config(make_vllm_config(enforce_eager=False))
 
 
-def test_only_mock_io_is_supported():
-    with pytest.raises(ValueError, match="only io_backend='mock'"):
+def test_kvio_is_optional_and_unknown_backends_are_rejected(monkeypatch):
+    monkeypatch.setenv("PYTHONHASHSEED", "0")
+    config = load_dsa_sparse_config(
+        make_vllm_config(
+            io_backend="kvio",
+            extra_dsa_fields={"kvio_model_id": 7},
+        )
+    )
+    assert config is not None
+    assert config.io_backend == "kvio"
+    assert config.kvio_model_id == 7
+
+    with pytest.raises(ValueError, match="must be 'mock' or 'kvio'"):
         load_dsa_sparse_config(make_vllm_config(io_backend="vendor"))
+
+
+def test_kvio_requires_deterministic_scheduler_block_hashes(monkeypatch):
+    monkeypatch.delenv("PYTHONHASHSEED", raising=False)
+
+    with pytest.raises(ValueError, match="PYTHONHASHSEED"):
+        load_dsa_sparse_config(make_vllm_config(io_backend="kvio"))
 
 
 @pytest.mark.parametrize("field", ["lookup_backend", "io_backend_options"])
@@ -129,10 +141,7 @@ def test_mtp_speculative_decode_is_supported(num_speculative_tokens):
     assert config is not None
     assert config.uses_mtp
     assert config.speculative_method == "mtp"
-    assert (
-        config.max_verify_tokens_per_request
-        == num_speculative_tokens + 1
-    )
+    assert config.max_verify_tokens_per_request == num_speculative_tokens + 1
 
 
 def test_non_mtp_speculative_decode_is_rejected():
@@ -147,16 +156,12 @@ def test_non_mtp_speculative_decode_is_rejected():
 
 def test_negative_speculative_token_count_is_rejected():
     with pytest.raises(ValueError, match="must not be negative"):
-        load_dsa_sparse_config(
-            make_vllm_config(num_speculative_tokens=-1)
-        )
+        load_dsa_sparse_config(make_vllm_config(num_speculative_tokens=-1))
 
 
 def test_mtp_verify_width_must_fit_current_sfa_limit():
     with pytest.raises(ValueError, match=r"num_speculative_tokens \+ 1 <= 16"):
-        load_dsa_sparse_config(
-            make_vllm_config(num_speculative_tokens=16)
-        )
+        load_dsa_sparse_config(make_vllm_config(num_speculative_tokens=16))
 
 
 def test_index_topk_is_fixed_to_2048():
@@ -166,9 +171,7 @@ def test_index_topk_is_fixed_to_2048():
 
 def test_model_length_must_fit_128k_index():
     with pytest.raises(ValueError, match="128K"):
-        load_dsa_sparse_config(
-            make_vllm_config(max_model_len=128 * 1024 + 1)
-        )
+        load_dsa_sparse_config(make_vllm_config(max_model_len=128 * 1024 + 1))
 
 
 def test_block_size_must_partition_lookup_regions():
@@ -178,6 +181,4 @@ def test_block_size_must_partition_lookup_regions():
 
 def test_only_glm5_sparse_model_is_supported():
     with pytest.raises(ValueError, match="glm_moe_dsa"):
-        load_dsa_sparse_config(
-            make_vllm_config(model_type="deepseek_v3")
-        )
+        load_dsa_sparse_config(make_vllm_config(model_type="deepseek_v3"))

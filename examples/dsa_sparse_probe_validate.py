@@ -371,47 +371,47 @@ def _validate_mtp_batch(
             "once per target step."
         )
 
-    store_events = _events_named(events, "accepted_store_mock")
-    store_pairs: set[tuple[int, str]] = set()
+    commit_events = _events_named(events, "accepted_tail_commit")
+    commit_pairs: set[tuple[int, str]] = set()
     step_accepted: dict[int, tuple[int, ...]] = {}
-    for event in store_events:
-        step_id = _require_step_id(event, "accepted_store_mock.target_step_id")
-        layer = _require_string(event.get("layer"), "accepted_store_mock.layer")
+    for event in commit_events:
+        step_id = _require_step_id(event, "accepted_tail_commit.target_step_id")
+        layer = _require_string(event.get("layer"), "accepted_tail_commit.layer")
         pair = (step_id, layer)
         if step_id not in step_ids or layer not in registered_ptrs:
-            _fail(f"accepted_store_mock names an unknown step/layer: {pair!r}")
-        if pair in store_pairs:
-            _fail(f"accepted_store_mock duplicated step/layer {pair!r}")
-        store_pairs.add(pair)
+            _fail(f"accepted_tail_commit names an unknown step/layer: {pair!r}")
+        if pair in commit_pairs:
+            _fail(f"accepted_tail_commit duplicated step/layer {pair!r}")
+        commit_pairs.add(pair)
         if event.get("cohort") != layer_to_cohort[layer]:
             _fail(
-                f"accepted_store_mock used the wrong cohort for layer "
+                f"accepted_tail_commit used the wrong cohort for layer "
                 f"{layer!r}: {event.get('cohort')!r}"
             )
         q_i = _require_q_i(
             event,
-            field="accepted_store_mock.q_i",
+            field="accepted_tail_commit.q_i",
             req_num=len(step_query_lens[step_id]),
         )
         if q_i != step_query_lens[step_id]:
-            _fail(f"accepted_store_mock q_i disagrees in target step {step_id}.")
+            _fail(f"accepted_tail_commit q_i disagrees in target step {step_id}.")
         accepted = _require_int_list(
             event.get("accepted_input_kv_count"),
-            "accepted_store_mock.accepted_input_kv_count",
+            "accepted_tail_commit.accepted_input_kv_count",
         )
         if len(accepted) != len(q_i) or any(
             count < 0 or count > query_len
             for count, query_len in zip(accepted, q_i)
         ):
             _fail(
-                "accepted_store_mock.accepted_input_kv_count must be a "
+                "accepted_tail_commit.accepted_input_kv_count must be a "
                 f"per-request prefix bounded by q_i, got {accepted!r}"
             )
         if event.get("committed_kv_count") != sum(accepted):
-            _fail("accepted_store_mock.committed_kv_count is inconsistent.")
+            _fail("accepted_tail_commit.committed_kv_count is inconsistent.")
         req_pool_entries = _require_int_list(
             event.get("req_pool_entries"),
-            "accepted_store_mock.req_pool_entries",
+            "accepted_tail_commit.req_pool_entries",
         )
         if (
             len(req_pool_entries) != len(q_i)
@@ -419,7 +419,7 @@ def _validate_mtp_batch(
             or any(entry < 0 for entry in req_pool_entries)
         ):
             _fail(
-                "accepted_store_mock.req_pool_entries must contain one "
+                "accepted_tail_commit.req_pool_entries must contain one "
                 "unique non-negative row per request."
             )
         committed_ranges = event.get("committed_position_ranges")
@@ -430,7 +430,7 @@ def _validate_mtp_batch(
             or not isinstance(staging_ranges, list)
             or len(staging_ranges) != len(q_i)
         ):
-            _fail("accepted_store_mock prefix range metadata is invalid.")
+            _fail("accepted_tail_commit prefix range metadata is invalid.")
         for count, position_range, staging_range in zip(
             accepted,
             committed_ranges,
@@ -448,7 +448,7 @@ def _validate_mtp_batch(
                 )
                 or position_range[1] - position_range[0] != count
             ):
-                _fail("accepted_store_mock committed position range is invalid.")
+                _fail("accepted_tail_commit committed position range is invalid.")
             if (
                 not isinstance(staging_range, list)
                 or len(staging_range) != 2
@@ -458,15 +458,15 @@ def _validate_mtp_batch(
                 )
                 or staging_range[1] - staging_range[0] != count
             ):
-                _fail("accepted_store_mock staging source range is invalid.")
+                _fail("accepted_tail_commit staging source range is invalid.")
         if step_id in step_accepted and step_accepted[step_id] != accepted:
             _fail(
                 f"Physical layers disagree on accepted prefix in step {step_id}."
             )
         step_accepted[step_id] = accepted
-    if store_pairs != expected_layer_step_pairs:
+    if commit_pairs != expected_layer_step_pairs:
         _fail(
-            "accepted_store_mock did not cover every physical layer exactly "
+            "accepted_tail_commit did not cover every physical layer exactly "
             "once per target step."
         )
 
@@ -481,7 +481,7 @@ def _validate_mtp_batch(
         "lookup_update_done": len(lookup_events),
         "history_load_mock": len(history_events),
         "hot_cache_sfa_done": len(hot_sfa_events),
-        "accepted_store_mock": len(store_events),
+        "accepted_tail_commit": len(commit_events),
     }
 
 

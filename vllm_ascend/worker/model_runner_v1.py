@@ -133,6 +133,11 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.dsa_sparse_backend import (
+    DSASparseKVBackend,
+    DSASparseStorageKeyEncoder,
+    create_dsa_sparse_backend,
+)
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -372,6 +377,14 @@ class NPUModelRunner(GPUModelRunner):
             str, DSASparseCoordinator
         ] = {}
         self._dsa_sparse_pd_handoffs: dict[str, DSASparsePDHandoff] = {}
+        self._dsa_sparse_backend: DSASparseKVBackend | None = None
+        self._dsa_sparse_storage_key_encoder = DSASparseStorageKeyEncoder()
+        self._dsa_sparse_committed_block_hashes: dict[
+            str, list[bytes | int]
+        ] = {}
+        self._dsa_sparse_candidate_block_hashes: dict[
+            str, list[bytes | int]
+        ] = {}
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -688,6 +701,21 @@ class NPUModelRunner(GPUModelRunner):
             for _, layer_name, attn_module in ordered_layers
         ]
 
+    def _get_dsa_sparse_target_main_layers(
+        self,
+    ) -> list[tuple[str, MLAAttention]]:
+        attn_layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            AttentionLayerBase,
+        )
+        layers = [
+            (layer_name, attn_module)
+            for layer_name, attn_module in attn_layers.items()
+            if isinstance(attn_module, MLAAttention)
+            and self._is_dsa_sparse_target_layer(layer_name)
+        ]
+        return sorted(layers, key=lambda layer: extract_layer_index(layer[0]))
+
     def _is_dsa_sparse_target_layer(
         self,
         layer_name: str,
@@ -787,6 +815,10 @@ class NPUModelRunner(GPUModelRunner):
                     if not impl.skip_topk
                     else cohorts[-1]["name"]
                 ),
+                layer_id=extract_layer_index(layer_name),
+                backend=self._dsa_sparse_backend,
+                storage_key_encoder=self._dsa_sparse_storage_key_encoder,
+                align_cache_for_kv_transfer=self.vllm_config.kv_transfer_config is not None,
             )
             if not impl.skip_topk:
                 leader = coordinator
@@ -834,6 +866,15 @@ class NPUModelRunner(GPUModelRunner):
         try:
             for _, coordinator in self._dsa_sparse_coordinators:
                 coordinator.reset_hot_request(pool_entry)
+                coordinator.set_request_block_hashes(
+                    pool_entry,
+                    self._dsa_sparse_committed_block_hashes.get(
+                        request_id, []
+                    ),
+                    self._dsa_sparse_candidate_block_hashes.get(
+                        request_id, []
+                    ),
+                )
             if handoff is None:
                 for coordinator in self._dsa_sparse_leader_coordinators:
                     coordinator.initialize_request(pool_entry)
@@ -851,6 +892,15 @@ class NPUModelRunner(GPUModelRunner):
             self.dsa_sparse_req_to_pool_entry.pop(request_id)
             self.dsa_sparse_free_pool_entries.appendleft(pool_entry)
             raise
+
+    def _ensure_dsa_sparse_request_admitted(
+        self,
+        request_id: str,
+        handoff: DSASparsePDHandoff | None = None,
+    ) -> None:
+        if request_id in self.dsa_sparse_req_to_pool_entry:
+            return
+        self._admit_dsa_sparse_request(request_id, handoff)
 
     def _initialize_dsa_sparse_request_from_handoff(
         self,
@@ -888,9 +938,6 @@ class NPUModelRunner(GPUModelRunner):
                 topk_token_ids=layer_topk[layer_name],
                 stored_token_count=handoff.stored_token_count,
                 block_size=handoff.block_size,
-                include_partial_tail=(
-                    self.ascend_config.dsa_sparse_config.uses_mtp
-                ),
             )
             resident_by_leader[id(coordinator)] = resident_token_ids
 
@@ -924,12 +971,16 @@ class NPUModelRunner(GPUModelRunner):
         )
 
     def _release_dsa_sparse_request(self, request_id: str) -> None:
-        pool_entry = self.dsa_sparse_req_to_pool_entry.pop(request_id)
+        pool_entry = self.dsa_sparse_req_to_pool_entry.pop(request_id, None)
+        if pool_entry is None:
+            return
         for _, coordinator in self._dsa_sparse_coordinators:
             coordinator.reset_hot_request(pool_entry)
         for coordinator in self._dsa_sparse_leader_coordinators:
             coordinator.reset_request(pool_entry)
         self.dsa_sparse_free_pool_entries.append(pool_entry)
+        self._dsa_sparse_committed_block_hashes.pop(request_id, None)
+        self._dsa_sparse_candidate_block_hashes.pop(request_id, None)
 
     def _set_dsa_sparse_req_pool_entries(
         self,
@@ -1025,12 +1076,54 @@ class NPUModelRunner(GPUModelRunner):
             accepted_input_kv_count,
             query_lens,
         ).contiguous()
+        query_positions = leader.query_positions
+        req_pool_entries = leader.req_pool_entries
+        if query_positions is None or req_pool_entries is None:
+            raise RuntimeError(
+                "DSA Sparse MTP sampling has no active packed lookup plan."
+            )
+        query_start_loc_list = query_start_loc.detach().cpu().tolist()
+        query_positions_list = query_positions.detach().cpu().tolist()
+        accepted_input_kv_count_list = (
+            accepted_input_kv_count.detach().cpu().tolist()
+        )
+        req_pool_entries_list = req_pool_entries.detach().cpu().tolist()
         for layer_name, coordinator in self._dsa_sparse_coordinators:
-            coordinator.store_accepted(
+            coordinator.commit_accepted_to_tail(
                 layer_name,
-                accepted_input_kv_count,
+                query_start_loc_list,
+                query_positions_list,
+                accepted_input_kv_count_list,
+                req_pool_entries_list,
             )
         self._dsa_sparse_target_step_id += 1
+
+    def _commit_dsa_sparse_decode_tail(self) -> None:
+        config = self.ascend_config.dsa_sparse_config
+        if (
+            config is None
+            or not config.is_consumer
+            or config.uses_mtp
+            or self.attn_state != AscendAttentionState.DecodeOnly
+        ):
+            return
+        if not self._dsa_sparse_coordinators:
+            return
+        coordinator = self._dsa_sparse_coordinators[0][1]
+        query_positions = coordinator.query_positions
+        req_pool_entries = coordinator.req_pool_entries
+        if query_positions is None or req_pool_entries is None:
+            raise RuntimeError(
+                "DSA Sparse Decode tail commit has no active lookup plan."
+            )
+        query_positions_list = query_positions.detach().cpu().tolist()
+        req_pool_entries_list = req_pool_entries.detach().cpu().tolist()
+        for layer_name, coordinator in self._dsa_sparse_coordinators:
+            coordinator.commit_decode_tail(
+                layer_name,
+                req_pool_entries_list,
+                query_positions_list,
+            )
 
     def _begin_dsa_sparse_producer_execution(
         self,
@@ -1083,6 +1176,14 @@ class NPUModelRunner(GPUModelRunner):
             stored_token_counts=stored_token_counts,
             publish_requests=publish_requests,
             layer_metadata=layer_metadata,
+            backend=self._dsa_sparse_backend,
+            storage_key_encoder=self._dsa_sparse_storage_key_encoder,
+            committed_block_hashes={
+                request_id: self._dsa_sparse_committed_block_hashes.get(
+                    request_id, []
+                )
+                for request_id in request_ids
+            },
         )
 
     def _init_device_properties(self) -> None:
@@ -1207,6 +1308,12 @@ class NPUModelRunner(GPUModelRunner):
         # This can be removed after the upstream fix is merged.
         req_data = scheduler_output.scheduled_cached_reqs
         self._record_dsa_sparse_pd_handoffs(scheduler_output)
+        self._record_dsa_sparse_block_hashes(scheduler_output)
+        if self._uses_dsa_sparse_main_cache() and scheduler_output.preempted_req_ids:
+            raise RuntimeError(
+                "DSA Sparse does not support local Decode preemption; "
+                "use RecomputeScheduler Proxy fallback"
+            )
 
         if self.use_async_scheduling:
             for i, req_id in enumerate(req_data.req_ids):
@@ -1223,18 +1330,39 @@ class NPUModelRunner(GPUModelRunner):
         if self._uses_dsa_sparse_main_cache():
             retiring_req_ids = set(scheduler_output.finished_req_ids)
             retiring_req_ids.update(
-                scheduler_output.preempted_req_ids or ()
+                request.request_id
+                for request in (
+                    getattr(scheduler_output, "recomputed_reqs", None) or ()
+                )
             )
             for request_id in retiring_req_ids:
                 self._release_dsa_sparse_request(request_id)
 
+            connector_metadata = getattr(
+                scheduler_output, "kv_connector_metadata", None
+            )
+            connector_requests = getattr(
+                connector_metadata, "requests", None
+            )
+            if isinstance(connector_requests, dict):
+                # Async remote loads can run in a no-forward step, before the
+                # request appears in scheduled_new_reqs. The Decode row must
+                # already exist when Mooncake resolves the partial-tail target.
+                for request_id in connector_requests:
+                    handoff = self._dsa_sparse_pd_handoffs.get(request_id)
+                    if handoff is not None:
+                        self._ensure_dsa_sparse_request_admitted(
+                            request_id,
+                            handoff,
+                        )
+
             for request in scheduler_output.scheduled_new_reqs:
-                self._admit_dsa_sparse_request(
+                self._ensure_dsa_sparse_request_admitted(
                     request.req_id,
                     self._dsa_sparse_pd_handoffs.get(request.req_id),
                 )
             for request_id in req_data.resumed_req_ids:
-                self._admit_dsa_sparse_request(
+                self._ensure_dsa_sparse_request_admitted(
                     request_id,
                     self._dsa_sparse_pd_handoffs.get(request_id),
                 )
@@ -1247,6 +1375,10 @@ class NPUModelRunner(GPUModelRunner):
                 set(scheduler_output.finished_req_ids) - new_request_ids
             ):
                 self._dsa_sparse_pd_handoffs.pop(request_id, None)
+        elif self.ascend_config.dsa_sparse_config is not None:
+            for request_id in scheduler_output.finished_req_ids:
+                self._dsa_sparse_committed_block_hashes.pop(request_id, None)
+                self._dsa_sparse_candidate_block_hashes.pop(request_id, None)
 
         return deferred_correction
 
@@ -1316,6 +1448,75 @@ class NPUModelRunner(GPUModelRunner):
             self.num_accepted_tokens.np[:num_reqs] = (
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs]
             )
+
+    def _record_dsa_sparse_block_hashes(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        config = self.ascend_config.dsa_sparse_config
+        if config is None:
+            return
+        scheduled_request_ids = scheduler_output.num_scheduled_tokens.keys()
+        scheduled_new_requests = [
+            request
+            for request in scheduler_output.scheduled_new_reqs
+            if request.req_id in scheduled_request_ids
+        ]
+        if any(not hasattr(request, "block_hashes") for request in scheduled_new_requests):
+            raise RuntimeError("DSA Sparse scheduler did not attach new-request block hashes")
+        committed_by_request = {
+            request.req_id: list(request.block_hashes)
+            for request in scheduled_new_requests
+        }
+        cached_requests = scheduler_output.scheduled_cached_reqs
+        cached_block_hashes = list(getattr(cached_requests, "block_hashes", ()))
+        if cached_requests.req_ids and len(cached_block_hashes) != len(cached_requests.req_ids):
+            raise RuntimeError("DSA Sparse cached block hashes are not request-aligned")
+        committed_by_request.update(
+            {
+                request_id: list(block_hashes)
+                for request_id, block_hashes in zip(
+                    cached_requests.req_ids,
+                    cached_block_hashes,
+                )
+            }
+        )
+        connector_block_hashes = getattr(
+            scheduler_output,
+            "dsa_sparse_connector_block_hashes",
+            {},
+        )
+        if not isinstance(connector_block_hashes, dict):
+            raise TypeError(
+                "DSA Sparse connector block hashes must be request-aligned"
+            )
+        committed_by_request.update(
+            {
+                request_id: list(block_hashes)
+                for request_id, block_hashes in connector_block_hashes.items()
+            }
+        )
+        candidate_by_request = getattr(
+            scheduler_output,
+            "dsa_candidate_block_hashes",
+            {},
+        )
+        request_ids = set(scheduler_output.num_scheduled_tokens)
+        request_ids.update(connector_block_hashes)
+        for request_id in request_ids:
+            committed = list(committed_by_request.get(request_id, ()))
+            candidates = list(candidate_by_request.get(request_id, ()))
+            self._dsa_sparse_committed_block_hashes[request_id] = committed
+            self._dsa_sparse_candidate_block_hashes[request_id] = candidates
+            pool_entry = self.dsa_sparse_req_to_pool_entry.get(request_id)
+            if pool_entry is None:
+                continue
+            for _, coordinator in self._dsa_sparse_coordinators:
+                coordinator.set_request_block_hashes(
+                    pool_entry,
+                    committed,
+                    candidates,
+                )
 
     def _record_dsa_sparse_pd_handoffs(
         self,
@@ -2586,6 +2787,23 @@ class NPUModelRunner(GPUModelRunner):
                 deferred_state_corrections_fn = self._update_states(
                     scheduler_output
                 )
+                config = self.ascend_config.dsa_sparse_config
+                if (
+                    config is not None
+                    and config.is_consumer
+                    and has_kv_transfer_group()
+                ):
+                    set_request_rows = getattr(
+                        get_kv_transfer_group(),
+                        "set_dsa_sparse_request_rows",
+                        None,
+                    )
+                    if not callable(set_request_rows):
+                        raise RuntimeError(
+                            "DSA Sparse partial-tail handoff requires a "
+                            "compatible KV connector"
+                        )
+                    set_request_rows(self.dsa_sparse_req_to_pool_entry)
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -3012,6 +3230,7 @@ class NPUModelRunner(GPUModelRunner):
         self._store_dsa_sparse_accepted(
             sampler_output.sampled_token_ids,
         )
+        self._commit_dsa_sparse_decode_tail()
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -4428,7 +4647,38 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        config = self.ascend_config.dsa_sparse_config
+        dsa_sparse_layer_caches: dict[
+            str, tuple[torch.Tensor, ...]
+        ] = {}
+        if config is not None:
+            self._dsa_sparse_backend = create_dsa_sparse_backend(config)
         self._initialize_dsa_sparse_coordinators()
+        if config is not None:
+            assert self._dsa_sparse_backend is not None
+            if config.is_consumer:
+                layer_caches = [
+                    (layer_name, coordinator.hot_main_cache)
+                    for layer_name, coordinator in self._dsa_sparse_coordinators
+                ]
+            else:
+                layer_caches = []
+                for layer_name, _ in self._get_dsa_sparse_target_main_layers():
+                    cache = kv_caches[layer_name]
+                    cache_planes = (
+                        (cache,)
+                        if isinstance(cache, torch.Tensor)
+                        else tuple(cache)
+                    )
+                    layer_caches.append((layer_name, cache_planes))
+            for layer_name, cache_planes in layer_caches:
+                dsa_sparse_layer_caches[layer_name] = cache_planes
+                self._dsa_sparse_backend.register_layer_cache(
+                    layer_id=extract_layer_index(layer_name),
+                    block_size=self.block_size,
+                    cache_planes=cache_planes,
+                )
+            self._dsa_sparse_backend.finalize_cache_registration()
         # TODO: refactor the logic of attention
         if (
             self.speculative_config
@@ -4447,10 +4697,40 @@ class NPUModelRunner(GPUModelRunner):
             self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group():
-            get_kv_transfer_group().register_kv_caches(kv_caches)
+            kv_transfer_group = get_kv_transfer_group()
+            if config is not None:
+                register_aux = getattr(
+                    kv_transfer_group,
+                    "register_dsa_sparse_aux_caches",
+                    None,
+                )
+                if not callable(register_aux):
+                    raise RuntimeError(
+                        "DSA Sparse P/D requires KV connector auxiliary cache "
+                        "registration"
+                    )
+                tail_layouts = (
+                    {
+                        layer_name: (
+                            coordinator.hot_blocks_per_request,
+                            coordinator.tail_base // self.block_size,
+                        )
+                        for layer_name, coordinator in (
+                            self._dsa_sparse_coordinators
+                        )
+                    }
+                    if config.is_consumer
+                    else {}
+                )
+                register_aux(dsa_sparse_layer_caches, tail_layouts)
+            kv_transfer_group.register_kv_caches(kv_caches)
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
+
+    def shutdown(self) -> None:
+        if self._dsa_sparse_backend is not None:
+            self._dsa_sparse_backend.close()
 
     def _bind_routed_experts_capturer(self, capturer=None) -> None:
         if vllm_version_is("0.23.0"):

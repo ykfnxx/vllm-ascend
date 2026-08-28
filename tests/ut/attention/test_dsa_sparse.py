@@ -7,10 +7,15 @@ import pytest
 import torch
 
 from vllm_ascend.attention.dsa_sparse import DSASparseCoordinator
+from vllm_ascend.dsa_sparse_backend import (
+    DSASparseStorageKeyEncoder,
+    MockDSASparseKVBackend,
+)
 from vllm_ascend.dsa_sparse_constants import (
     DSA_SPARSE_FREE_HEAD_STRIDE,
     DSA_SPARSE_FREE_SLOT_COUNT,
     DSA_SPARSE_INDEX_CAPACITY,
+    DSA_SPARSE_KV_TRANSFER_ALIGNMENT,
     DSA_SPARSE_LOOKUP_SLOT_COUNT,
     DSA_SPARSE_QUERY_WIDTH,
 )
@@ -59,6 +64,24 @@ def test_coordinator_owns_per_layer_hot_cache_and_leader_lookup_state():
     assert follower.slot_to_index is None
     assert follower.free_slots is None
     assert follower.free_head is None
+
+
+def test_hot_main_cache_honors_kv_transfer_alignment():
+    coordinator = DSASparseCoordinator(
+        max_num_seqs=1,
+        block_size=128,
+        plane_layouts=(
+            (torch.bfloat16, (1, 16)),
+            (torch.bfloat16, (1, 4)),
+        ),
+        device="cpu",
+        align_cache_for_kv_transfer=True,
+    )
+
+    assert len(coordinator.hot_main_cache) == 2
+    for cache in coordinator.hot_main_cache:
+        assert cache.is_contiguous()
+        assert cache.data_ptr() % DSA_SPARSE_KV_TRANSFER_ALIGNMENT == 0
 
 
 def test_mtp_coordinator_rejects_an_empty_verify_region():
@@ -119,6 +142,34 @@ def test_main_write_uses_stable_pool_entry_and_live_tail_offset():
     assert slots.dtype == torch.int32
 
 
+def test_normal_decode_puts_only_when_tail_becomes_full():
+    backend = MockDSASparseKVBackend()
+    coordinator = DSASparseCoordinator(
+        max_num_seqs=1,
+        block_size=128,
+        plane_layouts=(
+            (torch.float32, (1,)),
+            (torch.float32, (1,)),
+        ),
+        device="cpu",
+        backend=backend,
+        storage_key_encoder=DSASparseStorageKeyEncoder(),
+    )
+    backend.register_layer_cache(
+        layer_id=0,
+        block_size=128,
+        cache_planes=coordinator.hot_main_cache,
+    )
+    coordinator.set_request_block_hashes(0, [b"block-0"])
+
+    coordinator.commit_decode_tail("model.layers.0.self_attn.attn", [0], [126])
+    assert not backend.put_calls
+
+    coordinator.commit_decode_tail("model.layers.0.self_attn.attn", [0], [127])
+    assert len(backend.put_calls) == 1
+    assert backend.put_calls[0][2].tolist() == [80]
+
+
 def test_leader_resolves_once_and_follower_reuses_the_same_plan():
     leader = make_coordinator()
     follower = make_coordinator(leader)
@@ -167,11 +218,11 @@ def test_mtp_main_write_uses_per_request_verify_staging():
     )
 
     assert slots.tolist() == [
-        10241,
-        10242,
-        2 * 10368 + 10241,
-        2 * 10368 + 10242,
-        2 * 10368 + 10243,
+        10369,
+        10370,
+        2 * 10496 + 10369,
+        2 * 10496 + 10370,
+        2 * 10496 + 10371,
     ]
     assert slots.dtype == torch.int32
 
@@ -204,15 +255,15 @@ def test_mtp_leader_resolves_packed_history_and_staging_once():
     )
     req_pool_entries = torch.tensor([0, 2], dtype=torch.int32)
     query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
-    query_positions = torch.tensor([100, 101, 200], dtype=torch.int64)
+    query_positions = torch.tensor([130, 131, 260], dtype=torch.int64)
     topk = torch.full(
         (3, 1, DSA_SPARSE_QUERY_WIDTH),
         -1,
         dtype=torch.int64,
     )
-    topk[0, 0, :4] = torch.tensor([10, 100, 101, -1])
-    topk[1, 0, :4] = torch.tensor([10, 100, 101, 102])
-    topk[2, 0, :3] = torch.tensor([20, 200, 201])
+    topk[0, 0, :4] = torch.tensor([10, 128, 130, -1])
+    topk[1, 0, :4] = torch.tensor([10, 128, 130, 132])
+    topk[2, 0, :3] = torch.tensor([20, 256, 260])
     calls = []
 
     def fake_lookup(*args):
@@ -222,8 +273,7 @@ def test_mtp_leader_resolves_packed_history_and_staging_once():
         return torch.full_like(query_index, 77), lookup_mask.clone()
 
     with patch(
-        "vllm_ascend.attention.dsa_sparse."
-        "dsa_sparse_lookup_update_batch",
+        "vllm_ascend.attention.dsa_sparse.dsa_sparse_lookup_update_batch",
         side_effect=fake_lookup,
     ):
         leader.resolve_batch(
@@ -242,27 +292,27 @@ def test_mtp_leader_resolves_packed_history_and_staging_once():
     assert calls[0][7][2, :3].tolist() == [1, 0, 0]
     assert leader.attention_indices[0, :4].tolist() == [
         77,
-        10241,
-        -1,
+        10240,
+        10369,
         -1,
     ]
     assert leader.attention_indices[1, :4].tolist() == [
         77,
-        10241,
-        10242,
+        10240,
+        10369,
         -1,
     ]
     assert leader.attention_indices[2, :3].tolist() == [
         77,
-        10241,
-        -1,
+        10240,
+        10369,
     ]
     assert follower.attention_indices is leader.attention_indices
     assert follower.query_start_loc is leader.query_start_loc
     assert follower.query_positions is leader.query_positions
 
 
-def test_mtp_request_reset_zeros_only_the_fallback_slot():
+def test_mtp_request_reset_zeros_tail_and_fallback_only():
     coordinator = DSASparseCoordinator(
         max_num_seqs=2,
         block_size=128,
@@ -275,10 +325,16 @@ def test_mtp_request_reset_zeros_only_the_fallback_slot():
     row_base = coordinator.request_row_stride
     flat_cache[row_base + coordinator.fallback_zero_slot] = 9
     flat_cache[row_base + coordinator.verify_staging_base] = 7
+    flat_cache[row_base + coordinator.tail_base : row_base + coordinator.tail_base + coordinator.block_size] = 5
 
     coordinator.reset_hot_request(1)
 
     assert flat_cache[row_base + coordinator.fallback_zero_slot].item() == 0
+    assert (
+        flat_cache[row_base + coordinator.tail_base : row_base + coordinator.tail_base + coordinator.block_size]
+        .eq(0)
+        .all()
+    )
     assert flat_cache[row_base + coordinator.verify_staging_base].item() == 7
 
 
@@ -303,23 +359,73 @@ def test_mtp_mock_store_reports_only_the_accepted_prefix_lengths():
 
     with (
         patch(
-            "vllm_ascend.attention.dsa_sparse."
-            "dsa_sparse_probe.is_enabled",
+            "vllm_ascend.attention.dsa_sparse.dsa_sparse_probe.is_enabled",
             return_value=True,
         ),
         patch(
-            "vllm_ascend.attention.dsa_sparse."
-            "dsa_sparse_probe.synchronize_device",
+            "vllm_ascend.attention.dsa_sparse.dsa_sparse_probe.synchronize_device",
         ),
         patch(
-            "vllm_ascend.attention.dsa_sparse."
-            "dsa_sparse_probe.emit",
+            "vllm_ascend.attention.dsa_sparse.dsa_sparse_probe.emit",
         ) as emit,
     ):
-        coordinator.store_accepted(
+        coordinator.commit_accepted_to_tail(
             "model.layers.0.self_attn.attn",
-            accepted,
+            [0, 2, 5],
+            [100, 101, 200, 201, 202],
+            accepted.tolist(),
+            [0, 2],
         )
 
     assert emit.call_args.kwargs["accepted_input_kv_count"] == [1, 3]
     assert emit.call_args.kwargs["committed_kv_count"] == 4
+
+
+def test_mtp_commit_puts_full_tail_without_copying_rejected_suffix():
+    backend = MockDSASparseKVBackend()
+    coordinator = DSASparseCoordinator(
+        max_num_seqs=1,
+        block_size=128,
+        plane_layouts=(
+            (torch.float32, (1,)),
+            (torch.float32, (1,)),
+        ),
+        device="cpu",
+        mtp_enabled=True,
+        max_verify_tokens_per_request=3,
+        backend=backend,
+        storage_key_encoder=DSASparseStorageKeyEncoder(),
+    )
+    backend.register_layer_cache(
+        layer_id=0,
+        block_size=128,
+        cache_planes=coordinator.hot_main_cache,
+    )
+    coordinator.set_request_block_hashes(0, [b"block-0"])
+    coordinator.query_start_loc = torch.tensor([0, 3], dtype=torch.int32)
+    coordinator.query_positions = torch.tensor([126, 127, 128], dtype=torch.int64)
+    coordinator.req_pool_entries = torch.tensor([0], dtype=torch.int32)
+
+    for plane in coordinator.hot_main_cache:
+        flat = plane.view(-1)
+        flat[coordinator.tail_base : coordinator.tail_base + 126].fill_(1)
+        flat[coordinator.verify_staging_base : coordinator.verify_staging_base + 3] = torch.tensor(
+            [2, 3, 9], dtype=flat.dtype
+        )
+
+    coordinator.commit_accepted_to_tail(
+        "model.layers.0.self_attn.attn",
+        [0, 3],
+        [126, 127, 128],
+        [2],
+        [0],
+    )
+
+    assert len(backend.put_calls) == 1
+    assert backend.put_calls[0][0] == 0
+    assert backend.put_calls[0][2].tolist() == [80]
+    for plane in coordinator.hot_main_cache:
+        flat = plane.view(-1)
+        assert flat[coordinator.tail_base + 126].item() == 2
+        assert flat[coordinator.tail_base + 127].item() == 3
+        assert flat[coordinator.tail_base].item() == 1

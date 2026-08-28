@@ -22,6 +22,7 @@ class DSASparseFixedHBMBreakdown:
     """Persistent Decode-side Hot Cache and lookup-state bytes."""
 
     hot_payload_bytes: int
+    storage_id_bytes: int
     lookup_state_bytes_per_cohort: int
     cohort_count: int
     lookup_capacity: int
@@ -35,7 +36,7 @@ class DSASparseFixedHBMBreakdown:
 
     @property
     def core_fixed_tensor_bytes(self) -> int:
-        return self.hot_payload_bytes + self.lookup_state_bytes
+        return self.hot_payload_bytes + self.storage_id_bytes + self.lookup_state_bytes
 
     @property
     def fixed_hbm_bytes(self) -> int:
@@ -57,25 +58,34 @@ def calculate_dsa_sparse_fixed_hbm_bytes(
         max_verify_tokens_per_request,
         uses_mtp=uses_mtp,
     )
+    tail_and_transient_span = block_size + transient_region_span
     return DSASparseFixedHBMBreakdown(
         hot_payload_bytes=sum(
             _hot_payload_bytes(
                 max_num_seqs,
-                transient_region_span,
+                tail_and_transient_span,
                 dtype,
                 num_kv_heads,
                 head_size,
             )
             for dtype, num_kv_heads, head_size in layouts
         ),
+        storage_id_bytes=(
+            _tensor_bytes(
+                (
+                    len(layouts),
+                    max_num_seqs,
+                    DSA_SPARSE_INDEX_CAPACITY // block_size,
+                ),
+                torch.int64,
+            )
+        ),
         lookup_state_bytes_per_cohort=_lookup_state_bytes(max_num_seqs),
         cohort_count=cohort_count,
         lookup_capacity=DSA_SPARSE_LOOKUP_SLOT_COUNT,
-        transient_region_span=transient_region_span,
+        transient_region_span=tail_and_transient_span,
         fallback_slot_count=int(uses_mtp),
-        verify_staging_capacity=(
-            max_verify_tokens_per_request if uses_mtp else 0
-        ),
+        verify_staging_capacity=(max_verify_tokens_per_request if uses_mtp else 0),
     )
 
 
@@ -104,9 +114,7 @@ def _hot_payload_bytes(
     num_kv_heads: int,
     head_size: int,
 ) -> int:
-    hot_rows = max_num_seqs * (
-        DSA_SPARSE_LOOKUP_SLOT_COUNT + transient_region_span
-    )
+    hot_rows = max_num_seqs * (DSA_SPARSE_LOOKUP_SLOT_COUNT + transient_region_span)
     return _tensor_bytes((hot_rows, num_kv_heads, head_size), dtype)
 
 
@@ -119,15 +127,11 @@ def _transient_region_span(
     if block_size <= 0:
         raise ValueError("DSA Sparse block_size must be positive.")
     if not uses_mtp:
-        return block_size
+        return 0
     if max_verify_tokens_per_request <= 0:
-        raise ValueError(
-            "DSA Sparse MTP max_verify_tokens_per_request must be positive."
-        )
+        raise ValueError("DSA Sparse MTP max_verify_tokens_per_request must be positive.")
     transient_slots = 1 + max_verify_tokens_per_request
-    return (
-        (transient_slots + block_size - 1) // block_size
-    ) * block_size
+    return ((transient_slots + block_size - 1) // block_size) * block_size
 
 
 def _lookup_state_bytes(max_num_seqs: int) -> int:
