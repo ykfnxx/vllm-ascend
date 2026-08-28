@@ -111,6 +111,25 @@ def test_disabled_scheduler_returns_original_output(monkeypatch) -> None:
     assert not hasattr(scheduler.output, "dsa_offload_candidate_block_hashes")
 
 
+def test_connector_free_scheduler_has_no_remote_handoff_hashes(
+    monkeypatch,
+) -> None:
+    module, Scheduler = load_scheduler_module(monkeypatch)
+    scheduler = Scheduler()
+    scheduler.vllm_config = SimpleNamespace(additional_config={"dsa_offload": {}})
+    scheduler.requests = {
+        "new": make_request([b"new-0"], [1]),
+        "cached": make_request([b"cached-0"], [2]),
+    }
+    scheduler.output = make_output()
+    scheduler.output.kv_connector_metadata = None
+    scheduler.output.scheduled_spec_decode_tokens = {}
+
+    output = module.attach_block_hashes(scheduler, scheduler.output)
+
+    assert output.dsa_offload_connector_block_hashes == {}
+
+
 def test_publish_metadata_is_consumed_before_request_finish(monkeypatch) -> None:
     _, Scheduler = load_scheduler_module(monkeypatch)
     scheduler = Scheduler()

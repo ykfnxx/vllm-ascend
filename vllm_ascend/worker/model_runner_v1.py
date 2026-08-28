@@ -218,6 +218,7 @@ from vllm_ascend.dsa_offload.lookup import (
 from vllm_ascend.dsa_offload.pd import (
     PrefillPublishState,
     admit_from_handoff,
+    admit_local_from_prefill,
     validate_handoff,
 )
 
@@ -859,7 +860,12 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.dsa_offload_candidate_block_hashes
         )
 
-        connector_requests = scheduler_output.kv_connector_metadata.requests
+        connector_metadata = scheduler_output.kv_connector_metadata
+        connector_requests = (
+            connector_metadata.requests
+            if connector_metadata is not None
+            else {}
+        )
         for request_id, metadata in connector_requests.items():
             if metadata.dsa_offload_handoff is not None:
                 self._dsa_offload_handoffs[request_id] = (
@@ -874,7 +880,12 @@ class NPUModelRunner(GPUModelRunner):
         if hot_cache is None:
             return
 
-        connector_requests = scheduler_output.kv_connector_metadata.requests
+        connector_metadata = scheduler_output.kv_connector_metadata
+        connector_requests = (
+            connector_metadata.requests
+            if connector_metadata is not None
+            else {}
+        )
         layer_ids = {
             layer_name: layer_id
             for cohort in self._dsa_offload_cohorts
@@ -895,9 +906,10 @@ class NPUModelRunner(GPUModelRunner):
             if handoff is not None and request_id not in hot_cache.request_to_row:
                 hot_cache.admit(request_id)
 
-        get_kv_transfer_group().set_dsa_offload_request_rows(
-            hot_cache.request_to_row
-        )
+        if has_kv_transfer_group():
+            get_kv_transfer_group().set_dsa_offload_request_rows(
+                hot_cache.request_to_row
+            )
         scheduled_request_ids = [
             request.req_id for request in scheduler_output.scheduled_new_reqs
         ]
@@ -922,6 +934,41 @@ class NPUModelRunner(GPUModelRunner):
                     ),
                     io_backend=self._dsa_offload_io,
                 )
+
+    def _admit_local_dsa_offload_requests(self, batch: object) -> None:
+        config = self.dsa_offload_config
+        hot_cache = self._dsa_offload_hot_cache
+        prefill_state = batch.prefill_state
+        if (
+            config is None
+            or config.has_connector
+            or hot_cache is None
+            or prefill_state is None
+        ):
+            return
+
+        layer_ids = {
+            layer_name: layer_id
+            for cohort in self._dsa_offload_cohorts
+            for layer_name, layer_id in zip(
+                cohort.layer_names,
+                cohort.layer_ids,
+            )
+        }
+        for handoff in prefill_state.local_handoffs(self.block_size):
+            if handoff.request_id in hot_cache.request_to_row:
+                continue
+            admit_local_from_prefill(
+                handoff=handoff,
+                hot_cache=hot_cache,
+                cohorts=self._dsa_offload_cohorts,
+                lookup_states=self._dsa_offload_lookup_states,
+                layer_ids=layer_ids,
+                committed_block_hashes=(
+                    self._dsa_offload_committed_hashes[handoff.request_id]
+                ),
+                io_backend=self._dsa_offload_io,
+            )
 
     def _release_dsa_offload_requests(
         self,
@@ -1005,9 +1052,10 @@ class NPUModelRunner(GPUModelRunner):
             for layer_name in self._dsa_offload_main_specs:
                 metadata[layer_name].dsa_offload_batch = batch
         self._dsa_offload_batch = batch
-        get_kv_transfer_group().set_dsa_offload_publish_state(
-            batch.prefill_state
-        )
+        if has_kv_transfer_group():
+            get_kv_transfer_group().set_dsa_offload_publish_state(
+                batch.prefill_state
+            )
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         # Temporary rewind guard for KV-load-failure recompute.
@@ -2625,6 +2673,7 @@ class NPUModelRunner(GPUModelRunner):
             if (
                 self.dsa_offload_config is not None
                 and self.dsa_offload_config.is_consumer
+                and self.dsa_offload_config.has_connector
             ):
                 get_kv_transfer_group().wait_for_dsa_offload_load(
                     set(self.input_batch.req_ids)
@@ -2772,6 +2821,9 @@ class NPUModelRunner(GPUModelRunner):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         if self._dsa_offload_batch is not None:
+            self._admit_local_dsa_offload_requests(
+                self._dsa_offload_batch
+            )
             if self._dsa_offload_batch.is_mtp:
                 num_reqs = len(self._dsa_offload_batch.request_ids)
                 sampled_token_ids = sampler_output.sampled_token_ids[:num_reqs]

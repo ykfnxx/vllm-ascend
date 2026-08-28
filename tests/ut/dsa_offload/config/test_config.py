@@ -69,8 +69,49 @@ def test_feature_gate_and_valid_config() -> None:
     assert config.kvio_model_id == 9
     assert config.max_verify_tokens_per_request == 8
     assert config.kv_transfer_config is vllm_config.kv_transfer_config
+    assert config.has_connector
     assert config.kv_role == "kv_both"
     assert config.is_producer and config.is_consumer
+
+
+def test_connector_free_config_uses_local_mixed_role() -> None:
+    config = load_dsa_offload_config(make_config(kv_transfer_config=None))
+
+    assert config is not None
+    assert not config.has_connector
+    assert config.kv_role == "kv_both"
+    assert config.is_producer and config.is_consumer
+
+
+def test_io_backend_defaults_to_mock() -> None:
+    vllm_config = make_config()
+    vllm_config.additional_config = {"dsa_offload": {}}
+
+    config = load_dsa_offload_config(vllm_config)
+
+    assert config is not None
+    assert config.io_backend == "mock"
+
+
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+def test_local_shm_connector_is_supported_for_split_pd(role: str) -> None:
+    vllm_config = make_config()
+    vllm_config.kv_transfer_config.kv_connector = "LocalShmConnector"
+    vllm_config.kv_transfer_config.kv_role = role
+
+    config = load_dsa_offload_config(vllm_config)
+
+    assert config is not None
+    assert config.has_connector
+    assert config.kv_role == role
+
+
+def test_local_shm_connector_rejects_mixed_role() -> None:
+    vllm_config = make_config()
+    vllm_config.kv_transfer_config.kv_connector = "LocalShmConnector"
+
+    with pytest.raises(ValueError, match="omit kv_transfer_config"):
+        load_dsa_offload_config(vllm_config)
 
 
 @pytest.mark.parametrize(

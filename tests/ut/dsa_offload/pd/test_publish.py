@@ -40,6 +40,13 @@ def test_final_prefill_puts_full_blocks_and_captures_last_topk_and_tail(spy_io) 
     assert metadata.request_layer_topk_by_rank["final"][1]["layer"] == semantic_topk[1].tolist()
     assert metadata.request_partial_tail_blocks_by_rank["final"][1]["layer"] == 3
 
+    local = state.local_handoffs(block_size=4)
+    assert len(local) == 1
+    assert local[0].request_id == "final"
+    assert local[0].stored_token_count == 6
+    assert local[0].layer_topk["layer"] == semantic_topk[1].tolist()
+    assert local[0].partial_tail_blocks == {"layer": 3}
+
 
 def test_intermediate_prefill_does_not_publish(spy_io) -> None:
     state = PrefillPublishState(

@@ -14,19 +14,20 @@ class DSAOffloadConfig:
     io_backend: Literal["kvio", "mock"]
     kvio_model_id: int
     max_verify_tokens_per_request: int
-    kv_transfer_config: Any
+    kv_role: DSAOffloadRole
+    kv_transfer_config: Any | None
 
     @property
-    def kv_role(self) -> DSAOffloadRole:
-        return self.kv_transfer_config.kv_role
+    def has_connector(self) -> bool:
+        return self.kv_transfer_config is not None
 
     @property
     def is_producer(self) -> bool:
-        return self.kv_transfer_config.is_kv_producer
+        return self.kv_role in {"kv_producer", "kv_both"}
 
     @property
     def is_consumer(self) -> bool:
-        return self.kv_transfer_config.is_kv_consumer
+        return self.kv_role in {"kv_consumer", "kv_both"}
 
 
 def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
@@ -35,7 +36,9 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
         return None
 
     raw_config = additional_config["dsa_offload"]
-    io_backend = raw_config["io_backend"]
+    if not isinstance(raw_config, dict):
+        raise ValueError("additional_config.dsa_offload must be an object.")
+    io_backend = raw_config.get("io_backend", "mock")
     if io_backend not in {"kvio", "mock"}:
         raise ValueError("dsa_offload.io_backend must be 'kvio' or 'mock'.")
 
@@ -56,16 +59,30 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
         raise ValueError(f"DSA Offload max_model_len must not exceed {INDEX_CAPACITY}.")
 
     kv_transfer_config = vllm_config.kv_transfer_config
-    if kv_transfer_config is None or kv_transfer_config.kv_connector != "MooncakeConnectorV1":
-        raise ValueError("DSA Offload requires MooncakeConnectorV1.")
-    kv_role = kv_transfer_config.kv_role
-    if kv_role not in {"kv_producer", "kv_consumer", "kv_both"}:
-        raise ValueError("DSA Offload requires kv_producer, kv_consumer, or kv_both.")
+    if kv_transfer_config is None:
+        # A connector-free engine owns both phases of every request. Remote
+        # producer/consumer roles still require a connector to carry the P/D
+        # handoff and the partial target-cache tail.
+        kv_role: DSAOffloadRole = "kv_both"
+    else:
+        kv_connector = kv_transfer_config.kv_connector
+        if kv_connector not in {"MooncakeConnectorV1", "LocalShmConnector"}:
+            raise ValueError("DSA Offload supports only MooncakeConnectorV1 or LocalShmConnector.")
+        kv_role = kv_transfer_config.kv_role
+        if kv_role not in {"kv_producer", "kv_consumer", "kv_both"}:
+            raise ValueError("DSA Offload requires kv_producer, kv_consumer, or kv_both.")
+        if kv_connector == "LocalShmConnector" and kv_role == "kv_both":
+            raise ValueError(
+                "LocalShmConnector supports only separate kv_producer and "
+                "kv_consumer engines; omit kv_transfer_config for local kv_both."
+            )
 
-    prefill = kv_transfer_config.get_from_extra_config("prefill", {})
-    decode = kv_transfer_config.get_from_extra_config("decode", {})
-    if prefill["tp_size"] != decode["tp_size"]:
-        raise ValueError("DSA Offload requires equal Prefill and Decode TP sizes.")
+        prefill = kv_transfer_config.get_from_extra_config("prefill", {})
+        decode = kv_transfer_config.get_from_extra_config("decode", {})
+        if "tp_size" not in prefill or "tp_size" not in decode:
+            raise ValueError("DSA Offload connectors require prefill.tp_size and decode.tp_size.")
+        if prefill["tp_size"] != decode["tp_size"]:
+            raise ValueError("DSA Offload requires equal Prefill and Decode TP sizes.")
 
     parallel_config = vllm_config.parallel_config
     if (
@@ -93,6 +110,7 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
         io_backend=io_backend,
         kvio_model_id=kvio_model_id,
         max_verify_tokens_per_request=max_verify_tokens,
+        kv_role=kv_role,
         kv_transfer_config=kv_transfer_config,
     )
 

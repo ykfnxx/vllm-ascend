@@ -4,7 +4,7 @@
 #
 # Exercise the framework-side DSA Offload path with a small glm_moe_dsa model.
 #
-# The default P/D + mock scenario validates process isolation, Mooncake handoff,
+# The default P/D + mock scenario validates process isolation, connector handoff,
 # DSA lookup/update, Hot Cache use, and Sparse Flash Attention execution.
 # Select --io-backend kvio to additionally exercise real block PUT/token GET.
 
@@ -21,6 +21,7 @@ fi
 MODEL="$DEFAULT_MODEL"
 SERVED_MODEL_NAME="glm-moe-dsa"
 SCENARIO="pd"
+CONNECTOR="mooncake"
 IO_BACKEND="mock"
 KVIO_MODEL_ID="0"
 HOST_IP=""
@@ -47,6 +48,9 @@ LOG_DIR=""
 VERIFY_PATH="0"
 RUN_UNIT_TESTS="0"
 SKIP_CONCURRENT="0"
+LOCAL_SHM_DIR="/dev/shm/vllm-ascend-local-kv"
+LOCAL_SHM_NAMESPACE="dsa-offload-probe"
+LOCAL_SHM_TIMEOUT="120"
 
 usage() {
     cat <<'EOF'
@@ -62,6 +66,9 @@ Scenarios:
 Core options:
   --model MODEL               Local model path or Hugging Face ID.
   --served-model-name NAME    OpenAI API name. Default: glm-moe-dsa
+  --connector TYPE            mooncake, local-shm, or none. Default: mooncake
+                              local-shm is for split P/D on one host/container;
+                              none is for the single-engine both scenario.
   --io-backend BACKEND        mock or kvio. Default: mock
   --kvio-model-id ID          Non-negative KVIO model namespace. Default: 0
   --host-ip IP                Local IP used by Mooncake/HCCL.
@@ -83,6 +90,12 @@ Core options:
   --run-unit-tests             Run tests/ut/dsa_offload before the NPU probe.
   --skip-concurrent            In kv_both mode, skip the concurrent workload.
 
+LocalShm options:
+  --local-shm-dir DIR         Shared-memory root. Default:
+                              /dev/shm/vllm-ascend-local-kv
+  --local-shm-namespace NAME  Isolation namespace. Default: dsa-offload-probe
+  --local-shm-timeout SEC     Manifest wait timeout. Default: 120
+
 Port options:
   --prefill-http-port PORT    Default: 18100
   --decode-http-port PORT     Default: 18200
@@ -100,11 +113,11 @@ Workloads:
   4. kv_both only: overlapping requests to make mixed Prefill/Decode possible.
 
 Validation boundary:
-  mock is intentionally the default. In P/D it can still exercise Mooncake's
-  partial-tail handoff, but it does not perform capacity-layer full-block PUT or
-  token GET. It validates control flow and operator execution, not token
-  accuracy. kvio adds real capacity-layer PUT/GET, but output accuracy still
-  needs comparison with a known-good baseline checkpoint and environment.
+  mock is intentionally the default. With a split P/D connector it can still
+  exercise the partial-tail handoff, but it does not perform capacity-layer
+  full-block PUT or token GET. With --connector none it validates local cache
+  promotion only at the control-path level. kvio adds real capacity-layer
+  PUT/GET; output accuracy still needs a known-good baseline comparison.
 EOF
 }
 
@@ -145,6 +158,11 @@ while (($# > 0)); do
         --io-backend)
             require_value "$@"
             IO_BACKEND="$2"
+            shift 2
+            ;;
+        --connector)
+            require_value "$@"
+            CONNECTOR="$2"
             shift 2
             ;;
         --kvio-model-id)
@@ -269,6 +287,21 @@ while (($# > 0)); do
             SKIP_CONCURRENT="1"
             shift
             ;;
+        --local-shm-dir)
+            require_value "$@"
+            LOCAL_SHM_DIR="$2"
+            shift 2
+            ;;
+        --local-shm-namespace)
+            require_value "$@"
+            LOCAL_SHM_NAMESPACE="$2"
+            shift 2
+            ;;
+        --local-shm-timeout)
+            require_value "$@"
+            LOCAL_SHM_TIMEOUT="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -287,6 +320,22 @@ if [[ "$SCENARIO" != "pd" && "$SCENARIO" != "both" ]]; then
 fi
 if [[ "$IO_BACKEND" != "mock" && "$IO_BACKEND" != "kvio" ]]; then
     echo "--io-backend must be 'mock' or 'kvio'." >&2
+    exit 2
+fi
+if [[ "$CONNECTOR" != "mooncake" && "$CONNECTOR" != "local-shm" && "$CONNECTOR" != "none" ]]; then
+    echo "--connector must be 'mooncake', 'local-shm', or 'none'." >&2
+    exit 2
+fi
+if [[ "$SCENARIO" == "pd" && "$CONNECTOR" == "none" ]]; then
+    echo "Split P/D requires --connector mooncake or local-shm." >&2
+    exit 2
+fi
+if [[ "$SCENARIO" == "both" && "$CONNECTOR" == "local-shm" ]]; then
+    echo "local-shm supports split P/D only; use --connector none for local both." >&2
+    exit 2
+fi
+if [[ "$CONNECTOR" == "local-shm" && "$LOCAL_SHM_DIR" != /* ]]; then
+    echo "--local-shm-dir must be an absolute path." >&2
     exit 2
 fi
 if [[ -z "$HOST_IP" || -z "$IFNAME" ]]; then
@@ -310,6 +359,11 @@ for value_and_name in \
     "$STARTUP_TIMEOUT:startup-timeout"; do
     require_uint "${value_and_name%%:*}" "${value_and_name#*:}"
 done
+if ! [[ "$LOCAL_SHM_TIMEOUT" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || [[ "$LOCAL_SHM_TIMEOUT" =~ ^0+([.]0+)?$ ]]; then
+    echo "local-shm-timeout must be positive." >&2
+    exit 2
+fi
 
 if ((MTP_SPECULATIVE_TOKENS > 15)); then
     echo "mtp-speculative-tokens must be in [0, 15]." >&2
@@ -353,7 +407,9 @@ if [[ "$RUN_UNIT_TESTS" == "1" ]]; then
     echo "Running framework-side DSA Offload unit tests..."
     (
         cd "$REPO_ROOT"
-        python3 -m pytest -q tests/ut/dsa_offload
+        python3 -m pytest -q \
+            tests/ut/dsa_offload \
+            tests/ut/kv_offload/test_local_shm_connector.py
     )
 fi
 
@@ -477,6 +533,7 @@ python3 - \
     "$HEAD_SHA" \
     "$MODEL" \
     "$SCENARIO" \
+    "$CONNECTOR" \
     "$IO_BACKEND" \
     "$KVIO_MODEL_ID" \
     "$BLOCK_SIZE" \
@@ -493,6 +550,7 @@ import sys
     head,
     model,
     scenario,
+    connector,
     io_backend,
     kvio_model_id,
     block_size,
@@ -506,6 +564,7 @@ manifest = {
     "head": head,
     "model": model,
     "scenario": scenario,
+    "connector": connector,
     "io_backend": io_backend,
     "kvio_model_id": int(kvio_model_id),
     "block_size": int(block_size),
@@ -593,7 +652,6 @@ COMMON_NETWORK_ENV=(
 )
 
 DSA_CONFIG="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_offload\":{\"io_backend\":\"$IO_BACKEND\",\"kvio_model_id\":$KVIO_MODEL_ID}}"
-CONNECTOR_EXTRA='{"prefill":{"dp_size":1,"tp_size":1},"decode":{"dp_size":1,"tp_size":1}}'
 
 LAST_PID=""
 launch_server() {
@@ -608,10 +666,58 @@ launch_server() {
     local speculative_tokens="$9"
     local kv_config
     local profiler_config
+    local -a kv_transfer_args=()
     local -a profiler_args=()
     local -a speculative_args=()
 
-    kv_config="{\"kv_connector\":\"MooncakeConnectorV1\",\"kv_role\":\"$kv_role\",\"kv_port\":$kv_port,\"engine_id\":\"$engine_id\",\"kv_load_failure_policy\":\"fail\",\"kv_connector_extra_config\":$CONNECTOR_EXTRA}"
+    if [[ "$CONNECTOR" != "none" ]]; then
+        kv_config="$(python3 - \
+            "$CONNECTOR" \
+            "$kv_role" \
+            "$kv_port" \
+            "$engine_id" \
+            "$LOCAL_SHM_DIR" \
+            "$LOCAL_SHM_NAMESPACE" \
+            "$LOCAL_SHM_TIMEOUT" <<'PY'
+import json
+import sys
+
+(
+    connector,
+    role,
+    port,
+    engine_id,
+    shm_dir,
+    shm_namespace,
+    shm_timeout,
+) = sys.argv[1:]
+extra = {
+    "prefill": {"dp_size": 1, "tp_size": 1},
+    "decode": {"dp_size": 1, "tp_size": 1},
+}
+if connector == "local-shm":
+    extra.update(
+        shm_dir=shm_dir,
+        shm_namespace=shm_namespace,
+        shm_timeout=float(shm_timeout),
+    )
+config = {
+    "kv_connector": (
+        "MooncakeConnectorV1"
+        if connector == "mooncake"
+        else "LocalShmConnector"
+    ),
+    "kv_role": role,
+    "kv_port": int(port),
+    "engine_id": engine_id,
+    "kv_load_failure_policy": "fail",
+    "kv_connector_extra_config": extra,
+}
+print(json.dumps(config, separators=(",", ":")))
+PY
+)"
+        kv_transfer_args+=(--kv-transfer-config "$kv_config")
+    fi
     if ((speculative_tokens > 0)); then
         speculative_args+=(
             --speculative-config
@@ -659,7 +765,7 @@ PY
         --no-enable-prefix-caching \
         --compilation-config '{"cudagraph_mode":"NONE"}' \
         --additional-config "$DSA_CONFIG" \
-        --kv-transfer-config "$kv_config" \
+        "${kv_transfer_args[@]}" \
         "${speculative_args[@]}" \
         "${profiler_args[@]}" \
         >"$service_log" 2>&1 &
@@ -1025,7 +1131,7 @@ PY
 fi
 
 echo
-echo "PASS: DSA Offload $SCENARIO scenario completed with io_backend=$IO_BACKEND."
+echo "PASS: DSA Offload $SCENARIO scenario completed with connector=$CONNECTOR and io_backend=$IO_BACKEND."
 if [[ "$IO_BACKEND" == "mock" ]]; then
     echo "VALIDATED: config/bootstrap, request lifecycle, lookup, Hot Cache/SFA path, and role-specific control flow."
     echo "NOT VALIDATED: capacity-layer full-block PUT/token GET or output accuracy; rerun with --io-backend kvio."
@@ -1035,7 +1141,7 @@ else
 fi
 echo "Focused diagnostics:"
 if [[ "$SCENARIO" == "pd" ]]; then
-    echo "  grep -Ein 'dsa_offload|mooncake|npu_get_put|error|traceback' '$PREFILL_LOG' '$DECODE_LOG' '$PROXY_LOG'"
+    echo "  grep -Ein 'dsa_offload|mooncake|localshm|npu_get_put|error|traceback' '$PREFILL_LOG' '$DECODE_LOG' '$PROXY_LOG'"
 else
-    echo "  grep -Ein 'dsa_offload|mooncake|npu_get_put|error|traceback' '$BOTH_LOG'"
+    echo "  grep -Ein 'dsa_offload|mooncake|localshm|npu_get_put|error|traceback' '$BOTH_LOG'"
 fi

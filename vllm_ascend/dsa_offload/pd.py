@@ -64,6 +64,15 @@ class DSAOffloadPDHandoff:
         return handoff
 
 
+@dataclass(frozen=True)
+class DSAOffloadLocalHandoff:
+    request_id: str
+    stored_token_count: int
+    block_size: int
+    layer_topk: dict[str, list[int]]
+    partial_tail_blocks: dict[str, int]
+
+
 def validate_handoff(
     handoff: DSAOffloadPDHandoff,
     tp_size: int,
@@ -195,6 +204,33 @@ class PrefillPublishState:
             return None
         return DSAOffloadWorkerMetadata(request_topk, request_tails)
 
+    def local_handoffs(self, block_size: int) -> tuple[DSAOffloadLocalHandoff, ...]:
+        handoffs: list[DSAOffloadLocalHandoff] = []
+        for request_id, stored_token_count, should_publish in zip(
+            self.request_ids,
+            self.stored_token_counts,
+            self.publish_requests,
+        ):
+            if not should_publish:
+                continue
+            handoffs.append(
+                DSAOffloadLocalHandoff(
+                    request_id=request_id,
+                    stored_token_count=stored_token_count,
+                    block_size=block_size,
+                    layer_topk={
+                        layer_name: topk_by_request[request_id]
+                        for layer_name, topk_by_request in self.layer_topk.items()
+                    },
+                    partial_tail_blocks={
+                        layer_name: tails_by_request[request_id]
+                        for layer_name, tails_by_request in self.partial_tail_blocks.items()
+                        if request_id in tails_by_request
+                    },
+                )
+            )
+        return tuple(handoffs)
+
 
 def build_handoff(
     *,
@@ -239,11 +275,12 @@ def select_initial_resident(
     return selected
 
 
-def admit_from_handoff(
+def _initialize_hot_row(
     *,
     request_id: str,
-    handoff: DSAOffloadPDHandoff,
-    tp_rank: int,
+    stored_token_count: int,
+    block_size: int,
+    layer_topk: Mapping[str, Sequence[int]],
     hot_cache: HotCacheState,
     cohorts: Sequence[IndexCacheCohort],
     lookup_states: Mapping[str, LookupState],
@@ -253,7 +290,6 @@ def admit_from_handoff(
 ) -> int:
     row_id = hot_cache.request_to_row[request_id]
     clear_lookup_row(lookup_states, row_id)
-    layer_topk = handoff.layer_topk_by_rank[tp_rank]
     residents: dict[str, list[int]] = {}
     for cohort in cohorts:
         leader_topk = layer_topk[cohort.leader_layer]
@@ -262,8 +298,8 @@ def admit_from_handoff(
                 raise ValueError("IndexCache cohort layers must carry identical TopK.")
         residents[cohort.cohort_id] = select_initial_resident(
             leader_topk,
-            handoff.stored_token_count,
-            handoff.block_size,
+            stored_token_count,
+            block_size,
         )
 
     for layer_name, cache_planes in hot_cache.layer_caches.items():
@@ -282,7 +318,7 @@ def admit_from_handoff(
             )
             logical_blocks = torch.div(
                 positions,
-                handoff.block_size,
+                block_size,
                 rounding_mode="floor",
             )
             destination_slots = hot_cache.layout.global_slot(row_id, 0) + torch.arange(
@@ -293,7 +329,7 @@ def admit_from_handoff(
             io_backend.get_tokens(
                 layer_id=layer_id,
                 storage_ids=storage_ids[logical_blocks],
-                token_offsets=torch.remainder(positions, handoff.block_size),
+                token_offsets=torch.remainder(positions, block_size),
                 destination_slots=destination_slots,
             )
 
@@ -303,7 +339,88 @@ def admit_from_handoff(
             row_id,
             residents[cohort.cohort_id],
         )
+    return row_id
+
+
+def admit_from_handoff(
+    *,
+    request_id: str,
+    handoff: DSAOffloadPDHandoff,
+    tp_rank: int,
+    hot_cache: HotCacheState,
+    cohorts: Sequence[IndexCacheCohort],
+    lookup_states: Mapping[str, LookupState],
+    layer_ids: Mapping[str, int],
+    committed_block_hashes: Sequence[bytes],
+    io_backend: IOBackend,
+) -> int:
+    row_id = _initialize_hot_row(
+        request_id=request_id,
+        stored_token_count=handoff.stored_token_count,
+        block_size=handoff.block_size,
+        layer_topk=handoff.layer_topk_by_rank[tp_rank],
+        hot_cache=hot_cache,
+        cohorts=cohorts,
+        lookup_states=lookup_states,
+        layer_ids=layer_ids,
+        committed_block_hashes=committed_block_hashes,
+        io_backend=io_backend,
+    )
     hot_cache.mark_ready(request_id)
+    return row_id
+
+
+def admit_local_from_prefill(
+    *,
+    handoff: DSAOffloadLocalHandoff,
+    hot_cache: HotCacheState,
+    cohorts: Sequence[IndexCacheCohort],
+    lookup_states: Mapping[str, LookupState],
+    layer_ids: Mapping[str, int],
+    committed_block_hashes: Sequence[bytes],
+    io_backend: IOBackend,
+) -> int:
+    expected_layers = set(layer_ids)
+    if handoff.block_size != hot_cache.layout.block_size:
+        raise ValueError("DSA Offload local Prefill and Decode block sizes differ.")
+    if set(handoff.layer_topk) != expected_layers:
+        raise ValueError("DSA Offload local handoff has incomplete target layers.")
+    if any(
+        len(positions) != QUERY_WIDTH or any(not isinstance(position, int) for position in positions)
+        for positions in handoff.layer_topk.values()
+    ):
+        raise ValueError(f"DSA Offload local handoff TopK must contain {QUERY_WIDTH} integer positions per layer.")
+    if handoff.stored_token_count % handoff.block_size:
+        if set(handoff.partial_tail_blocks) != expected_layers:
+            raise ValueError("DSA Offload local partial tail has incomplete target layers.")
+    elif handoff.partial_tail_blocks:
+        raise ValueError("Block-aligned DSA Offload local handoff must not contain partial tails.")
+
+    row_id = hot_cache.admit(handoff.request_id)
+    try:
+        _initialize_hot_row(
+            request_id=handoff.request_id,
+            stored_token_count=handoff.stored_token_count,
+            block_size=handoff.block_size,
+            layer_topk=handoff.layer_topk,
+            hot_cache=hot_cache,
+            cohorts=cohorts,
+            lookup_states=lookup_states,
+            layer_ids=layer_ids,
+            committed_block_hashes=committed_block_hashes,
+            io_backend=io_backend,
+        )
+        tail_tokens = handoff.stored_token_count % handoff.block_size
+        if tail_tokens:
+            destination_block = hot_cache.layout.row_block_base(row_id) + hot_cache.layout.tail_block_offset
+            for layer_name, source_block in handoff.partial_tail_blocks.items():
+                for plane in hot_cache.layer_caches[layer_name]:
+                    plane[destination_block, :tail_tokens].copy_(plane[source_block, :tail_tokens])
+        hot_cache.mark_ready(handoff.request_id)
+    except Exception:
+        clear_lookup_row(lookup_states, row_id)
+        hot_cache.release(handoff.request_id)
+        raise
     return row_id
 
 

@@ -3,8 +3,8 @@
 本文面向 `dsa-offload-0.23` 分支，说明如何使用当前框架侧实现启动
 GLM-5.2 服务，以及 DSA Offload 新增参数的含义、约束和推荐配置。
 
-本文核对基线为 `dsa-offload-0.23` 的 `0ab3c0e5162add73151778202780c45c442cd6e4`。
-如果分支继续演进，应重新核对本文列出的 gate 和参数契约。
+本文核对基线为当前 checkout 的 `dsa-offload-0.23`。如果分支继续演进，应重新
+核对本文列出的 gate 和参数契约。
 
 > 本文命令以单个 Prefill engine 和单个 Decode engine 为例。模型需要多少
 > NPU、TP 应设为多少，仍取决于权重格式和单卡显存；调整 TP 时，必须同时
@@ -17,10 +17,13 @@ GLM-5.2 服务，以及 DSA Offload 新增参数的含义、约束和推荐配�
 ```text
 Prefill Main KV Cache
   |-- 完整 block --------------------> IO backend (mock 或 KVIO)
-  `-- 未对齐的末尾 token -----------> Mooncake 辅助传输区
+  `-- 未对齐的末尾 token
+       |-- 分离 P/D -----------------> Mooncake 或 LocalShm connector
+       `-- 单 engine kv_both --------> 本地 Main -> Hot Cache 复制
 
 Decode
-  |-- Mooncake 接收 P/D handoff 和末尾 token
+  |-- 分离 P/D：connector 接收 handoff 和末尾 token
+  |-- 单 engine：Prefill 完成后本地晋升为 Hot Cache 请求
   |-- DSA TopK 查找
   |-- cache miss 从 IO backend 读入 Hot Cache
   `-- SFA 从 Hot Cache/Main Cache 读取
@@ -42,7 +45,7 @@ Decode
 | 模型 | `model_type=glm_moe_dsa`，即 GLM-5 系列 |
 | DSA TopK | 模型配置中 `index_topk=2048` |
 | 最大上下文 | `--max-model-len` 不得超过 `131072` |
-| KV connector | 只能直接使用 `MooncakeConnectorV1` |
+| KV connector | 分离 P/D 使用 `MooncakeConnectorV1` 或 `LocalShmConnector`；单 engine 可不配置 |
 | P/D TP | Prefill TP 和 Decode TP 必须相等 |
 | PP/PCP/DCP | 均必须为 1，即当前不能启用 |
 | speculative decoding | 只支持 `method=mtp`，draft token 数最多 15 |
@@ -51,6 +54,10 @@ Decode
 因此，普通 GLM-5.2 文档中的 `PP2`、DCP、P/D 不同 TP、
 `MultiConnector`、超过 128K 的上下文，以及 `method=deepseek_mtp`，都不能
 直接复制到本分支的 DSA Offload 命令中。
+
+这里的“不配置 connector”只表示同一个 engine 同时执行 Prefill 和 Decode。
+两个独立 engine 之间必须有 connector 携带请求 handoff 和未满 block 的尾部
+payload；不能仅靠 IO backend 代替这段 P/D 协议。
 
 ## 2. 安装和启动前检查
 
@@ -179,7 +186,7 @@ Prefill、Decode 和代理之间的 HTTP 端口，以及 Mooncake 的 `kv_port` 
 | 字段 | 是否必填 | 推荐值和含义 |
 | --- | --- | --- |
 | `dsa_offload` | 是 | 存在该对象即启用 DSA Offload |
-| `dsa_offload.io_backend` | 是 | 首次冒烟填 `mock`；真实部署填 `kvio` |
+| `dsa_offload.io_backend` | 否 | 默认 `mock`；首次冒烟用 `mock`，真实部署填 `kvio` |
 | `dsa_offload.kvio_model_id` | 否 | 非负整数，默认 0；同一模型的 P/D 必须一致，不同并行服务建议使用不同 ID |
 | `ascend_compilation_config.enable_npugraph_ex` | 否 | 不是 DSA 新参数；首次验证建议为 `false`，稳定后再单独验证图模式 |
 
@@ -198,9 +205,17 @@ GLM-5.2 的 OpenAI API 能力也不是 DSA 新参数。如需自动工具调用�
 
 本文命令为了缩小首轮验证变量，暂未启用这些 API 层选项。
 
-### 3.2 `--kv-transfer-config`
+### 3.2 `--kv-transfer-config` 与 connector 选择
 
-Prefill 侧示例：
+有三种部署方式：
+
+| 拓扑 | 配置方式 | 适用范围 |
+| --- | --- | --- |
+| 跨主机或通用分离 P/D | `MooncakeConnectorV1` | 生产 P/D 数据传输 |
+| 同一主机、同一容器内的分离 P/D | `LocalShmConnector` | 简化单机验证，不支持跨主机 |
+| 单 engine 混合 Prefill/Decode | 完全省略 `--kv-transfer-config` | 本地 `kv_both`，无需 P/D connector |
+
+分离 P/D 的 Prefill 侧 Mooncake 示例：
 
 ```json
 {
@@ -217,13 +232,13 @@ Prefill 侧示例：
 ```
 
 Decode 侧只需把 `kv_role` 改为 `kv_consumer`，并使用独立的 `kv_port` 和
-`engine_id`。同机一体化服务使用 `kv_role=kv_both`。
+`engine_id`。
 
 | 字段 | 填法 |
 | --- | --- |
-| `kv_connector` | 固定为 `MooncakeConnectorV1`，不能换成 `MultiConnector` |
-| `kv_role` | P=`kv_producer`，D=`kv_consumer`，一体化=`kv_both` |
-| `kv_port` | Mooncake engine 的基础端口；实例之间不能冲突 |
+| `kv_connector` | 分离 P/D 填 `MooncakeConnectorV1` 或 `LocalShmConnector`，不能填 `MultiConnector` |
+| `kv_role` | 分离 P/D 的 P=`kv_producer`、D=`kv_consumer`；无 connector 时由框架隐式使用 `kv_both` |
+| `kv_port` | connector 控制配置的基础端口；实例之间不能冲突 |
 | `engine_id` | 每个 engine 使用唯一字符串 |
 | `kv_load_failure_policy` | bring-up 推荐 `fail`，便于暴露真实传输失败 |
 | `prefill.dp_size` / `decode.dp_size` | 示例是单 P、单 D engine，所以均为 1；按真实全局拓扑填写 |
@@ -231,6 +246,41 @@ Decode 侧只需把 `kv_role` 改为 `kv_consumer`，并使用独立的 `kv_port
 
 `--block-size` 也必须在 P/D 两侧保持一致。当前 handoff 会在运行时校验它，
 本文统一使用 `128`。
+
+同机 LocalShm 的配置只需替换 connector，并增加三个可选字段：
+
+```json
+{
+  "kv_connector": "LocalShmConnector",
+  "kv_role": "kv_producer",
+  "kv_port": 30000,
+  "engine_id": "glm52-dsa-prefill",
+  "kv_load_failure_policy": "fail",
+  "kv_connector_extra_config": {
+    "prefill": {"dp_size": 1, "tp_size": 8},
+    "decode": {"dp_size": 1, "tp_size": 8},
+    "shm_dir": "/dev/shm/vllm-ascend-local-kv",
+    "shm_namespace": "glm52-dsa-instance-a",
+    "shm_timeout": 120
+  }
+}
+```
+
+Decode 侧使用完全相同的 `shm_dir` 和 `shm_namespace`，只把 role、port 和
+engine ID 改成 Decode 值。LocalShm 还有以下限制：
+
+- P/D 必须在同一主机和同一容器/IPC namespace 中，且能看到同一个绝对
+  `shm_dir`。
+- P/D TP 必须相等，rank `r` 只与 rank `r` 交换数据；DP、PP、PCP、DCP
+  必须为 1。
+- payload 通过文件映射同步执行 D2H/H2D。它不创建 Mooncake
+  TransferEngine，也没有 TP 重分片或后台传输线程。
+- 每个独立部署使用唯一 `shm_namespace`，避免请求文件命名空间冲突。
+- `shm_timeout` 单位为秒且必须大于 0；默认值为 120。
+
+单 engine 模式不要构造 `kv_role=kv_both` 的 LocalShm 配置，而是完全省略
+`--kv-transfer-config`。框架会在最终 Prefill step 后，将请求从 Main cache
+本地晋升到 Hot Cache，并直接复制未满 block 的尾部。
 
 ## 4. 推荐验证顺序
 
@@ -245,6 +295,7 @@ bash examples/dsa_offload_probe.sh \
   --model /path/to/hardware-compatible-glm-moe-dsa \
   --host-ip 192.168.1.10 \
   --ifname eth0 \
+  --connector mooncake \
   --io-backend mock \
   --scenario pd \
   --verify-path
@@ -257,6 +308,7 @@ bash examples/dsa_offload_probe.sh \
   --model /path/to/hardware-compatible-glm-moe-dsa \
   --host-ip 192.168.1.10 \
   --ifname eth0 \
+  --connector mooncake \
   --io-backend kvio \
   --kvio-model-id 52 \
   --scenario pd \
@@ -264,6 +316,9 @@ bash examples/dsa_offload_probe.sh \
 ```
 
 probe 是单机 TP1 的功能验证工具，不替代 GLM-5.2 多卡容量验证。
+
+同一容器内验证 LocalShm 时改为 `--connector local-shm`；验证无 connector
+的本地混合生命周期时使用 `--scenario both --connector none`。
 
 ### 4.2 GLM-5.2 P/D 部署变量
 
@@ -361,7 +416,7 @@ memory`，优先降低 `--max-num-seqs`，再检查模型权重、TP 和
 
 ### 4.5 启动 P/D 代理并请求
 
-待 P/D `/health` 均返回成功后启动标准 Mooncake P/D 代理：
+待 P/D `/health` 均返回成功后启动标准 P/D 代理：
 
 ```bash
 cd /home/solidyang/workspace/vllm-ascend
@@ -391,15 +446,10 @@ prompt、block 对齐/非对齐长度、并发请求和长上下文精度验证�
 
 ## 5. 单服务 `kv_both` 部署
 
-不需要 P/D 代理时，可在一个 engine 上使用 `kv_both`。即使是一体化拓扑，
-DSA Offload 仍要求配置 `MooncakeConnectorV1`：
+不需要 P/D 代理时，可由一个 engine 同时完成 Prefill 和 Decode。当前实现会
+隐式使用 `kv_both`，命令中不要传 `--kv-transfer-config`：
 
 ```bash
-BOTH_KV_PORT=30200
-BOTH_KV_CONFIG=$(printf \
-  '{"kv_connector":"MooncakeConnectorV1","kv_role":"kv_both","kv_port":%d,"engine_id":"glm52-dsa-both","kv_load_failure_policy":"fail","kv_connector_extra_config":{"prefill":{"dp_size":1,"tp_size":%d},"decode":{"dp_size":1,"tp_size":%d}}}' \
-  "$BOTH_KV_PORT" "$TP_SIZE" "$TP_SIZE")
-
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 vllm serve "$MODEL" \
@@ -419,9 +469,11 @@ vllm serve "$MODEL" \
   --enforce-eager \
   --no-enable-prefix-caching \
   --compilation-config '{"cudagraph_mode":"NONE"}' \
-  --additional-config "$DSA_CONFIG" \
-  --kv-transfer-config "$BOTH_KV_CONFIG"
+  --additional-config "$DSA_CONFIG"
 ```
+
+本地晋升仍依赖 IO backend 恢复完整历史 block：`mock` 只验证调度、lookup、
+Main-to-Hot 尾部复制和 SFA 控制路径；需要验证输出精度时必须改用 `kvio`。
 
 ## 6. 可选：启用 MTP
 
@@ -471,7 +523,8 @@ DSA_CONFIG=$(printf \
 | `supports only the GLM-5 family` | 模型的 `model_type` 不是 `glm_moe_dsa` |
 | `requires index_topk=2048` | 权重对应的 `config.json` 不符合当前算子契约 |
 | `max_model_len must not exceed 131072` | 降低 `--max-model-len`，不能直接使用 GLM-5.2 的 198K/256K/1M 示例 |
-| `requires MooncakeConnectorV1` | 不要使用 `MultiConnector` 或其他 connector |
+| `supports only MooncakeConnectorV1 or LocalShmConnector` | 分离 P/D 不要使用 `MultiConnector` 或其他 connector |
+| `omit kv_transfer_config for local kv_both` | 单 engine 完全删除 `--kv-transfer-config`，不要给 LocalShm 配 `kv_both` |
 | `requires equal Prefill and Decode TP sizes` | 对齐命令行 TP 和 connector 内的两处 TP |
 | `does not support PP, PCP, or DCP` | 删除 PP、PCP、DCP 参数，均保持 1 |
 | `supports speculative decoding only with MTP` | 使用 `method=mtp`，或先删除 speculative 配置 |
@@ -480,6 +533,7 @@ DSA_CONFIG=$(printf \
 | `No module named rdma_kv_ops` | KVIO 运行时未安装；mock 不需要该模块 |
 | `KVIO aiv_init failed` | 检查 KVIO/RDMA 初始化、注册内存、设备和 native 库版本 |
 | Mooncake 传输失败或超时 | 检查 `VLLM_HOST_IP`、NIC、`MC_TCP_BIND_ADDRESS`、端口和防火墙 |
+| LocalShm 等待 manifest 超时 | 检查 P/D 是否共享 IPC namespace、目录/namespace 是否一致、Prefill 是否仍存活 |
 | tiny 模型在 `MlaPrologV3` 失败 | 检查 shape，换用 A5 算子支持的小模型 |
 | Decode 出现 preemption | 当前实现不支持；降低并发/序列长度或增加容量 |
 
@@ -489,9 +543,10 @@ DSA_CONFIG=$(printf \
 
 1. 环境：两侧分支、HEAD、vLLM/vLLM Ascend/CANN 版本一致。
 2. 启动：P/D 或 `kv_both` 均通过 `/health`。
-3. 控制面：P/D handoff 完成，无等待或超时。
+3. 生命周期：分离 P/D handoff 或单 engine 本地晋升完成，无等待或超时。
 4. DSA 算子：lookup/update 单请求和 batch 路径均实际执行。
-5. Mooncake payload：未对齐末尾 token 能正确传输。
+5. 尾部 payload：Mooncake、LocalShm 或本地 Main-to-Hot 的未对齐末尾 token
+   能正确传输。
 6. KVIO payload：完整 block PUT、Decode miss GET 和 wait 均实际执行。
 7. 功能：覆盖 block 对齐、非对齐、重复历史、短/长上下文和并发请求。
 8. 精度：使用 `kvio` 与不启用 DSA Offload 的基线比较输出；不要使用

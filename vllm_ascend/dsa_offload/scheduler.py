@@ -29,7 +29,8 @@ def attach_block_hashes(
     cached = scheduler_output.scheduled_cached_reqs
     cached.block_hashes = [list(scheduler.requests[request_id].block_hashes) for request_id in cached.req_ids]
 
-    connector_requests = scheduler_output.kv_connector_metadata.requests
+    connector_metadata = scheduler_output.kv_connector_metadata
+    connector_requests = connector_metadata.requests if connector_metadata is not None else {}
     scheduler_output.dsa_offload_connector_block_hashes = {
         request_id: list(scheduler.requests[request_id].block_hashes)
         for request_id, metadata in connector_requests.items()
