@@ -39,9 +39,12 @@
 #include "gmm/grouped_matmul_swiglu_quant_weight_nz_tensor_list/grouped_matmul_swiglu_quant_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_v2/grouped_matmul_swiglu_quant_v2_torch_adpt.h"
 #include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
+#include "attention/lightning_indexer_hi_cached/lightning_indexer_hi_cached_torch_adpt.h"
+#include "attention/prefetch_qli_fusion/prefetch_qli_fusion_torch_adpt.h"
 #include "mc2/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "moe/moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
+#include "moe/scatter_nd_update_mean/scatter_nd_update_mean_torch_adpt.h"
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "attention/kv_quant_sparse_flash_attention/kv_quant_sparse_flash_attention_torch_adpt.h"
 #include "attention/lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
@@ -51,6 +54,8 @@
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
 #include "attention/dsa_offload_lookup_update/dsa_offload_lookup_update_torch_adpt.h"
 #include "attention/dsa_offload_lookup_update_batch/dsa_offload_lookup_update_batch_torch_adpt.h"
+#include "attention/dsa_sparse_turbo_lookup_update_batch/dsa_sparse_turbo_lookup_update_batch_torch_adpt.h"
+#include "attention/dsa_sparse_turbo_prefetch_lookup_update_batch/dsa_sparse_turbo_prefetch_lookup_update_batch_torch_adpt.h"
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
 #include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
@@ -2906,6 +2911,29 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("npu_scatter_nd_update_v2", torch::kPrivateUse1, &vllm_ascend::npu_scatter_nd_update_v2);
 
+    ops.def(
+        "npu_scatter_nd_update_mean(Tensor(a!) flat_key_cache, Tensor indices, Tensor updates, "
+        "Tensor(b!) key_mean, int block_size) -> ()"
+    );
+    ops.impl(
+        "npu_scatter_nd_update_mean",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_scatter_nd_update_mean);
+
+    ops.def(
+        "npu_lightning_indexer_hi_cached(Tensor query, Tensor key, Tensor weights, "
+        "Tensor key_mean, *, Tensor? actual_seq_lengths_query=None, "
+        "Tensor? actual_seq_lengths_key=None, Tensor? block_table=None, "
+        "str layout_query='BSND', str layout_key='PA_BSND', "
+        "int sparse_count=2048, int sparse_mode=3, int hi_block_size=128, "
+        "int hi_block_num=128, int sink=1, int recent=2, "
+        "str block_pooling_mode='mean') -> Tensor"
+    );
+    ops.impl(
+        "npu_lightning_indexer_hi_cached",
+        torch::kPrivateUse1,
+        &vllm_ascend::npu_lightning_indexer_hi_cached);
+
     // This operator is planned to be integrated into PTA in the near future.
     // Once that happens, the implementation in csrc will be removed.
     ops.def(
@@ -2983,7 +3011,62 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "dsa_offload_lookup_update_batch",
         torch::kPrivateUse1,
         &vllm_ascend::dsa_offload_lookup_update_batch);
-    
+
+    ops.def(
+        "dsa_sparse_turbo_lookup_update_batch("
+            "Tensor(a!) index, "
+            "Tensor(b!) slot_to_index, "
+            "Tensor(c!) free_slots, "
+            "Tensor(d!) free_head, "
+            "Tensor req_pool_entries, "
+            "Tensor query_start_loc, "
+            "Tensor query_index, "
+            "Tensor lookup_mask, "
+            "int req_num"
+        ") -> (Tensor, Tensor)"
+    );
+    ops.impl(
+        "dsa_sparse_turbo_lookup_update_batch",
+        torch::kPrivateUse1,
+        &vllm_ascend::dsa_sparse_turbo_lookup_update_batch);
+
+    ops.def(
+        "dsa_sparse_turbo_prefetch_lookup_update_batch("
+            "Tensor(a!) index, "
+            "Tensor(b!) slot_to_index, "
+            "Tensor(c!) free_slots, "
+            "Tensor(d!) free_head, "
+            "Tensor req_pool_entries, "
+            "Tensor query_start_loc, "
+            "Tensor query_index, "
+            "Tensor lookup_mask, "
+            "int req_num"
+        ") -> (Tensor, Tensor)"
+    );
+    ops.impl(
+        "dsa_sparse_turbo_prefetch_lookup_update_batch",
+        torch::kPrivateUse1,
+        &vllm_ascend::dsa_sparse_turbo_prefetch_lookup_update_batch);
+
+    ops.def(
+        "prefetch_qli_fusion("
+            "Tensor hidden_states, "
+            "Tensor wqkv, Tensor ws_qkv, "
+            "Tensor wqb, Tensor ws_qb, "
+            "Tensor gamma1, Tensor beta1, "
+            "Tensor cos, Tensor sin, "
+            "Tensor wk_weights_proj, "
+            "int q_lora_rank, int n_head, int head_dim, "
+            "int qk_rope_head_dim, float alpha, float beta, "
+            "float eps, int source_rows_before_gather=0, "
+            "Tensor? alpha_vec=None, Tensor? beta_vec=None"
+        ") -> (Tensor q_li, Tensor weights)"
+    );
+    ops.impl(
+        "prefetch_qli_fusion",
+        torch::kPrivateUse1,
+        &vllm_ascend::prefetch_qli_fusion);
+
     // Fused GDN gating.
     ops.def(
         "npu_fused_gdn_gating(Tensor A_log, "

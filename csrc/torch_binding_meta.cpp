@@ -287,6 +287,59 @@ std::tuple<at::Tensor, at::Tensor> npu_lightning_indexer_meta(
     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
 }
 
+at::Tensor npu_lightning_indexer_hi_cached_meta(
+    const at::Tensor &query,
+    const at::Tensor &key,
+    const at::Tensor &weights,
+    const at::Tensor &key_mean,
+    const c10::optional<at::Tensor> &actual_seq_lengths_query,
+    const c10::optional<at::Tensor> &actual_seq_lengths_key,
+    const c10::optional<at::Tensor> &block_table,
+    c10::string_view layout_query,
+    c10::string_view layout_key,
+    int64_t sparse_count,
+    int64_t sparse_mode,
+    int64_t hi_block_size,
+    int64_t hi_block_num,
+    int64_t sink,
+    int64_t recent,
+    c10::string_view block_pooling_mode)
+{
+    (void)weights;
+    (void)actual_seq_lengths_query;
+    (void)actual_seq_lengths_key;
+    (void)block_table;
+    (void)sparse_mode;
+    (void)hi_block_size;
+    (void)hi_block_num;
+    (void)sink;
+    (void)recent;
+    (void)block_pooling_mode;
+    TORCH_CHECK(key_mean.dim() == 4,
+                "key_mean must be 4-D: [kv_blocks, 1, kv_heads, head_dim].");
+    TORCH_CHECK(sparse_count > 0, "sparse_count must be positive.");
+
+    const std::string query_layout_str = std::string(layout_query);
+    const std::string key_layout_str = std::string(layout_key);
+    const int64_t key_head_dim = key_layout_str == "TND" ? 1 : 2;
+    at::SmallVector<int64_t, 4> output_size;
+    if (query_layout_str == "BSND") {
+        output_size = {
+            query.size(0),
+            query.size(1),
+            key.size(key_head_dim),
+            sparse_count,
+        };
+    } else {
+        output_size = {
+            query.size(0),
+            key.size(key_head_dim),
+            sparse_count,
+        };
+    }
+    return at::empty(output_size, query.options().dtype(at::kInt));
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const at::Tensor &sparse_indices, double scale_value,
@@ -1635,6 +1688,20 @@ void npu_scatter_nd_update_v2_meta(
     return;
 }
 
+void npu_scatter_nd_update_mean_meta(
+    at::Tensor& flat_key_cache,
+    const at::Tensor& indices,
+    const at::Tensor& updates,
+    at::Tensor& key_mean,
+    int64_t block_size)
+{
+    (void)flat_key_cache;
+    (void)indices;
+    (void)updates;
+    (void)key_mean;
+    (void)block_size;
+}
+
 // N-gram spec decode meta
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_ngram_spec_decode_meta(
     at::Tensor &token_ids,
@@ -1804,6 +1871,101 @@ std::tuple<at::Tensor, at::Tensor> dsa_offload_lookup_update_batch(
     };
 }
 
+std::tuple<at::Tensor, at::Tensor> dsa_sparse_turbo_lookup_update_batch(
+    at::Tensor& index,
+    at::Tensor& slot_to_index,
+    at::Tensor& free_slots,
+    at::Tensor& free_head,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& query_index,
+    const at::Tensor& lookup_mask,
+    int64_t req_num)
+{
+    (void)index;
+    (void)slot_to_index;
+    (void)free_slots;
+    (void)free_head;
+    (void)req_pool_entries;
+    (void)query_start_loc;
+    (void)lookup_mask;
+    (void)req_num;
+    return {
+        at::empty_like(query_index),
+        at::empty_like(query_index),
+    };
+}
+
+std::tuple<at::Tensor, at::Tensor> dsa_sparse_turbo_prefetch_lookup_update_batch(
+    at::Tensor& index,
+    at::Tensor& slot_to_index,
+    at::Tensor& free_slots,
+    at::Tensor& free_head,
+    const at::Tensor& req_pool_entries,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& query_index,
+    const at::Tensor& lookup_mask,
+    int64_t req_num)
+{
+    (void)index;
+    (void)slot_to_index;
+    (void)free_slots;
+    (void)free_head;
+    (void)req_pool_entries;
+    (void)query_start_loc;
+    (void)lookup_mask;
+    (void)req_num;
+    return {
+        at::empty_like(query_index),
+        at::empty_like(query_index),
+    };
+}
+
+std::tuple<at::Tensor, at::Tensor> prefetch_qli_fusion(
+    const at::Tensor& hidden_states,
+    const at::Tensor& wqkv,
+    const at::Tensor& ws_qkv,
+    const at::Tensor& wqb,
+    const at::Tensor& ws_qb,
+    const at::Tensor& gamma1,
+    const at::Tensor& beta1,
+    const at::Tensor& cos,
+    const at::Tensor& sin,
+    const at::Tensor& wk_weights_proj,
+    int64_t q_lora_rank,
+    int64_t n_head,
+    int64_t head_dim,
+    int64_t qk_rope_head_dim,
+    double alpha,
+    double beta,
+    double eps,
+    int64_t source_rows_before_gather,
+    const c10::optional<at::Tensor>& alpha_vec,
+    const c10::optional<at::Tensor>& beta_vec)
+{
+    (void)wqkv;
+    (void)ws_qkv;
+    (void)wqb;
+    (void)ws_qb;
+    (void)gamma1;
+    (void)beta1;
+    (void)cos;
+    (void)sin;
+    (void)wk_weights_proj;
+    (void)q_lora_rank;
+    (void)qk_rope_head_dim;
+    (void)alpha;
+    (void)beta;
+    (void)eps;
+    (void)source_rows_before_gather;
+    (void)alpha_vec;
+    (void)beta_vec;
+    const int64_t token_count = hidden_states.size(0);
+    auto q_li = at::empty({token_count, n_head, head_dim}, hidden_states.options());
+    auto weights = at::empty({token_count, n_head}, hidden_states.options());
+    return {q_li, weights};
+}
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -1859,6 +2021,10 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("dispatch_gmm_combine_decode", &vllm_ascend::meta::dispatch_gmm_combine_decode_meta);
     // Lightning indexer
     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
+    ops.impl("npu_lightning_indexer_hi_cached",
+             &vllm_ascend::meta::npu_lightning_indexer_hi_cached_meta);
+    ops.impl("prefetch_qli_fusion",
+             &vllm_ascend::meta::prefetch_qli_fusion);
     // Sparse flash attention
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
     ops.impl("npu_kv_quant_sparse_flash_attention",
@@ -1911,6 +2077,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("indexer_compress_epilog_v2", &vllm_ascend::meta::indexer_compress_epilog_v2_meta);
     ops.impl("npu_dequant_swiglu_quant", &vllm_ascend::meta::npu_dequant_swiglu_quant_meta);
     ops.impl("npu_scatter_nd_update_v2", &vllm_ascend::meta::npu_scatter_nd_update_v2_meta);
+    ops.impl("npu_scatter_nd_update_mean",
+             &vllm_ascend::meta::npu_scatter_nd_update_mean_meta);
     // Lightning indexer quant
     ops.impl("npu_lightning_indexer_quant", &vllm_ascend::meta::npu_lightning_indexer_quant_meta);
     // N-gram spec decode
@@ -1926,6 +2094,10 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
              &vllm_ascend::meta::dsa_offload_lookup_update);
     ops.impl("dsa_offload_lookup_update_batch",
              &vllm_ascend::meta::dsa_offload_lookup_update_batch);
+    ops.impl("dsa_sparse_turbo_lookup_update_batch",
+             &vllm_ascend::meta::dsa_sparse_turbo_lookup_update_batch);
+    ops.impl("dsa_sparse_turbo_prefetch_lookup_update_batch",
+             &vllm_ascend::meta::dsa_sparse_turbo_prefetch_lookup_update_batch);
     // npu_fused_gdn_gating
     ops.impl("npu_fused_gdn_gating", &vllm_ascend::meta::npu_fused_gdn_gating_meta);
 }
