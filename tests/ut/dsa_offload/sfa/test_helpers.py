@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -12,6 +12,7 @@ from vllm_ascend.dsa_offload.lookup import (
     build_dsa_offload_batch,
 )
 from vllm_ascend.dsa_offload.sfa import (
+    SFAAddressingWorkspace,
     prepare_main_slot_mapping,
     resolve_sfa_inputs,
 )
@@ -43,6 +44,11 @@ def make_mixed_batch(spy_io, *, is_mtp: bool = False):
         is_mtp=is_mtp,
         committed_block_hashes={"prefill": [], "decode": [b"block"]},
         candidate_block_hashes={},
+        sfa_workspace=SFAAddressingWorkspace.create(
+            max_num_seqs=layout.max_num_seqs,
+            max_block_table_width=layout.hot_blocks_per_row,
+            device="cpu",
+        ),
     )
     return batch, row
 
@@ -51,15 +57,19 @@ def test_feature_off_returns_original_inputs() -> None:
     slots = torch.tensor([1, 2], dtype=torch.int64)
     topk = torch.tensor([[1, 2]], dtype=torch.int32)
     table = torch.tensor([[3, 4]], dtype=torch.int32)
+    seq_lens = torch.tensor([2], dtype=torch.int32)
 
     assert prepare_main_slot_mapping(batch=None, default_slot_mapping=slots) is slots
     resolved = resolve_sfa_inputs(
         layer_name="layer",
         semantic_topk=topk,
         default_block_table=table,
+        default_actual_seq_lengths_kv=seq_lens,
         batch=None,
     )
-    assert resolved == (topk, table)
+    assert resolved.sparse_indices is topk
+    assert resolved.block_table is table
+    assert resolved.actual_seq_lengths_kv is seq_lens
 
 
 def test_mixed_batch_keeps_prefill_mapping_and_redirects_decode_tail(spy_io) -> None:
@@ -92,10 +102,11 @@ def test_mtp_verification_writes_staging_without_touching_prefill(spy_io) -> Non
 
 
 def test_leader_looks_up_once_and_follower_performs_own_get(spy_io) -> None:
-    batch, _ = make_mixed_batch(spy_io)
+    batch, row = make_mixed_batch(spy_io)
+    assert batch.hot_cache is not None
     mapped = torch.tensor([[8, 9]], dtype=torch.int32)
     table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
-    hot_table = torch.tensor([[1, 2], [9, 10]], dtype=torch.int32)
+    seq_lens = torch.tensor([2, 6], dtype=torch.int32)
     empty = torch.empty(0, dtype=torch.int64)
     plan = LookupPlan(
         mapped_indices=mapped,
@@ -105,7 +116,6 @@ def test_leader_looks_up_once_and_follower_performs_own_get(spy_io) -> None:
         miss_destination_slots=empty,
         miss_batch_indices=empty.to(torch.int32),
         query_request_rows=empty.to(torch.int32),
-        hot_block_table=hot_table,
         tail_mask=torch.empty(0, dtype=torch.bool),
         fallback_mask=torch.empty(0, dtype=torch.bool),
         staging_mask=torch.empty(0, dtype=torch.bool),
@@ -123,24 +133,38 @@ def test_leader_looks_up_once_and_follower_performs_own_get(spy_io) -> None:
         patch("vllm_ascend.dsa_offload.lookup.make_lookup_plan", side_effect=make_plan) as lookup,
         patch("vllm_ascend.dsa_offload.lookup.load_plan_misses", side_effect=load_misses),
     ):
-        leader_topk, leader_table = resolve_sfa_inputs(
+        leader_addressing = resolve_sfa_inputs(
             layer_name="leader",
             semantic_topk=mapped,
             default_block_table=table,
+            default_actual_seq_lengths_kv=seq_lens,
             batch=batch,
         )
-        assert leader_topk is mapped
-        assert torch.equal(leader_table, hot_table)
+        assert leader_addressing.sparse_indices is mapped
+        assert leader_addressing.block_table[0, :2].tolist() == [1, 2]
+        assert torch.count_nonzero(leader_addressing.block_table[0, 2:]) == 0
+        assert torch.equal(
+            leader_addressing.block_table[1],
+            batch.hot_cache.hot_block_table[row],
+        )
+        assert leader_addressing.actual_seq_lengths_kv.tolist() == [2, batch.layout.row_stride]
         events.append("sfa:leader")
         follower_default = torch.tensor([[5, 6], [7, 8]], dtype=torch.int32)
-        follower_topk, follower_table = resolve_sfa_inputs(
+        follower_addressing = resolve_sfa_inputs(
             layer_name="follower",
             semantic_topk=mapped,
             default_block_table=follower_default,
+            default_actual_seq_lengths_kv=seq_lens,
             batch=batch,
         )
-        assert follower_topk is mapped
-        assert follower_table.tolist() == [[5, 6], [9, 10]]
+        assert follower_addressing.sparse_indices is mapped
+        assert follower_addressing.block_table[0, :2].tolist() == [5, 6]
+        assert torch.count_nonzero(follower_addressing.block_table[0, 2:]) == 0
+        assert torch.equal(
+            follower_addressing.block_table[1],
+            batch.hot_cache.hot_block_table[row],
+        )
+        assert follower_addressing.actual_seq_lengths_kv.tolist() == [2, batch.layout.row_stride]
         events.append("sfa:follower")
 
     lookup.assert_called_once()
@@ -152,3 +176,45 @@ def test_leader_looks_up_once_and_follower_performs_own_get(spy_io) -> None:
         "get:4",
         "sfa:follower",
     ]
+
+
+def test_fixed_hot_addressing_does_not_depend_on_model_block_table_width() -> None:
+    layout = HotCacheLayout(128, 2, 16)
+    cache = torch.empty((layout.hot_blocks, layout.block_size, 1))
+    hot_cache = HotCacheState(layout, {"layer": (cache,)})
+    row = hot_cache.admit("decode")
+    workspace = SFAAddressingWorkspace.create(
+        max_num_seqs=layout.max_num_seqs,
+        max_block_table_width=layout.hot_blocks_per_row,
+        device="cpu",
+    )
+    batch = build_dsa_offload_batch(
+        layout=layout,
+        hot_cache=hot_cache,
+        io_backend=Mock(),
+        cohorts=(),
+        lookup_states={},
+        request_ids=("prefill", "decode"),
+        query_counts=(1, 1),
+        query_positions=torch.tensor([0, 4095], dtype=torch.int64),
+        is_mtp=False,
+        committed_block_hashes={"prefill": [], "decode": []},
+        candidate_block_hashes={},
+        sfa_workspace=workspace,
+    )
+    ordinary_table = torch.arange(64, dtype=torch.int32).reshape(2, 32)
+    ordinary_seq_lens = torch.tensor([128, 4096], dtype=torch.int32)
+
+    effective_table, effective_seq_lens = workspace.compose(
+        default_block_table=ordinary_table,
+        default_actual_seq_lengths_kv=ordinary_seq_lens,
+        batch=batch,
+    )
+
+    assert effective_table.shape == (2, 82)
+    assert effective_table[0, :32].tolist() == ordinary_table[0].tolist()
+    assert torch.count_nonzero(effective_table[0, 32:]) == 0
+    assert torch.equal(effective_table[1], hot_cache.hot_block_table[row])
+    assert effective_seq_lens.tolist() == [128, 10496]
+    assert ordinary_table.shape == (2, 32)
+    assert ordinary_seq_lens.tolist() == [128, 4096]

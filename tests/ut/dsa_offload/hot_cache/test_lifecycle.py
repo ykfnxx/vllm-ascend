@@ -12,6 +12,14 @@ def test_admission_release_abort_and_row_reuse_clear_transient() -> None:
     cache = torch.ones((layout.hot_blocks, layout.block_size, 1))
     state = HotCacheState(layout, {"layer": (cache,)})
 
+    assert state.hot_block_table.shape == (2, layout.hot_blocks_per_row)
+    assert state.hot_block_table[0, :3].tolist() == [0, 1, 2]
+    assert state.hot_block_table[1, :3].tolist() == [
+        layout.hot_blocks_per_row,
+        layout.hot_blocks_per_row + 1,
+        layout.hot_blocks_per_row + 2,
+    ]
+
     assert state.admit("first") == 0
     transient = cache.flatten(0, 1)[layout.tail_base : layout.row_stride]
     assert torch.count_nonzero(transient) == 0

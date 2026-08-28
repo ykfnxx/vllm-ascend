@@ -50,7 +50,6 @@ def test_history_tail_and_miss_are_mapped_to_fixed_hot_slots(spy_io) -> None:
     ) as lookup:
         plan = make_lookup_plan(
             semantic_topk=semantic,
-            default_block_table=torch.full((1, layout.hot_blocks_per_row), 99, dtype=torch.int32),
             cohort=cohort,
             batch=batch,
         )
@@ -61,7 +60,6 @@ def test_history_tail_and_miss_are_mapped_to_fixed_hot_slots(spy_io) -> None:
     assert plan.miss_logical_blocks.tolist() == [1]
     assert plan.miss_block_offsets.tolist() == [1]
     assert plan.miss_destination_slots.tolist() == [layout.replaceable_base]
-    assert plan.hot_block_table[0, : layout.hot_blocks_per_row].tolist() == list(range(layout.hot_blocks_per_row))
 
 
 def test_candidate_hashes_extend_committed_prefix(spy_io) -> None:
@@ -109,7 +107,6 @@ def test_lookup_hit_does_not_call_io(spy_io) -> None:
         miss_destination_slots=empty,
         miss_batch_indices=empty.to(torch.int32),
         query_request_rows=torch.tensor([0], dtype=torch.int32),
-        hot_block_table=torch.empty((1, 0), dtype=torch.int32),
         tail_mask=torch.empty((1, 0), dtype=torch.bool),
         fallback_mask=torch.empty((1, 0), dtype=torch.bool),
         staging_mask=torch.empty((1, 0), dtype=torch.bool),

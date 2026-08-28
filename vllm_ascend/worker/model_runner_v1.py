@@ -221,6 +221,7 @@ from vllm_ascend.dsa_offload.pd import (
     admit_local_from_prefill,
     validate_handoff,
 )
+from vllm_ascend.dsa_offload.sfa import SFAAddressingWorkspace
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
@@ -365,6 +366,7 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_offload_cohorts = ()
         self._dsa_offload_layout: HotCacheLayout | None = None
         self._dsa_offload_hot_cache: HotCacheState | None = None
+        self._dsa_offload_sfa_workspace: SFAAddressingWorkspace | None = None
         self._dsa_offload_lookup_states = {}
         self._dsa_offload_io = None
         self._dsa_offload_handoffs = {}
@@ -776,6 +778,7 @@ class NPUModelRunner(GPUModelRunner):
             self._dsa_offload_io.close()
         self._dsa_offload_io = None
         self._dsa_offload_hot_cache = None
+        self._dsa_offload_sfa_workspace = None
         self._dsa_offload_lookup_states = {}
         self._dsa_offload_handoffs = {}
         self._dsa_offload_committed_hashes = {}
@@ -830,6 +833,21 @@ class NPUModelRunner(GPUModelRunner):
             self._dsa_offload_hot_cache = HotCacheState(
                 layout,
                 layer_caches,
+            )
+            block_tables = getattr(self.input_batch.block_table, "block_tables", None)
+            if block_tables is None:
+                block_tables = (self.input_batch.block_table,)
+            normal_block_table_width = max(
+                block_table.block_table.gpu.shape[1]
+                for block_table in block_tables
+            )
+            self._dsa_offload_sfa_workspace = SFAAddressingWorkspace.create(
+                max_num_seqs=self.max_num_reqs,
+                max_block_table_width=max(
+                    normal_block_table_width,
+                    layout.hot_blocks_per_row,
+                ),
+                device=self.device,
             )
             self._dsa_offload_lookup_states = create_lookup_states(
                 self._dsa_offload_cohorts,
@@ -1038,6 +1056,7 @@ class NPUModelRunner(GPUModelRunner):
             committed_block_hashes=self._dsa_offload_committed_hashes,
             candidate_block_hashes=self._dsa_offload_candidate_hashes,
             prefill_state=prefill_state,
+            sfa_workspace=self._dsa_offload_sfa_workspace,
         )
 
     def _attach_dsa_offload_batch(

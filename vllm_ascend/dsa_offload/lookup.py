@@ -4,6 +4,7 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import accumulate
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -18,6 +19,9 @@ from .constants import (
 from .hot_cache import HotCacheLayout, HotCacheState
 from .io import IOBackend, make_storage_ids
 from .ops import LookupState, lookup_update, lookup_update_batch
+
+if TYPE_CHECKING:
+    from .sfa import SFAAddressingWorkspace
 
 INVALID_INDEX = -1
 
@@ -147,7 +151,6 @@ class LookupPlan:
     miss_destination_slots: torch.Tensor
     miss_batch_indices: torch.Tensor
     query_request_rows: torch.Tensor
-    hot_block_table: torch.Tensor
     tail_mask: torch.Tensor
     fallback_mask: torch.Tensor
     staging_mask: torch.Tensor
@@ -169,6 +172,8 @@ class DSAOffloadBatch:
     committed_block_hashes: Mapping[str, Sequence[bytes]]
     candidate_block_hashes: Mapping[str, Sequence[bytes]]
     prefill_state: object | None = None
+    sfa_workspace: "SFAAddressingWorkspace | None" = None
+    decode_request_indices_tensor: torch.Tensor | None = None
     lookup_plans: dict[str, LookupPlan] = field(default_factory=dict)
 
     def block_hashes(self, request_index: int) -> Sequence[bytes]:
@@ -192,6 +197,7 @@ def build_dsa_offload_batch(
     committed_block_hashes: Mapping[str, Sequence[bytes]],
     candidate_block_hashes: Mapping[str, Sequence[bytes]],
     prefill_state: object | None = None,
+    sfa_workspace: "SFAAddressingWorkspace | None" = None,
 ) -> DSAOffloadBatch:
     query_ends = tuple(accumulate(query_counts))
     query_ranges = tuple(zip((0, *query_ends[:-1]), query_ends))
@@ -220,13 +226,18 @@ def build_dsa_offload_batch(
         committed_block_hashes=committed_block_hashes,
         candidate_block_hashes=candidate_block_hashes,
         prefill_state=prefill_state,
+        sfa_workspace=sfa_workspace,
+        decode_request_indices_tensor=torch.tensor(
+            decode_request_indices,
+            dtype=torch.int64,
+            device=query_positions.device,
+        ),
     )
 
 
 def make_lookup_plan(
     *,
     semantic_topk: torch.Tensor,
-    default_block_table: torch.Tensor,
     cohort: IndexCacheCohort,
     batch: DSAOffloadBatch,
 ) -> LookupPlan:
@@ -338,12 +349,6 @@ def make_lookup_plan(
         batch.layout.hot_block_base + miss_rows * batch.layout.hot_blocks_per_row
     ) * batch.layout.block_size + miss_slots
 
-    hot_tables = batch.layout.block_table(request_rows)
-    merged_block_table = default_block_table.clone()
-    for decode_index, request_index in enumerate(batch.decode_request_indices):
-        merged_block_table[request_index].zero_()
-        merged_block_table[request_index, : hot_tables.shape[1]] = hot_tables[decode_index]
-
     return LookupPlan(
         mapped_indices=merged_indices.reshape(topk_shape),
         miss_positions=miss_positions,
@@ -356,7 +361,6 @@ def make_lookup_plan(
         miss_destination_slots=miss_destination_slots,
         miss_batch_indices=expanded_batch_indices[active_misses].to(torch.int32),
         query_request_rows=query_request_rows,
-        hot_block_table=merged_block_table,
         tail_mask=tail_mask,
         fallback_mask=fallback_mask,
         staging_mask=staging_mask,

@@ -107,9 +107,24 @@ class HotCacheState:
     request_to_row: dict[str, int] = field(default_factory=dict)
     ready_requests: set[str] = field(default_factory=set)
     free_rows: deque[int] = field(init=False)
+    hot_block_table: torch.Tensor = field(init=False)
 
     def __post_init__(self) -> None:
         self.free_rows = deque(range(self.layout.max_num_seqs))
+        if not self.layer_caches:
+            raise ValueError("DSA Offload Hot Cache requires at least one layer cache.")
+        first_cache_planes = next(iter(self.layer_caches.values()))
+        if not first_cache_planes:
+            raise ValueError("DSA Offload Hot Cache layers require at least one cache plane.")
+        row_ids = torch.arange(
+            self.layout.max_num_seqs,
+            dtype=torch.int32,
+            device=first_cache_planes[0].device,
+        )
+        # This is the fixed virtual address space consumed by Decode SFA. It is
+        # owned by the Hot Cache and deliberately independent of max_model_len
+        # and vLLM's scheduler-managed block table width.
+        self.hot_block_table = self.layout.block_table(row_ids)
 
     def admit(self, request_id: str) -> int:
         row_id = self.free_rows.popleft()

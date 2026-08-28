@@ -1999,21 +1999,22 @@ class AscendSFAImpl(MLAAttentionImpl):
             block_table=attn_metadata.block_table,
             batch=attn_metadata.dsa_offload_batch,
         )
-        topk_indices, sfa_block_table = resolve_sfa_inputs(
+        sfa_addressing = resolve_sfa_inputs(
             layer_name=layer_name,
             semantic_topk=topk_indices,
             default_block_table=attn_metadata.block_table,
+            default_actual_seq_lengths_kv=actual_seq_lengths_key,
             batch=attn_metadata.dsa_offload_batch,
         )
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope,
             q_pe,
             kv_cache,
-            topk_indices,
+            sfa_addressing.sparse_indices,
             attn_metadata,
             actual_seq_lengths_query,
-            actual_seq_lengths_key,
-            block_table=sfa_block_table,
+            sfa_addressing.actual_seq_lengths_kv,
+            block_table=sfa_addressing.block_table,
         )
 
         attn_output = self._v_up_proj(attn_output)
