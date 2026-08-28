@@ -49,6 +49,7 @@
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
+#include "attention/dsa_sparse_lookup_update/dsa_sparse_lookup_update_torch_adpt.h"
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
 #include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
@@ -2946,6 +2947,31 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "store_kv_block(Tensor key_in, Tensor key_cache_in, Tensor group_len, Tensor group_key_idx,Tensor group_key_cache_idx, int block_size=0) -> ()"
     );
     ops.impl("store_kv_block", torch::kPrivateUse1, &vllm_ascend::store_kv_block);
+
+    ops.def(
+        "dsa_sparse_lookup_update("
+            "Tensor(a!) token_to_hot, "
+            "Tensor(b!) hot_to_token, "
+            "Tensor(c!) lru_slots, "
+            "Tensor(d!) state_seat_epoch, "
+            "Tensor row_to_cache_seat, "
+            "Tensor row_seat_epoch, "
+            "Tensor query_positions, "
+            "Tensor query_to_row, "
+            "Tensor query_to_lane, "
+            "Tensor query_valid_mask, "
+            "Tensor valid_topk_counts, "
+            "Tensor seq_lens, "
+            "Tensor topk_positions, "
+            "Tensor(e!) resolved_hot_indices, "
+            "Tensor(f!) miss_mask, "
+            "Tensor(g!) workspace"
+        ") -> ()"
+    );
+    ops.impl(
+        "dsa_sparse_lookup_update",
+        torch::kPrivateUse1,
+        &vllm_ascend::dsa_sparse_lookup_update);
     
     // Fused GDN gating.
     ops.def(

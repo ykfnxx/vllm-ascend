@@ -23,6 +23,7 @@ class TestIndexerWrapper(TestBase):
         mock_indexer.softmax_scale = 0.123
         mock_indexer.topk_indices_buffer = torch.randn(10)
         mock_indexer.k_cache = torch.randn(10)
+        original_k_cache = mock_indexer.k_cache
 
         wrapper = IndexerWrapper(mock_indexer)
 
@@ -34,9 +35,10 @@ class TestIndexerWrapper(TestBase):
         self.assertIs(wrapper.wk_weights_proj, mock_indexer.wk_weights_proj)
         self.assertIs(wrapper.k_norm, mock_indexer.k_norm)
         self.assertEqual(wrapper.softmax_scale, 0.123)
+        self.assertIs(wrapper.k_cache, original_k_cache)
+        self.assertIs(mock_indexer.k_cache, original_k_cache)
 
         self.assertIsNone(mock_indexer.topk_indices_buffer)
-        self.assertIsNone(mock_indexer.k_cache)
 
     def test_forward(self):
         mock_indexer = MagicMock()

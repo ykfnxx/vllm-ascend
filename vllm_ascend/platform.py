@@ -447,6 +447,44 @@ class NPUPlatform(Platform):
         )
 
     @classmethod
+    def _validate_dsa_sparse_config(
+        cls,
+        vllm_config: VllmConfig,
+        ascend_config: Any,
+    ) -> None:
+        config = getattr(ascend_config, "dsa_sparse_config", None)
+        if config is None:
+            return
+
+        if get_ascend_device_type() != AscendDeviceType.A5:
+            raise ValueError("DSA Sparse currently requires an Ascend A5 device.")
+        if not model_uses_sfa_sparse(vllm_config.model_config):
+            raise ValueError("DSA Sparse requires the GLM-5 sparse SFA model path.")
+        if getattr(vllm_config, "use_v2_model_runner", False):
+            raise ValueError("DSA Sparse currently supports only the V1 model runner.")
+
+        from vllm.config.compilation import CUDAGraphMode
+
+        cudagraph_mode = vllm_config.compilation_config.cudagraph_mode
+        if cudagraph_mode != CUDAGraphMode.NONE:
+            raise ValueError("This DSA Sparse milestone is eager-only and requires cudagraph_mode=NONE.")
+        if ascend_config.xlite_graph_config.enabled:
+            raise ValueError("DSA Sparse eager does not support xlite graph execution.")
+        if ascend_config.enable_flashcomm1 or ascend_config.enable_sp_by_pass or ascend_config.enable_shared_expert_dp:
+            raise ValueError(
+                "DSA Sparse eager supports tensor parallelism but does not yet support sequence-parallel token padding."
+            )
+
+        kv_transfer_config = vllm_config.kv_transfer_config
+        if not getattr(kv_transfer_config, "kv_connector", None):
+            raise ValueError("DSA Sparse requires a configured P/D KV connector.")
+        if config.is_consumer and getattr(kv_transfer_config, "kv_load_failure_policy", "fail") != "fail":
+            raise ValueError(
+                "DSA Sparse Decode workers require "
+                "kv_load_failure_policy='fail'; local prefill recompute is unsupported."
+            )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         from vllm_ascend.quantization.utils import maybe_auto_detect_quantization
 
@@ -473,6 +511,7 @@ class NPUPlatform(Platform):
         cls._fix_incompatible_config(vllm_config)
 
         ascend_config = init_ascend_config(vllm_config)
+        cls._validate_dsa_sparse_config(vllm_config, ascend_config)
 
         from vllm_ascend.logger import configure_ascend_file_logging
         from vllm_ascend.logger import configure_ascend_logging

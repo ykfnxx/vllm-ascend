@@ -221,6 +221,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "chunk_gated_delta_rule_fwd_h"
         "store_kv_block"
         "store_kv_block_metadata"
+        "dsa_sparse_lookup_update"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")

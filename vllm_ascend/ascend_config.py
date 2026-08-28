@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
+from vllm_ascend.dsa_sparse_config import load_dsa_sparse_config
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -39,6 +41,7 @@ class AscendConfig:
 
         ascend_compilation_config = additional_config.get("ascend_compilation_config", {})
         self.ascend_compilation_config = AscendCompilationConfig(**ascend_compilation_config)
+        self.dsa_sparse_config = load_dsa_sparse_config(vllm_config)
 
         ascend_fusion_config = additional_config.get("ascend_fusion_config", {})
         self.ascend_fusion_config = AscendFusionConfig(**ascend_fusion_config)

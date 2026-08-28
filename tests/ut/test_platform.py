@@ -55,8 +55,10 @@ class TestNPUPlatform(TestBase):
         mock_ascend_config.enable_mc2_hierarchy_comm = False
         mock_ascend_config.enable_fused_mc2 = False
         mock_ascend_config.enable_flashcomm1 = False
+        mock_ascend_config.enable_sp_by_pass = False
         mock_ascend_config.SLO_limits_for_dynamic_batch = -1
         mock_ascend_config.enable_shared_expert_dp = False
+        mock_ascend_config.dsa_sparse_config = None
         mock_ascend_config.update_compile_ranges_split_points = MagicMock()
         return mock_ascend_config
 
@@ -78,6 +80,79 @@ class TestNPUPlatform(TestBase):
         self.assertEqual(NPUPlatform.device_control_env_var, "ASCEND_RT_VISIBLE_DEVICES")
         self.assertEqual(NPUPlatform.dispatch_key, "PrivateUse1")
         self.assertEqual(NPUPlatform.supported_quantization, [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD])
+
+    @patch("vllm_ascend.platform.model_uses_sfa_sparse", return_value=True)
+    @patch("vllm_ascend.platform.get_ascend_device_type", return_value=AscendDeviceType.A5)
+    def test_validate_dsa_sparse_eager_platform(
+        self,
+        _mock_device_type,
+        _mock_sparse_model,
+    ):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = False
+        vllm_config.kv_transfer_config.kv_connector = "FakeConnector"
+        vllm_config.kv_transfer_config.kv_load_failure_policy = "fail"
+        vllm_config.cache_config.enable_prefix_caching = True
+        ascend_config = self.mock_vllm_ascend_config()
+        ascend_config.dsa_sparse_config = MagicMock(is_consumer=True)
+
+        self.platform._validate_dsa_sparse_config(vllm_config, ascend_config)
+
+        self.assertTrue(vllm_config.cache_config.enable_prefix_caching)
+
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("use_v2_model_runner", True, "V1 model runner"),
+            ("cudagraph_mode", CUDAGraphMode.FULL, "cudagraph_mode=NONE"),
+            ("kv_connector", None, "P/D KV connector"),
+            ("kv_load_failure_policy", "recompute", "local prefill recompute"),
+            ("enable_flashcomm1", True, "sequence-parallel"),
+            ("enable_shared_expert_dp", True, "sequence-parallel"),
+        ],
+    )
+    @patch("vllm_ascend.platform.model_uses_sfa_sparse", return_value=True)
+    @patch("vllm_ascend.platform.get_ascend_device_type", return_value=AscendDeviceType.A5)
+    def test_validate_dsa_sparse_rejects_unsupported_runtime(
+        self,
+        _mock_device_type,
+        _mock_sparse_model,
+        field,
+        value,
+        message,
+    ):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.use_v2_model_runner = False
+        vllm_config.kv_transfer_config.kv_connector = "FakeConnector"
+        vllm_config.kv_transfer_config.kv_load_failure_policy = "fail"
+        ascend_config = self.mock_vllm_ascend_config()
+        ascend_config.dsa_sparse_config = MagicMock(is_consumer=True)
+        if field == "cudagraph_mode":
+            vllm_config.compilation_config.cudagraph_mode = value
+        elif field in {"kv_connector", "kv_load_failure_policy"}:
+            setattr(vllm_config.kv_transfer_config, field, value)
+        elif field in {"enable_flashcomm1", "enable_shared_expert_dp"}:
+            setattr(ascend_config, field, value)
+        else:
+            setattr(vllm_config, field, value)
+
+        with self.assertRaisesRegex(ValueError, message):
+            self.platform._validate_dsa_sparse_config(
+                vllm_config,
+                ascend_config,
+            )
+
+    @patch("vllm_ascend.platform.get_ascend_device_type", return_value=AscendDeviceType.A3)
+    def test_validate_dsa_sparse_requires_a5(self, _mock_device_type):
+        vllm_config = self.mock_vllm_config()
+        ascend_config = self.mock_vllm_ascend_config()
+        ascend_config.dsa_sparse_config = MagicMock(is_consumer=True)
+
+        with self.assertRaisesRegex(ValueError, "Ascend A5"):
+            self.platform._validate_dsa_sparse_config(
+                vllm_config,
+                ascend_config,
+            )
 
     def test_is_sleep_mode_available(self):
         self.assertTrue(self.platform.is_sleep_mode_available())
