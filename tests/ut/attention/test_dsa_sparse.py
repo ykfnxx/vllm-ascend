@@ -3,6 +3,7 @@
 
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from vllm_ascend.attention.dsa_sparse import DSASparseCoordinator
@@ -17,6 +18,9 @@ from vllm_ascend.dsa_sparse_constants import (
 
 def make_coordinator(
     leader: DSASparseCoordinator | None = None,
+    *,
+    mtp_enabled: bool = False,
+    max_verify_tokens_per_request: int = 1,
 ) -> DSASparseCoordinator:
     return DSASparseCoordinator(
         max_num_seqs=3,
@@ -24,6 +28,8 @@ def make_coordinator(
         plane_layouts=((torch.bfloat16, (1, 576)),),
         device="cpu",
         leader=leader,
+        mtp_enabled=mtp_enabled,
+        max_verify_tokens_per_request=max_verify_tokens_per_request,
     )
 
 
@@ -53,6 +59,14 @@ def test_coordinator_owns_per_layer_hot_cache_and_leader_lookup_state():
     assert follower.slot_to_index is None
     assert follower.free_slots is None
     assert follower.free_head is None
+
+
+def test_mtp_coordinator_rejects_an_empty_verify_region():
+    with pytest.raises(ValueError, match="verify capacity"):
+        make_coordinator(
+            mtp_enabled=True,
+            max_verify_tokens_per_request=0,
+        )
 
 
 def test_request_initialization_and_release_reset_the_leader_row():
@@ -139,3 +153,173 @@ def test_leader_resolves_once_and_follower_reuses_the_same_plan():
     assert follower.hot_block_table is leader.hot_block_table
     assert follower.slot_out is leader.slot_out
     assert follower.miss_out is leader.miss_out
+
+
+def test_mtp_main_write_uses_per_request_verify_staging():
+    coordinator = make_coordinator(
+        mtp_enabled=True,
+        max_verify_tokens_per_request=4,
+    )
+    slots = coordinator.build_main_slot_mapping_batch(
+        torch.tensor([0, 2], dtype=torch.int32),
+        torch.tensor([0, 2, 5], dtype=torch.int32),
+        torch.tensor([100, 101, 200, 201, 202], dtype=torch.int64),
+    )
+
+    assert slots.tolist() == [
+        10241,
+        10242,
+        2 * 10368 + 10241,
+        2 * 10368 + 10242,
+        2 * 10368 + 10243,
+    ]
+    assert slots.dtype == torch.int32
+
+
+def test_mtp_main_write_waits_for_the_previous_store():
+    coordinator = make_coordinator(
+        mtp_enabled=True,
+        max_verify_tokens_per_request=4,
+    )
+
+    with patch.object(coordinator, "wait_for_store") as wait_for_store:
+        coordinator.build_main_slot_mapping_batch(
+            torch.tensor([0], dtype=torch.int32),
+            torch.tensor([0, 1], dtype=torch.int32),
+            torch.tensor([100], dtype=torch.int64),
+        )
+
+    wait_for_store.assert_called_once_with()
+
+
+def test_mtp_leader_resolves_packed_history_and_staging_once():
+    leader = make_coordinator(
+        mtp_enabled=True,
+        max_verify_tokens_per_request=4,
+    )
+    follower = make_coordinator(
+        leader,
+        mtp_enabled=True,
+        max_verify_tokens_per_request=4,
+    )
+    req_pool_entries = torch.tensor([0, 2], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
+    query_positions = torch.tensor([100, 101, 200], dtype=torch.int64)
+    topk = torch.full(
+        (3, 1, DSA_SPARSE_QUERY_WIDTH),
+        -1,
+        dtype=torch.int64,
+    )
+    topk[0, 0, :4] = torch.tensor([10, 100, 101, -1])
+    topk[1, 0, :4] = torch.tensor([10, 100, 101, 102])
+    topk[2, 0, :3] = torch.tensor([20, 200, 201])
+    calls = []
+
+    def fake_lookup(*args):
+        calls.append(args)
+        query_index = args[6]
+        lookup_mask = args[7]
+        return torch.full_like(query_index, 77), lookup_mask.clone()
+
+    with patch(
+        "vllm_ascend.attention.dsa_sparse."
+        "dsa_sparse_lookup_update_batch",
+        side_effect=fake_lookup,
+    ):
+        leader.resolve_batch(
+            topk,
+            req_pool_entries,
+            query_start_loc,
+            query_positions,
+        )
+        follower.reuse_leader_plan(req_pool_entries)
+
+    assert len(calls) == 1
+    assert calls[0][4] is req_pool_entries
+    assert calls[0][5] is query_start_loc
+    assert calls[0][7][0, :4].tolist() == [1, 0, 0, 0]
+    assert calls[0][7][1, :4].tolist() == [1, 0, 0, 0]
+    assert calls[0][7][2, :3].tolist() == [1, 0, 0]
+    assert leader.attention_indices[0, :4].tolist() == [
+        77,
+        10241,
+        -1,
+        -1,
+    ]
+    assert leader.attention_indices[1, :4].tolist() == [
+        77,
+        10241,
+        10242,
+        -1,
+    ]
+    assert leader.attention_indices[2, :3].tolist() == [
+        77,
+        10241,
+        -1,
+    ]
+    assert follower.attention_indices is leader.attention_indices
+    assert follower.query_start_loc is leader.query_start_loc
+    assert follower.query_positions is leader.query_positions
+
+
+def test_mtp_request_reset_zeros_only_the_fallback_slot():
+    coordinator = DSASparseCoordinator(
+        max_num_seqs=2,
+        block_size=128,
+        plane_layouts=((torch.bfloat16, (1,)),),
+        device="cpu",
+        mtp_enabled=True,
+        max_verify_tokens_per_request=4,
+    )
+    flat_cache = coordinator.hot_main_cache[0].view(-1)
+    row_base = coordinator.request_row_stride
+    flat_cache[row_base + coordinator.fallback_zero_slot] = 9
+    flat_cache[row_base + coordinator.verify_staging_base] = 7
+
+    coordinator.reset_hot_request(1)
+
+    assert flat_cache[row_base + coordinator.fallback_zero_slot].item() == 0
+    assert flat_cache[row_base + coordinator.verify_staging_base].item() == 7
+
+
+def test_mtp_mock_store_reports_only_the_accepted_prefix_lengths():
+    coordinator = make_coordinator(
+        mtp_enabled=True,
+        max_verify_tokens_per_request=4,
+    )
+    coordinator.query_start_loc = torch.tensor(
+        [0, 2, 5],
+        dtype=torch.int32,
+    )
+    coordinator.query_positions = torch.tensor(
+        [100, 101, 200, 201, 202],
+        dtype=torch.int64,
+    )
+    coordinator.req_pool_entries = torch.tensor(
+        [0, 2],
+        dtype=torch.int32,
+    )
+    accepted = torch.tensor([1, 3], dtype=torch.int32)
+
+    with (
+        patch(
+            "vllm_ascend.attention.dsa_sparse."
+            "dsa_sparse_probe.is_enabled",
+            return_value=True,
+        ),
+        patch(
+            "vllm_ascend.attention.dsa_sparse."
+            "dsa_sparse_probe.synchronize_device",
+        ),
+        patch(
+            "vllm_ascend.attention.dsa_sparse."
+            "dsa_sparse_probe.emit",
+        ) as emit,
+    ):
+        coordinator.store_accepted(
+            "model.layers.0.self_attn.attn",
+            accepted,
+        )
+
+    assert emit.call_args.kwargs["accepted_input_kv_count"] == [1, 3]
+    assert emit.call_args.kwargs["committed_kv_count"] == 4

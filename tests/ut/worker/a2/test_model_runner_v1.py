@@ -23,6 +23,9 @@ from vllm_ascend.attention.indexer import (
 )
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
+from vllm_ascend.worker.dsa_sparse_external_main import (
+    add_dsa_sparse_main_metadata,
+)
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -330,6 +333,7 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             kv_lora_rank=512,
             qk_rope_head_dim=64,
             index_head_dim=128,
+            num_hidden_layers=1,
         )
         runner.vllm_config.cache_config.cache_dtype = "auto"
 
@@ -356,6 +360,166 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertIsInstance(
             runner._dsa_sparse_main_specs[main_layer_name],
             AscendMLAAttentionSpec,
+        )
+
+    @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_dsa_sparse_decode_keeps_mtp_draft_in_scheduler_spec(
+        self,
+        mock_get_layers,
+        _mock_has_ec_transfer,
+    ):
+        runner = self._build_runner()
+        runner.use_sparse = True
+        runner.block_size = 128
+        runner.kv_cache_dtype = torch.bfloat16
+        runner.ascend_config = MagicMock()
+        runner.ascend_config.dsa_sparse_config = SimpleNamespace(
+            kv_role="kv_consumer",
+        )
+        runner.model_config.hf_text_config = SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            num_hidden_layers=1,
+        )
+        runner.vllm_config.cache_config.cache_dtype = "auto"
+
+        target_layer_name = "model.layers.0.self_attn.attn"
+        draft_layer_name = "model.layers.1.self_attn.attn"
+
+        def make_mla_module():
+            module = MLAAttention.__new__(MLAAttention)
+            torch.nn.Module.__init__(module)
+            module.impl = SimpleNamespace(enable_sparse_sfa_c8=False)
+            return module
+
+        mock_get_layers.return_value = {
+            target_layer_name: make_mla_module(),
+            draft_layer_name: make_mla_module(),
+        }
+
+        scheduler_specs = runner.get_kv_cache_spec()
+
+        self.assertEqual(set(scheduler_specs), {draft_layer_name})
+        self.assertEqual(
+            set(runner._dsa_sparse_main_specs),
+            {target_layer_name},
+        )
+        self.assertIsInstance(
+            scheduler_specs[draft_layer_name],
+            AscendMLAAttentionSpec,
+        )
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
+    def test_dsa_sparse_ordered_layers_excludes_mtp_draft(
+        self,
+        mock_get_layers,
+    ):
+        runner = self._build_runner()
+        target_layer_name = "model.layers.0.self_attn.attn"
+        draft_layer_name = "model.layers.1.self_attn.attn"
+        target_module = MLAAttention.__new__(MLAAttention)
+        draft_module = MLAAttention.__new__(MLAAttention)
+        runner._dsa_sparse_main_specs = {
+            target_layer_name: MagicMock(),
+        }
+        mock_get_layers.return_value = {
+            draft_layer_name: draft_module,
+            target_layer_name: target_module,
+        }
+
+        ordered_layers = runner._get_dsa_sparse_ordered_layers()
+
+        self.assertEqual(
+            ordered_layers,
+            [(target_layer_name, target_module)],
+        )
+
+    def test_dsa_sparse_main_metadata_preserves_mtp_draft_spec(self):
+        block_size = 128
+        indexer_layer_name = "model.layers.0.self_attn.indexer.k_cache"
+        draft_layer_name = "model.layers.1.self_attn.attn"
+        target_layer_name = "model.layers.0.self_attn.attn"
+        indexer_spec = AscendSFAIndexerCacheSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+        )
+        draft_spec = AscendMLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+        )
+        target_spec = AscendMLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=torch.bfloat16,
+            cache_dtype_str="auto",
+        )
+        scheduler_specs = {
+            indexer_layer_name: indexer_spec,
+            draft_layer_name: draft_spec,
+        }
+        cache_tensors = [
+            KVCacheTensor(
+                size=indexer_spec.page_size_bytes * 2,
+                shared_by=[indexer_layer_name],
+            ),
+            KVCacheTensor(
+                size=draft_spec.page_size_bytes * 2,
+                shared_by=[draft_layer_name],
+            ),
+        ]
+        kv_cache_config = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=cache_tensors,
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=list(scheduler_specs),
+                    kv_cache_spec=UniformTypeKVCacheSpecs(
+                        block_size=block_size,
+                        kv_cache_specs=scheduler_specs,
+                    ),
+                ),
+            ],
+        )
+
+        group_id = add_dsa_sparse_main_metadata(
+            kv_cache_config,
+            {target_layer_name: target_spec},
+        )
+
+        self.assertEqual(group_id, 0)
+        projected_group = kv_cache_config.kv_cache_groups[0]
+        self.assertEqual(
+            set(projected_group.layer_names),
+            {
+                indexer_layer_name,
+                draft_layer_name,
+                target_layer_name,
+            },
+        )
+        self.assertIsInstance(
+            projected_group.kv_cache_spec,
+            UniformTypeKVCacheSpecs,
+        )
+        self.assertEqual(
+            projected_group.kv_cache_spec.kv_cache_specs,
+            {
+                indexer_layer_name: indexer_spec,
+                draft_layer_name: draft_spec,
+                target_layer_name: target_spec,
+            },
+        )
+        self.assertIs(kv_cache_config.kv_cache_tensors, cache_tensors)
+        self.assertEqual(
+            [tensor.shared_by for tensor in kv_cache_config.kv_cache_tensors],
+            [[indexer_layer_name], [draft_layer_name]],
         )
 
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
@@ -440,6 +604,10 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
             "model.layers.2.self_attn.attn": layer_2,
             "model.layers.0.self_attn.attn": layer_0,
             "model.layers.1.self_attn.attn": layer_1,
+        }
+        runner._dsa_sparse_main_specs = {
+            layer_name: MagicMock()
+            for layer_name in mock_get_layers.return_value
         }
 
         fixed_hbm_bytes = runner.get_dsa_sparse_fixed_hbm_bytes()
@@ -1010,13 +1178,18 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
                 kv_role="kv_consumer",
                 is_consumer=True,
                 is_producer=False,
+                uses_mtp=False,
             )
         )
         runner.dsa_sparse_req_to_pool_entry = {}
         runner.dsa_sparse_free_pool_entries = deque(range(3))
-        runner._dsa_sparse_leader_coordinators = (MagicMock(),)
+        leader = MagicMock()
+        leader.leader = None
+        leader.request_row_stride = 10368
+        runner._dsa_sparse_leader_coordinators = (leader,)
+        runner._dsa_sparse_coordinators = (("layer.0", leader),)
         runner._dsa_sparse_leader_by_layer = {
-            "layer.0": runner._dsa_sparse_leader_coordinators[0]
+            "layer.0": leader
         }
         runner._dsa_sparse_pd_handoffs = {}
         runner._dsa_sparse_main_specs = {
@@ -1120,6 +1293,61 @@ class TestNPUModelRunnerDSASparse(unittest.TestCase):
         self.assertEqual(pool_entry, 0)
         self.assertEqual(resident[:5], [255, 7, 3, 128, 200])
         self.assertEqual(len(resident), 256)
+        leader.load_initial_resident.assert_called_once_with(
+            layer_name="layer.0",
+            remote_request_id="prefill-request",
+            pool_entry=0,
+            resident_token_ids=resident,
+        )
+
+    @patch("vllm_ascend.worker.model_runner_v1.get_tp_group")
+    def test_handoff_loads_every_physical_layer_before_installing_lookup(
+        self,
+        mock_get_tp_group,
+    ):
+        runner = self._build_runner()
+        mock_get_tp_group.return_value.rank_in_group = 0
+        leader = runner._dsa_sparse_leader_coordinators[0]
+        follower = MagicMock()
+        follower.leader = leader
+        follower.request_row_stride = leader.request_row_stride
+        runner._dsa_sparse_coordinators = (
+            ("layer.0", leader),
+            ("layer.1", follower),
+        )
+        events = []
+        leader.load_initial_resident.side_effect = (
+            lambda **kwargs: events.append(("load", kwargs["layer_name"]))
+        )
+        follower.load_initial_resident.side_effect = (
+            lambda **kwargs: events.append(("load", kwargs["layer_name"]))
+        )
+        leader.initialize_request.side_effect = (
+            lambda *_args: events.append(("initialize", "layer.0"))
+        )
+        topk = list(range(2048))
+        handoff = DSASparsePDHandoff(
+            remote_request_id="prefill-request",
+            stored_token_count=259,
+            block_size=128,
+            layer_topk_by_rank={
+                0: {
+                    "layer.0": topk,
+                    "layer.1": topk,
+                }
+            },
+        )
+
+        runner._admit_dsa_sparse_request("request-a", handoff)
+
+        self.assertEqual(
+            events,
+            [
+                ("load", "layer.0"),
+                ("load", "layer.1"),
+                ("initialize", "layer.0"),
+            ],
+        )
 
     def test_metadata_contains_only_the_shared_pool_entry_tensor(self):
         runner = self._build_runner()

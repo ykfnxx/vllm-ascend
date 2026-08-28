@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 import torch
 
+from vllm_ascend import dsa_sparse_probe
 from vllm_ascend.dsa_sparse_constants import (
     DSA_SPARSE_QUERY_WIDTH,
     DSA_SPARSE_RESIDENT_SLOT_COUNT,
@@ -24,6 +25,7 @@ def build_dsa_sparse_resident_token_ids(
     stored_token_count: int,
     block_size: int,
     resident_token_count: int = DSA_SPARSE_RESIDENT_SLOT_COUNT,
+    include_partial_tail: bool = False,
 ) -> list[int]:
     """Build a TopK-first resident set while preserving score order."""
 
@@ -43,17 +45,22 @@ def build_dsa_sparse_resident_token_ids(
             "DSA Sparse resident_token_count must fit the 8K region."
         )
 
-    # The final partial block is addressed through the independent dense-tail
-    # region, so only complete historical blocks belong in lookup residency.
-    dense_tail_start = (stored_token_count // block_size) * block_size
-    target_count = min(resident_token_count, dense_tail_start)
+    # Normal decode addresses the final partial block through its independent
+    # dense-tail region. MTP has no dense tail: its transient region is verify
+    # staging, so every stored prompt token is eligible for initial residency.
+    resident_history_end = (
+        stored_token_count
+        if include_partial_tail
+        else (stored_token_count // block_size) * block_size
+    )
+    target_count = min(resident_token_count, resident_history_end)
     selected: list[int] = []
     selected_set: set[int] = set()
     for raw_token_id in topk_token_ids:
         token_id = int(raw_token_id)
         if (
             token_id < 0
-            or token_id >= dense_tail_start
+            or token_id >= resident_history_end
             or token_id in selected_set
         ):
             continue
@@ -62,7 +69,7 @@ def build_dsa_sparse_resident_token_ids(
         if len(selected) == target_count:
             return selected
 
-    for token_id in range(dense_tail_start):
+    for token_id in range(resident_history_end):
         if token_id in selected_set:
             continue
         selected.append(token_id)
@@ -239,6 +246,8 @@ class DSASparseProducerAttentionContext(Protocol):
         self,
         layer_name: str,
         semantic_topk_positions: torch.Tensor,
+        main_cache: tuple[torch.Tensor, ...],
+        block_table: torch.Tensor,
     ) -> None: ...
 
 
@@ -250,12 +259,16 @@ class DSASparseProducerBatchContext:
         *,
         request_ids: Sequence[str],
         scheduled_token_counts: Sequence[int],
+        stored_token_counts: Sequence[int],
         publish_requests: Sequence[bool],
         layer_metadata: Mapping[str, object],
     ) -> None:
         self.request_ids = tuple(str(request_id) for request_id in request_ids)
         self.scheduled_token_counts = tuple(
             int(count) for count in scheduled_token_counts
+        )
+        self.stored_token_counts = tuple(
+            int(count) for count in stored_token_counts
         )
         self.publish_requests = tuple(bool(value) for value in publish_requests)
         self.layer_metadata = dict(layer_metadata)
@@ -265,6 +278,7 @@ class DSASparseProducerBatchContext:
         request_count = len(self.request_ids)
         if not (
             len(self.scheduled_token_counts)
+            == len(self.stored_token_counts)
             == len(self.publish_requests)
             == request_count
         ):
@@ -284,6 +298,8 @@ class DSASparseProducerBatchContext:
         self,
         layer_name: str,
         semantic_topk_positions: torch.Tensor,
+        main_cache: tuple[torch.Tensor, ...],
+        block_table: torch.Tensor,
     ) -> None:
         if layer_name in self._published_layers:
             raise RuntimeError(
@@ -297,6 +313,24 @@ class DSASparseProducerBatchContext:
         if semantic_topk_positions.shape[0] < total_scheduled_tokens:
             raise ValueError(
                 "DSA Sparse TopK rows do not cover the Prefill batch."
+            )
+        if not main_cache:
+            raise ValueError(
+                "DSA Sparse P publication requires Main cache planes."
+            )
+
+        # This is the P-side payload publication boundary. The current IO is
+        # intentionally a mock; a real backend must complete its PUT before
+        # this function records TopK and allows the scheduler handoff.
+        if dsa_sparse_probe.is_enabled():
+            dsa_sparse_probe.emit(
+                "initial_publish_mock",
+                layer=layer_name,
+                request_ids=list(self.request_ids),
+                stored_token_counts=list(self.stored_token_counts),
+                publish_requests=list(self.publish_requests),
+                main_cache_ptrs=[plane.data_ptr() for plane in main_cache],
+                block_table_shape=list(block_table.shape),
             )
 
         layer_topk: dict[str, list[int]] = {}
@@ -399,12 +433,14 @@ def begin_dsa_sparse_producer_execution(
     *,
     request_ids: Sequence[str],
     scheduled_token_counts: Sequence[int],
+    stored_token_counts: Sequence[int],
     publish_requests: Sequence[bool],
     layer_metadata: Mapping[str, object],
 ) -> DSASparseProducerExecution:
     context = DSASparseProducerBatchContext(
         request_ids=request_ids,
         scheduled_token_counts=scheduled_token_counts,
+        stored_token_counts=stored_token_counts,
         publish_requests=publish_requests,
         layer_metadata=layer_metadata,
     )

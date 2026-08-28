@@ -45,6 +45,18 @@ def test_resident_selection_preserves_topk_order_and_excludes_dense_tail():
     assert resident == [255, 7, 3, 128, 200, 0]
 
 
+def test_mtp_resident_selection_includes_the_partial_prompt_tail():
+    resident = build_dsa_sparse_resident_token_ids(
+        topk_token_ids=[258, 257, 255],
+        stored_token_count=259,
+        block_size=128,
+        resident_token_count=4,
+        include_partial_tail=True,
+    )
+
+    assert resident == [258, 257, 255, 0]
+
+
 def test_pd_handoff_round_trips_through_transfer_params():
     handoff = _make_handoff()
     transfer_params = {DSA_SPARSE_PD_HANDOFF_KEY: handoff.to_dict()}
@@ -69,6 +81,7 @@ def test_producer_execution_captures_only_final_prefill_rows_and_detaches():
     execution = begin_dsa_sparse_producer_execution(
         request_ids=["request-a", "request-b"],
         scheduled_token_counts=[2, 3],
+        stored_token_counts=[2, 3],
         publish_requests=[False, True],
         layer_metadata={layer_name: metadata},
     )
@@ -79,7 +92,14 @@ def test_producer_execution_captures_only_final_prefill_rows_and_detaches():
 
     with execution as context:
         assert metadata.dsa_sparse_producer_context is context
-        context.publish_layer(layer_name, topk)
+        main_cache = (torch.empty((1, 128, 1, 1)),)
+        block_table = torch.zeros((2, 1), dtype=torch.int32)
+        context.publish_layer(
+            layer_name,
+            topk,
+            main_cache,
+            block_table,
+        )
         assert context.layer_topk(layer_name) == {
             "request-b": topk[4].reshape(-1).tolist()
         }
@@ -93,6 +113,7 @@ def test_producer_execution_rejects_incomplete_topk_rows():
     execution = begin_dsa_sparse_producer_execution(
         request_ids=["request-a"],
         scheduled_token_counts=[2],
+        stored_token_counts=[2],
         publish_requests=[True],
         layer_metadata={layer_name: metadata},
     )
@@ -105,6 +126,8 @@ def test_producer_execution_rejects_incomplete_topk_rows():
                     (1, 1, DSA_SPARSE_QUERY_WIDTH),
                     dtype=torch.int32,
                 ),
+                (torch.empty((1, 128, 1, 1)),),
+                torch.zeros((1, 1), dtype=torch.int32),
             )
 
 

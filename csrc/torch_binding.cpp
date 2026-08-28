@@ -52,6 +52,7 @@
 #include "attention/asu_hbm_index_lookup/asu_hbm_index_lookup_torch_adpt.h"
 #include "attention/asu_hbm_index_maintain_aicpu/asu_hbm_index_maintain_aicpu_torch_adpt.h"
 #include "attention/dsa_sparse_lookup_update/dsa_sparse_lookup_update_torch_adpt.h"
+#include "attention/dsa_sparse_lookup_update_batch/dsa_sparse_lookup_update_batch_torch_adpt.h"
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
 #include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
@@ -3000,7 +3001,25 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "dsa_sparse_lookup_update",
         torch::kPrivateUse1,
         &vllm_ascend::dsa_sparse_lookup_update);
-    
+
+    ops.def(
+        "dsa_sparse_lookup_update_batch("
+            "Tensor(a!) index, "
+            "Tensor(b!) slot_to_index, "
+            "Tensor(c!) free_slots, "
+            "Tensor(d!) free_head, "
+            "Tensor req_pool_entries, "
+            "Tensor query_start_loc, "
+            "Tensor query_index, "
+            "Tensor lookup_mask, "
+            "int req_num"
+        ") -> (Tensor, Tensor)"
+    );
+    ops.impl(
+        "dsa_sparse_lookup_update_batch",
+        torch::kPrivateUse1,
+        &vllm_ascend::dsa_sparse_lookup_update_batch);
+
     // Fused GDN gating.
     ops.def(
         "npu_fused_gdn_gating(Tensor A_log, "

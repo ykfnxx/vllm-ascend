@@ -881,7 +881,6 @@ class KVCacheRecvingThread(threading.Thread):
         for group_pull in group_pulls:
             group_idx = group_pull.group_id
             group_spec, layer_indices = self.kv_group2layeridx[group_idx]
-            kv_cache_group_id = group_spec.get("kv_cache_group_id", group_idx)
             layer_names = group_spec.get("layer_names")
             if layer_names is not None and len(layer_names) != len(layer_indices):
                 raise RuntimeError(
@@ -905,8 +904,13 @@ class KVCacheRecvingThread(threading.Thread):
             tp_num_need_pulls = group_pull.num_group_pulls
             inner_offset = group_pull.remote_tp_offset
             is_mamba_group = group_spec["kv_cache_spec_type"] == "MambaSpec"
-            local_group_block_ids = local_block_ids[kv_cache_group_id]
-            remote_group_block_ids = remote_block_ids[kv_cache_group_id]
+            # ``local_block_ids`` and ``remote_block_ids`` have already been
+            # expanded by _get_kv_split_metadata and are indexed by Mooncake
+            # transfer group, not by scheduler KV cache group. One scheduler
+            # group can split into multiple transfer groups with different
+            # physical block scales (DSA Indexer + MTP draft).
+            local_group_block_ids = local_block_ids[group_idx]
+            remote_group_block_ids = remote_block_ids[group_idx]
             has_group_blocks = bool(local_group_block_ids)
             if not has_group_blocks and (is_mamba_group or not has_replicate_k_blocks):
                 continue
@@ -1187,10 +1191,10 @@ class KVCacheRecvingThread(threading.Thread):
         """Build the remote physical layer index map from handshake metadata.
 
         P and D may expose different physical layer indices for the same model
-        layer.  This happens for DSA Sparse because P registers Main and
-        Indexer layers while D registers only Indexer layers.  The serialized
-        layer names are stable across the two workers, so they are the
-        authoritative mapping for the remote address arrays.
+        layer. This happens for DSA Sparse because target Main is runner-owned
+        on D, while Indexer and any MTP draft cache remain scheduler-managed.
+        The serialized layer names are stable across the two workers, so they
+        are the authoritative mapping for the remote address arrays.
 
         Older or hand-written test metadata may not include ``layer_names``.
         Returning an empty map preserves the historical index-based behavior
@@ -1218,6 +1222,57 @@ class KVCacheRecvingThread(threading.Thread):
                     )
                 layer_name_to_idx[layer_name] = layer_idx
         return layer_name_to_idx
+
+    @classmethod
+    def _get_missing_remote_layer_names(
+        cls,
+        local_kv_group2layeridx: dict[
+            int,
+            tuple[dict[str, Any], list[int]],
+        ],
+        remote_kv_group2layeridx: dict[
+            int,
+            tuple[dict[str, Any], list[int]],
+        ],
+    ) -> list[str] | None:
+        """Validate name-based P/D layer compatibility.
+
+        DSA Sparse intentionally exposes different scheduler-visible layouts:
+        target Main is not registered by D's scheduler, while Indexer and any
+        MTP draft cache remain registered. Therefore the serialized
+        dictionaries need not be equal; every D-local layer must instead have
+        a stable-name match on P. ``None`` preserves the legacy equality
+        warning for metadata that predates serialized layer names.
+        """
+
+        for remote_group_spec, _ in remote_kv_group2layeridx.values():
+            if remote_group_spec.get("layer_names") is None:
+                return None
+        remote_layer_name_to_idx = cls._build_remote_layer_name_to_idx(
+            remote_kv_group2layeridx,
+        )
+
+        local_layer_names: set[str] = set()
+        for local_group_idx, (
+            local_group_spec,
+            local_layer_indices,
+        ) in local_kv_group2layeridx.items():
+            layer_names = local_group_spec.get("layer_names")
+            if layer_names is None:
+                return None
+            if len(layer_names) != len(local_layer_indices):
+                raise RuntimeError(
+                    "Mooncake local KV group metadata has inconsistent "
+                    "layer names and indices: "
+                    f"group_idx={local_group_idx}, "
+                    f"layer_names={layer_names}, "
+                    f"layer_indices={local_layer_indices}."
+                )
+            local_layer_names.update(layer_names)
+
+        return sorted(
+            local_layer_names - remote_layer_name_to_idx.keys()
+        )
 
     @staticmethod
     def _resolve_remote_layer_idx(
@@ -1547,13 +1602,47 @@ class KVCacheRecvingThread(threading.Thread):
                 f"Conflict engine id {engine_id} with local engine id {self.local_engine_id}."
             )
             if agent_meta.kv_group2layeridx != self.kv_group2layeridx:
-                logger.debug(
-                    "Remote kv_group2layeridx differs from local. Inspect the remote and local metadata "
-                    "to determine whether the difference is expected for the configured parallelism "
-                    "and KV cache layouts. remote=%s, local=%s. ",
-                    agent_meta.kv_group2layeridx,
-                    self.kv_group2layeridx,
+                additional_config = getattr(
+                    self.vllm_config,
+                    "additional_config",
+                    None,
                 )
+                dsa_sparse_enabled = (
+                    isinstance(additional_config, dict)
+                    and "dsa_sparse_config" in additional_config
+                )
+                missing_layer_names = (
+                    self._get_missing_remote_layer_names(
+                        self.kv_group2layeridx,
+                        agent_meta.kv_group2layeridx,
+                    )
+                    if dsa_sparse_enabled
+                    else None
+                )
+                if missing_layer_names:
+                    raise RuntimeError(
+                        "Mooncake remote KV metadata is missing DSA Sparse "
+                        "Decode layers: "
+                        f"remote_engine_id={engine_id!r}, "
+                        f"remote_handshake_port={remote_handshake_port}, "
+                        f"missing_layer_names={missing_layer_names}."
+                    )
+                if missing_layer_names is None:
+                    logger.debug(
+                        "Remote kv_group2layeridx differs from local. Inspect "
+                        "whether the difference is expected for the configured "
+                        "parallelism and KV cache layouts. remote=%s, local=%s. ",
+                        agent_meta.kv_group2layeridx,
+                        self.kv_group2layeridx,
+                    )
+                else:
+                    logger.debug(
+                        "Mooncake DSA Sparse P/D KV metadata is compatible "
+                        "by layer name although physical layouts differ. "
+                        "remote_engine_id=%s remote_handshake_port=%s",
+                        engine_id,
+                        remote_handshake_port,
+                    )
             with self.remote_metadata_lock:
                 self.remote_kv_group2layeridx[engine_id][remote_handshake_port] = agent_meta.kv_group2layeridx
                 self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr
@@ -2572,7 +2661,54 @@ class MooncakeConnectorWorker:
             model_config = speculative_config.draft_model_config
         return model_config.get_total_num_kv_heads()
 
-    def _build_kv_group2layeridx(self) -> dict[int, tuple[dict[str, Any], list[int]]]:
+    def _get_dsa_sparse_transfer_layer_names(
+        self,
+    ) -> set[str] | None:
+        """Return the cache layers DSA Sparse should expose to Mooncake.
+
+        Decode owns target-model Main KV in its Hot Cache, so Mooncake must
+        only move scheduler-managed payloads that exist on both P and D:
+        Indexer cache and, when enabled, the MTP draft cache.  Prefill still
+        owns and uses its target Main tensors; excluding them here only removes
+        them from Mooncake registration and handshake metadata.
+
+        ``None`` means that the ordinary, unfiltered Mooncake layout applies.
+        """
+
+        if getattr(self.dsa_sparse_config, "kv_role", None) != "kv_producer":
+            return None
+
+        from vllm.v1.worker.utils import extract_layer_index
+
+        num_attn_module = (
+            2
+            if self.vllm_config.model_config.hf_text_config.model_type
+            == "longcat_flash"
+            else 1
+        )
+        transfer_layer_names: set[str] = set()
+        for group_spec in self.kv_cache_config.kv_cache_groups:
+            for layer_name in group_spec.layer_names:
+                layer_spec = group_spec.kv_cache_spec
+                if isinstance(layer_spec, UniformTypeKVCacheSpecs):
+                    layer_spec = layer_spec.kv_cache_specs[layer_name]
+
+                is_target_main = False
+                if isinstance(layer_spec, MLAAttentionSpec) and "mtp" not in layer_name:
+                    layer_idx = extract_layer_index(
+                        layer_name,
+                        num_attn_module,
+                    )
+                    is_target_main = layer_idx < self.total_layers
+                if not is_target_main:
+                    transfer_layer_names.add(layer_name)
+
+        return transfer_layer_names
+
+    def _build_kv_group2layeridx(
+        self,
+        transfer_layer_names: set[str] | None = None,
+    ) -> dict[int, tuple[dict[str, Any], list[int]]]:
         from vllm.v1.worker.utils import extract_layer_index
 
         kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]] = {}
@@ -2588,12 +2724,17 @@ class MooncakeConnectorWorker:
             # an eagle layer and assign a new layer id starting from total_layers.
             assigned_indices: set[int] = set()
             for layer_name in group_spec.layer_names:
+                if transfer_layer_names is not None and layer_name not in transfer_layer_names:
+                    continue
                 if "mtp" in layer_name:
                     layer_idx = next_mtp_layer_idx
                     next_mtp_layer_idx += 1
                 else:
                     layer_idx = extract_layer_index(layer_name, num_attn_module)
-                    if assigned_indices and layer_idx < min(assigned_indices) or layer_idx in assigned_indices:
+                    if (
+                        assigned_indices
+                        and layer_idx < min(assigned_indices)
+                    ) or layer_idx in assigned_indices:
                         layer_idx = next_mtp_layer_idx
                         next_mtp_layer_idx += 1
                 assigned_indices.add(layer_idx)
@@ -2676,6 +2817,8 @@ class MooncakeConnectorWorker:
             shared_addrs: list[int] = []
             has_mtp = False
             for layer_name in kv_cache_tensor.shared_by:
+                if layer_name not in kv_caches:
+                    continue
                 has_mtp = has_mtp or "mtp" in layer_name
                 layer_spec = self._get_layer_spec(layer_name)
                 conv_padding = max(conv_padding, self._get_mamba_conv_padding(layer_spec))
@@ -2702,6 +2845,8 @@ class MooncakeConnectorWorker:
         for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
             shared_addrs: list[int] = []
             for layer_name in kv_cache_tensor.shared_by:
+                if layer_name not in kv_caches:
+                    continue
                 for single_kv_cache in self._as_kv_cache_tuple(kv_caches[layer_name]):
                     shared_addrs.append(single_kv_cache.data_ptr())
 
@@ -2733,10 +2878,29 @@ class MooncakeConnectorWorker:
 
         self.num_blocks = self.kv_cache_config.num_blocks
         logger.info("num_blocks: %s", self.num_blocks)
-        self.kv_caches = kv_caches
+        transfer_layer_names = self._get_dsa_sparse_transfer_layer_names()
+        if transfer_layer_names is None:
+            transfer_kv_caches = kv_caches
+        else:
+            transfer_kv_caches = {
+                layer_name: kv_cache
+                for layer_name, kv_cache in kv_caches.items()
+                if layer_name in transfer_layer_names
+            }
+            excluded_layer_names = sorted(
+                set(kv_caches) - set(transfer_kv_caches)
+            )
+            logger.info(
+                "DSA Sparse Prefill excludes target Main caches from "
+                "Mooncake payload registration: excluded_layers=%s",
+                excluded_layer_names,
+            )
+        self.kv_caches = transfer_kv_caches
         # Maps each KV cache group to its serialized group spec and physical
         # layer indices: {group_id: (group_spec, [layer_idx0, layer_idx1, ...])}.
-        self.kv_group2layeridx = self._build_kv_group2layeridx()
+        self.kv_group2layeridx = self._build_kv_group2layeridx(
+            transfer_layer_names,
+        )
         self._is_hma_required = self._is_hma_required or self._requires_group_aware_attention_transfer()
         has_mamba_group = self._has_mamba_group()
         layer_name_to_idx = {
@@ -2763,7 +2927,7 @@ class MooncakeConnectorWorker:
 
         # TODO: For DSV4 use_compress, metadata/transfer can be optimized by
         # aggregating layer views that share the same raw KVCacheTensor.
-        for layer_name, kv_cache_tuple in kv_caches.items():
+        for layer_name, kv_cache_tuple in transfer_kv_caches.items():
             layer_idx = layer_name_to_idx[layer_name]
             for single_kv_cache in self._as_kv_cache_tuple(kv_cache_tuple):
                 tensor_num_blocks = single_kv_cache.shape[0]
@@ -2776,16 +2940,22 @@ class MooncakeConnectorWorker:
                 self.kv_caches_base_addr[layer_idx].append(single_kv_cache.data_ptr())
 
         if has_mamba_group:
-            ptrs, lengths = self._get_registered_kv_tensor_buffers(kv_caches)
+            ptrs, lengths = self._get_registered_kv_tensor_buffers(
+                transfer_kv_caches
+            )
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
         elif self.use_hybrid:
-            ptrs, lengths = self._get_registered_kv_tensor_buffers_hybrid(kv_caches)
+            ptrs, lengths = self._get_registered_kv_tensor_buffers_hybrid(
+                transfer_kv_caches
+            )
             register_regions = RegisterRegions(ptrs=ptrs, lengths=lengths)
         else:
             # For normal attention / sparse-c8 KV cache, keep metadata at the
             # logical tensor level but merge registration ranges by underlying
             # storage to avoid exceeding the HCCL per-process region limit.
-            register_regions = collect_storage_merged_register_regions(kv_caches)
+            register_regions = collect_storage_merged_register_regions(
+                transfer_kv_caches
+            )
 
         validate_register_region_count(register_regions)
         global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
@@ -3076,10 +3246,10 @@ class MooncakeConnectorWorker:
             * remote_handshake_port_list[i]: remote P worker handshake ports
               to pull from. The inner list length is the number of TP pulls
               needed for that shard.
-            * local_block_ids_list[i]: local kernel block ids, grouped by KV cache
-              group, where received blocks are written.
-            * remote_block_ids_list[i]: remote kernel block ids, grouped by KV cache
-              group, where blocks are read from.
+            * local_block_ids_list[i]: local kernel block ids, grouped by
+              Mooncake transfer group, where received blocks are written.
+            * remote_block_ids_list[i]: remote kernel block ids, grouped by
+              Mooncake transfer group, where blocks are read from.
 
         In PCP/DCP scenarios, prompt blocks can be split across multiple remote
         P workers. This method also accounts for unequal P/D prefix-cache hits
@@ -3096,15 +3266,18 @@ class MooncakeConnectorWorker:
             remote_handshake_port_list = [[x + meta.remote_port for x in chosen_rank_list]]
             # No CP: expand logical blocks into kernel blocks here so the transfer
             # stage consumes kernel-level ids directly (chunk_starts no longer needed).
-            local_block_ids: list[list[int]] = [[] for _ in meta.local_block_ids]
-            remote_block_ids: list[list[int]] = [[] for _ in meta.remote_block_ids]
+            local_block_ids: list[list[int]] = [
+                [] for _ in self.kv_group2layeridx
+            ]
+            remote_block_ids: list[list[int]] = [
+                [] for _ in self.kv_group2layeridx
+            ]
             for group_idx, (group_spec, layer_indices) in self.kv_group2layeridx.items():
                 local_kernel_block_ids, remote_kernel_block_ids = self._get_kernel_block_ids(
                     layer_indices, meta, group_idx, group_spec
                 )
-                kv_cache_group_id = self._get_kv_cache_group_id(group_idx, group_spec)
-                local_block_ids[kv_cache_group_id] = local_kernel_block_ids
-                remote_block_ids[kv_cache_group_id] = remote_kernel_block_ids
+                local_block_ids[group_idx] = local_kernel_block_ids
+                remote_block_ids[group_idx] = remote_kernel_block_ids
             local_block_ids_list = [tuple(local_block_ids) for _ in remote_handshake_port_list]
             remote_block_ids_list = [tuple(remote_block_ids) for _ in remote_handshake_port_list]
             return (
@@ -3403,11 +3576,23 @@ class MooncakeConnectorWorker:
             group_local_block_ids: list[list[int]] = []
             is_final_shard = remote_kv_id == len(remote_handshake_port_list) - 1
             for group_idx, (group_spec, _) in kv_group_items:
+                kv_cache_group_id = self._get_kv_cache_group_id(
+                    group_idx,
+                    group_spec,
+                )
                 if group_spec["kv_cache_spec_type"] == "MambaSpec":
                     # Mamba state is not context-block sharded like attention
                     # KV. Transfer the final state from the final PCP/DCP shard.
-                    group_remote_block_ids.append(list(meta.remote_block_ids[group_idx]) if is_final_shard else [])
-                    group_local_block_ids.append(list(meta.local_block_ids[group_idx]) if is_final_shard else [])
+                    group_remote_block_ids.append(
+                        list(meta.remote_block_ids[kv_cache_group_id])
+                        if is_final_shard
+                        else []
+                    )
+                    group_local_block_ids.append(
+                        list(meta.local_block_ids[kv_cache_group_id])
+                        if is_final_shard
+                        else []
+                    )
                     continue
                 # Attention: expand to kernel blocks here. Remote is sliced from remote_first
                 # (skips this rank's prefix-cached blocks) then expanded; local kernels are
@@ -3416,7 +3601,9 @@ class MooncakeConnectorWorker:
                 # n == 0, so both kernel lists naturally come out empty.
                 _, remote_scale, kernel_size = group_kernel_params[group_idx]
                 remote_logical = list(
-                    meta.remote_block_ids[group_idx][remote_first : remote_first + num_blocks_to_pull]
+                    meta.remote_block_ids[kv_cache_group_id][
+                        remote_first : remote_first + num_blocks_to_pull
+                    ]
                 )
                 kernel_remote = self._expand_block_ids(remote_logical, remote_scale)
                 kernel_local = self._local_kernel_ids_for_shard(
@@ -3430,7 +3617,7 @@ class MooncakeConnectorWorker:
                     remote_cp_size,
                     remote_block_size,
                     kernel_size,
-                    list(meta.local_block_ids[group_idx]),
+                    list(meta.local_block_ids[kv_cache_group_id]),
                 )
                 num_kernel_blocks = min(len(kernel_remote), len(kernel_local))
                 group_remote_block_ids.append(kernel_remote[:num_kernel_blocks])

@@ -261,6 +261,8 @@ class AscendSFAMetadata:
     group_key_idx: torch.Tensor | None = None
     group_key_cache_idx: torch.Tensor | None = None
     dsa_sparse_req_pool_entries: torch.Tensor | None = None
+    dsa_sparse_query_start_loc: torch.Tensor | None = None
+    dsa_sparse_query_positions: torch.Tensor | None = None
     dsa_sparse_producer_context: (
         DSASparseProducerAttentionContext | None
     ) = None
@@ -548,6 +550,12 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
             group_len=actual_group_len,
             group_key_idx=actual_group_key_idx,
             group_key_cache_idx=actual_group_key_cache_idx,
+            dsa_sparse_query_start_loc=(
+                common_attn_metadata.query_start_loc[: num_reqs + 1]
+            ),
+            dsa_sparse_query_positions=(
+                common_attn_metadata.positions[:num_actual_tokens]
+            ),
         )
 
     def build_for_graph_capture(
@@ -1646,9 +1654,21 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if dsa_sparse_probe.is_enabled():
             dsa_sparse_probe.synchronize_device()
+            coordinator = self.dsa_sparse_coordinator
             dsa_sparse_probe.emit(
                 "hot_cache_sfa_done",
                 layer=self.layer_name or "",
+                target_step_id=(
+                    coordinator.target_step_id
+                    if coordinator is not None
+                    else None
+                ),
+                execution_mode=(
+                    "mtp_batch"
+                    if coordinator is not None
+                    and coordinator.mtp_enabled
+                    else "single_query"
+                ),
                 hot_cache_ptrs=[
                     plane.data_ptr()
                     for plane in hot_main_cache
@@ -1720,6 +1740,10 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata.dsa_sparse_producer_context
         )
         req_pool_entries = attn_metadata.dsa_sparse_req_pool_entries
+        dsa_query_start_loc = (
+            attn_metadata.dsa_sparse_query_start_loc
+        )
+        dsa_query_positions = attn_metadata.dsa_sparse_query_positions
         if (
             dsa_sparse_coordinator is not None
             and dsa_sparse_producer_context is not None
@@ -1751,22 +1775,31 @@ class AscendSFAImpl(MLAAttentionImpl):
                 or attn_metadata.sfa_cp_metadata is not None
             ):
                 raise RuntimeError("DSA Sparse eager does not support context-parallel SFA.")
-            if (
-                attn_metadata.attn_state
-                != AscendAttentionState.DecodeOnly
-            ):
+            expected_attn_state = (
+                AscendAttentionState.SpecDecoding
+                if dsa_sparse_coordinator.mtp_enabled
+                else AscendAttentionState.DecodeOnly
+            )
+            if attn_metadata.attn_state != expected_attn_state:
                 raise RuntimeError("DSA Sparse eager does not support D-side prefill or mixed batches.")
             if req_pool_entries is None:
                 raise RuntimeError("DSA Sparse request pool entries are unavailable.")
-            if (
-                attn_metadata.num_actual_tokens
-                != req_pool_entries.shape[0]
-                or attn_metadata.num_input_tokens
-                != attn_metadata.num_actual_tokens
-            ):
+            if attn_metadata.num_input_tokens != attn_metadata.num_actual_tokens:
+                raise RuntimeError("DSA Sparse requires an unpadded target batch.")
+            if dsa_sparse_coordinator.mtp_enabled:
+                if dsa_query_start_loc is None or dsa_query_positions is None:
+                    raise RuntimeError(
+                        "DSA Sparse MTP packed query metadata is unavailable."
+                    )
+                if dsa_query_positions.shape[0] != attn_metadata.num_actual_tokens:
+                    raise RuntimeError(
+                        "DSA Sparse MTP positions must match packed target tokens."
+                    )
+            elif attn_metadata.num_actual_tokens != req_pool_entries.shape[0]:
                 raise RuntimeError("DSA Sparse requires one unpadded token per request.")
             kv_cache = dsa_sparse_coordinator.hot_main_cache
 
+        main_kv_cache = kv_cache
         kv_cache = self._compose_sfa_kv_cache(kv_cache)
 
         cos = attn_metadata.cos
@@ -1791,10 +1824,23 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         if dsa_sparse_coordinator is not None:
             assert req_pool_entries is not None
-            main_slot_mapping = dsa_sparse_coordinator.build_main_slot_mapping(
-                req_pool_entries,
-                attn_metadata.seq_lens,
-            )
+            if dsa_sparse_coordinator.mtp_enabled:
+                assert dsa_query_start_loc is not None
+                assert dsa_query_positions is not None
+                main_slot_mapping = (
+                    dsa_sparse_coordinator.build_main_slot_mapping_batch(
+                        req_pool_entries,
+                        dsa_query_start_loc,
+                        dsa_query_positions,
+                    )
+                )
+            else:
+                main_slot_mapping = (
+                    dsa_sparse_coordinator.build_main_slot_mapping(
+                        req_pool_entries,
+                        attn_metadata.seq_lens,
+                    )
+                )
             slot_mapping_sfa = main_slot_mapping
 
         # Inputs and outputs may be padded for CUDA graphs
@@ -2038,9 +2084,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 assert k_li is not None
                 k_li = self._get_full_kv(k_li, attn_metadata)
 
-        if dsa_sparse_coordinator is not None:
-            dsa_sparse_coordinator.mock_store_newest()
-
         if kv_cache is not None and self.is_kv_producer:
             attn_metadata.reshape_cache_event = torch.npu.Event()
 
@@ -2122,11 +2165,21 @@ class AscendSFAImpl(MLAAttentionImpl):
                 self._update_indexcache_topk_indices(topk_indices)
             if dsa_sparse_coordinator is not None:
                 assert req_pool_entries is not None
-                dsa_sparse_coordinator.resolve(
-                    topk_indices,
-                    req_pool_entries,
-                    attn_metadata.seq_lens,
-                )
+                if dsa_sparse_coordinator.mtp_enabled:
+                    assert dsa_query_start_loc is not None
+                    assert dsa_query_positions is not None
+                    dsa_sparse_coordinator.resolve_batch(
+                        topk_indices,
+                        req_pool_entries,
+                        dsa_query_start_loc,
+                        dsa_query_positions,
+                    )
+                else:
+                    dsa_sparse_coordinator.resolve(
+                        topk_indices,
+                        req_pool_entries,
+                        attn_metadata.seq_lens,
+                    )
                 if dsa_sparse_probe.is_enabled():
                     query_index = cast(
                         torch.Tensor,
@@ -2141,10 +2194,25 @@ class AscendSFAImpl(MLAAttentionImpl):
                         dsa_sparse_coordinator.miss_out,
                     )
                     dsa_sparse_probe.synchronize_device()
+                    query_lens = None
+                    if dsa_sparse_coordinator.query_start_loc is not None:
+                        query_lens = (
+                            dsa_sparse_coordinator.query_start_loc[1:]
+                            - dsa_sparse_coordinator.query_start_loc[:-1]
+                        ).detach().cpu().tolist()
                     dsa_sparse_probe.emit(
                         "lookup_update_done",
                         cohort=layer_name,
                         role="target",
+                        target_step_id=(
+                            dsa_sparse_coordinator.target_step_id
+                        ),
+                        operator=(
+                            "dsa_sparse_lookup_update_batch"
+                            if dsa_sparse_coordinator.mtp_enabled
+                            else "dsa_sparse_lookup_update"
+                        ),
+                        q_i=query_lens,
                         req_num=req_pool_entries.shape[0],
                         req_pool_entries_shape=list(
                             req_pool_entries.shape
@@ -2161,6 +2229,18 @@ class AscendSFAImpl(MLAAttentionImpl):
                         miss_out_shape=list(
                             miss_out.shape
                         ),
+                        history_miss_count=int(
+                            miss_out.sum().item()
+                        ),
+                        fallback_overflow_count=(
+                            int(
+                                slot_out.eq(
+                                    dsa_sparse_coordinator.fallback_zero_slot
+                                ).sum().item()
+                            )
+                            if dsa_sparse_coordinator.mtp_enabled
+                            else 0
+                        ),
                     )
 
         if dsa_sparse_producer_context is not None:
@@ -2168,6 +2248,8 @@ class AscendSFAImpl(MLAAttentionImpl):
             dsa_sparse_producer_context.publish_layer(
                 layer_name,
                 topk_indices,
+                tuple(main_kv_cache),
+                attn_metadata.block_table,
             )
 
         if dsa_sparse_coordinator is None:
@@ -2182,7 +2264,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_key,
             )
         else:
-            dsa_sparse_coordinator.mock_load_misses()
+            dsa_sparse_coordinator.load_history_misses(layer_name)
             assert dsa_sparse_coordinator.attention_indices is not None
             assert dsa_sparse_coordinator.hot_block_table is not None
             attn_output = self._execute_dsa_sparse_hot_cache_attention(

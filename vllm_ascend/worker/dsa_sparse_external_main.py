@@ -21,11 +21,13 @@ def add_dsa_sparse_main_metadata(
     kv_cache_config: KVCacheConfig,
     main_specs: Mapping[str, AscendMLAAttentionSpec],
 ) -> int | None:
-    """Add runner-only Main metadata to the sole Indexer cache group.
+    """Add runner-only Main metadata to the group containing Indexer caches.
 
     ``kv_cache_config`` must already be a worker-owned copy. Its cache tensors
-    remain untouched, so only the Indexer payload is allocated and registered.
-    The returned group id is the existing Indexer group position.
+    remain untouched, so only scheduler-managed payloads are allocated and
+    registered. Under MTP, vLLM may place the draft MLA cache in the same
+    uniform Full-Attention group as the Indexer caches. The returned group id
+    is the existing group position.
     """
 
     if not main_specs:
@@ -40,13 +42,20 @@ def add_dsa_sparse_main_metadata(
         f"DSA Sparse Decode requires exactly one Indexer KV cache group, got {indexer_group_ids}."
     )
     group_id = indexer_group_ids[0]
-    indexer_group = kv_cache_config.kv_cache_groups[group_id]
-    indexer_specs = _expand_group_specs(indexer_group)
+    scheduler_group = kv_cache_config.kv_cache_groups[group_id]
+    scheduler_specs = _expand_group_specs(scheduler_group)
 
-    assert all(isinstance(spec, AscendSFAIndexerCacheSpec) for spec in indexer_specs.values()), (
-        "The DSA Sparse Decode Indexer group must contain only Indexer specs."
+    assert all(
+        isinstance(
+            spec,
+            (AscendSFAIndexerCacheSpec, AscendMLAAttentionSpec),
+        )
+        for spec in scheduler_specs.values()
+    ), (
+        "The DSA Sparse Decode Indexer group may contain only Indexer specs "
+        "and scheduler-managed MTP draft MLA specs."
     )
-    assert not (set(indexer_specs) & set(main_specs)), (
+    assert not (set(scheduler_specs) & set(main_specs)), (
         "External Main layers must be absent from the scheduler KV cache group."
     )
     assert not any(
@@ -54,17 +63,17 @@ def add_dsa_sparse_main_metadata(
         for cache_tensor in kv_cache_config.kv_cache_tensors
     ), "External Main layers must not own scheduler cache tensors."
 
-    block_size = indexer_group.kv_cache_spec.block_size
+    block_size = scheduler_group.kv_cache_spec.block_size
     assert all(spec.block_size == block_size for spec in main_specs.values()), (
         "Main and Indexer specs in a DSA Sparse cohort must use one block size."
     )
 
-    combined_specs: dict[str, KVCacheSpec] = dict(indexer_specs)
+    combined_specs: dict[str, KVCacheSpec] = dict(scheduler_specs)
     combined_specs.update(main_specs)
     kv_cache_config.kv_cache_groups[group_id] = replace(
-        indexer_group,
+        scheduler_group,
         layer_names=[
-            *indexer_group.layer_names,
+            *scheduler_group.layer_names,
             *main_specs,
         ],
         kv_cache_spec=UniformTypeKVCacheSpecs(
