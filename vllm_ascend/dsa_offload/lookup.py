@@ -706,10 +706,9 @@ def load_prefetch_misses(
             raise RuntimeError(
                 "DSA Offload dense prefetch Gather requires a Hot Cache"
             )
-        destination_block_table = hot_cache.hot_block_table.index_select(
-            0,
-            plan.query_request_rows.to(torch.int64),
-        ).contiguous()
+        destination_block_table = hot_cache.layout.block_table(
+            plan.query_request_rows
+        )
         if dense_gather(
             layer_id=layer_id,
             destination_block_table=destination_block_table,
@@ -748,10 +747,9 @@ def load_plan_misses(
         hot_cache = batch.hot_cache
         if hot_cache is None:
             raise RuntimeError("DSA Offload dense gather requires a Hot Cache")
-        destination_block_table = hot_cache.hot_block_table.index_select(
-            0,
-            plan.query_request_rows.to(torch.int64),
-        ).contiguous()
+        destination_block_table = hot_cache.layout.block_table(
+            plan.query_request_rows
+        )
         if dense_gather(
             layer_id=layer_id,
             destination_block_table=destination_block_table,

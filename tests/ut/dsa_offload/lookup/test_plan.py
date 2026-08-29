@@ -151,7 +151,7 @@ def test_graph_prefetch_plan_uses_fixed_dense_gather_metadata(spy_io) -> None:
         cohorts=(cohort,),
         lookup_states={"leader": state},
         request_ids=("first", "second"),
-        request_rows=torch.tensor([1, 0], dtype=torch.int32),
+        request_rows=torch.tensor([1, -1], dtype=torch.int32),
         decode_request_indices=(0, 1),
         query_ranges=((0, 2), (2, 3)),
         query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
@@ -181,7 +181,7 @@ def test_graph_prefetch_plan_uses_fixed_dense_gather_metadata(spy_io) -> None:
 
     assert lookup.call_args.args[1] is batch.request_rows
     assert torch.equal(lookup.call_args.args[2], semantic)
-    assert plan.query_request_rows.tolist() == [1, 1, 0]
+    assert plan.query_request_rows.tolist() == [1, 1, -1]
     assert plan.query_indices is not None
     assert torch.equal(plan.query_indices, semantic)
     assert plan.lookup_slots is not None
@@ -198,7 +198,11 @@ def test_graph_prefetch_plan_uses_fixed_dense_gather_metadata(spy_io) -> None:
 
     assert len(gather_calls) == 1
     assert gather_calls[0]["layer_id"] == 7
-    assert gather_calls[0]["request_rows"].tolist() == [1, 1, 0]
+    assert gather_calls[0]["request_rows"].tolist() == [1, 1, -1]
+    assert torch.equal(
+        gather_calls[0]["destination_block_table"],
+        layout.block_table(plan.query_request_rows),
+    )
     assert torch.equal(gather_calls[0]["token_positions"], semantic)
 
 
