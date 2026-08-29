@@ -94,6 +94,19 @@ def test_io_backend_defaults_to_mock() -> None:
     assert config.io_backend == "mock"
 
 
+def test_hidden_state_prefetch_allows_graph_mode() -> None:
+    vllm_config = make_config()
+    vllm_config.model_config.enforce_eager = False
+    vllm_config.additional_config["dsa_offload"][
+        "enable_prefetch_with_hidden_states"
+    ] = True
+
+    config = load_dsa_offload_config(vllm_config)
+
+    assert config is not None
+    assert config.enable_prefetch_with_hidden_states
+
+
 def test_kvgather_sim_and_tail_block_length_are_accepted() -> None:
     vllm_config = make_config()
     vllm_config.additional_config["dsa_offload"]["io_backend"] = (

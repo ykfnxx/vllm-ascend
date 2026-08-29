@@ -818,7 +818,6 @@ PY
         --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
         --seed 0 \
         --trust-remote-code \
-        --enforce-eager \
         --no-enable-prefix-caching \
         --compilation-config '{"cudagraph_mode":"NONE"}' \
         --additional-config "$dsa_config" \

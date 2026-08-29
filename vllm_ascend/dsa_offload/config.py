@@ -79,8 +79,6 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
         raise ValueError("DSA Offload requires Ascend A5.")
 
     model_config = vllm_config.model_config
-    if enable_prefetch and not bool(getattr(model_config, "enforce_eager", False)):
-        raise ValueError("DSA Offload hidden-state prefetch requires eager execution.")
     hf_config = getattr(model_config, "hf_text_config", None)
     if hf_config is None:
         hf_config = model_config.hf_config

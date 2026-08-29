@@ -34,6 +34,15 @@ def test_glm52_prefetch_profile_and_cp16_coefficients() -> None:
     assert profile is PredictionCoefficientProfile.GLM52_W4A8
     alpha, beta = get_group_predict_coefficients(profile, 2)
     assert len(alpha) == len(beta) == 16
+    assert alpha[:2] == (1.426778885800295, 0.037143112479008)
+    assert beta[:2] == (-0.0014946481492795387, 0.0017293299924049557)
+
+    w8_alpha, w8_beta = get_group_predict_coefficients(
+        PredictionCoefficientProfile.GLM52_W8A8,
+        2,
+    )
+    assert w8_alpha == (0.7627772709274597, *((1.0,) * 15))
+    assert w8_beta == (-0.0008454544838177624, *((0.0,) * 15))
 
 
 def test_group_coefficients_and_reduced_topk_keep_runtime_shapes() -> None:
