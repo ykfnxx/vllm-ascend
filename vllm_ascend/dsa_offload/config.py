@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from .constants import INDEX_CAPACITY, QUERY_WIDTH
 
+PREFETCH_TOP_K_MIN = 128
+
 DSAOffloadRole = Literal["kv_producer", "kv_consumer", "kv_both"]
 
 
@@ -16,6 +18,10 @@ class DSAOffloadConfig:
     max_verify_tokens_per_request: int
     kv_role: DSAOffloadRole
     kv_transfer_config: Any | None
+    enable_prefetch_with_hidden_states: bool
+    prefetch_top_k: int
+    enable_turbo_lookup: bool
+    enable_turbo_prefetch_lookup: bool
 
     @property
     def has_connector(self) -> bool:
@@ -44,12 +50,37 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
             "dsa_offload.io_backend must be 'kvio', 'mock', or 'kvgather_sim'."
         )
 
+    enable_prefetch = raw_config.get("enable_prefetch_with_hidden_states", False)
+    if not isinstance(enable_prefetch, bool):
+        raise TypeError("dsa_offload.enable_prefetch_with_hidden_states must be a boolean.")
+    prefetch_top_k = raw_config.get("prefetch_top_k", QUERY_WIDTH)
+    if isinstance(prefetch_top_k, bool) or not isinstance(prefetch_top_k, int):
+        raise TypeError("dsa_offload.prefetch_top_k must be an integer.")
+    if not PREFETCH_TOP_K_MIN <= prefetch_top_k <= QUERY_WIDTH:
+        raise ValueError(
+            "dsa_offload.prefetch_top_k must be in "
+            f"[{PREFETCH_TOP_K_MIN}, {QUERY_WIDTH}]."
+        )
+    enable_turbo_lookup = raw_config.get("enable_turbo_lookup", True)
+    if not isinstance(enable_turbo_lookup, bool):
+        raise TypeError("dsa_offload.enable_turbo_lookup must be a boolean.")
+    enable_turbo_prefetch_lookup = raw_config.get(
+        "enable_turbo_prefetch_lookup",
+        True,
+    )
+    if not isinstance(enable_turbo_prefetch_lookup, bool):
+        raise TypeError(
+            "dsa_offload.enable_turbo_prefetch_lookup must be a boolean."
+        )
+
     from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
     if get_ascend_device_type() != AscendDeviceType.A5:
         raise ValueError("DSA Offload requires Ascend A5.")
 
     model_config = vllm_config.model_config
+    if enable_prefetch and not bool(getattr(model_config, "enforce_eager", False)):
+        raise ValueError("DSA Offload hidden-state prefetch requires eager execution.")
     hf_config = getattr(model_config, "hf_text_config", None)
     if hf_config is None:
         hf_config = model_config.hf_config
@@ -122,6 +153,10 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
         max_verify_tokens_per_request=max_verify_tokens,
         kv_role=kv_role,
         kv_transfer_config=kv_transfer_config,
+        enable_prefetch_with_hidden_states=enable_prefetch,
+        prefetch_top_k=prefetch_top_k,
+        enable_turbo_lookup=enable_turbo_lookup,
+        enable_turbo_prefetch_lookup=enable_turbo_prefetch_lookup,
     )
 
 

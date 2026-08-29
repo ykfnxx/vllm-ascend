@@ -157,10 +157,18 @@ def fixed_memory_bytes(
     layout: HotCacheLayout,
     target_specs: Sequence[object],
     cohort_count: int,
+    prefetch_layer_count: int = 0,
 ) -> int:
     hot_payload_bytes = sum(layout.hot_blocks * spec.page_size_bytes for spec in target_specs)
     lookup_ints = layout.max_num_seqs * (INDEX_CAPACITY + LOOKUP_SLOTS + REPLACEABLE_SLOTS + FREE_HEAD_STRIDE)
-    return hot_payload_bytes + cohort_count * lookup_ints * 4
+    storage_id_blocks = _cdiv(INDEX_CAPACITY, layout.block_size)
+    storage_id_bytes = (
+        prefetch_layer_count
+        * layout.max_num_seqs
+        * storage_id_blocks
+        * 8
+    )
+    return hot_payload_bytes + cohort_count * lookup_ints * 4 + storage_id_bytes
 
 
 def resize_target_tensors(

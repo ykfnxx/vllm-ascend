@@ -82,3 +82,43 @@ def asu_kv_gather(
         block_size,
         request_rows.shape[0],
     )
+
+
+def turbo_lookup_update_batch(
+    state: LookupState,
+    request_rows: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    query_indices: torch.Tensor,
+    lookup_mask: torch.Tensor,
+) -> LookupOutput:
+    return torch.ops._C_ascend.dsa_sparse_turbo_lookup_update_batch(
+        state.index,
+        state.slot_to_index,
+        state.free_slots,
+        state.free_head,
+        request_rows,
+        query_start_loc,
+        query_indices,
+        lookup_mask,
+        request_rows.shape[0],
+    )
+
+
+def turbo_prefetch_lookup_update_batch(
+    state: LookupState,
+    request_rows: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    query_indices: torch.Tensor,
+    lookup_mask: torch.Tensor,
+) -> LookupOutput:
+    return torch.ops._C_ascend.dsa_sparse_turbo_prefetch_lookup_update_batch(
+        state.index,
+        state.slot_to_index,
+        state.free_slots,
+        state.free_head,
+        request_rows,
+        query_start_loc,
+        query_indices,
+        lookup_mask,
+        request_rows.shape[0],
+    )

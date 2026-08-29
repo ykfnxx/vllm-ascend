@@ -47,6 +47,7 @@ class KVIOBackend:
         self._namespace: torch.Tensor | None = None
         self._put_opcode: torch.Tensor | None = None
         self._get_opcode: torch.Tensor | None = None
+        self._io_tail_event: object | None = None
 
     def register_put_cache(
         self,
@@ -278,6 +279,11 @@ class KVIOBackend:
         assert self._task_id is not None
         assert self._model_id_tensor is not None
         assert self._namespace is not None
+        current_stream = None
+        if self._task_id.device.type == "npu":
+            current_stream = torch.npu.current_stream()
+            if self._io_tail_event is not None:
+                current_stream.wait_event(self._io_tail_event)
         io_nums = self._task_id.new_full((1,), cache_ids.numel())
         self._tensor_ops.npu_get_put_batch(
             self._task_id,
@@ -293,6 +299,8 @@ class KVIOBackend:
         )
         self._tensor_ops.npu_send_wait(self._task_id, io_nums)
         self._task_id.add_(1)
+        if current_stream is not None:
+            self._io_tail_event = current_stream.record_event()
 
     def close(self) -> None:
         self._pending_put.clear()
@@ -304,3 +312,4 @@ class KVIOBackend:
         self._namespace = None
         self._put_opcode = None
         self._get_opcode = None
+        self._io_tail_event = None

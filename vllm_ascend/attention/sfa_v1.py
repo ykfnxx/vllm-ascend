@@ -42,6 +42,8 @@ from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.dsa_offload.sfa import (
+    maybe_start_group_prefetch,
+    prepare_indexer_cache_write,
     prepare_main_slot_mapping,
     publish_prefill_layer,
     resolve_sfa_inputs,
@@ -1691,6 +1693,22 @@ class AscendSFAImpl(MLAAttentionImpl):
         num_input_tokens = attn_metadata.num_input_tokens
         output_padded = output
 
+        def start_group_prefetch(source_rows_before_gather: int) -> None:
+            ranked_source_rows = (
+                source_rows_before_gather
+                if self.enable_sp and not self.enable_dsa_cp and need_gather_q_kv
+                else None
+            )
+            maybe_start_group_prefetch(
+                layer_name=layer_name,
+                hidden_states=hidden_states,
+                cos=cos,
+                sin=sin,
+                default_block_table=attn_metadata.block_table,
+                batch=attn_metadata.dsa_offload_batch,
+                source_rows_before_gather=ranked_source_rows,
+            )
+
         # all-gather o_proj weight for prefill stage of PD mix node
         o_proj_full_handle = None
         o_proj_full_param_handles = None
@@ -1705,10 +1723,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             AscendAttentionState.DecodeOnly,
             AscendAttentionState.SpecDecoding,
         ):
+            source_rows_before_gather = hidden_states.shape[0]
             if self.enable_sp:
                 hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     hidden_states.contiguous(), need_gather_q_kv
                 )
+            start_group_prefetch(source_rows_before_gather)
             assert slot_mapping.numel() == hidden_states.shape[0], (
                 "SFA Prolog V3 requires one cache index per input token, "
                 f"got token_x={hidden_states.shape[0]} and cache_index={slot_mapping.numel()}."
@@ -1733,9 +1753,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         elif self.enable_mlapo and (
             get_ascend_device_type() == AscendDeviceType.A5 or num_input_tokens <= MLAPO_MAX_SUPPORTED_TOKENS
         ):
+            source_rows_before_gather = hidden_states.shape[0]
             hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                 hidden_states.contiguous(), need_gather_q_kv
             )
+            start_group_prefetch(source_rows_before_gather)
             hidden_states, ql_nope, q_pe, q_c = self._sfa_preprocess_with_mlapo(
                 hidden_states=hidden_states,
                 kv_cache=kv_cache,
@@ -1760,10 +1782,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
                 inputs=self.fused_qkv_a_proj.weight, dependency=hidden_states
             )
+            source_rows_before_gather = hidden_states.shape[0]
             if self.enable_sp and not self.enable_dsa_cp:
                 hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(
                     hidden_states.contiguous(), need_gather_q_kv
                 )
+            start_group_prefetch(source_rows_before_gather)
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             q_c, kv_no_split = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
@@ -1931,7 +1955,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                 dsa_k_cache_idx = 2
                 dsa_k_scale_cache_idx = 3
 
-            if get_ascend_config().c8_enable_reshape_optim:
+            key_mean_written = prepare_indexer_cache_write(
+                layer_name=layer_name,
+                key_cache=kv_cache[dsa_k_cache_idx],
+                indexer_cache=tuple(self.indexer.k_cache.kv_cache),
+                enable_sparse_li_c8=self.enable_sparse_li_c8,
+                slot_mapping=slot_mapping,
+                key=k_li,
+                block_size=int(kv_cache[dsa_k_cache_idx].shape[1]),
+                batch=attn_metadata.dsa_offload_batch,
+            )
+            if not key_mean_written and get_ascend_config().c8_enable_reshape_optim:
                 torch.ops._C_ascend.store_kv_block(
                     k_li,
                     kv_cache[dsa_k_cache_idx],
@@ -1940,7 +1974,7 @@ class AscendSFAImpl(MLAAttentionImpl):
                     attn_metadata.group_key_cache_idx,
                     attn_metadata.block_size,
                 )
-            else:
+            elif not key_mean_written:
                 torch_npu.npu_scatter_nd_update_(
                     kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
                     slot_mapping.view(-1, 1),

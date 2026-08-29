@@ -149,6 +149,9 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "scatter_nd_update_v2"
         "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
         "lightning_indexer"
+        "lightning_indexer_hi_cached"
+        "scatter_nd_update_mean"
+        "prefetch_qli_fusion"
         "sparse_flash_attention"
         "kv_quant_sparse_flash_attention"
         "dispatch_ffn_combine"
@@ -224,6 +227,11 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "dsa_offload_lookup_update"
         "dsa_offload_lookup_update_batch"
         "asu_kv_gather"
+        "dsa_sparse_turbo_lookup_update_batch"
+        "dsa_sparse_turbo_prefetch_lookup_update_batch"
+        "lightning_indexer_hi_cached"
+        "scatter_nd_update_mean"
+        "prefetch_qli_fusion"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -258,6 +266,10 @@ log_selected_ops
   log "subshell cwd after cd=$(pwd)"
   log "preserving csrc/build and cleaning output dirs"
   rm -rf -- output build_out
+
+  # Refresh generated metadata for the selected operator set.
+  rm -f -- "build/binary/${SOC_ARG}/bin/binary_info_config.json" \
+          "build/binary/${SOC_ARG}/bin/relocatable_kernel_info_config.json"
 
   : "${CUSTOM_OPS:?CUSTOM_OPS is not set}"
   : "${SOC_VERSION:?SOC_VERSION is not set}"

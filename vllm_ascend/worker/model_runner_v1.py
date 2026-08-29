@@ -222,6 +222,14 @@ from vllm_ascend.dsa_offload.pd import (
     admit_local_from_prefill,
     validate_handoff,
 )
+from vllm_ascend.dsa_offload.prefetch import (
+    GroupedPrefetchRuntime,
+    create_grouped_prefetch_runtime,
+)
+from vllm_ascend.dsa_offload.prefetch_coefficients import (
+    PREFETCH_GROUP_SIZE,
+    get_active_prefetch_groups,
+)
 from vllm_ascend.dsa_offload.sfa import SFAAddressingWorkspace
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -375,6 +383,8 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_offload_committed_hashes: dict[str, list[bytes]] = {}
         self._dsa_offload_candidate_hashes: dict[str, list[bytes]] = {}
         self._dsa_offload_batch = None
+        self._dsa_offload_ordered_layers = ()
+        self._dsa_offload_prefetch_runtime: GroupedPrefetchRuntime | None = None
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -763,6 +773,16 @@ class NPUModelRunner(GPUModelRunner):
             layout,
             tuple(self._dsa_offload_main_specs.values()),
             len(self._dsa_offload_cohorts),
+            (
+                len(
+                    get_active_prefetch_groups(
+                        self.model_config.hf_text_config.num_hidden_layers
+                    )
+                )
+                * PREFETCH_GROUP_SIZE
+                if config.enable_prefetch_with_hidden_states
+                else 0
+            ),
         )
 
     def validate_dsa_offload_cache(self) -> None:
@@ -787,6 +807,7 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_offload_committed_hashes = {}
         self._dsa_offload_candidate_hashes = {}
         self._dsa_offload_batch = None
+        self._dsa_offload_prefetch_runtime = None
         super().shutdown()
 
     def _initialize_dsa_offload(
@@ -877,6 +898,16 @@ class NPUModelRunner(GPUModelRunner):
                     ),
                     self.compilation_config.cudagraph_mode.name,
                 )
+        self._dsa_offload_prefetch_runtime = create_grouped_prefetch_runtime(
+            config=config,
+            num_hidden_layers=self.model_config.hf_text_config.num_hidden_layers,
+            ordered_layers=self._dsa_offload_ordered_layers,
+            cohorts=self._dsa_offload_cohorts,
+            quant_config=self.vllm_config.quant_config,
+            max_num_seqs=self.max_num_reqs,
+            block_size=self.block_size,
+            device=self.device,
+        )
 
     def _record_dsa_offload_metadata(
         self,
@@ -1020,6 +1051,8 @@ class NPUModelRunner(GPUModelRunner):
             if hot_cache is not None and request_id in hot_cache.request_to_row:
                 row_id = hot_cache.request_to_row[request_id]
                 clear_lookup_row(self._dsa_offload_lookup_states, row_id)
+                if self._dsa_offload_prefetch_runtime is not None:
+                    self._dsa_offload_prefetch_runtime.clear_request_row(row_id)
                 hot_cache.release(request_id)
             self._dsa_offload_handoffs.pop(request_id, None)
             self._dsa_offload_committed_hashes.pop(request_id, None)
@@ -1080,11 +1113,18 @@ class NPUModelRunner(GPUModelRunner):
             candidate_block_hashes=self._dsa_offload_candidate_hashes,
             prefill_state=prefill_state,
             sfa_workspace=self._dsa_offload_sfa_workspace,
+            prefetch_runtime=self._dsa_offload_prefetch_runtime,
+            enable_turbo_lookup=config.enable_turbo_lookup,
+            enable_turbo_prefetch_lookup=(
+                config.enable_turbo_prefetch_lookup
+            ),
         )
         graph_rows = self._dsa_offload_graph_request_rows
         if graph_rows is not None:
             graph_rows[: batch.request_rows.shape[0]].copy_(batch.request_rows)
             batch.request_rows = graph_rows[: batch.request_rows.shape[0]]
+        if self._dsa_offload_prefetch_runtime is not None:
+            self._dsa_offload_prefetch_runtime.update_storage_ids(batch)
         return batch
 
     def _make_dsa_offload_graph_batch(
@@ -4719,6 +4759,15 @@ class NPUModelRunner(GPUModelRunner):
                         * current_kv_cache_spec.head_size
                         * get_dtype_size(current_kv_cache_spec.dtype)
                     )
+                    mean_tensor_size = (
+                        num_blocks
+                        * current_kv_cache_spec.sfa_dcp_replicated_indexer_size
+                        * current_kv_cache_spec.num_kv_heads
+                        * current_kv_cache_spec.head_size
+                        * get_dtype_size(current_kv_cache_spec.dtype)
+                        if current_kv_cache_spec.key_mean_cache
+                        else 0
+                    )
                     if current_kv_cache_spec.scale_dim:
                         scale_tensor_size = (
                             num_blocks
@@ -4738,6 +4787,14 @@ class NPUModelRunner(GPUModelRunner):
                         raw_cache = (
                             self._allocate_int8_cache_tensor(
                                 k_tensor_size,
+                                alignment,
+                            ),
+                        )
+                    if mean_tensor_size:
+                        raw_cache = (
+                            *raw_cache,
+                            self._allocate_int8_cache_tensor(
+                                mean_tensor_size,
                                 alignment,
                             ),
                         )
@@ -4928,12 +4985,21 @@ class NPUModelRunner(GPUModelRunner):
                     kv_caches[layer_name] = kv_cache
                 elif isinstance(current_kv_cache_spec, AscendSFAIndexerCacheSpec):
                     raw_cache = kv_cache_raw_tensors[layer_name]
+                    raw_index = 0
+                    raw_k_tensor = raw_cache[raw_index]
+                    raw_index += 1
+                    raw_scale_tensor = None
                     if current_kv_cache_spec.scale_dim:
-                        raw_k_tensor, raw_scale_tensor = raw_cache
-                        sum_page_size_bytes = raw_k_tensor.numel() + raw_scale_tensor.numel()
-                    else:
-                        (raw_k_tensor,) = raw_cache
-                        sum_page_size_bytes = raw_k_tensor.numel()
+                        raw_scale_tensor = raw_cache[raw_index]
+                        raw_index += 1
+                    raw_mean_tensor = None
+                    if current_kv_cache_spec.key_mean_cache:
+                        raw_mean_tensor = raw_cache[raw_index]
+                        raw_index += 1
+                    assert raw_index == len(raw_cache)
+                    sum_page_size_bytes = sum(
+                        tensor.numel() for tensor in raw_cache
+                    )
                     assert sum_page_size_bytes % current_kv_cache_spec.page_size_bytes == 0
                     num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes
                     assert num_blocks >= kv_cache_config.num_blocks
@@ -4944,7 +5010,8 @@ class NPUModelRunner(GPUModelRunner):
                         current_kv_cache_spec.head_size,
                     )
                     indexer_k_cache = raw_k_tensor.view(current_kv_cache_spec.dtype).view(kv_cache_shape)
-                    if current_kv_cache_spec.scale_dim:
+                    cache_tensors: list[torch.Tensor] = [indexer_k_cache]
+                    if raw_scale_tensor is not None:
                         scale_cache_shape = attn_backend.get_kv_cache_shape(
                             num_blocks * current_kv_cache_spec.sfa_dcp_replicated_indexer_size,
                             current_kv_cache_spec.block_size,
@@ -4954,9 +5021,21 @@ class NPUModelRunner(GPUModelRunner):
                         indexer_scale_cache = raw_scale_tensor.view(
                             current_kv_cache_spec.scale_dtype
                         ).view(scale_cache_shape)
-                        kv_caches[layer_name] = (indexer_k_cache, indexer_scale_cache)
-                    else:
-                        kv_caches[layer_name] = (indexer_k_cache,)
+                        cache_tensors.append(indexer_scale_cache)
+                    if raw_mean_tensor is not None:
+                        mean_cache_shape = (
+                            num_blocks
+                            * current_kv_cache_spec.sfa_dcp_replicated_indexer_size,
+                            1,
+                            current_kv_cache_spec.num_kv_heads,
+                            current_kv_cache_spec.head_size,
+                        )
+                        cache_tensors.append(
+                            raw_mean_tensor.view(
+                                current_kv_cache_spec.dtype
+                            ).view(mean_cache_shape)
+                        )
+                    kv_caches[layer_name] = tuple(cache_tensors)
                 elif isinstance(current_kv_cache_spec, AttentionSpec):
                     # cache_only_layers (extract_hidden_states) are allocated
                     # as a single tensor by the branch at the top of
@@ -5375,6 +5454,18 @@ class NPUModelRunner(GPUModelRunner):
         kv_cache_spec: dict[str, list[KVCacheSpec]] = defaultdict(list)
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        prefetch_target_layer_ids: frozenset[int] = frozenset()
+        if (
+            self.dsa_offload_config is not None
+            and self.dsa_offload_config.enable_prefetch_with_hidden_states
+        ):
+            prefetch_target_layer_ids = frozenset(
+                get_active_prefetch_groups(
+                    self.model_config.hf_text_config.num_hidden_layers
+                ).values()
+            )
 
         # NOTE: Must process Attention/MLAAttention before MambaBase to maintain
         # ordering expected by graph parameter update logic in attention backends.
@@ -5442,6 +5533,11 @@ class NPUModelRunner(GPUModelRunner):
 
             elif isinstance(attn_module, DeepseekV32IndexerCache):
                 cache_sparse_li_c8 = self.ascend_config.is_sparse_li_c8_layer(layer_name)
+                key_mean_cache = (
+                    not cache_sparse_li_c8
+                    and extract_layer_index(layer_name)
+                    in prefetch_target_layer_ids
+                )
                 kv_cache_spec[layer_name] = AscendSFAIndexerCacheSpec(
                     block_size=self.block_size,
                     num_kv_heads=1,
@@ -5452,6 +5548,7 @@ class NPUModelRunner(GPUModelRunner):
                     scale_dtype=self.c8_k_scale_cache_dtype if cache_sparse_li_c8 else torch.int8,
                     cache_sparse_li_c8=cache_sparse_li_c8,
                     sfa_dcp_replicated_indexer_size=self.sfa_dcp_replicated_indexer_size,
+                    key_mean_cache=key_mean_cache,
                 )
 
             elif isinstance(attn_module, MambaBase):
@@ -5488,8 +5585,6 @@ class NPUModelRunner(GPUModelRunner):
                     object.__setattr__(kv_cache_spec[layer_name], "page_size_padded", mamba_page_size_padded)
 
         if self.dsa_offload_config is not None:
-            from vllm.model_executor.models.utils import extract_layer_index
-
             target_layer_count = self.model_config.hf_text_config.num_hidden_layers
             target_layers = sorted(
                 (
@@ -5505,6 +5600,10 @@ class NPUModelRunner(GPUModelRunner):
                 layer_name: kv_cache_spec[layer_name]
                 for _, layer_name, _ in target_layers
             }
+            self._dsa_offload_ordered_layers = tuple(
+                (layer_name, layer_index, attn_module.impl)
+                for layer_index, layer_name, attn_module in target_layers
+            )
             self._dsa_offload_cohorts = scan_index_cache_cohorts(
                 tuple(
                     (

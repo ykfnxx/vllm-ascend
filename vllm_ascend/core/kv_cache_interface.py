@@ -95,6 +95,7 @@ class AscendSFAIndexerCacheSpec(FullAttentionSpec):
     cache_sparse_li_c8: bool = False
     cache_dtype_str: str | None = None
     sfa_dcp_replicated_indexer_size: int = 1
+    key_mean_cache: bool = False
 
     @property
     def page_size_bytes(self) -> int:
@@ -103,10 +104,13 @@ class AscendSFAIndexerCacheSpec(FullAttentionSpec):
     @property
     def real_page_size_bytes(self) -> int:
         num_heads_per_page = self.block_size * self.num_kv_heads
-        return (
-            self.sfa_dcp_replicated_indexer_size
-            * num_heads_per_page
+        mean_elements_per_page = self.num_kv_heads if self.key_mean_cache else 0
+        return self.sfa_dcp_replicated_indexer_size * (
+            num_heads_per_page
             * (self.head_size * get_dtype_size(self.dtype) + self.scale_dim * get_dtype_size(self.scale_dtype))
+            + mean_elements_per_page
+            * self.head_size
+            * get_dtype_size(self.dtype)
         )
 
     @classmethod
@@ -125,6 +129,7 @@ class AscendSFAIndexerCacheSpec(FullAttentionSpec):
                 spec.cache_dtype_str,
                 spec.cache_sparse_li_c8,
                 spec.sfa_dcp_replicated_indexer_size,
+                spec.key_mean_cache,
             )
             for spec in specs
         }
@@ -141,6 +146,7 @@ class AscendSFAIndexerCacheSpec(FullAttentionSpec):
             cache_dtype_str=specs[0].cache_dtype_str,
             cache_sparse_li_c8=specs[0].cache_sparse_li_c8,
             sfa_dcp_replicated_indexer_size=specs[0].sfa_dcp_replicated_indexer_size,
+            key_mean_cache=specs[0].key_mean_cache,
         )
 
 
