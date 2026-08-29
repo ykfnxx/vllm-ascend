@@ -42,6 +42,8 @@ MAX_TOKENS="4"
 MAX_MODEL_LEN="4096"
 BLOCK_SIZE="128"
 MTP_SPECULATIVE_TOKENS="0"
+ENABLE_PREFETCH_WITH_HIDDEN_STATES="0"
+PREFETCH_TOP_K="2048"
 GPU_MEMORY_UTILIZATION="0.50"
 STARTUP_TIMEOUT="900"
 LOG_DIR=""
@@ -80,6 +82,10 @@ Core options:
   --prompt-token-id ID        Repeated vocabulary token ID. Default: 100
   --max-tokens N              Decode tokens for the main workload. Default: 4
   --mtp-speculative-tokens N  Enable MTP with N draft tokens, range [0, 15].
+  --enable-prefetch-with-hidden-states
+                              Enable grouped hidden-state prefetch on Decode.
+  --prefetch-top-k N          Predicted Top-K width, range [128, 2048].
+                              Default: 2048
   --max-model-len N           Context limit. Default: 4096
   --block-size N               Force one known block size. Default: 128
   --gpu-memory-utilization F  Per-engine NPU memory fraction. Default: 0.50
@@ -120,6 +126,8 @@ Validation boundary:
   full-block PUT or token GET. With --connector none it validates local cache
   promotion only at the control-path level. kvio adds real capacity-layer
   PUT/GET; output accuracy still needs a known-good baseline comparison.
+  With hidden-state prefetch enabled, --verify-path additionally requires the
+  predicted LightningIndexer and the MTP prefetch lookup when MTP is enabled.
 EOF
 }
 
@@ -252,6 +260,15 @@ while (($# > 0)); do
             MTP_SPECULATIVE_TOKENS="$2"
             shift 2
             ;;
+        --enable-prefetch-with-hidden-states)
+            ENABLE_PREFETCH_WITH_HIDDEN_STATES="1"
+            shift
+            ;;
+        --prefetch-top-k)
+            require_value "$@"
+            PREFETCH_TOP_K="$2"
+            shift 2
+            ;;
         --max-model-len)
             require_value "$@"
             MAX_MODEL_LEN="$2"
@@ -356,6 +373,7 @@ for value_and_name in \
     "$PROMPT_TOKEN_ID:prompt-token-id" \
     "$MAX_TOKENS:max-tokens" \
     "$MTP_SPECULATIVE_TOKENS:mtp-speculative-tokens" \
+    "$PREFETCH_TOP_K:prefetch-top-k" \
     "$MAX_MODEL_LEN:max-model-len" \
     "$BLOCK_SIZE:block-size" \
     "$STARTUP_TIMEOUT:startup-timeout"; do
@@ -369,6 +387,10 @@ fi
 
 if ((MTP_SPECULATIVE_TOKENS > 15)); then
     echo "mtp-speculative-tokens must be in [0, 15]." >&2
+    exit 2
+fi
+if ((PREFETCH_TOP_K < 128 || PREFETCH_TOP_K > 2048)); then
+    echo "prefetch-top-k must be in [128, 2048]." >&2
     exit 2
 fi
 if ((BLOCK_SIZE == 0 || MAX_TOKENS == 0)); then
@@ -421,7 +443,8 @@ PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
     "$MODEL" \
     "$IO_BACKEND" \
     "$PROMPT_TOKEN_ID" \
-    "$MTP_SPECULATIVE_TOKENS" <<'PY'
+    "$MTP_SPECULATIVE_TOKENS" \
+    "$ENABLE_PREFETCH_WITH_HIDDEN_STATES" <<'PY'
 from __future__ import annotations
 
 import importlib
@@ -434,6 +457,7 @@ model_name = sys.argv[2]
 io_backend = sys.argv[3]
 prompt_token_id = int(sys.argv[4])
 mtp_tokens = int(sys.argv[5])
+prefetch_enabled = bool(int(sys.argv[6]))
 
 model_path = Path(model_name)
 if model_path.is_dir() and (model_path / "config.json").is_file():
@@ -488,7 +512,17 @@ namespace = torch.ops._C_ascend
 required_ops = [
     "dsa_offload_lookup_update",
     "dsa_offload_lookup_update_batch",
+    "dsa_sparse_turbo_lookup_update_batch",
 ]
+if prefetch_enabled:
+    required_ops.extend(
+        [
+            "dsa_sparse_turbo_prefetch_lookup_update_batch",
+            "npu_lightning_indexer_hi_cached",
+            "npu_scatter_nd_update_mean",
+            "prefetch_qli_fusion",
+        ]
+    )
 if io_backend == "kvio":
     required_ops.extend(["npu_get_put_batch", "npu_send_wait"])
     rdma_kv_ops = importlib.import_module("rdma_kv_ops")
@@ -512,6 +546,7 @@ print(
                 "num_nextn_predict_layers", 0
             ),
             "io_backend": io_backend,
+            "enable_prefetch_with_hidden_states": prefetch_enabled,
             "vllm_ascend": str(package_path),
             "native_ops": required_ops,
         },
@@ -542,7 +577,9 @@ python3 - \
     "$ALIGNED_PROMPT_TOKENS" \
     "$TAIL_PROMPT_TOKENS" \
     "$MAX_TOKENS" \
-    "$MTP_SPECULATIVE_TOKENS" <<'PY'
+    "$MTP_SPECULATIVE_TOKENS" \
+    "$ENABLE_PREFETCH_WITH_HIDDEN_STATES" \
+    "$PREFETCH_TOP_K" <<'PY'
 import json
 import sys
 
@@ -560,6 +597,8 @@ import sys
     tail_prompt_tokens,
     max_tokens,
     mtp_speculative_tokens,
+    enable_prefetch_with_hidden_states,
+    prefetch_top_k,
 ) = sys.argv[1:]
 manifest = {
     "branch": branch,
@@ -574,6 +613,10 @@ manifest = {
     "tail_prompt_tokens": int(tail_prompt_tokens),
     "max_tokens": int(max_tokens),
     "mtp_speculative_tokens": int(mtp_speculative_tokens),
+    "enable_prefetch_with_hidden_states": bool(
+        int(enable_prefetch_with_hidden_states)
+    ),
+    "prefetch_top_k": int(prefetch_top_k),
 }
 with open(output_path, "w", encoding="utf-8") as output_file:
     json.dump(manifest, output_file, indent=2, sort_keys=True)
@@ -653,8 +696,6 @@ COMMON_NETWORK_ENV=(
     "OMP_NUM_THREADS=1"
 )
 
-DSA_CONFIG="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_offload\":{\"io_backend\":\"$IO_BACKEND\",\"kvio_model_id\":$KVIO_MODEL_ID}}"
-
 LAST_PID=""
 launch_server() {
     local service_name="$1"
@@ -668,6 +709,8 @@ launch_server() {
     local speculative_tokens="$9"
     local kv_config
     local profiler_config
+    local prefetch_enabled="false"
+    local dsa_config
     local -a kv_transfer_args=()
     local -a profiler_args=()
     local -a speculative_args=()
@@ -726,7 +769,13 @@ PY
             "{\"method\":\"mtp\",\"num_speculative_tokens\":$speculative_tokens}"
         )
     fi
-    if [[ "$VERIFY_PATH" == "1" ]]; then
+    if [[ "$kv_role" != "kv_producer" \
+        && "$ENABLE_PREFETCH_WITH_HIDDEN_STATES" == "1" ]]; then
+        prefetch_enabled="true"
+    fi
+    dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_offload\":{\"io_backend\":\"$IO_BACKEND\",\"kvio_model_id\":$KVIO_MODEL_ID,\"enable_prefetch_with_hidden_states\":$prefetch_enabled,\"prefetch_top_k\":$PREFETCH_TOP_K}}"
+    if [[ "$VERIFY_PATH" == "1" ]] \
+        && [[ "$kv_role" != "kv_producer" || "$IO_BACKEND" == "kvio" ]]; then
         mkdir -p "$profile_dir"
         profiler_config="$(python3 - "$profile_dir" <<'PY'
 import json
@@ -748,6 +797,7 @@ PY
     fi
 
     echo "Starting $service_name on physical NPU $device_id..."
+    echo "  hidden_state_prefetch=$prefetch_enabled prefetch_top_k=$PREFETCH_TOP_K"
     env \
         "${COMMON_NETWORK_ENV[@]}" \
         "ASCEND_RT_VISIBLE_DEVICES=$device_id" \
@@ -755,6 +805,7 @@ PY
         --host 0.0.0.0 \
         --port "$http_port" \
         --served-model-name "$SERVED_MODEL_NAME" \
+        --quantization ascend \
         --tensor-parallel-size 1 \
         --block-size "$BLOCK_SIZE" \
         --max-model-len "$MAX_MODEL_LEN" \
@@ -766,7 +817,7 @@ PY
         --enforce-eager \
         --no-enable-prefix-caching \
         --compilation-config '{"cudagraph_mode":"NONE"}' \
-        --additional-config "$DSA_CONFIG" \
+        --additional-config "$dsa_config" \
         "${kv_transfer_args[@]}" \
         "${speculative_args[@]}" \
         "${profiler_args[@]}" \
@@ -1047,6 +1098,8 @@ PY
     python3 - \
         "$SCENARIO" \
         "$IO_BACKEND" \
+        "$ENABLE_PREFETCH_WITH_HIDDEN_STATES" \
+        "$MTP_SPECULATIVE_TOKENS" \
         "$PREFILL_PROFILE_DIR" \
         "$DECODE_PROFILE_DIR" \
         "$BOTH_PROFILE_DIR" <<'PY'
@@ -1056,7 +1109,17 @@ import re
 import sys
 from pathlib import Path
 
-scenario, io_backend, prefill_raw, decode_raw, both_raw = sys.argv[1:]
+(
+    scenario,
+    io_backend,
+    prefetch_enabled_raw,
+    mtp_speculative_tokens_raw,
+    prefill_raw,
+    decode_raw,
+    both_raw,
+) = sys.argv[1:]
+prefetch_enabled = bool(int(prefetch_enabled_raw))
+mtp_enabled = int(mtp_speculative_tokens_raw) > 0
 profile_files = {
     "Prefill": Path(prefill_raw),
     "Decode": Path(decode_raw),
@@ -1102,6 +1165,8 @@ require_any(
         "dsaoffloadlookupupdate",
         "aclndsaoffloadlookupupdatebatch",
         "aclndsaoffloadlookupupdate",
+        "dsasparseturbolookupupdatebatch",
+        "aclndsasparseturbolookupupdatebatch",
     ),
     f"{decode_name} DSA lookup/update",
 )
@@ -1110,6 +1175,27 @@ require_any(
     ("sparseflashattention", "nputsparseflashattention"),
     f"{decode_name} Sparse Flash Attention",
 )
+
+if prefetch_enabled and mtp_enabled:
+    require_any(
+        decode_profile,
+        (
+            "dsasparseturboprefetchlookupupdatebatch",
+            "aclndsasparseturboprefetchlookupupdatebatch",
+        ),
+        f"{decode_name} DSA predicted prefetch lookup/update",
+    )
+if prefetch_enabled:
+    require_any(
+        decode_profile,
+        (
+            "npulightningindexerhicached",
+            "lightningindexerhicached",
+            "npuquantlightningindexer",
+            "quantlightningindexer",
+        ),
+        f"{decode_name} predicted LightningIndexer",
+    )
 
 if io_backend == "kvio":
     require_any(
@@ -1127,6 +1213,11 @@ if io_backend == "kvio":
 
 print(
     "PASS: profiler contains DSA lookup/update and Sparse Flash Attention"
+    + (
+        " plus grouped hidden-state prefetch"
+        if prefetch_enabled
+        else ""
+    )
     + (" plus KVIO PUT/GET" if io_backend == "kvio" else "")
 )
 PY
@@ -1134,6 +1225,14 @@ fi
 
 echo
 echo "PASS: DSA Offload $SCENARIO scenario completed with connector=$CONNECTOR and io_backend=$IO_BACKEND."
+if [[ "$ENABLE_PREFETCH_WITH_HIDDEN_STATES" == "1" ]]; then
+    if [[ "$VERIFY_PATH" == "1" ]]; then
+        echo "VALIDATED: grouped hidden-state prefetch lookup and Indexer execution with prefetch_top_k=$PREFETCH_TOP_K."
+    else
+        echo "EXERCISED: grouped hidden-state prefetch with prefetch_top_k=$PREFETCH_TOP_K."
+        echo "STILL NEEDED: rerun with --verify-path for prefetch operator evidence."
+    fi
+fi
 if [[ "$IO_BACKEND" == "mock" ]]; then
     echo "VALIDATED: config/bootstrap, request lifecycle, lookup, Hot Cache/SFA path, and role-specific control flow."
     echo "NOT VALIDATED: capacity-layer full-block PUT/token GET or output accuracy; rerun with --io-backend kvio."
