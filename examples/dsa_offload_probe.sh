@@ -44,6 +44,7 @@ BLOCK_SIZE="128"
 MTP_SPECULATIVE_TOKENS="0"
 ENABLE_PREFETCH_WITH_HIDDEN_STATES="0"
 PREFETCH_TOP_K="2048"
+CUDAGRAPH_MODE="FULL_DECODE_ONLY"
 GPU_MEMORY_UTILIZATION="0.50"
 STARTUP_TIMEOUT="900"
 LOG_DIR=""
@@ -86,6 +87,8 @@ Core options:
                               Enable grouped hidden-state prefetch on Decode.
   --prefetch-top-k N          Predicted Top-K width, range [128, 2048].
                               Default: 2048
+  --cudagraph-mode MODE       FULL_DECODE_ONLY or NONE.
+                              Default: FULL_DECODE_ONLY
   --max-model-len N           Context limit. Default: 4096
   --block-size N               Force one known block size. Default: 128
   --gpu-memory-utilization F  Per-engine NPU memory fraction. Default: 0.50
@@ -128,7 +131,7 @@ Validation boundary:
   PUT/GET. kvgather_sim invokes ASU KV Gather with synthetic zero source
   blocks. Output accuracy still needs a known-good baseline comparison.
   With hidden-state prefetch enabled, --verify-path additionally requires the
-  predicted LightningIndexer and the MTP prefetch lookup when MTP is enabled.
+  predicted LightningIndexer and, with MTP, turbo prefetch LookupUpdate.
 EOF
 }
 
@@ -270,6 +273,11 @@ while (($# > 0)); do
             PREFETCH_TOP_K="$2"
             shift 2
             ;;
+        --cudagraph-mode)
+            require_value "$@"
+            CUDAGRAPH_MODE="$2"
+            shift 2
+            ;;
         --max-model-len)
             require_value "$@"
             MAX_MODEL_LEN="$2"
@@ -341,6 +349,16 @@ fi
 if [[ "$IO_BACKEND" != "mock" && "$IO_BACKEND" != "kvio" && \
       "$IO_BACKEND" != "kvgather_sim" ]]; then
     echo "--io-backend must be 'mock', 'kvio', or 'kvgather_sim'." >&2
+    exit 2
+fi
+if [[ "$CUDAGRAPH_MODE" != "FULL_DECODE_ONLY" && \
+      "$CUDAGRAPH_MODE" != "NONE" ]]; then
+    echo "--cudagraph-mode must be 'FULL_DECODE_ONLY' or 'NONE'." >&2
+    exit 2
+fi
+if [[ "$IO_BACKEND" == "kvio" && \
+      "$CUDAGRAPH_MODE" == "FULL_DECODE_ONLY" ]]; then
+    echo "kvio uses dynamic compact GET metadata and does not support FULL_DECODE_ONLY; use --cudagraph-mode NONE." >&2
     exit 2
 fi
 if [[ "$CONNECTOR" != "mooncake" && "$CONNECTOR" != "local-shm" && "$CONNECTOR" != "none" ]]; then
@@ -513,18 +531,22 @@ importlib.import_module("vllm_ascend.vllm_ascend_C")
 namespace = torch.ops._C_ascend
 required_ops = [
     "dsa_offload_lookup_update",
-    "dsa_offload_lookup_update_batch",
-    "dsa_sparse_turbo_lookup_update_batch",
 ]
-if prefetch_enabled:
+if mtp_tokens:
     required_ops.extend(
         [
-            "dsa_sparse_turbo_prefetch_lookup_update_batch",
-            "npu_lightning_indexer_hi_cached",
-            "npu_scatter_nd_update_mean",
-            "prefetch_qli_fusion",
+            "dsa_offload_lookup_update_batch",
+            "dsa_sparse_turbo_lookup_update_batch",
         ]
     )
+if prefetch_enabled:
+    required_ops.extend([
+        "npu_lightning_indexer_hi_cached",
+        "npu_scatter_nd_update_mean",
+        "prefetch_qli_fusion",
+    ])
+    if mtp_tokens:
+        required_ops.append("dsa_sparse_turbo_prefetch_lookup_update_batch")
 if io_backend == "kvio":
     required_ops.extend(["npu_get_put_batch", "npu_send_wait"])
     rdma_kv_ops = importlib.import_module("rdma_kv_ops")
@@ -801,7 +823,7 @@ PY
     fi
 
     echo "Starting $service_name on physical NPU $device_id..."
-    echo "  hidden_state_prefetch=$prefetch_enabled prefetch_top_k=$PREFETCH_TOP_K"
+    echo "  hidden_state_prefetch=$prefetch_enabled prefetch_top_k=$PREFETCH_TOP_K graph_mode=$CUDAGRAPH_MODE"
     env \
         "${COMMON_NETWORK_ENV[@]}" \
         "ASCEND_RT_VISIBLE_DEVICES=$device_id" \
@@ -819,7 +841,7 @@ PY
         --seed 0 \
         --trust-remote-code \
         --no-enable-prefix-caching \
-        --compilation-config '{"cudagraph_mode":"NONE"}' \
+        --compilation-config "{\"cudagraph_mode\":\"$CUDAGRAPH_MODE\"}" \
         --additional-config "$dsa_config" \
         "${kv_transfer_args[@]}" \
         "${speculative_args[@]}" \
@@ -1065,6 +1087,17 @@ if scenario == "both" and not skip_concurrent:
 PY
 
 if [[ "$VERIFY_PATH" == "1" ]]; then
+    if [[ "$SCENARIO" == "pd" ]]; then
+        GRAPH_REPLAY_LOG="$DECODE_LOG"
+    else
+        GRAPH_REPLAY_LOG="$BOTH_LOG"
+    fi
+    if [[ "$CUDAGRAPH_MODE" == "FULL_DECODE_ONLY" ]] && \
+       ! grep -q "Replaying aclgraph" "$GRAPH_REPLAY_LOG"; then
+        echo "FULL_DECODE_ONLY was configured but ACL Graph replay evidence is missing." >&2
+        tail -n 160 "$GRAPH_REPLAY_LOG" >&2 || true
+        exit 1
+    fi
     echo "Stopping and analyzing runtime profiler(s)..."
     stop_profiles
     for profile_dir in \

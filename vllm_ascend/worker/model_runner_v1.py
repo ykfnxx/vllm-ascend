@@ -214,6 +214,7 @@ from vllm_ascend.dsa_offload.lookup import (
     build_dsa_offload_batch,
     clear_lookup_row,
     create_lookup_states,
+    pack_graph_decode_metadata,
     scan_index_cache_cohorts,
 )
 from vllm_ascend.dsa_offload.pd import (
@@ -377,6 +378,9 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_offload_hot_cache: HotCacheState | None = None
         self._dsa_offload_sfa_workspace: SFAAddressingWorkspace | None = None
         self._dsa_offload_graph_request_rows: torch.Tensor | None = None
+        self._dsa_offload_graph_batches: dict[
+            BatchDescriptor, DSAOffloadBatch
+        ] = {}
         self._dsa_offload_lookup_states = {}
         self._dsa_offload_io = None
         self._dsa_offload_handoffs = {}
@@ -802,6 +806,7 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_offload_hot_cache = None
         self._dsa_offload_sfa_workspace = None
         self._dsa_offload_graph_request_rows = None
+        self._dsa_offload_graph_batches = {}
         self._dsa_offload_lookup_states = {}
         self._dsa_offload_handoffs = {}
         self._dsa_offload_committed_hashes = {}
@@ -817,6 +822,16 @@ class NPUModelRunner(GPUModelRunner):
         config = self.dsa_offload_config
         if config is None:
             return
+        if (
+            config.is_consumer
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            and config.io_backend not in {"mock", "kvgather_sim"}
+        ):
+            raise ValueError(
+                "DSA Offload FULL_DECODE_ONLY requires a fixed-shape I/O "
+                "backend ('mock' or 'kvgather_sim'); kvio uses dynamic "
+                "compact GET metadata and must run with cudagraph_mode=NONE."
+            )
         layout = self._dsa_offload_layout
         assert layout is not None
         layer_caches = {
@@ -880,24 +895,43 @@ class NPUModelRunner(GPUModelRunner):
                 self.device,
             )
             if (
-                config.io_backend == "kvgather_sim"
+                config.io_backend in {"mock", "kvgather_sim"}
                 and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
             ):
+                is_mtp = (
+                    self.speculative_config is not None
+                    and self.speculative_config.method == "mtp"
+                )
+                main_lookup_op = (
+                    "dsa_sparse_turbo_lookup_update_batch"
+                    if is_mtp and config.enable_turbo_lookup
+                    else "dsa_offload_lookup_update_batch"
+                    if is_mtp
+                    else "dsa_offload_lookup_update"
+                )
                 self._dsa_offload_graph_request_rows = torch.arange(
                     self.max_num_reqs,
                     dtype=torch.int32,
                     device=self.device,
                 )
-                logger.info(
-                    "DSA_OFFLOAD_KVGATHER_SIM_GRAPH_ACTIVE "
-                    "lookup=dsa_offload_lookup_update_batch "
-                    "gather=asu_kv_gather mtp=%d graph_mode=%s",
-                    int(
-                        self.speculative_config is not None
-                        and self.speculative_config.method == "mtp"
-                    ),
-                    self.compilation_config.cudagraph_mode.name,
-                )
+                if config.io_backend == "kvgather_sim":
+                    logger.info(
+                        "DSA_OFFLOAD_KVGATHER_SIM_GRAPH_ACTIVE "
+                        "lookup=%s "
+                        "gather=asu_kv_gather mtp=%d graph_mode=%s",
+                        main_lookup_op,
+                        int(is_mtp),
+                        self.compilation_config.cudagraph_mode.name,
+                    )
+                else:
+                    logger.info(
+                        "DSA_OFFLOAD_MOCK_GRAPH_ACTIVE "
+                        "lookup=%s "
+                        "mtp=%d graph_mode=%s",
+                        main_lookup_op,
+                        int(is_mtp),
+                        self.compilation_config.cudagraph_mode.name,
+                    )
         self._dsa_offload_prefetch_runtime = create_grouped_prefetch_runtime(
             config=config,
             num_hidden_layers=self.model_config.hf_text_config.num_hidden_layers,
@@ -908,6 +942,37 @@ class NPUModelRunner(GPUModelRunner):
             block_size=self.block_size,
             device=self.device,
         )
+        if (
+            config.is_consumer
+            and self._dsa_offload_prefetch_runtime is not None
+            and self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+        ):
+            if self._dsa_offload_graph_request_rows is None:
+                raise RuntimeError(
+                    "DSA Offload graph prefetch requires fixed request-row "
+                    "metadata."
+                )
+            is_mtp = (
+                self.speculative_config is not None
+                and self.speculative_config.method == "mtp"
+            )
+            prefetch_lookup_op = (
+                "dsa_sparse_turbo_prefetch_lookup_update_batch"
+                if is_mtp and config.enable_turbo_prefetch_lookup
+                else "dsa_offload_lookup_update_batch"
+                if is_mtp
+                else "dsa_offload_lookup_update"
+            )
+            logger.info(
+                "DSA_OFFLOAD_GRAPH_PREFETCH_ACTIVE "
+                "compute=hidden_state_topk "
+                "lookup=%s "
+                "gather=%s stream=shared",
+                prefetch_lookup_op,
+                "asu_kv_gather"
+                if config.io_backend == "kvgather_sim"
+                else "mock",
+            )
 
     def _record_dsa_offload_metadata(
         self,
@@ -1129,13 +1194,21 @@ class NPUModelRunner(GPUModelRunner):
 
     def _make_dsa_offload_graph_batch(
         self,
+        batch_desc: BatchDescriptor,
         num_reqs: int,
         num_scheduled_tokens: np.ndarray,
         total_num_scheduled_tokens: int,
     ) -> DSAOffloadBatch:
+        existing = self._dsa_offload_graph_batches.get(batch_desc)
+        if existing is not None:
+            existing.lookup_plans.clear()
+            return existing
+
+        config = self.dsa_offload_config
         layout = self._dsa_offload_layout
         hot_cache = self._dsa_offload_hot_cache
         request_rows = self._dsa_offload_graph_request_rows
+        assert config is not None
         assert layout is not None
         assert hot_cache is not None
         assert request_rows is not None
@@ -1144,7 +1217,7 @@ class NPUModelRunner(GPUModelRunner):
         )
         query_ranges = tuple(zip((0, *query_ends[:-1]), query_ends))
         request_ids = tuple(f"graph-{index}" for index in range(num_reqs))
-        return DSAOffloadBatch(
+        graph_batch = DSAOffloadBatch(
             layout=layout,
             hot_cache=hot_cache,
             io_backend=self._dsa_offload_io,
@@ -1168,7 +1241,15 @@ class NPUModelRunner(GPUModelRunner):
                 device=self.device,
             ),
             graph_query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
+            prefetch_runtime=self._dsa_offload_prefetch_runtime,
+            enable_turbo_lookup=config.enable_turbo_lookup,
+            enable_turbo_prefetch_lookup=(
+                config.enable_turbo_prefetch_lookup
+            ),
         )
+        graph_batch.packed_decode = pack_graph_decode_metadata(graph_batch)
+        self._dsa_offload_graph_batches[batch_desc] = graph_batch
+        return graph_batch
 
     def _attach_dsa_offload_batch(
         self,
@@ -4081,6 +4162,7 @@ class NPUModelRunner(GPUModelRunner):
             if self._dsa_offload_graph_request_rows is not None:
                 assert attn_metadata is not None
                 graph_batch = self._make_dsa_offload_graph_batch(
+                    batch_desc,
                     num_reqs,
                     num_scheduled_tokens,
                     num_tokens_unpadded,

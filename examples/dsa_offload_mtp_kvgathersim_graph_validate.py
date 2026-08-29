@@ -15,7 +15,7 @@ PROFILE_FILENAMES = {
 }
 GRAPH_MARKER = (
     "DSA_OFFLOAD_KVGATHER_SIM_GRAPH_ACTIVE "
-    "lookup=dsa_offload_lookup_update_batch "
+    "lookup=dsa_sparse_turbo_lookup_update_batch "
     "gather=asu_kv_gather mtp=1 graph_mode=FULL_DECODE_ONLY"
 )
 
@@ -42,7 +42,7 @@ def _profile_evidence(profile_dir: Path) -> dict[str, bool]:
             reader = csv.reader(profile_file)
             for row in reader:
                 normalized = _normalize(" ".join(row))
-                evidence["lookup_update_batch"] |= "dsaoffloadlookupupdatebatch" in normalized
+                evidence["lookup_update_batch"] |= "dsasparseturbolookupupdatebatch" in normalized
                 evidence["asu_kv_gather"] |= "asukvgather" in normalized
                 evidence["sparse_flash_attention"] |= "sparseflashattention" in normalized
     missing = [name for name, found in evidence.items() if not found]
@@ -106,7 +106,7 @@ def validate(
         "decode_graph": "FULL_DECODE_ONLY",
         "decode_graph_replayed": True,
         "dmp": False,
-        "lookup_operator": "dsa_offload_lookup_update_batch",
+        "lookup_operator": "dsa_sparse_turbo_lookup_update_batch",
         "gather_operator": "asu_kv_gather",
         "gather_source_payload": "synthetic_zero",
         "profile_scope": "decode_only",

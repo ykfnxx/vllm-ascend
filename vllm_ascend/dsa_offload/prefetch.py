@@ -268,7 +268,7 @@ class _PredictionTarget:
         query_lengths = packed.query_start_loc[1:]
         historical_lengths = packed.query_positions[
             packed.query_start_loc[:-1].to(torch.int64)
-        ]
+        ].to(torch.int32)
         decode_block_table = block_table.index_select(
             0,
             packed.request_indices.to(torch.int64),
@@ -341,15 +341,15 @@ class GroupedPrefetchController:
         target_cohort: IndexCacheCohort,
         target: _PredictionTarget,
         storage_ids: Mapping[int, torch.Tensor],
+        stream: object | None,
     ) -> None:
         if len(target_cohort.layer_ids) != PREFETCH_GROUP_SIZE:
             raise ValueError("Grouped prefetch targets must contain four physical layers.")
         self.source_layer_name = source_layer_name
         self.target_cohort = target_cohort
         self.target = target
-        sample = next(iter(storage_ids.values()))
         self._storage_ids = storage_ids
-        self._stream = torch.npu.Stream() if sample.device.type == "npu" else None
+        self._stream = stream
         self._prepared: _PreparedPrefetch | None = None
         self._compute_done_event: object | None = None
         self._ready_event: object | None = None
@@ -518,10 +518,19 @@ class GroupedPrefetchRuntime:
         self._row_hashes: list[tuple[bytes, ...] | None] = [
             None
         ] * max_num_seqs
+        self._prefetch_stream: object | None = None
         self._outgoing: dict[str, GroupedPrefetchController] = {}
         self._incoming: dict[str, GroupedPrefetchController] = {}
         if not config.is_consumer:
             return
+        sample = next(iter(self.storage_ids.values()), None)
+        # Allocate once before graph capture. Every group serializes prediction,
+        # fused prefetch LookupUpdate and Gather on this one graph-stable stream.
+        self._prefetch_stream = (
+            torch.npu.Stream()
+            if sample is not None and sample.device.type == "npu"
+            else None
+        )
         profile = get_prediction_coefficient_profile(quant_config)
         if not isinstance(profile, PredictionCoefficientProfile):
             raise RuntimeError(
@@ -583,6 +592,7 @@ class GroupedPrefetchRuntime:
                 target_cohort=cohort,
                 target=target,
                 storage_ids=self.storage_ids,
+                stream=self._prefetch_stream,
             )
             self._outgoing[source_name] = controller
             self._incoming[target_name] = controller

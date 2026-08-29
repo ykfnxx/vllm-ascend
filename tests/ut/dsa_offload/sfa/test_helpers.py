@@ -14,6 +14,7 @@ from vllm_ascend.dsa_offload.lookup import (
 )
 from vllm_ascend.dsa_offload.sfa import (
     SFAAddressingWorkspace,
+    prepare_indexer_cache_write,
     prepare_main_slot_mapping,
     resolve_sfa_inputs,
 )
@@ -71,6 +72,51 @@ def test_feature_off_returns_original_inputs() -> None:
     assert resolved.sparse_indices is topk
     assert resolved.block_table is table
     assert resolved.actual_seq_lengths_kv is seq_lens
+
+
+def test_prefetch_target_key_write_updates_mean_cache() -> None:
+    runtime = Mock(target_layer_names=frozenset({"target"}))
+    batch = DSAOffloadBatch(
+        layout=HotCacheLayout(4, 1, 2),
+        hot_cache=None,
+        io_backend=Mock(),
+        cohorts=(),
+        lookup_states={},
+        request_ids=("decode",),
+        request_rows=torch.tensor([0], dtype=torch.int32),
+        decode_request_indices=(0,),
+        query_ranges=((0, 1),),
+        query_positions=torch.tensor([8], dtype=torch.int64),
+        is_mtp=False,
+        committed_block_hashes={"decode": []},
+        candidate_block_hashes={},
+        prefetch_runtime=runtime,
+    )
+    key_cache = torch.empty((2, 4, 1, 8))
+    key_mean = torch.empty((2, 1, 1, 8))
+    key = torch.empty((1, 1, 8))
+    slot_mapping = torch.tensor([0], dtype=torch.int64)
+
+    with patch.object(
+        torch.ops._C_ascend,
+        "npu_scatter_nd_update_mean",
+        create=True,
+    ) as update_mean:
+        handled = prepare_indexer_cache_write(
+            layer_name="target",
+            key_cache=key_cache,
+            indexer_cache=(key_cache, key_mean),
+            enable_sparse_li_c8=False,
+            slot_mapping=slot_mapping,
+            key=key,
+            block_size=4,
+            batch=batch,
+        )
+
+    assert handled
+    runtime.wait_for_compute_before_key_write.assert_called_once_with("target")
+    update_mean.assert_called_once()
+    assert update_mean.call_args.args[3] is key_mean
 
 
 def test_mixed_batch_keeps_prefill_mapping_and_redirects_decode_tail(spy_io) -> None:

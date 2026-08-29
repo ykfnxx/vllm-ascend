@@ -41,7 +41,7 @@ def test_graph_profile_validator_accepts_required_runtime_evidence(
     ) as output:
         writer = csv.writer(output)
         writer.writerow(["Name"])
-        writer.writerow(["dsa_offload_lookup_update_batch"])
+        writer.writerow(["dsa_sparse_turbo_lookup_update_batch"])
         writer.writerow(["aclnnAsuKvGather"])
         writer.writerow(["SparseFlashAttention"])
 
