@@ -54,6 +54,7 @@ from vllm_ascend.dsa_offload.scheduler import (
     DSAOffloadAdmissionBudget,
     attach_block_hashes,
     consume_publish_metadata,
+    dsa_offload_consumer_enabled,
     dsa_offload_enabled,
     is_dsa_offload_handoff_request,
 )
@@ -209,7 +210,7 @@ class RecomputeScheduler(Scheduler):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
-        dsa_offload_active = dsa_offload_enabled(self)
+        dsa_offload_active = dsa_offload_consumer_enabled(self)
         dsa_admission_budget = self._dsa_offload_admission_budget
         dsa_admission_budget.sync(set(self.requests))
         # Encoder-related.
@@ -691,10 +692,10 @@ class RecomputeScheduler(Scheduler):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
-                    # DSA keeps the historical Main KV in external storage and
-                    # owns a fixed Hot Cache row. Requiring the full input
-                    # sequence to fit would charge that history a second time.
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl and not is_dsa_request,
+                    # The D scheduler KV-cache view excludes offloaded Main
+                    # MLA. This check therefore charges only the real
+                    # sequence-length-dependent cache (for example Indexer).
+                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
                 )
 
                 if new_blocks is None:

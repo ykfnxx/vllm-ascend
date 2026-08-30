@@ -83,6 +83,19 @@ def test_dsa_handoff_request_detection(monkeypatch) -> None:
     assert not module.is_dsa_offload_handoff_request(SimpleNamespace(kv_transfer_params=None))
 
 
+def test_dsa_admission_path_is_decode_only(monkeypatch) -> None:
+    module, Scheduler = load_scheduler_module(monkeypatch)
+    scheduler = Scheduler()
+    scheduler.vllm_config = SimpleNamespace(
+        additional_config={"dsa_offload": {}},
+        kv_transfer_config=SimpleNamespace(is_kv_consumer=True),
+    )
+    assert module.dsa_offload_consumer_enabled(scheduler)
+
+    scheduler.vllm_config.kv_transfer_config.is_kv_consumer = False
+    assert not module.dsa_offload_consumer_enabled(scheduler)
+
+
 def make_output():
     return SimpleNamespace(
         scheduled_new_reqs=[SimpleNamespace(req_id="new")],

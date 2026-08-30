@@ -182,6 +182,21 @@ def dsa_offload_enabled(scheduler: "Scheduler") -> bool:
     return isinstance(additional_config, Mapping) and "dsa_offload" in additional_config
 
 
+def dsa_offload_consumer_enabled(scheduler: "Scheduler") -> bool:
+    """Return whether this scheduler belongs to a DSA Offload Decode node."""
+    if not dsa_offload_enabled(scheduler):
+        return False
+    transfer_config = getattr(
+        getattr(scheduler, "vllm_config", None),
+        "kv_transfer_config",
+        None,
+    )
+    return bool(
+        transfer_config is not None
+        and getattr(transfer_config, "is_kv_consumer", False)
+    )
+
+
 def attach_block_hashes(
     scheduler: "Scheduler",
     scheduler_output: "SchedulerOutput",

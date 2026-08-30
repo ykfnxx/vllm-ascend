@@ -200,6 +200,9 @@ from vllm_ascend.core.kv_cache_interface import (
 )
 from vllm_ascend.dsa_offload.config import load_dsa_offload_config
 from vllm_ascend.dsa_offload.decode_hash import DecodeBlockHashState
+from vllm_ascend.dsa_offload.external_main import (
+    add_decode_external_main_cache,
+)
 from vllm_ascend.dsa_offload.hot_cache import (
     HotCacheLayout,
     HotCacheState,
@@ -4529,12 +4532,22 @@ class NPUModelRunner(GPUModelRunner):
                 ),
                 hot_block_base=hot_block_base,
             )
-            resize_target_tensors(
-                kv_cache_config,
-                self._dsa_offload_main_specs,
-                self._dsa_offload_layout,
-                self.dsa_offload_config.kv_role,
-            )
+            if self.dsa_offload_config.kv_role == "kv_consumer":
+                # Main MLA history is external on a pure Decode worker. Keep it
+                # out of the scheduler's variable KV-cache budget, then restore
+                # only worker metadata plus the fixed Hot Cache tensors here.
+                add_decode_external_main_cache(
+                    kv_cache_config,
+                    self._dsa_offload_main_specs,
+                    self._dsa_offload_layout.hot_blocks,
+                )
+            else:
+                resize_target_tensors(
+                    kv_cache_config,
+                    self._dsa_offload_main_specs,
+                    self._dsa_offload_layout,
+                    self.dsa_offload_config.kv_role,
+                )
         self.kv_cache_config = kv_cache_config
         self._mamba_bufs = None
         self._mamba_copy_bufs = None
@@ -5572,7 +5585,7 @@ class NPUModelRunner(GPUModelRunner):
         if has_ec_transfer() and get_ec_transfer().is_producer:
             return {}
 
-        kv_cache_spec: dict[str, list[KVCacheSpec]] = defaultdict(list)
+        kv_cache_spec: dict[str, KVCacheSpec] = {}
         attn_layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
         from vllm.model_executor.models.utils import extract_layer_index
@@ -5735,6 +5748,13 @@ class NPUModelRunner(GPUModelRunner):
                     for layer_index, layer_name, attn_module in target_layers
                 )
             )
+            if self.dsa_offload_config.kv_role == "kv_consumer":
+                # The Decode scheduler must see only sequence-length-dependent
+                # cache (notably the Indexer cache). Main MLA is backed by the
+                # fixed per-request Hot Cache plus external storage and is
+                # restored on the worker-owned KV-cache config during init.
+                for layer_name in self._dsa_offload_main_specs:
+                    del kv_cache_spec[layer_name]
 
         return kv_cache_spec
 
