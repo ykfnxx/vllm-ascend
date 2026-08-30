@@ -89,6 +89,25 @@ def test_decode_tail_commit_rejects_missing_block_hash(spy_io) -> None:
         commit_decode_tail(batch)
 
 
+def test_decode_tail_commit_uses_worker_hash_resolver(spy_io) -> None:
+    batch, _ = make_batch(
+        spy_io,
+        position=3,
+        is_mtp=False,
+        committed=[],
+        candidate=[],
+    )
+
+    commit_decode_tail(
+        batch,
+        lambda **kwargs: b"resolved-0",
+    )
+
+    assert spy_io.put_calls[-1]["storage_ids"].tolist() == [
+        make_storage_id(b"resolved-0", 6)
+    ]
+
+
 def test_mtp_commits_only_accepted_prefix_then_puts_candidate_block(spy_io) -> None:
     batch, cache = make_batch(
         spy_io,

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
 import copy
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -92,6 +93,42 @@ def _committed_hashes(
     )
 
 
+def _decode_hash_context(
+    scheduler: "Scheduler",
+    request_id: str,
+    committed_hashes: list[bytes],
+) -> tuple[int, bytes | None, tuple[int, ...], tuple[Any, ...] | None]:
+    from vllm.v1.core.kv_cache_utils import generate_block_hash_extra_keys
+
+    request = scheduler.requests[request_id]
+    block_size = scheduler.block_size
+    block_index = len(committed_hashes)
+    block_start = block_index * block_size
+    block_end = block_start + block_size
+    known_token_ids = tuple(request._all_token_ids[block_start:block_end])
+    extra_keys, _ = generate_block_hash_extra_keys(
+        request,
+        block_start,
+        block_end,
+        0 if block_start == 0 else -1,
+    )
+    parent_hash = committed_hashes[-1] if committed_hashes else None
+    return block_index, parent_hash, known_token_ids, extra_keys
+
+
+def _needs_decode_hash_context(
+    scheduler: "Scheduler",
+    request_id: str,
+    committed_hashes: Sequence[bytes],
+) -> bool:
+    request = scheduler.requests[request_id]
+    next_block_end = (len(committed_hashes) + 1) * scheduler.block_size
+    return (
+        request.num_tokens + request.num_output_placeholders
+        >= next_block_end
+    )
+
+
 def dsa_offload_enabled(scheduler: "Scheduler") -> bool:
     additional_config = scheduler.vllm_config.additional_config
     return "dsa_offload" in additional_config
@@ -104,25 +141,54 @@ def attach_block_hashes(
     if not dsa_offload_enabled(scheduler):
         return scheduler_output
 
+    committed_by_request: dict[str, list[bytes]] = {}
+
+    def committed(request_id: str) -> list[bytes]:
+        if request_id not in committed_by_request:
+            committed_by_request[request_id] = _committed_hashes(
+                scheduler,
+                request_id,
+            )
+        return committed_by_request[request_id]
+
     for request_data in scheduler_output.scheduled_new_reqs:
-        request_data.block_hashes = _committed_hashes(
-            scheduler,
-            request_data.req_id,
-        )
+        request_data.block_hashes = committed(request_data.req_id)
 
     cached = scheduler_output.scheduled_cached_reqs
     cached.block_hashes = [
-        _committed_hashes(scheduler, request_id)
+        committed(request_id)
         for request_id in cached.req_ids
     ]
 
     connector_metadata = scheduler_output.kv_connector_metadata
     connector_requests = connector_metadata.requests if connector_metadata is not None else {}
     scheduler_output.dsa_offload_connector_block_hashes = {
-        request_id: _committed_hashes(scheduler, request_id)
+        request_id: committed(request_id)
         for request_id, metadata in connector_requests.items()
         if metadata.dsa_offload_handoff is not None
     }
+
+    scheduler_output.dsa_offload_decode_hash_contexts = {}
+    scheduler_config = getattr(scheduler.vllm_config, "scheduler_config", None)
+    if getattr(scheduler_config, "async_scheduling", False):
+        scheduled_request_ids = {
+            request_data.req_id
+            for request_data in scheduler_output.scheduled_new_reqs
+        }
+        scheduled_request_ids.update(cached.req_ids)
+        scheduler_output.dsa_offload_decode_hash_contexts = {
+            request_id: _decode_hash_context(
+                scheduler,
+                request_id,
+                committed(request_id),
+            )
+            for request_id in scheduled_request_ids
+            if _needs_decode_hash_context(
+                scheduler,
+                request_id,
+                committed(request_id),
+            )
+        }
 
     candidate_hashes: dict[str, list[bytes]] = {}
     for request_id, token_ids in scheduler_output.scheduled_spec_decode_tokens.items():

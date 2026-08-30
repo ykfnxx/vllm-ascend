@@ -22,7 +22,7 @@ import math
 import sys
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
@@ -199,6 +199,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSlidingWindowMLASpec,
 )
 from vllm_ascend.dsa_offload.config import load_dsa_offload_config
+from vllm_ascend.dsa_offload.decode_hash import DecodeBlockHashState
 from vllm_ascend.dsa_offload.hot_cache import (
     HotCacheLayout,
     HotCacheState,
@@ -386,6 +387,16 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_offload_handoffs = {}
         self._dsa_offload_committed_hashes: dict[str, list[bytes]] = {}
         self._dsa_offload_candidate_hashes: dict[str, list[bytes]] = {}
+        self._dsa_offload_decode_hash_state = (
+            DecodeBlockHashState.create(
+                vllm_config.cache_config.block_size,
+                vllm_config.cache_config.prefix_caching_hash_algo,
+            )
+            if self.dsa_offload_config is not None
+            and self.dsa_offload_config.is_consumer
+            and self.use_async_scheduling
+            else None
+        )
         self._dsa_offload_batch = None
         self._dsa_offload_ordered_layers = ()
         self._dsa_offload_prefetch_runtime: GroupedPrefetchRuntime | None = None
@@ -811,6 +822,7 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_offload_handoffs = {}
         self._dsa_offload_committed_hashes = {}
         self._dsa_offload_candidate_hashes = {}
+        self._dsa_offload_decode_hash_state = None
         self._dsa_offload_batch = None
         self._dsa_offload_prefetch_runtime = None
         super().shutdown()
@@ -978,21 +990,32 @@ class NPUModelRunner(GPUModelRunner):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> None:
-        for request_data in scheduler_output.scheduled_new_reqs:
-            self._dsa_offload_committed_hashes[request_data.req_id] = list(
-                request_data.block_hashes
+        hash_state = self._dsa_offload_decode_hash_state
+
+        def record(request_id: str, scheduler_hashes: Sequence[bytes]) -> None:
+            current = self._dsa_offload_committed_hashes.get(request_id, ())
+            self._dsa_offload_committed_hashes[request_id] = (
+                hash_state.reconcile(
+                    request_id,
+                    current,
+                    scheduler_hashes,
+                )
+                if hash_state is not None
+                else list(scheduler_hashes)
             )
+
+        for request_data in scheduler_output.scheduled_new_reqs:
+            record(request_data.req_id, request_data.block_hashes)
         cached = scheduler_output.scheduled_cached_reqs
         for request_id, block_hashes in zip(
             cached.req_ids,
             cached.block_hashes,
         ):
-            self._dsa_offload_committed_hashes[request_id] = list(
-                block_hashes
-            )
-        self._dsa_offload_committed_hashes.update(
-            scheduler_output.dsa_offload_connector_block_hashes
-        )
+            record(request_id, block_hashes)
+        for request_id, block_hashes in scheduler_output.dsa_offload_connector_block_hashes.items():
+            record(request_id, block_hashes)
+        if hash_state is not None:
+            hash_state.update_contexts(scheduler_output.dsa_offload_decode_hash_contexts)
         self._dsa_offload_candidate_hashes = (
             scheduler_output.dsa_offload_candidate_block_hashes
         )
@@ -1121,6 +1144,10 @@ class NPUModelRunner(GPUModelRunner):
                 hot_cache.release(request_id)
             self._dsa_offload_handoffs.pop(request_id, None)
             self._dsa_offload_committed_hashes.pop(request_id, None)
+        if self._dsa_offload_decode_hash_state is not None:
+            self._dsa_offload_decode_hash_state.release(
+                finished_request_ids
+            )
 
     def _make_dsa_offload_batch(
         self,
@@ -3032,6 +3059,14 @@ class NPUModelRunner(GPUModelRunner):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         if self._dsa_offload_batch is not None:
+            block_hash_resolver = None
+            if self._dsa_offload_decode_hash_state is not None:
+                block_hash_resolver = partial(
+                    self._dsa_offload_decode_hash_state.resolve,
+                    batch=self._dsa_offload_batch,
+                    query_token_ids=self.input_ids.gpu,
+                    committed_block_hashes=self._dsa_offload_committed_hashes,
+                )
             self._admit_local_dsa_offload_requests(
                 self._dsa_offload_batch
             )
@@ -3066,9 +3101,13 @@ class NPUModelRunner(GPUModelRunner):
                     )
                     .to("cpu")
                     .tolist(),
+                    block_hash_resolver,
                 )
             else:
-                commit_decode_tail(self._dsa_offload_batch)
+                commit_decode_tail(
+                    self._dsa_offload_batch,
+                    block_hash_resolver,
+                )
             self._dsa_offload_batch = None
 
         if self.need_accepted_tokens:

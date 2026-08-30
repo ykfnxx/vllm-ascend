@@ -66,6 +66,8 @@ def make_request(block_hashes, tokens, hasher=None):
         _all_token_ids=list(tokens),
         all_token_ids=list(tokens),
         _block_hasher=hasher,
+        num_tokens=len(tokens),
+        num_output_placeholders=0,
     )
 
 
@@ -141,6 +143,49 @@ def test_connector_free_scheduler_has_no_remote_handoff_hashes(
     output = module.attach_block_hashes(scheduler, scheduler.output)
 
     assert output.dsa_offload_connector_block_hashes == {}
+
+
+def test_async_scheduler_attaches_incomplete_decode_block_context(
+    monkeypatch,
+) -> None:
+    module, Scheduler = load_scheduler_module(monkeypatch)
+    kv_cache_utils = types.ModuleType("vllm.v1.core.kv_cache_utils")
+    kv_cache_utils.generate_block_hash_extra_keys = (
+        lambda request, start, end, mm_index: (("extra",), mm_index)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.v1.core.kv_cache_utils",
+        kv_cache_utils,
+    )
+
+    scheduler = Scheduler()
+    scheduler.vllm_config = SimpleNamespace(
+        additional_config={"dsa_offload": {}},
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+    )
+    scheduler.block_size = 4
+    scheduler.requests = {
+        "request": make_request(
+            [b"block-0"],
+            [1, 2, 3, 4, 5, 6, 7],
+            lambda request: [],
+        )
+    }
+    scheduler.requests["request"].num_output_placeholders = 1
+    output = SimpleNamespace(
+        scheduled_new_reqs=[SimpleNamespace(req_id="request")],
+        scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        kv_connector_metadata=None,
+        scheduled_spec_decode_tokens={},
+        finished_req_ids=set(),
+    )
+
+    module.attach_block_hashes(scheduler, output)
+
+    assert output.dsa_offload_decode_hash_contexts == {
+        "request": (1, b"block-0", (5, 6, 7), ("extra",))
+    }
 
 
 def test_connector_free_scheduler_generates_incremental_dsa_hashes(
