@@ -2,15 +2,62 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
 import copy
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
 from vllm.v1.utils import ConstantList
 
+from .pd import DSA_OFFLOAD_PD_HANDOFF_KEY
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.core.sched.scheduler import Scheduler
+
+
+def is_dsa_offload_handoff_request(request: Any) -> bool:
+    """Return whether a request carries a DSA Offload P/D handoff."""
+    params = getattr(request, "kv_transfer_params", None)
+    return isinstance(params, Mapping) and DSA_OFFLOAD_PD_HANDOFF_KEY in params
+
+
+@dataclass
+class DSAOffloadAdmissionBudget:
+    """Scheduler-side mirror of the fixed per-request Hot Cache rows.
+
+    The worker owns the physical rows. The scheduler only needs to ensure that
+    requests loading remote KV and requests already decoding never exceed the
+    same ``max_num_seqs`` capacity. A row remains reserved across the remote-KV
+    wait and decode phases and is released when the request leaves the
+    scheduler.
+    """
+
+    max_rows: int
+    admitted_request_ids: set[str] = field(default_factory=set)
+
+    @property
+    def remaining_rows(self) -> int:
+        return self.max_rows - len(self.admitted_request_ids)
+
+    def can_admit(self, request_id: str) -> bool:
+        return request_id in self.admitted_request_ids or self.remaining_rows > 0
+
+    def admit(self, request_id: str) -> bool:
+        if request_id in self.admitted_request_ids:
+            return True
+        if self.remaining_rows <= 0:
+            return False
+        self.admitted_request_ids.add(request_id)
+        return True
+
+    def is_admitted(self, request_id: str) -> bool:
+        return request_id in self.admitted_request_ids
+
+    def sync(self, live_request_ids: set[str]) -> None:
+        self.admitted_request_ids.intersection_update(live_request_ids)
+
+    def release(self, request_ids: set[str]) -> None:
+        self.admitted_request_ids.difference_update(request_ids)
 
 
 @dataclass
@@ -130,8 +177,9 @@ def _needs_decode_hash_context(
 
 
 def dsa_offload_enabled(scheduler: "Scheduler") -> bool:
-    additional_config = scheduler.vllm_config.additional_config
-    return "dsa_offload" in additional_config
+    vllm_config = getattr(scheduler, "vllm_config", None)
+    additional_config = getattr(vllm_config, "additional_config", None)
+    return isinstance(additional_config, Mapping) and "dsa_offload" in additional_config
 
 
 def attach_block_hashes(

@@ -8,7 +8,37 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.request import Request
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 
-from vllm_ascend.core.recompute_scheduler import RecomputeScheduler
+from vllm_ascend.core.recompute_scheduler import (
+    RecomputeScheduler,
+    _has_waiting_admission_budget,
+)
+
+
+def test_dsa_remote_load_can_use_waiting_pass_without_compute_budget():
+    assert _has_waiting_admission_budget(
+        allow_compute=False,
+        token_budget=0,
+        dsa_offload_active=True,
+        dsa_rows_remaining=1,
+    )
+
+
+def test_waiting_pass_stops_when_compute_and_dsa_row_budgets_are_exhausted():
+    assert not _has_waiting_admission_budget(
+        allow_compute=True,
+        token_budget=0,
+        dsa_offload_active=True,
+        dsa_rows_remaining=0,
+    )
+
+
+def test_non_dsa_waiting_pass_still_uses_compute_budget():
+    assert _has_waiting_admission_budget(
+        allow_compute=True,
+        token_budget=1,
+        dsa_offload_active=False,
+        dsa_rows_remaining=0,
+    )
 
 
 def test_pd_consumer_first_step_injects_placeholder_spec_tokens():

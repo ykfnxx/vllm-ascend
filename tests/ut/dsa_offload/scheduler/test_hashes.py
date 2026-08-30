@@ -29,21 +29,58 @@ def load_scheduler_module(monkeypatch):
         "vllm.v1.core": types.ModuleType("vllm.v1.core"),
         "vllm.v1.core.sched": types.ModuleType("vllm.v1.core.sched"),
         "vllm.v1.core.sched.scheduler": types.ModuleType("vllm.v1.core.sched.scheduler"),
+        "vllm_ascend": types.ModuleType("vllm_ascend"),
+        "vllm_ascend.dsa_offload": types.ModuleType("vllm_ascend.dsa_offload"),
+        "vllm_ascend.dsa_offload.pd": types.ModuleType("vllm_ascend.dsa_offload.pd"),
     }
     modules["vllm.v1.utils"].ConstantList = ConstantList
     modules["vllm.v1.core.sched.scheduler"].Scheduler = Scheduler
+    modules["vllm_ascend.dsa_offload.pd"].DSA_OFFLOAD_PD_HANDOFF_KEY = "dsa_offload_handoff"
     for module in modules.values():
         module.__path__ = []
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
     spec = importlib.util.spec_from_file_location(
-        "_dsa_offload_scheduler_test",
+        "vllm_ascend.dsa_offload._scheduler_test",
         ROOT / "vllm_ascend" / "dsa_offload" / "scheduler.py",
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module, Scheduler
+
+
+def test_dsa_admission_budget_tracks_rows_until_request_release(monkeypatch) -> None:
+    module, _ = load_scheduler_module(monkeypatch)
+    budget = module.DSAOffloadAdmissionBudget(max_rows=2)
+
+    assert budget.remaining_rows == 2
+    assert budget.admit("loading")
+    assert budget.admit("running")
+    assert budget.remaining_rows == 0
+    assert budget.can_admit("loading")
+    assert not budget.can_admit("queued")
+    assert not budget.admit("queued")
+
+    budget.sync({"running", "queued"})
+    assert budget.admitted_request_ids == {"running"}
+    assert budget.remaining_rows == 1
+    assert budget.admit("queued")
+
+    budget.release({"running"})
+    assert budget.admitted_request_ids == {"queued"}
+
+
+def test_dsa_handoff_request_detection(monkeypatch) -> None:
+    module, _ = load_scheduler_module(monkeypatch)
+
+    assert module.is_dsa_offload_handoff_request(
+        SimpleNamespace(kv_transfer_params={"dsa_offload_handoff": {}})
+    )
+    assert not module.is_dsa_offload_handoff_request(
+        SimpleNamespace(kv_transfer_params={"do_remote_prefill": True})
+    )
+    assert not module.is_dsa_offload_handoff_request(SimpleNamespace(kv_transfer_params=None))
 
 
 def make_output():

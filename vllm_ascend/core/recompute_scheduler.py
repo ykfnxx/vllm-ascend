@@ -50,6 +50,14 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
+from vllm_ascend.dsa_offload.scheduler import (
+    DSAOffloadAdmissionBudget,
+    attach_block_hashes,
+    consume_publish_metadata,
+    dsa_offload_enabled,
+    is_dsa_offload_handoff_request,
+)
+
 
 @dataclass
 class RecomputeSchedulerConfig(SchedulerConfig):
@@ -92,6 +100,16 @@ class RecomputeSchedulerOutput(SchedulerOutput):
     recomputed_reqs: list[RecomputeReqInfo] | None = None
 
 
+def _has_waiting_admission_budget(
+    *,
+    allow_compute: bool,
+    token_budget: int,
+    dsa_offload_active: bool,
+    dsa_rows_remaining: int,
+) -> bool:
+    return (allow_compute and token_budget > 0) or (dsa_offload_active and dsa_rows_remaining > 0)
+
+
 class RecomputeScheduler(Scheduler):
     running: list[Request]
 
@@ -106,6 +124,7 @@ class RecomputeScheduler(Scheduler):
             and self.vllm_config.kv_transfer_config.is_kv_consumer
         )
         self.is_kv_producer = self.vllm_config.kv_transfer_config and self.vllm_config.kv_transfer_config.is_kv_producer
+        self._dsa_offload_admission_budget = DSAOffloadAdmissionBudget(self.max_num_running_reqs)
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -190,6 +209,9 @@ class RecomputeScheduler(Scheduler):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        dsa_offload_active = dsa_offload_enabled(self)
+        dsa_admission_budget = self._dsa_offload_admission_budget
+        dsa_admission_budget.sync(set(self.requests))
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
         encoder_compute_budget = self.max_num_encoder_input_tokens
@@ -296,6 +318,14 @@ class RecomputeScheduler(Scheduler):
                     # drop the request to PD proxy.
                     transfer_config = self.vllm_config.kv_transfer_config
                     if transfer_config is not None and not transfer_config.is_kv_producer:
+                        preemption_candidate = self.running[-1]
+                        if dsa_admission_budget.is_admitted(preemption_candidate.request_id):
+                            logger.debug(
+                                "[RecomputeScheduler] Cannot preempt DSA Offload request %s; "
+                                "stop scheduling after KV allocation failure.",
+                                preemption_candidate.request_id,
+                            )
+                            break
                         recomputed_req = self.running.pop()
                         recomputed_req_id = recomputed_req.request_id
                         recomputed_block_ids = self.kv_cache_manager.get_block_ids(recomputed_req_id)
@@ -434,12 +464,27 @@ class RecomputeScheduler(Scheduler):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Next, schedule the WAITING requests.
-        if not preempted_reqs and not recomputed_reqs and self._pause_state == PauseState.UNPAUSED:
+        # Next, schedule the WAITING requests. DSA Offload remote loads consume
+        # a fixed Hot Cache row but no model compute tokens, so they may still be
+        # admitted when the running batch exhausted the compute-token budget or
+        # caused an unrelated preemption/recompute in this step.
+        allow_waiting_compute = not preempted_reqs and not recomputed_reqs
+        if self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
-            while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                if len(self.running) == self.max_num_running_reqs:
+            while self.waiting or self.skipped_waiting:
+                dsa_rows_remaining = dsa_admission_budget.remaining_rows
+                if not _has_waiting_admission_budget(
+                    allow_compute=allow_waiting_compute,
+                    token_budget=token_budget,
+                    dsa_offload_active=dsa_offload_active,
+                    dsa_rows_remaining=dsa_rows_remaining,
+                ):
+                    break
+                if (
+                    len(self.running) == self.max_num_running_reqs
+                    and not (dsa_offload_active and dsa_rows_remaining > 0)
+                ):
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -447,6 +492,7 @@ class RecomputeScheduler(Scheduler):
 
                 request = request_queue.peek_request()
                 request_id = request.request_id
+                is_dsa_request = dsa_offload_active and is_dsa_offload_handoff_request(request)
 
                 # try to promote blocked statuses while traversing skipped queue.
                 if self._is_blocked_waiting_status(request.status) and not self._try_promote_blocked_waiting_request(
@@ -545,6 +591,26 @@ class RecomputeScheduler(Scheduler):
                     num_new_local_computed_tokens = 0
                     num_computed_tokens = request.num_computed_tokens
 
+                is_dsa_async_load = is_dsa_request and load_kv_async
+                if is_dsa_async_load:
+                    if not dsa_admission_budget.can_admit(request_id):
+                        # A DSA load owns its Hot Cache row from transfer start
+                        # until the request leaves the scheduler. Do not start a
+                        # transfer which the worker cannot admit.
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
+                elif (
+                    not allow_waiting_compute
+                    or token_budget <= 0
+                    or len(self.running) == self.max_num_running_reqs
+                ):
+                    # Preserve compute admission constraints while continuing
+                    # the scan for zero-compute DSA loads later in the queue.
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
@@ -625,7 +691,10 @@ class RecomputeScheduler(Scheduler):
                     num_external_computed_tokens=num_external_computed_tokens,
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
-                    full_sequence_must_fit=self.scheduler_reserve_full_isl,
+                    # DSA keeps the historical Main KV in external storage and
+                    # owns a fixed Hot Cache row. Requiring the full input
+                    # sequence to fit would charge that history a second time.
+                    full_sequence_must_fit=self.scheduler_reserve_full_isl and not is_dsa_request,
                 )
 
                 if new_blocks is None:
@@ -635,6 +704,12 @@ class RecomputeScheduler(Scheduler):
                     # manager
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
+                    if is_dsa_async_load:
+                        # One DSA request must not head-of-line block later
+                        # requests which may have a lower non-offloaded KV cost.
+                        request_queue.pop_request()
+                        step_skipped_waiting.prepend_request(request)
+                        continue
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -656,6 +731,9 @@ class RecomputeScheduler(Scheduler):
 
                 request = request_queue.pop_request()
                 if load_kv_async:
+                    if is_dsa_async_load:
+                        admitted = dsa_admission_budget.admit(request_id)
+                        assert admitted, "DSA Hot Cache budget changed during scheduling"
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
@@ -821,7 +899,7 @@ class RecomputeScheduler(Scheduler):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
-        return scheduler_output
+        return attach_block_hashes(self, scheduler_output)
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
@@ -833,6 +911,10 @@ class RecomputeScheduler(Scheduler):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        if dsa_offload_enabled(self):
+            # RecomputeScheduler overrides Scheduler.update_from_output, so the
+            # generic DSA wrapper cannot consume worker publish metadata for it.
+            consume_publish_metadata(self, model_runner_output)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
