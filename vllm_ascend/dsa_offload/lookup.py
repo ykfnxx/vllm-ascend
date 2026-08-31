@@ -13,6 +13,7 @@ from .constants import (
     FREE_HEAD_STRIDE,
     INDEX_CAPACITY,
     LOOKUP_SLOTS,
+    QUERY_WIDTH,
     REPLACEABLE_SLOTS,
     RESIDENT_SLOTS,
 )
@@ -22,6 +23,8 @@ from .ops import (
     LookupState,
     lookup_update,
     lookup_update_batch,
+    resolve_update_batch_v2,
+    turbo_resolve_update_batch_v2,
     turbo_lookup_update_batch,
     turbo_prefetch_lookup_update_batch,
 )
@@ -166,6 +169,15 @@ class LookupPlan:
 
 
 @dataclass(frozen=True)
+class DirectLookupPlan:
+    semantic_topk: torch.Tensor
+    mapped_indices: torch.Tensor
+    gather_mask: torch.Tensor
+    request_rows: torch.Tensor
+    query_start_loc: torch.Tensor
+
+
+@dataclass(frozen=True)
 class PackedDecodeMetadata:
     request_indices: torch.Tensor
     request_rows: torch.Tensor
@@ -212,7 +224,14 @@ class DSAOffloadBatch:
     prefetch_runtime: object | None = None
     enable_turbo_lookup: bool = False
     enable_turbo_prefetch_lookup: bool = False
-    lookup_plans: dict[str, LookupPlan] = field(default_factory=dict)
+    enable_direct_abi: bool = False
+    direct_lookup_buffers: dict[
+        str, tuple[torch.Tensor, torch.Tensor]
+    ] = field(default_factory=dict)
+    direct_sfa_addressing: tuple[torch.Tensor, torch.Tensor] | None = None
+    lookup_plans: dict[str, LookupPlan | DirectLookupPlan] = field(
+        default_factory=dict
+    )
 
     def block_hashes(self, request_index: int) -> Sequence[bytes]:
         request_id = self.request_ids[request_index]
@@ -239,6 +258,7 @@ def build_dsa_offload_batch(
     prefetch_runtime: object | None = None,
     enable_turbo_lookup: bool = False,
     enable_turbo_prefetch_lookup: bool = False,
+    enable_direct_abi: bool = False,
 ) -> DSAOffloadBatch:
     query_ends = tuple(accumulate(query_counts))
     query_ranges = tuple(zip((0, *query_ends[:-1]), query_ends))
@@ -276,6 +296,7 @@ def build_dsa_offload_batch(
         prefetch_runtime=prefetch_runtime,
         enable_turbo_lookup=enable_turbo_lookup,
         enable_turbo_prefetch_lookup=enable_turbo_prefetch_lookup,
+        enable_direct_abi=enable_direct_abi,
     )
     batch.packed_decode = pack_decode_metadata(batch)
     return batch
@@ -552,6 +573,52 @@ def make_lookup_plan(
     )
 
 
+def make_direct_lookup_plan(
+    *,
+    semantic_topk: torch.Tensor,
+    cohort: IndexCacheCohort,
+    batch: DSAOffloadBatch,
+) -> DirectLookupPlan:
+    if semantic_topk.ndim != 3 or semantic_topk.shape[1:] != (1, QUERY_WIDTH):
+        raise ValueError(
+            "DSA direct lookup requires semantic_topk [T, 1, 2048]."
+        )
+    query_start_loc = batch.graph_query_start_loc
+    if query_start_loc is None:
+        raise RuntimeError("DSA direct lookup requires Full Graph metadata.")
+    mapped_indices_out, gather_mask_out = batch.direct_lookup_buffers[
+        cohort.cohort_id
+    ]
+    if mapped_indices_out.shape != semantic_topk.shape:
+        raise ValueError(
+            "DSA direct lookup output shape does not match semantic_topk."
+        )
+    state = batch.lookup_states[cohort.cohort_id]
+    lookup = (
+        turbo_resolve_update_batch_v2
+        if batch.is_mtp and batch.enable_turbo_lookup
+        else resolve_update_batch_v2
+    )
+    mapped_indices, gather_mask = lookup(
+        state,
+        batch.request_rows,
+        query_start_loc,
+        batch.query_positions,
+        semantic_topk,
+        mapped_indices_out,
+        gather_mask_out,
+        batch.layout.block_size,
+        int(batch.is_mtp),
+    )
+    return DirectLookupPlan(
+        semantic_topk=semantic_topk,
+        mapped_indices=mapped_indices,
+        gather_mask=gather_mask,
+        request_rows=batch.request_rows,
+        query_start_loc=query_start_loc,
+    )
+
+
 def make_prefetch_lookup_plan(
     *,
     semantic_topk: torch.Tensor,
@@ -787,4 +854,23 @@ def load_plan_misses(
         storage_ids=storage_ids,
         token_offsets=plan.miss_block_offsets,
         destination_slots=plan.miss_destination_slots,
+    )
+
+
+def load_direct_plan_misses(
+    plan: DirectLookupPlan,
+    layer_id: int,
+    batch: DSAOffloadBatch,
+) -> tuple[torch.Tensor, ...]:
+    hot_cache = batch.hot_cache
+    if hot_cache is None:
+        raise RuntimeError("DSA direct Gather requires a Hot Cache.")
+    return batch.io_backend.gather_history_misses_direct(
+        layer_id=layer_id,
+        hot_block_table_pool=hot_cache.hot_block_table,
+        request_rows=plan.request_rows,
+        query_start_loc=plan.query_start_loc,
+        semantic_topk=plan.semantic_topk,
+        mapped_indices=plan.mapped_indices,
+        gather_mask=plan.gather_mask,
     )

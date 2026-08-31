@@ -55,6 +55,62 @@ def lookup_update_batch(
     )
 
 
+def resolve_update_batch_v2(
+    state: LookupState,
+    request_rows: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    query_positions: torch.Tensor,
+    semantic_topk: torch.Tensor,
+    mapped_indices_out: torch.Tensor,
+    gather_mask_out: torch.Tensor,
+    block_size: int,
+    decode_mode: int,
+) -> LookupOutput:
+    return torch.ops._C_ascend.dsa_offload_resolve_update_batch_v2(
+        state.index,
+        state.slot_to_index,
+        state.free_slots,
+        state.free_head,
+        request_rows,
+        query_start_loc,
+        query_positions,
+        semantic_topk,
+        mapped_indices_out,
+        gather_mask_out,
+        request_rows.shape[0],
+        block_size,
+        decode_mode,
+    )
+
+
+def turbo_resolve_update_batch_v2(
+    state: LookupState,
+    request_rows: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    query_positions: torch.Tensor,
+    semantic_topk: torch.Tensor,
+    mapped_indices_out: torch.Tensor,
+    gather_mask_out: torch.Tensor,
+    block_size: int,
+    decode_mode: int,
+) -> LookupOutput:
+    return torch.ops._C_ascend.dsa_sparse_turbo_resolve_update_batch_v2(
+        state.index,
+        state.slot_to_index,
+        state.free_slots,
+        state.free_head,
+        request_rows,
+        query_start_loc,
+        query_positions,
+        semantic_topk,
+        mapped_indices_out,
+        gather_mask_out,
+        request_rows.shape[0],
+        block_size,
+        decode_mode,
+    )
+
+
 def asu_kv_gather(
     destination_kv_cache: torch.Tensor,
     destination_k_rope: torch.Tensor,
@@ -79,6 +135,37 @@ def asu_kv_gather(
         token_positions,
         destination_slots,
         miss_mask,
+        block_size,
+        request_rows.shape[0],
+    )
+
+
+def asu_kv_gather_direct_v2(
+    destination_kv_cache: torch.Tensor,
+    destination_k_rope: torch.Tensor,
+    hot_block_table_pool: torch.Tensor,
+    source_kv_cache: torch.Tensor,
+    source_k_rope: torch.Tensor,
+    source_block_table: torch.Tensor,
+    request_rows: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    semantic_topk: torch.Tensor,
+    mapped_indices: torch.Tensor,
+    gather_mask: torch.Tensor,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops._C_ascend.asu_kv_gather_direct_v2(
+        destination_kv_cache,
+        destination_k_rope,
+        hot_block_table_pool,
+        source_kv_cache,
+        source_k_rope,
+        source_block_table,
+        request_rows,
+        query_start_loc,
+        semantic_topk,
+        mapped_indices,
+        gather_mask,
         block_size,
         request_rows.shape[0],
     )

@@ -7,11 +7,12 @@ import torch
 
 from .constants import INDEX_CAPACITY
 from .hot_cache import HotCacheLayout
-from .ops import asu_kv_gather
+from .ops import asu_kv_gather, asu_kv_gather_direct_v2
 
 
 @dataclass(frozen=True)
 class _LayerCache:
+    destination_planes: tuple[torch.Tensor, torch.Tensor]
     destination_kv: torch.Tensor
     destination_rope: torch.Tensor
     source_kv: torch.Tensor
@@ -80,6 +81,7 @@ class KVGatherSimBackend:
             device=destination_kv.device,
         )
         self._layers[int(layer_id)] = _LayerCache(
+            (cache_planes[0], cache_planes[1]),
             destination_kv,
             destination_rope,
             source_kv,
@@ -134,6 +136,38 @@ class KVGatherSimBackend:
             self._layout.block_size,
         )
         return True
+
+    def gather_history_misses_direct(
+        self,
+        *,
+        layer_id: int,
+        hot_block_table_pool: torch.Tensor,
+        request_rows: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        semantic_topk: torch.Tensor,
+        mapped_indices: torch.Tensor,
+        gather_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        layer = self._layers[int(layer_id)]
+        destination_kv, destination_rope = asu_kv_gather_direct_v2(
+            layer.destination_kv,
+            layer.destination_rope,
+            hot_block_table_pool,
+            layer.source_kv,
+            layer.source_rope,
+            layer.source_block_table,
+            request_rows,
+            query_start_loc,
+            semantic_topk,
+            mapped_indices,
+            gather_mask,
+            self._layout.block_size,
+        )
+        original_kv, original_rope = layer.destination_planes
+        return (
+            destination_kv.view_as(original_kv),
+            destination_rope.view_as(original_rope),
+        )
 
     def close(self) -> None:
         self._layers.clear()

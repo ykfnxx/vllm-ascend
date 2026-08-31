@@ -199,6 +199,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSlidingWindowMLASpec,
 )
 from vllm_ascend.dsa_offload.config import load_dsa_offload_config
+from vllm_ascend.dsa_offload.constants import QUERY_WIDTH
 from vllm_ascend.dsa_offload.decode_hash import DecodeBlockHashState
 from vllm_ascend.dsa_offload.external_main import (
     add_decode_external_main_cache,
@@ -382,6 +383,7 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_offload_hot_cache: HotCacheState | None = None
         self._dsa_offload_sfa_workspace: SFAAddressingWorkspace | None = None
         self._dsa_offload_graph_request_rows: torch.Tensor | None = None
+        self._dsa_offload_query_positions_i32 = None
         self._dsa_offload_graph_batches: dict[
             BatchDescriptor, DSAOffloadBatch
         ] = {}
@@ -519,6 +521,16 @@ class NPUModelRunner(GPUModelRunner):
             pin_memory=self.pin_memory,
         )
         self._dsa_positions_np_buf = self._dsa_positions_cpu_buf.numpy()
+        if (
+            self.dsa_offload_config is not None
+            and self.dsa_offload_config.is_consumer
+            and self.dsa_offload_config.enable_direct_abi
+            and self.dsa_offload_config.io_backend == "kvgather_sim"
+        ):
+            self._dsa_offload_query_positions_i32 = self._make_buffer(
+                max_buffer_num_tokens,
+                dtype=torch.int32,
+            )
 
         self.use_eagle = (
             vllm_config.speculative_config.use_eagle()
@@ -917,13 +929,20 @@ class NPUModelRunner(GPUModelRunner):
                     self.speculative_config is not None
                     and self.speculative_config.method == "mtp"
                 )
-                main_lookup_op = (
-                    "dsa_sparse_turbo_lookup_update_batch"
-                    if is_mtp and config.enable_turbo_lookup
-                    else "dsa_offload_lookup_update_batch"
-                    if is_mtp
-                    else "dsa_offload_lookup_update"
-                )
+                if config.enable_direct_abi and config.io_backend == "kvgather_sim":
+                    main_lookup_op = (
+                        "dsa_sparse_turbo_resolve_update_batch_v2"
+                        if is_mtp and config.enable_turbo_lookup
+                        else "dsa_offload_resolve_update_batch_v2"
+                    )
+                else:
+                    main_lookup_op = (
+                        "dsa_sparse_turbo_lookup_update_batch"
+                        if is_mtp and config.enable_turbo_lookup
+                        else "dsa_offload_lookup_update_batch"
+                        if is_mtp
+                        else "dsa_offload_lookup_update"
+                    )
                 self._dsa_offload_graph_request_rows = torch.arange(
                     self.max_num_reqs,
                     dtype=torch.int32,
@@ -933,8 +952,13 @@ class NPUModelRunner(GPUModelRunner):
                     logger.info(
                         "DSA_OFFLOAD_KVGATHER_SIM_GRAPH_ACTIVE "
                         "lookup=%s "
-                        "gather=asu_kv_gather mtp=%d graph_mode=%s",
+                        "gather=%s mtp=%d graph_mode=%s",
                         main_lookup_op,
+                        (
+                            "asu_kv_gather_direct_v2"
+                            if config.enable_direct_abi
+                            else "asu_kv_gather"
+                        ),
                         int(is_mtp),
                         self.compilation_config.cudagraph_mode.name,
                     )
@@ -1200,7 +1224,13 @@ class NPUModelRunner(GPUModelRunner):
             lookup_states=self._dsa_offload_lookup_states,
             request_ids=request_ids,
             query_counts=query_counts,
-            query_positions=self.positions[:total_num_scheduled_tokens],
+            query_positions=(
+                self._dsa_offload_query_positions_i32.gpu[
+                    :total_num_scheduled_tokens
+                ]
+                if self._dsa_offload_query_positions_i32 is not None
+                else self.positions[:total_num_scheduled_tokens]
+            ),
             is_mtp=bool(
                 scheduler_output.scheduled_spec_decode_tokens
             ),
@@ -1213,6 +1243,7 @@ class NPUModelRunner(GPUModelRunner):
             enable_turbo_prefetch_lookup=(
                 config.enable_turbo_prefetch_lookup
             ),
+            enable_direct_abi=config.enable_direct_abi,
         )
         graph_rows = self._dsa_offload_graph_request_rows
         if graph_rows is not None:
@@ -1232,6 +1263,7 @@ class NPUModelRunner(GPUModelRunner):
         existing = self._dsa_offload_graph_batches.get(batch_desc)
         if existing is not None:
             existing.lookup_plans.clear()
+            existing.direct_sfa_addressing = None
             return existing
 
         config = self.dsa_offload_config
@@ -1242,6 +1274,12 @@ class NPUModelRunner(GPUModelRunner):
         assert layout is not None
         assert hot_cache is not None
         assert request_rows is not None
+        query_positions_i32 = self._dsa_offload_query_positions_i32
+        direct = config.enable_direct_abi and config.io_backend == "kvgather_sim"
+        if direct and query_positions_i32 is None:
+            raise RuntimeError(
+                "DSA Offload graph lookup requires int32 query positions."
+            )
         query_ends = tuple(
             np.cumsum(num_scheduled_tokens[:num_reqs]).tolist()
         )
@@ -1257,7 +1295,11 @@ class NPUModelRunner(GPUModelRunner):
             request_rows=request_rows[:num_reqs],
             decode_request_indices=tuple(range(num_reqs)),
             query_ranges=query_ranges,
-            query_positions=self.positions[:total_num_scheduled_tokens],
+            query_positions=(
+                query_positions_i32.gpu[:total_num_scheduled_tokens]
+                if query_positions_i32 is not None
+                else self.positions[:total_num_scheduled_tokens]
+            ),
             is_mtp=bool(
                 self.speculative_config is not None
                 and self.speculative_config.method == "mtp"
@@ -1275,6 +1317,26 @@ class NPUModelRunner(GPUModelRunner):
             enable_turbo_lookup=config.enable_turbo_lookup,
             enable_turbo_prefetch_lookup=(
                 config.enable_turbo_prefetch_lookup
+            ),
+            enable_direct_abi=config.enable_direct_abi,
+            direct_lookup_buffers=(
+                {
+                    cohort.cohort_id: (
+                        torch.empty(
+                            (total_num_scheduled_tokens, 1, QUERY_WIDTH),
+                            dtype=torch.int32,
+                            device=self.device,
+                        ),
+                        torch.empty(
+                            (total_num_scheduled_tokens, 1, QUERY_WIDTH),
+                            dtype=torch.int32,
+                            device=self.device,
+                        ),
+                    )
+                    for cohort in self._dsa_offload_cohorts
+                }
+                if direct
+                else {}
             ),
         )
         graph_batch.packed_decode = pack_graph_decode_metadata(graph_batch)
@@ -1500,6 +1562,17 @@ class NPUModelRunner(GPUModelRunner):
             self.query_pos.np[: cu_num_tokens[-1]],
             out=positions_np,
         )
+        if self._dsa_offload_query_positions_i32 is not None:
+            np.copyto(
+                self._dsa_offload_query_positions_i32.np[
+                    :total_num_scheduled_tokens
+                ],
+                positions_np,
+                casting="unsafe",
+            )
+            self._dsa_offload_query_positions_i32.copy_to_gpu(
+                total_num_scheduled_tokens
+            )
 
         # For PCP, compute slot_mapping on GPU using pre-PCP-split positions.
         # Use blocking .to(device) to ensure data lands on GPU before PCP

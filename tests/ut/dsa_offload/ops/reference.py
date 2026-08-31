@@ -5,6 +5,9 @@ from dataclasses import dataclass
 
 INVALID_INDEX = -1
 FALLBACK_SENTINEL = 10 * 1024
+TAIL_BASE = 10 * 1024
+FALLBACK_SLOT = TAIL_BASE + 128
+STAGING_BASE = FALLBACK_SLOT + 1
 
 
 @dataclass
@@ -138,3 +141,70 @@ def lookup_update_batch_reference(
             state.free_head[state_row][0] = 0
 
     return slot_out, miss_out
+
+
+def resolve_update_v2_reference(
+    state: ReferenceState,
+    request_rows: list[int],
+    query_start_loc: list[int],
+    query_positions: list[int],
+    semantic_topk: list[list[int]],
+    *,
+    block_size: int,
+    decode_mode: int,
+) -> tuple[list[list[int]], list[list[int]]]:
+    query_width = len(semantic_topk[0])
+    query_num = len(semantic_topk)
+    history_mask = [[0] * query_width for _ in range(query_num)]
+    verify_starts: list[int | None] = [None] * query_num
+    tail_starts: list[int | None] = [None] * query_num
+
+    for request_index, state_row in enumerate(request_rows):
+        begin = query_start_loc[request_index]
+        end = query_start_loc[request_index + 1]
+        if state_row < 0 or begin == end:
+            continue
+        verify_start = query_positions[begin]
+        tail_start = verify_start // block_size * block_size
+        for query_index in range(begin, end):
+            verify_starts[query_index] = verify_start
+            tail_starts[query_index] = tail_start
+            for entry, token in enumerate(semantic_topk[query_index]):
+                history_mask[query_index][entry] = int(
+                    0 <= token < tail_start
+                )
+
+    safe_rows = [row if row >= 0 else 0 for row in request_rows]
+    raw_slots, raw_misses = lookup_update_batch_reference(
+        state,
+        safe_rows,
+        query_start_loc,
+        semantic_topk,
+        history_mask,
+    )
+    mapped = [[INVALID_INDEX] * query_width for _ in range(query_num)]
+    gather = [[0] * query_width for _ in range(query_num)]
+    for query_index in range(query_num):
+        verify_start = verify_starts[query_index]
+        tail_start = tail_starts[query_index]
+        if verify_start is None or tail_start is None:
+            continue
+        current_position = query_positions[query_index]
+        for entry, token in enumerate(semantic_topk[query_index]):
+            if not 0 <= token < len(state.index[0]):
+                continue
+            if token < tail_start:
+                raw_slot = raw_slots[query_index][entry]
+                mapped[query_index][entry] = (
+                    FALLBACK_SLOT
+                    if raw_slot == FALLBACK_SENTINEL
+                    else raw_slot
+                )
+                gather[query_index][entry] = raw_misses[query_index][entry]
+            elif decode_mode == 0 and token <= current_position:
+                mapped[query_index][entry] = TAIL_BASE + token - tail_start
+            elif decode_mode == 1 and token < verify_start:
+                mapped[query_index][entry] = TAIL_BASE + token - tail_start
+            elif decode_mode == 1 and token <= current_position:
+                mapped[query_index][entry] = STAGING_BASE + token - verify_start
+    return mapped, gather

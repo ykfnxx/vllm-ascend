@@ -9,15 +9,69 @@ import torch
 from vllm_ascend.dsa_offload.hot_cache import HotCacheLayout, HotCacheState
 from vllm_ascend.dsa_offload.lookup import (
     DSAOffloadBatch,
+    DirectLookupPlan,
     IndexCacheCohort,
     LookupPlan,
     load_plan_misses,
     load_prefetch_misses,
+    make_direct_lookup_plan,
     make_lookup_plan,
     make_prefetch_lookup_plan,
     pack_graph_decode_metadata,
 )
 from vllm_ascend.dsa_offload.ops import LookupState
+
+
+def test_direct_plan_preserves_indexer_and_out_tensor_identity(spy_io) -> None:
+    layout = HotCacheLayout(128, 2, 2)
+    cohort = IndexCacheCohort("leader", "leader", ("leader",), (7,))
+    state = LookupState(
+        index=torch.empty((2, 1), dtype=torch.int32),
+        slot_to_index=torch.empty((2, 1), dtype=torch.int32),
+        free_slots=torch.empty((2, 1), dtype=torch.int32),
+        free_head=torch.empty((2, 1), dtype=torch.int32),
+    )
+    topk = torch.empty((3, 1, 2048), dtype=torch.int32)
+    mapped = torch.empty_like(topk)
+    mask = torch.empty_like(topk)
+    query_start = torch.tensor([0, 2, 3], dtype=torch.int32)
+    batch = DSAOffloadBatch(
+        layout=layout,
+        hot_cache=None,
+        io_backend=spy_io,
+        cohorts=(cohort,),
+        lookup_states={"leader": state},
+        request_ids=("first", "second"),
+        request_rows=torch.tensor([1, 0], dtype=torch.int32),
+        decode_request_indices=(0, 1),
+        query_ranges=((0, 2), (2, 3)),
+        query_positions=torch.tensor([128, 129, 256], dtype=torch.int32),
+        is_mtp=True,
+        committed_block_hashes={"first": (), "second": ()},
+        candidate_block_hashes={},
+        graph_query_start_loc=query_start,
+        enable_turbo_lookup=True,
+        enable_direct_abi=True,
+        direct_lookup_buffers={"leader": (mapped, mask)},
+    )
+
+    with patch(
+        "vllm_ascend.dsa_offload.lookup.turbo_resolve_update_batch_v2",
+        return_value=(mapped, mask),
+    ) as lookup:
+        plan = make_direct_lookup_plan(
+            semantic_topk=topk,
+            cohort=cohort,
+            batch=batch,
+        )
+
+    assert isinstance(plan, DirectLookupPlan)
+    assert lookup.call_args.args[4] is topk
+    assert lookup.call_args.args[5] is mapped
+    assert lookup.call_args.args[6] is mask
+    assert plan.semantic_topk is topk
+    assert plan.mapped_indices is mapped
+    assert plan.gather_mask is mask
 
 
 def test_history_tail_and_miss_are_mapped_to_fixed_hot_slots(spy_io) -> None:

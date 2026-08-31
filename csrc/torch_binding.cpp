@@ -56,6 +56,9 @@
 #include "attention/dsa_offload_lookup_update_batch/dsa_offload_lookup_update_batch_torch_adpt.h"
 #include "attention/asu_kv_gather/asu_kv_gather_torch_adpt.h"
 #include "attention/dsa_sparse_turbo_lookup_update_batch/dsa_sparse_turbo_lookup_update_batch_torch_adpt.h"
+#include "attention/dsa_offload_resolve_update_batch_v2/dsa_offload_resolve_update_batch_v2_torch_adpt.h"
+#include "attention/dsa_sparse_turbo_resolve_update_batch_v2/dsa_sparse_turbo_resolve_update_batch_v2_torch_adpt.h"
+#include "attention/asu_kv_gather_direct_v2/asu_kv_gather_direct_v2_torch_adpt.h"
 #include "attention/dsa_sparse_turbo_prefetch_lookup_update_batch/dsa_sparse_turbo_prefetch_lookup_update_batch_torch_adpt.h"
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
@@ -3051,6 +3054,72 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "dsa_sparse_turbo_lookup_update_batch",
         torch::kPrivateUse1,
         &vllm_ascend::dsa_sparse_turbo_lookup_update_batch);
+
+    ops.def(
+        "dsa_offload_resolve_update_batch_v2("
+            "Tensor(a!) index, "
+            "Tensor(b!) slot_to_index, "
+            "Tensor(c!) free_slots, "
+            "Tensor(d!) free_head, "
+            "Tensor request_rows, "
+            "Tensor query_start_loc, "
+            "Tensor query_positions, "
+            "Tensor semantic_topk, "
+            "Tensor(e!) mapped_indices_out, "
+            "Tensor(f!) gather_mask_out, "
+            "int req_num, "
+            "int block_size, "
+            "int decode_mode"
+        ") -> (Tensor(e!), Tensor(f!))"
+    );
+    ops.impl(
+        "dsa_offload_resolve_update_batch_v2",
+        torch::kPrivateUse1,
+        &vllm_ascend::dsa_offload_resolve_update_batch_v2);
+
+    ops.def(
+        "dsa_sparse_turbo_resolve_update_batch_v2("
+            "Tensor(a!) index, "
+            "Tensor(b!) slot_to_index, "
+            "Tensor(c!) free_slots, "
+            "Tensor(d!) free_head, "
+            "Tensor request_rows, "
+            "Tensor query_start_loc, "
+            "Tensor query_positions, "
+            "Tensor semantic_topk, "
+            "Tensor(e!) mapped_indices_out, "
+            "Tensor(f!) gather_mask_out, "
+            "int req_num, "
+            "int block_size, "
+            "int decode_mode"
+        ") -> (Tensor(e!), Tensor(f!))"
+    );
+    ops.impl(
+        "dsa_sparse_turbo_resolve_update_batch_v2",
+        torch::kPrivateUse1,
+        &vllm_ascend::dsa_sparse_turbo_resolve_update_batch_v2);
+
+    ops.def(
+        "asu_kv_gather_direct_v2("
+            "Tensor(a!) destination_kv_cache, "
+            "Tensor(b!) destination_k_rope, "
+            "Tensor hot_block_table_pool, "
+            "Tensor source_kv_cache, "
+            "Tensor source_k_rope, "
+            "Tensor source_block_table, "
+            "Tensor request_rows, "
+            "Tensor query_start_loc, "
+            "Tensor semantic_topk, "
+            "Tensor mapped_indices, "
+            "Tensor gather_mask, "
+            "int block_size, "
+            "int req_num"
+        ") -> (Tensor(a!), Tensor(b!))"
+    );
+    ops.impl(
+        "asu_kv_gather_direct_v2",
+        torch::kPrivateUse1,
+        &vllm_ascend::asu_kv_gather_direct_v2);
 
     ops.def(
         "dsa_sparse_turbo_prefetch_lookup_update_batch("

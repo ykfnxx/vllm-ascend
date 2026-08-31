@@ -67,6 +67,7 @@ def test_feature_gate_and_valid_config() -> None:
 
     assert config is not None
     assert config.io_backend == "mock"
+    assert config.enable_direct_abi
     assert config.kvio_model_id == 9
     assert config.max_verify_tokens_per_request == 8
     assert config.kv_transfer_config is vllm_config.kv_transfer_config
@@ -105,6 +106,14 @@ def test_hidden_state_prefetch_allows_graph_mode() -> None:
 
     assert config is not None
     assert config.enable_prefetch_with_hidden_states
+
+
+def test_direct_abi_requires_boolean() -> None:
+    vllm_config = make_config()
+    vllm_config.additional_config["dsa_offload"]["enable_direct_abi"] = 1
+
+    with pytest.raises(TypeError, match="enable_direct_abi"):
+        load_dsa_offload_config(vllm_config)
 
 
 def test_kvgather_sim_and_tail_block_length_are_accepted() -> None:

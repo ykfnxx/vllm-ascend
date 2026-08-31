@@ -20,6 +20,7 @@ class DSAOffloadConfig:
     kv_transfer_config: Any | None
     enable_prefetch_with_hidden_states: bool
     prefetch_top_k: int
+    enable_direct_abi: bool
     enable_turbo_lookup: bool
     enable_turbo_prefetch_lookup: bool
 
@@ -64,6 +65,9 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
     enable_turbo_lookup = raw_config.get("enable_turbo_lookup", True)
     if not isinstance(enable_turbo_lookup, bool):
         raise TypeError("dsa_offload.enable_turbo_lookup must be a boolean.")
+    enable_direct_abi = raw_config.get("enable_direct_abi", True)
+    if not isinstance(enable_direct_abi, bool):
+        raise TypeError("dsa_offload.enable_direct_abi must be a boolean.")
     enable_turbo_prefetch_lookup = raw_config.get(
         "enable_turbo_prefetch_lookup",
         True,
@@ -153,6 +157,7 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
         kv_transfer_config=kv_transfer_config,
         enable_prefetch_with_hidden_states=enable_prefetch,
         prefetch_top_k=prefetch_top_k,
+        enable_direct_abi=enable_direct_abi,
         enable_turbo_lookup=enable_turbo_lookup,
         enable_turbo_prefetch_lookup=enable_turbo_prefetch_lookup,
     )

@@ -15,8 +15,8 @@ PROFILE_FILENAMES = {
 }
 GRAPH_MARKER = (
     "DSA_OFFLOAD_KVGATHER_SIM_GRAPH_ACTIVE "
-    "lookup=dsa_sparse_turbo_lookup_update_batch "
-    "gather=asu_kv_gather mtp=1 graph_mode=FULL_DECODE_ONLY"
+    "lookup=dsa_sparse_turbo_resolve_update_batch_v2 "
+    "gather=asu_kv_gather_direct_v2 mtp=1 graph_mode=FULL_DECODE_ONLY"
 )
 
 
@@ -29,8 +29,8 @@ def _profile_evidence(profile_dir: Path) -> dict[str, bool]:
     if not profile_files:
         raise RuntimeError(f"No analyzed operator CSV exists under {profile_dir}")
     evidence = {
-        "lookup_update_batch": False,
-        "asu_kv_gather": False,
+        "resolve_update_batch_v2": False,
+        "asu_kv_gather_direct_v2": False,
         "sparse_flash_attention": False,
     }
     for path in profile_files:
@@ -42,8 +42,12 @@ def _profile_evidence(profile_dir: Path) -> dict[str, bool]:
             reader = csv.reader(profile_file)
             for row in reader:
                 normalized = _normalize(" ".join(row))
-                evidence["lookup_update_batch"] |= "dsasparseturbolookupupdatebatch" in normalized
-                evidence["asu_kv_gather"] |= "asukvgather" in normalized
+                evidence["resolve_update_batch_v2"] |= (
+                    "dsasparseturboresolveupdatebatchv2" in normalized
+                )
+                evidence["asu_kv_gather_direct_v2"] |= (
+                    "asukvgatherdirectv2" in normalized
+                )
                 evidence["sparse_flash_attention"] |= "sparseflashattention" in normalized
     missing = [name for name, found in evidence.items() if not found]
     if missing:
@@ -106,8 +110,8 @@ def validate(
         "decode_graph": "FULL_DECODE_ONLY",
         "decode_graph_replayed": True,
         "dmp": False,
-        "lookup_operator": "dsa_sparse_turbo_lookup_update_batch",
-        "gather_operator": "asu_kv_gather",
+        "lookup_operator": "dsa_sparse_turbo_resolve_update_batch_v2",
+        "gather_operator": "asu_kv_gather_direct_v2",
         "gather_source_payload": "synthetic_zero",
         "profile_scope": "decode_only",
         "profile_evidence": evidence,

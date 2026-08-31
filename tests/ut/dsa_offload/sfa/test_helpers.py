@@ -8,6 +8,7 @@ import torch
 from vllm_ascend.dsa_offload.hot_cache import HotCacheLayout, HotCacheState
 from vllm_ascend.dsa_offload.lookup import (
     DSAOffloadBatch,
+    DirectLookupPlan,
     IndexCacheCohort,
     LookupPlan,
     build_dsa_offload_batch,
@@ -64,6 +65,7 @@ def test_feature_off_returns_original_inputs() -> None:
     assert prepare_main_slot_mapping(batch=None, default_slot_mapping=slots) is slots
     resolved = resolve_sfa_inputs(
         layer_name="layer",
+        main_cache=(torch.empty(0),),
         semantic_topk=topk,
         default_block_table=table,
         default_actual_seq_lengths_kv=seq_lens,
@@ -213,6 +215,7 @@ def test_leader_looks_up_once_and_follower_performs_own_get(spy_io) -> None:
     ):
         leader_addressing = resolve_sfa_inputs(
             layer_name="leader",
+            main_cache=(torch.empty(0),),
             semantic_topk=mapped,
             default_block_table=table,
             default_actual_seq_lengths_kv=seq_lens,
@@ -230,6 +233,7 @@ def test_leader_looks_up_once_and_follower_performs_own_get(spy_io) -> None:
         follower_default = torch.tensor([[5, 6], [7, 8]], dtype=torch.int32)
         follower_addressing = resolve_sfa_inputs(
             layer_name="follower",
+            main_cache=(torch.empty(0),),
             semantic_topk=mapped,
             default_block_table=follower_default,
             default_actual_seq_lengths_kv=seq_lens,
@@ -254,6 +258,56 @@ def test_leader_looks_up_once_and_follower_performs_own_get(spy_io) -> None:
         "get:4",
         "sfa:follower",
     ]
+
+
+def test_direct_cohort_reuses_one_sfa_addressing_compose(spy_io) -> None:
+    batch, _ = make_mixed_batch(spy_io)
+    assert batch.sfa_workspace is not None
+    batch.enable_direct_abi = True
+    batch.graph_query_start_loc = torch.tensor([0, 2, 3], dtype=torch.int32)
+    spy_io.gather_history_misses_direct = Mock()
+    topk = torch.empty((3, 1, 2048), dtype=torch.int32)
+    mapped = torch.empty_like(topk)
+    mask = torch.zeros_like(topk)
+    plan = DirectLookupPlan(
+        semantic_topk=topk,
+        mapped_indices=mapped,
+        gather_mask=mask,
+        request_rows=batch.request_rows,
+        query_start_loc=batch.graph_query_start_loc,
+    )
+    table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    seq_lens = torch.tensor([2, 6], dtype=torch.int32)
+
+    with (
+        patch(
+            "vllm_ascend.dsa_offload.lookup.make_direct_lookup_plan",
+            return_value=plan,
+        ) as lookup,
+        patch(
+            "vllm_ascend.dsa_offload.lookup.load_direct_plan_misses",
+            side_effect=lambda _plan, _layer_id, _batch: (torch.empty(0),),
+        ) as gather,
+        patch.object(
+            batch.sfa_workspace,
+            "compose",
+            wraps=batch.sfa_workspace.compose,
+        ) as compose,
+    ):
+        for layer_name in ("leader", "follower"):
+            resolved = resolve_sfa_inputs(
+                layer_name=layer_name,
+                main_cache=(torch.empty(0),),
+                semantic_topk=topk,
+                default_block_table=table,
+                default_actual_seq_lengths_kv=seq_lens,
+                batch=batch,
+            )
+            assert resolved.sparse_indices is mapped
+
+    lookup.assert_called_once()
+    assert gather.call_count == 2
+    compose.assert_called_once()
 
 
 def test_fixed_hot_addressing_does_not_depend_on_model_block_table_width() -> None:

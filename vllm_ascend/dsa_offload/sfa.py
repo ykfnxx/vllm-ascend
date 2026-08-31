@@ -21,6 +21,7 @@ __all__ = [
 
 @dataclass(frozen=True)
 class SFAAddressingView:
+    main_cache: tuple[torch.Tensor, ...]
     sparse_indices: torch.Tensor
     block_table: torch.Tensor
     actual_seq_lengths_kv: torch.Tensor
@@ -228,6 +229,7 @@ def prepare_indexer_cache_write(
 def resolve_sfa_inputs(
     *,
     layer_name: str,
+    main_cache: tuple[torch.Tensor, ...],
     semantic_topk: torch.Tensor,
     default_block_table: torch.Tensor,
     default_actual_seq_lengths_kv: torch.Tensor,
@@ -235,6 +237,7 @@ def resolve_sfa_inputs(
 ) -> SFAAddressingView:
     if batch is None or not batch.decode_request_indices:
         return SFAAddressingView(
+            main_cache=main_cache,
             sparse_indices=semantic_topk,
             block_table=default_block_table,
             actual_seq_lengths_kv=default_actual_seq_lengths_kv,
@@ -245,25 +248,54 @@ def resolve_sfa_inputs(
     if plan is None:
         if batch.prefetch_runtime is not None:
             batch.prefetch_runtime.wait_before_exact_lookup(layer_name)
-        plan = _lookup.make_lookup_plan(
-            semantic_topk=semantic_topk,
-            cohort=cohort,
-            batch=batch,
+        direct = (
+            batch.enable_direct_abi
+            and batch.graph_query_start_loc is not None
+            and hasattr(batch.io_backend, "gather_history_misses_direct")
+        )
+        plan = (
+            _lookup.make_direct_lookup_plan(
+                semantic_topk=semantic_topk,
+                cohort=cohort,
+                batch=batch,
+            )
+            if direct
+            else _lookup.make_lookup_plan(
+                semantic_topk=semantic_topk,
+                cohort=cohort,
+                batch=batch,
+            )
         )
         batch.lookup_plans[cohort.cohort_id] = plan
     layer_id = cohort.layer_ids[cohort.layer_names.index(layer_name)]
-    _lookup.load_plan_misses(plan, layer_id, batch)
+    resolved_main_cache = (
+        _lookup.load_direct_plan_misses(plan, layer_id, batch)
+        if isinstance(plan, _lookup.DirectLookupPlan)
+        else main_cache
+    )
+    if isinstance(plan, _lookup.LookupPlan):
+        _lookup.load_plan_misses(plan, layer_id, batch)
     if batch.prefetch_runtime is not None:
         batch.prefetch_runtime.release_after_exact_load(layer_name)
     workspace = batch.sfa_workspace
     if workspace is None:
         raise RuntimeError("DSA Offload Decode requires a persistent SFA addressing workspace.")
-    sfa_block_table, actual_seq_lengths_kv = workspace.compose(
-        default_block_table=default_block_table,
-        default_actual_seq_lengths_kv=default_actual_seq_lengths_kv,
-        batch=batch,
+    addressing = (
+        batch.direct_sfa_addressing
+        if isinstance(plan, _lookup.DirectLookupPlan)
+        else None
     )
+    if addressing is None:
+        addressing = workspace.compose(
+            default_block_table=default_block_table,
+            default_actual_seq_lengths_kv=default_actual_seq_lengths_kv,
+            batch=batch,
+        )
+        if isinstance(plan, _lookup.DirectLookupPlan):
+            batch.direct_sfa_addressing = addressing
+    sfa_block_table, actual_seq_lengths_kv = addressing
     return SFAAddressingView(
+        main_cache=resolved_main_cache,
         sparse_indices=plan.mapped_indices,
         block_table=sfa_block_table,
         actual_seq_lengths_kv=actual_seq_lengths_kv,

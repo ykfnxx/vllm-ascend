@@ -1923,6 +1923,96 @@ std::tuple<at::Tensor, at::Tensor> dsa_sparse_turbo_lookup_update_batch(
     };
 }
 
+std::tuple<at::Tensor, at::Tensor> dsa_offload_resolve_update_batch_v2(
+    at::Tensor& index,
+    at::Tensor& slot_to_index,
+    at::Tensor& free_slots,
+    at::Tensor& free_head,
+    const at::Tensor& request_rows,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& query_positions,
+    const at::Tensor& semantic_topk,
+    at::Tensor& mapped_indices_out,
+    at::Tensor& gather_mask_out,
+    int64_t req_num,
+    int64_t block_size,
+    int64_t decode_mode)
+{
+    (void)index;
+    (void)slot_to_index;
+    (void)free_slots;
+    (void)free_head;
+    (void)request_rows;
+    (void)query_start_loc;
+    (void)query_positions;
+    (void)semantic_topk;
+    (void)req_num;
+    (void)block_size;
+    (void)decode_mode;
+    return {mapped_indices_out, gather_mask_out};
+}
+
+std::tuple<at::Tensor, at::Tensor>
+dsa_sparse_turbo_resolve_update_batch_v2(
+    at::Tensor& index,
+    at::Tensor& slot_to_index,
+    at::Tensor& free_slots,
+    at::Tensor& free_head,
+    const at::Tensor& request_rows,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& query_positions,
+    const at::Tensor& semantic_topk,
+    at::Tensor& mapped_indices_out,
+    at::Tensor& gather_mask_out,
+    int64_t req_num,
+    int64_t block_size,
+    int64_t decode_mode)
+{
+    return dsa_offload_resolve_update_batch_v2(
+        index,
+        slot_to_index,
+        free_slots,
+        free_head,
+        request_rows,
+        query_start_loc,
+        query_positions,
+        semantic_topk,
+        mapped_indices_out,
+        gather_mask_out,
+        req_num,
+        block_size,
+        decode_mode);
+}
+
+std::tuple<at::Tensor, at::Tensor> asu_kv_gather_direct_v2(
+    at::Tensor& destination_kv_cache,
+    at::Tensor& destination_k_rope,
+    const at::Tensor& hot_block_table_pool,
+    const at::Tensor& source_kv_cache,
+    const at::Tensor& source_k_rope,
+    const at::Tensor& source_block_table,
+    const at::Tensor& request_rows,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& semantic_topk,
+    const at::Tensor& mapped_indices,
+    const at::Tensor& gather_mask,
+    int64_t block_size,
+    int64_t req_num)
+{
+    (void)hot_block_table_pool;
+    (void)source_kv_cache;
+    (void)source_k_rope;
+    (void)source_block_table;
+    (void)request_rows;
+    (void)query_start_loc;
+    (void)semantic_topk;
+    (void)mapped_indices;
+    (void)gather_mask;
+    (void)block_size;
+    (void)req_num;
+    return {destination_kv_cache, destination_k_rope};
+}
+
 std::tuple<at::Tensor, at::Tensor> dsa_sparse_turbo_prefetch_lookup_update_batch(
     at::Tensor& index,
     at::Tensor& slot_to_index,
@@ -2125,6 +2215,12 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
              &vllm_ascend::meta::asu_kv_gather);
     ops.impl("dsa_sparse_turbo_lookup_update_batch",
              &vllm_ascend::meta::dsa_sparse_turbo_lookup_update_batch);
+    ops.impl("dsa_offload_resolve_update_batch_v2",
+             &vllm_ascend::meta::dsa_offload_resolve_update_batch_v2);
+    ops.impl("dsa_sparse_turbo_resolve_update_batch_v2",
+             &vllm_ascend::meta::dsa_sparse_turbo_resolve_update_batch_v2);
+    ops.impl("asu_kv_gather_direct_v2",
+             &vllm_ascend::meta::asu_kv_gather_direct_v2);
     ops.impl("dsa_sparse_turbo_prefetch_lookup_update_batch",
              &vllm_ascend::meta::dsa_sparse_turbo_prefetch_lookup_update_batch);
     // npu_fused_gdn_gating

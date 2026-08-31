@@ -2023,8 +2023,6 @@ class AscendSFAImpl(MLAAttentionImpl):
                 actual_seq_lengths_query=actual_seq_lengths_query,
                 actual_seq_lengths_key=actual_seq_lengths_key,
             )
-            if self.use_index_cache:
-                self._update_indexcache_topk_indices(topk_indices)
 
         publish_prefill_layer(
             layer_name=layer_name,
@@ -2035,6 +2033,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         )
         sfa_addressing = resolve_sfa_inputs(
             layer_name=layer_name,
+            main_cache=main_cache,
             semantic_topk=topk_indices,
             default_block_table=attn_metadata.block_table,
             default_actual_seq_lengths_kv=actual_seq_lengths_key,
@@ -2043,13 +2042,15 @@ class AscendSFAImpl(MLAAttentionImpl):
         attn_output = self._execute_sparse_flash_attention_process(
             ql_nope,
             q_pe,
-            kv_cache,
+            self._compose_sfa_kv_cache(sfa_addressing.main_cache),
             sfa_addressing.sparse_indices,
             attn_metadata,
             actual_seq_lengths_query,
             sfa_addressing.actual_seq_lengths_kv,
             block_table=sfa_addressing.block_table,
         )
+        if self.use_index_cache and not self.skip_topk:
+            self._update_indexcache_topk_indices(topk_indices)
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()
