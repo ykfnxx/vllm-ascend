@@ -11,6 +11,7 @@ from vllm_ascend.dsa_offload.lookup import (
     DSAOffloadBatch,
     IndexCacheCohort,
     LookupPlan,
+    get_packed_addressing_metadata,
     load_plan_misses,
     load_prefetch_misses,
     make_lookup_plan,
@@ -18,6 +19,70 @@ from vllm_ascend.dsa_offload.lookup import (
     pack_graph_decode_metadata,
 )
 from vllm_ascend.dsa_offload.ops import LookupState
+
+
+def test_packed_addressing_metadata_is_shared_within_decode_step(
+    spy_io,
+) -> None:
+    layout = HotCacheLayout(4, 2, 2)
+    batch = DSAOffloadBatch(
+        layout=layout,
+        hot_cache=None,
+        io_backend=spy_io,
+        cohorts=(),
+        lookup_states={},
+        request_ids=("first", "second"),
+        request_rows=torch.tensor([1, 0], dtype=torch.int32),
+        decode_request_indices=(0, 1),
+        query_ranges=((0, 2), (2, 3)),
+        query_positions=torch.tensor([7, 8, 12], dtype=torch.int64),
+        is_mtp=True,
+        committed_block_hashes={"first": [], "second": []},
+        candidate_block_hashes={},
+        graph_query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
+    )
+
+    first = get_packed_addressing_metadata(batch)
+    second = get_packed_addressing_metadata(batch)
+
+    assert second is first
+    assert first.query_lengths.tolist() == [2, 1]
+    assert first.query_request_rows.tolist() == [1, 1, 0]
+    assert first.query_positions.tolist() == [7, 8, 12]
+    assert first.verify_starts.tolist() == [7, 12]
+    assert first.tail_starts.tolist() == [4, 12]
+    assert first.expanded_verify_starts.tolist() == [7, 7, 12]
+    assert first.expanded_tail_starts.tolist() == [4, 4, 12]
+    assert first.expanded_query_starts.tolist() == [0, 0, 2]
+
+
+def test_new_decode_batch_recomputes_growing_sequence_metadata(spy_io) -> None:
+    layout = HotCacheLayout(4, 1, 2)
+
+    def make_batch(position: int) -> DSAOffloadBatch:
+        return DSAOffloadBatch(
+            layout=layout,
+            hot_cache=None,
+            io_backend=spy_io,
+            cohorts=(),
+            lookup_states={},
+            request_ids=("request",),
+            request_rows=torch.tensor([0], dtype=torch.int32),
+            decode_request_indices=(0,),
+            query_ranges=((0, 1),),
+            query_positions=torch.tensor([position], dtype=torch.int64),
+            is_mtp=False,
+            committed_block_hashes={"request": []},
+            candidate_block_hashes={},
+        )
+
+    previous = get_packed_addressing_metadata(make_batch(7))
+    current = get_packed_addressing_metadata(make_batch(8))
+
+    assert previous.verify_starts.tolist() == [7]
+    assert previous.tail_starts.tolist() == [4]
+    assert current.verify_starts.tolist() == [8]
+    assert current.tail_starts.tolist() == [8]
 
 
 def test_history_tail_and_miss_are_mapped_to_fixed_hot_slots(spy_io) -> None:
@@ -114,6 +179,8 @@ def test_graph_plan_keeps_dense_lookup_and_gather_metadata(spy_io) -> None:
     assert lookup.call_args.args[1] is batch.request_rows
     assert torch.equal(lookup.call_args.args[2], semantic)
     assert plan.query_request_rows.tolist() == [1, 1, 0]
+    assert batch.packed_addressing is not None
+    assert plan.query_request_rows is batch.packed_addressing.query_request_rows
     assert plan.query_indices is not None
     assert torch.equal(plan.query_indices, semantic)
     assert plan.lookup_slots is not None
@@ -182,6 +249,8 @@ def test_graph_prefetch_plan_uses_fixed_dense_gather_metadata(spy_io) -> None:
     assert lookup.call_args.args[1] is batch.request_rows
     assert torch.equal(lookup.call_args.args[2], semantic)
     assert plan.query_request_rows.tolist() == [1, 1, -1]
+    assert batch.packed_addressing is not None
+    assert plan.query_request_rows is batch.packed_addressing.query_request_rows
     assert plan.query_indices is not None
     assert torch.equal(plan.query_indices, semantic)
     assert plan.lookup_slots is not None
