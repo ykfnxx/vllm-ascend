@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 
 from vllm.v1.kv_cache_interface import (
+    HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -56,12 +57,16 @@ def add_decode_external_main_cache(
     group_id = indexer_group_ids[0]
     indexer_group = kv_cache_config.kv_cache_groups[group_id]
     indexer_specs = _expand_group_specs(indexer_group)
+    # vLLM groups the MTP hidden-state cache with the Indexer cache when
+    # both resolve to the same full-attention allocation class. Keep that
+    # scheduler-owned cache in the group while rejecting unrelated specs.
     if not all(
-        isinstance(spec, AscendSFAIndexerCacheSpec)
+        isinstance(spec, (AscendSFAIndexerCacheSpec, HiddenStateCacheSpec))
         for spec in indexer_specs.values()
     ):
         raise ValueError(
-            "The DSA Offload Decode Indexer group must contain only Indexer specs."
+            "The DSA Offload Decode Indexer group may contain only Indexer "
+            "and MTP hidden-state specs."
         )
 
     main_layer_names = set(main_specs)
