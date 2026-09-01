@@ -1213,6 +1213,10 @@ class NPUModelRunner(GPUModelRunner):
             enable_turbo_prefetch_lookup=(
                 config.enable_turbo_prefetch_lookup
             ),
+            enable_turbo_fused_lookup=config.enable_turbo_fused_lookup,
+            enable_turbo_fused_prefetch_lookup=(
+                config.enable_turbo_fused_prefetch_lookup
+            ),
         )
         graph_rows = self._dsa_offload_graph_request_rows
         if graph_rows is not None:
@@ -1275,6 +1279,10 @@ class NPUModelRunner(GPUModelRunner):
             enable_turbo_lookup=config.enable_turbo_lookup,
             enable_turbo_prefetch_lookup=(
                 config.enable_turbo_prefetch_lookup
+            ),
+            enable_turbo_fused_lookup=config.enable_turbo_fused_lookup,
+            enable_turbo_fused_prefetch_lookup=(
+                config.enable_turbo_fused_prefetch_lookup
             ),
         )
         graph_batch.packed_decode = pack_graph_decode_metadata(graph_batch)

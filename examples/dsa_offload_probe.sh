@@ -537,6 +537,7 @@ if mtp_tokens:
         [
             "dsa_offload_lookup_update_batch",
             "dsa_sparse_turbo_lookup_update_batch",
+            "dsa_sparse_turbo_fused_lookup_update_batch",
         ]
     )
 if prefetch_enabled:
@@ -546,7 +547,12 @@ if prefetch_enabled:
         "prefetch_qli_fusion",
     ])
     if mtp_tokens:
-        required_ops.append("dsa_sparse_turbo_prefetch_lookup_update_batch")
+        required_ops.extend(
+            [
+                "dsa_sparse_turbo_prefetch_lookup_update_batch",
+                "dsa_sparse_turbo_fused_prefetch_lookup_update_batch",
+            ]
+        )
 if io_backend == "kvio":
     required_ops.extend(["npu_get_put_batch", "npu_send_wait"])
     rdma_kv_ops = importlib.import_module("rdma_kv_ops")
@@ -1203,6 +1209,8 @@ require_any(
         "aclndsaoffloadlookupupdate",
         "dsasparseturbolookupupdatebatch",
         "aclndsasparseturbolookupupdatebatch",
+        "dsasparseturbofusedlookupupdatebatch",
+        "aclndsasparseturbofusedlookupupdatebatch",
     ),
     f"{decode_name} DSA lookup/update",
 )
@@ -1218,6 +1226,8 @@ if prefetch_enabled and mtp_enabled:
         (
             "dsasparseturboprefetchlookupupdatebatch",
             "aclndsasparseturboprefetchlookupupdatebatch",
+            "dsasparseturbofusedprefetchlookupupdatebatch",
+            "aclndsasparseturbofusedprefetchlookupupdatebatch",
         ),
         f"{decode_name} DSA predicted prefetch lookup/update",
     )

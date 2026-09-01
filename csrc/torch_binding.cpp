@@ -57,6 +57,8 @@
 #include "attention/asu_kv_gather/asu_kv_gather_torch_adpt.h"
 #include "attention/dsa_sparse_turbo_lookup_update_batch/dsa_sparse_turbo_lookup_update_batch_torch_adpt.h"
 #include "attention/dsa_sparse_turbo_prefetch_lookup_update_batch/dsa_sparse_turbo_prefetch_lookup_update_batch_torch_adpt.h"
+#include "attention/dsa_sparse_turbo_fused_lookup_update_batch/dsa_sparse_turbo_fused_lookup_update_batch_torch_adpt.h"
+#include "attention/dsa_sparse_turbo_fused_prefetch_lookup_update_batch/dsa_sparse_turbo_fused_prefetch_lookup_update_batch_torch_adpt.h"
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
 #include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
@@ -3069,6 +3071,47 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "dsa_sparse_turbo_prefetch_lookup_update_batch",
         torch::kPrivateUse1,
         &vllm_ascend::dsa_sparse_turbo_prefetch_lookup_update_batch);
+
+    ops.def(
+        "dsa_sparse_turbo_fused_lookup_update_batch("
+            "Tensor(a!) index, "
+            "Tensor(b!) slot_to_index, "
+            "Tensor(c!) free_slots, "
+            "Tensor(d!) free_head, "
+            "Tensor request_rows, "
+            "Tensor query_start_loc, "
+            "Tensor query_index, "
+            "Tensor query_positions, "
+            "Tensor verify_starts, "
+            "int req_num, "
+            "int block_size, "
+            "int is_mtp"
+        ") -> (Tensor, Tensor)"
+    );
+    ops.impl(
+        "dsa_sparse_turbo_fused_lookup_update_batch",
+        torch::kPrivateUse1,
+        &vllm_ascend::dsa_sparse_turbo_fused_lookup_update_batch);
+
+    ops.def(
+        "dsa_sparse_turbo_fused_prefetch_lookup_update_batch("
+            "Tensor(a!) index, "
+            "Tensor(b!) slot_to_index, "
+            "Tensor(c!) free_slots, "
+            "Tensor(d!) free_head, "
+            "Tensor request_rows, "
+            "Tensor query_start_loc, "
+            "Tensor query_index, "
+            "Tensor query_positions, "
+            "Tensor verify_starts, "
+            "int req_num, "
+            "int block_size"
+        ") -> (Tensor, Tensor)"
+    );
+    ops.impl(
+        "dsa_sparse_turbo_fused_prefetch_lookup_update_batch",
+        torch::kPrivateUse1,
+        &vllm_ascend::dsa_sparse_turbo_fused_prefetch_lookup_update_batch);
 
     ops.def(
         "prefetch_qli_fusion("
