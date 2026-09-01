@@ -73,7 +73,7 @@ def test_admission_loads_each_follower_before_exposing_mapping(spy_io) -> None:
         cohorts=(cohort,),
         lookup_states=states,
         layer_ids={"leader": 3, "follower": 4},
-        committed_block_hashes=[b"block-0"],
+        committed_block_keys=[101],
         io_backend=spy_io,
     )
 
@@ -107,7 +107,7 @@ def test_local_admission_loads_full_history_and_copies_partial_tail(
         cohorts=(cohort,),
         lookup_states=states,
         layer_ids={"layer": 3},
-        committed_block_hashes=[b"block-0"],
+        committed_block_keys=[101],
         io_backend=spy_io,
     )
 
@@ -120,7 +120,7 @@ def test_local_admission_loads_full_history_and_copies_partial_tail(
     assert "request" in hot_cache.ready_requests
 
 
-def test_local_admission_rejects_missing_full_block_hashes(spy_io) -> None:
+def test_local_admission_rejects_missing_full_block_keys(spy_io) -> None:
     layout = HotCacheLayout(4, 1, 2, hot_block_base=4)
     plane = torch.zeros((4 + layout.hot_blocks, 4, 1))
     hot_cache = HotCacheState(layout, {"layer": (plane,)})
@@ -138,7 +138,7 @@ def test_local_admission_rejects_missing_full_block_hashes(spy_io) -> None:
 
     with pytest.raises(
         RuntimeError,
-        match=r"Hot Cache admission for request request requires 1 block hashes",
+        match=r"Hot Cache admission for request request requires 1 block keys",
     ):
         admit_local_from_prefill(
             handoff=handoff,
@@ -146,6 +146,6 @@ def test_local_admission_rejects_missing_full_block_hashes(spy_io) -> None:
             cohorts=(cohort,),
             lookup_states=states,
             layer_ids={"layer": 3},
-            committed_block_hashes=[],
+            committed_block_keys=[],
             io_backend=spy_io,
         )

@@ -35,8 +35,8 @@ def make_batch(spy_io, *, position: int, is_mtp: bool, committed, candidate):
             dtype=torch.int64,
         ),
         is_mtp=is_mtp,
-        committed_block_hashes={"request": committed},
-        candidate_block_hashes={"request": candidate},
+        committed_block_keys={"request": committed},
+        candidate_block_keys={"request": candidate},
     )
     return batch, cache
 
@@ -46,7 +46,7 @@ def test_decode_put_happens_only_when_tail_becomes_full(spy_io) -> None:
         spy_io,
         position=2,
         is_mtp=False,
-        committed=[b"block-0"],
+        committed=[101],
         candidate=[],
     )
     commit_decode_tail(partial)
@@ -56,7 +56,7 @@ def test_decode_put_happens_only_when_tail_becomes_full(spy_io) -> None:
         spy_io,
         position=3,
         is_mtp=False,
-        committed=[b"block-0"],
+        committed=[101],
         candidate=[],
     )
     events = ["model"]
@@ -69,11 +69,13 @@ def test_decode_put_happens_only_when_tail_becomes_full(spy_io) -> None:
     spy_io.put_blocks = ordered_put
     commit_decode_tail(full)
     assert events == ["model", "put"]
-    assert spy_io.put_calls[-1]["storage_ids"].tolist() == [make_storage_id(b"block-0", 6)]
+    assert spy_io.put_calls[-1]["storage_ids"].tolist() == [
+        make_storage_id(101, 6)
+    ]
     assert spy_io.put_calls[-1]["source_block_ids"].tolist() == [full.layout.tail_block_offset]
 
 
-def test_decode_tail_commit_rejects_missing_block_hash(spy_io) -> None:
+def test_decode_tail_commit_rejects_missing_block_key(spy_io) -> None:
     batch, _ = make_batch(
         spy_io,
         position=3,
@@ -84,12 +86,12 @@ def test_decode_tail_commit_rejects_missing_block_hash(spy_io) -> None:
 
     with pytest.raises(
         RuntimeError,
-        match=r"Decode tail commit for request request requires 1 block hashes",
+        match=r"Decode tail commit for request request requires 1 block keys",
     ):
         commit_decode_tail(batch)
 
 
-def test_decode_tail_commit_uses_worker_hash_resolver(spy_io) -> None:
+def test_decode_tail_commit_uses_worker_key_resolver(spy_io) -> None:
     batch, _ = make_batch(
         spy_io,
         position=3,
@@ -100,11 +102,11 @@ def test_decode_tail_commit_uses_worker_hash_resolver(spy_io) -> None:
 
     commit_decode_tail(
         batch,
-        lambda **kwargs: b"resolved-0",
+        lambda **kwargs: 202,
     )
 
     assert spy_io.put_calls[-1]["storage_ids"].tolist() == [
-        make_storage_id(b"resolved-0", 6)
+        make_storage_id(202, 6)
     ]
 
 
@@ -114,7 +116,7 @@ def test_mtp_commits_only_accepted_prefix_then_puts_candidate_block(spy_io) -> N
         position=3,
         is_mtp=True,
         committed=[],
-        candidate=[b"candidate-0"],
+        candidate=[303],
     )
     slots = cache.flatten(0, 1)
     slots[batch.layout.staging_base : batch.layout.staging_base + 3, 0] = torch.tensor([11.0, 12.0, 99.0])
@@ -134,4 +136,6 @@ def test_mtp_commits_only_accepted_prefix_then_puts_candidate_block(spy_io) -> N
     assert slots[batch.layout.tail_base + 3, 0].item() == 11
     assert slots[batch.layout.tail_base, 0].item() == 12
     assert slots[batch.layout.tail_base + 1, 0].item() == 0
-    assert spy_io.put_calls[-1]["storage_ids"].tolist() == [make_storage_id(b"candidate-0", 6)]
+    assert spy_io.put_calls[-1]["storage_ids"].tolist() == [
+        make_storage_id(303, 6)
+    ]
