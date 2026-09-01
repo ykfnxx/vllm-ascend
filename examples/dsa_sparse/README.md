@@ -508,7 +508,10 @@ AIV block、`blockDim=min(req_num, aiv_count)`”的切分可以作为第一版�
    `query_positions/verify_starts`；
 7. 已删除 `LookupPlan` 中没有运行时消费者的
    `tail_mask/fallback_mask/staging_mask`；
-8. 需在 A5 重新编译后，用两份独立 LookupState 对拍全部状态副作用并复核整网
+8. Fused 主流程和预取流程将算子输出的 INT32 `miss_mask` 直接交给 dense Gather；
+   图模式不再为未消费的 eager miss plan 执行 `.bool()`，用于消除 Lookup 与 Gather
+   之间的 `InplaceCopy/Cast`；
+9. 需在 A5 重新编译后，用两份独立 LookupState 对拍全部状态副作用并复核整网
    profiling；最后再决定是否扩展 non-MTP fused 路径。
 
 建议使用新的 V2 算子名，而不是直接修改旧算子 ABI，以避免旧 wheel、自定义算子

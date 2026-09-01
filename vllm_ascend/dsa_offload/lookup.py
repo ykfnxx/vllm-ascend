@@ -601,6 +601,8 @@ def make_lookup_plan(
         and batch.enable_turbo_lookup
         and batch.enable_turbo_fused_lookup
     )
+    active_misses: torch.Tensor | None = None
+    fused_dense_miss: torch.Tensor | None = None
     if fused_lookup:
         mapped, fused_dense_miss = turbo_fused_lookup_update_batch(
             state,
@@ -613,7 +615,11 @@ def make_lookup_plan(
             batch.layout.block_size,
             int(batch.is_mtp),
         )
-        active_misses = fused_dense_miss.bool()
+        # Dense Gather consumes the fused INT32 mask directly.  Converting it
+        # to BOOL here records an otherwise unused InplaceCopy/Cast pair in a
+        # full Decode graph.  Materialize the BOOL view only for the eager
+        # sparse-miss fallback below.
+        dense_miss_mask = fused_dense_miss if use_dense_gather else None
         miss_lookup_offsets = mapped
     else:
         expanded_verify_starts, tail_starts = (
@@ -695,6 +701,11 @@ def make_lookup_plan(
             torch.full_like(mapped, INVALID_INDEX),
         )
         active_misses = miss_out.bool() & history_mask & ~fallback_mask
+        dense_miss_mask = (
+            active_misses.to(torch.int32).contiguous()
+            if use_dense_gather
+            else None
+        )
         miss_lookup_offsets = lookup_offsets
 
     if graph_mode:
@@ -703,7 +714,7 @@ def make_lookup_plan(
         merged_indices = semantic.clone()
         merged_indices.index_copy_(0, packed.token_indices, mapped)
 
-    if graph_mode:
+    if graph_mode or use_dense_gather:
         miss_positions = packed_topk.new_empty((0,), dtype=torch.int64)
         miss_logical_blocks = packed_topk.new_empty((0,), dtype=torch.int64)
         miss_block_offsets = packed_topk.new_empty((0,), dtype=torch.int64)
@@ -711,6 +722,9 @@ def make_lookup_plan(
         miss_batch_indices = packed_topk.new_empty((0,), dtype=torch.int32)
     else:
         assert query_batch_indices is not None
+        if active_misses is None:
+            assert fused_dense_miss is not None
+            active_misses = fused_dense_miss.bool()
         expanded_rows = query_request_rows.unsqueeze(1).expand_as(packed_topk)
         expanded_batch_indices = query_batch_indices.unsqueeze(1).expand_as(
             packed_topk
@@ -742,15 +756,7 @@ def make_lookup_plan(
             if use_dense_gather
             else None
         ),
-        dense_miss_mask=(
-            (
-                fused_dense_miss
-                if fused_lookup
-                else active_misses.to(torch.int32).contiguous()
-            )
-            if use_dense_gather
-            else None
-        ),
+        dense_miss_mask=dense_miss_mask,
         miss_positions=miss_positions,
         miss_logical_blocks=miss_logical_blocks,
         miss_block_offsets=miss_block_offsets,
@@ -787,6 +793,8 @@ def make_prefetch_lookup_plan(
         and batch.enable_turbo_prefetch_lookup
         and batch.enable_turbo_fused_prefetch_lookup
     )
+    active: torch.Tensor | None = None
+    fused_dense_miss: torch.Tensor | None = None
     if fused_prefetch_lookup:
         logical_slots, fused_dense_miss = (
             turbo_fused_prefetch_lookup_update_batch(
@@ -798,7 +806,10 @@ def make_prefetch_lookup_plan(
                 batch.layout.block_size,
             )
         )
-        active = fused_dense_miss.bool()
+        # As in the exact path, dense Gather accepts the fused INT32 mask.
+        # Delay BOOL conversion until the eager sparse fallback actually
+        # indexes miss rows.
+        dense_miss_mask = fused_dense_miss if use_dense_gather else None
     else:
         _, tail_starts = get_expanded_lookup_boundaries(batch)
         valid_mask = (query_indices >= 0) & (query_indices < INDEX_CAPACITY)
@@ -831,6 +842,11 @@ def make_prefetch_lookup_plan(
             & (slot_out >= 0)
             & (slot_out < LOOKUP_SLOTS)
         )
+        dense_miss_mask = (
+            active.to(torch.int32).contiguous()
+            if use_dense_gather
+            else None
+        )
         logical_slots = batch.layout.lookup_offsets(slot_out)
     if graph_mode or use_dense_gather:
         miss_positions = query_indices.new_empty((0,), dtype=torch.int64)
@@ -839,6 +855,9 @@ def make_prefetch_lookup_plan(
         miss_destination_slots = query_indices.new_empty((0,), dtype=torch.int64)
         miss_rows = query_indices.new_empty((0,), dtype=torch.int64)
     else:
+        if active is None:
+            assert fused_dense_miss is not None
+            active = fused_dense_miss.bool()
         expanded_rows = query_request_rows.unsqueeze(1).expand_as(
             query_indices
         )
@@ -861,15 +880,7 @@ def make_prefetch_lookup_plan(
     return PrefetchLookupPlan(
         query_indices=query_indices if use_dense_gather else None,
         lookup_slots=logical_slots if use_dense_gather else None,
-        dense_miss_mask=(
-            (
-                fused_dense_miss
-                if fused_prefetch_lookup
-                else active.to(torch.int32).contiguous()
-            )
-            if use_dense_gather
-            else None
-        ),
+        dense_miss_mask=dense_miss_mask,
         query_request_rows=query_request_rows,
         miss_positions=miss_positions,
         miss_logical_blocks=miss_logical_blocks,
