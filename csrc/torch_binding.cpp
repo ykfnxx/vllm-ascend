@@ -52,7 +52,6 @@
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
-#include "attention/dsa_offload_lookup_update/dsa_offload_lookup_update_torch_adpt.h"
 #include "attention/dsa_offload_lookup_update_batch/dsa_offload_lookup_update_batch_torch_adpt.h"
 #include "attention/asu_kv_gather/asu_kv_gather_torch_adpt.h"
 #include "attention/dsa_sparse_turbo_lookup_update_batch/dsa_sparse_turbo_lookup_update_batch_torch_adpt.h"
@@ -2979,7 +2978,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("store_kv_block", torch::kPrivateUse1, &vllm_ascend::store_kv_block);
 
     ops.def(
-        "dsa_offload_lookup_update("
+        "dsa_offload_lookup_update_batch("
             "Tensor(a!) index, "
             "Tensor(b!) slot_to_index, "
             "Tensor(c!) free_slots, "
@@ -2994,24 +2993,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
             "int fallback_slot, "
             "int staging_base, "
             "int decode_mode"
-        ") -> (Tensor, Tensor)"
-    );
-    ops.impl(
-        "dsa_offload_lookup_update",
-        torch::kPrivateUse1,
-        &vllm_ascend::dsa_offload_lookup_update);
-
-    ops.def(
-        "dsa_offload_lookup_update_batch("
-            "Tensor(a!) index, "
-            "Tensor(b!) slot_to_index, "
-            "Tensor(c!) free_slots, "
-            "Tensor(d!) free_head, "
-            "Tensor request_rows, "
-            "Tensor query_start_loc, "
-            "Tensor query_indices, "
-            "Tensor lookup_mask, "
-            "int req_num"
         ") -> (Tensor, Tensor)"
     );
     ops.impl(

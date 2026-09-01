@@ -15,7 +15,7 @@ PROFILE_FILENAMES = {
 }
 GRAPH_MARKER = (
     "DSA_OFFLOAD_KVGATHER_SIM_GRAPH_ACTIVE "
-    "lookup=dsa_offload_lookup_update "
+    "lookup=dsa_offload_lookup_update_batch "
     "gather=asu_kv_gather mtp=1 graph_mode=FULL_DECODE_ONLY"
 )
 
@@ -106,7 +106,7 @@ def validate(
         "decode_graph": "FULL_DECODE_ONLY",
         "decode_graph_replayed": True,
         "dmp": False,
-        "lookup_operator": "dsa_offload_lookup_update",
+        "lookup_operator": "dsa_offload_lookup_update_batch",
         "gather_operator": "asu_kv_gather",
         "gather_source_payload": "synthetic_zero",
         "profile_scope": "decode_only",

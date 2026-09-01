@@ -10,8 +10,12 @@
 
 struct DsaOffloadLookupUpdateBatchTilingData {
     uint32_t reqNum;
-    uint32_t poolCapacity;
-    uint32_t queryNum;
+    uint32_t blockSize;
+    uint32_t replaceableBase;
+    uint32_t tailBase;
+    uint32_t fallbackSlot;
+    uint32_t stagingBase;
+    uint32_t decodeMode;
 };
 
 struct DsaOffloadLookupUpdateBatchCompileInfo {};

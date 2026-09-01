@@ -224,7 +224,6 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "chunk_gated_delta_rule_fwd_h"
         "store_kv_block"
         "store_kv_block_metadata"
-        "dsa_offload_lookup_update"
         "dsa_offload_lookup_update_batch"
         "asu_kv_gather"
         "dsa_sparse_turbo_lookup_update_batch"

@@ -530,11 +530,10 @@ if repo_root not in package_path.parents:
 importlib.import_module("vllm_ascend.vllm_ascend_C")
 namespace = torch.ops._C_ascend
 required_ops = [
-    "dsa_offload_lookup_update",
+    "dsa_offload_lookup_update_batch",
 ]
 if prefetch_enabled:
     required_ops.extend([
-        "dsa_offload_lookup_update_batch",
         "npu_lightning_indexer_hi_cached",
         "npu_scatter_nd_update_mean",
         "prefetch_qli_fusion",

@@ -5,7 +5,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 OPERATOR_NAMES = (
-    "dsa_offload_lookup_update",
     "dsa_offload_lookup_update_batch",
     "asu_kv_gather",
 )
@@ -24,6 +23,7 @@ def test_native_sources_use_only_dsa_offload_names() -> None:
     assert "DsaSparse" not in source
     assert "DSA_SPARSE" not in source
     assert all(operator_root.is_dir() for operator_root in operator_roots)
+    assert not (ROOT / "csrc" / "attention" / "dsa_offload_lookup_update").exists()
 
 
 def test_native_operator_directories_match_kernel_names() -> None:

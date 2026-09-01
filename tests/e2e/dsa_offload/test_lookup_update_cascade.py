@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from vllm_ascend.dsa_offload.ops import LookupState, lookup_update
+from vllm_ascend.dsa_offload.ops import LookupState, lookup_update_batch
 from vllm_ascend.utils import (
     AscendDeviceType,
     enable_custom_op,
@@ -17,7 +17,7 @@ pytestmark = [
     pytest.mark.ascend_a5,
     pytest.mark.skipif(
         get_ascend_device_type() != AscendDeviceType.A5,
-        reason="DsaOffloadLookupUpdate requires Ascend A5",
+        reason="DsaOffloadLookupUpdateBatch requires Ascend A5",
     ),
 ]
 
@@ -60,7 +60,7 @@ def run_lookup(
     semantic_topk: torch.Tensor,
     decode_mode: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return lookup_update(
+    return lookup_update_batch(
         state,
         torch.tensor(request_rows, dtype=torch.int32, device="npu"),
         torch.tensor(query_start_loc, dtype=torch.int32, device="npu"),
@@ -105,19 +105,20 @@ def test_normal_decode_and_prefill_passthrough() -> None:
 
 
 @torch.inference_mode()
-def test_mtp_tail_staging_and_cross_query_protection() -> None:
-    state = make_state(1)
+def test_mtp_batch_tail_staging_and_cross_query_protection() -> None:
+    state = make_state(2)
     semantic = torch.full(
-        (2, 1, 2048), -1, dtype=torch.int32, device="npu"
+        (3, 1, 2048), -1, dtype=torch.int32, device="npu"
     )
     semantic[0, 0, :4] = torch.tensor([1, 6, 8, -1], device="npu")
     semantic[1, 0, :4] = torch.tensor([6, 7, 8, 9], device="npu")
+    semantic[2, 0, :4] = torch.tensor([2, 12, 13, -1], device="npu")
 
     mapped, misses = run_lookup(
         state,
-        [0],
-        [0, 2],
-        [8, 9],
+        [0, 1],
+        [0, 2, 3],
+        [8, 9, 12],
         semantic,
         decode_mode=1,
     )
@@ -125,9 +126,11 @@ def test_mtp_tail_staging_and_cross_query_protection() -> None:
     assert mapped[:, 0, :4].cpu().tolist() == [
         [1, 8192, 10245, -1],
         [8192, 0, 10245, 10246],
+        [2, 10245, -1, -1],
     ]
     assert misses[:, 0, :4].cpu().tolist() == [
         [0, 1, 0, 0],
         [0, 1, 0, 0],
+        [0, 0, 0, 0],
     ]
     assert state.index[0, [1, 6, 7]].cpu().tolist() == [1, 8192, 0]

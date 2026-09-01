@@ -936,7 +936,7 @@ class NPUModelRunner(GPUModelRunner):
                     self.speculative_config is not None
                     and self.speculative_config.method == "mtp"
                 )
-                main_lookup_op = "dsa_offload_lookup_update"
+                main_lookup_op = "dsa_offload_lookup_update_batch"
                 request_rows = self._dsa_offload_request_rows
                 assert request_rows is not None
                 request_rows.np[:] = np.arange(

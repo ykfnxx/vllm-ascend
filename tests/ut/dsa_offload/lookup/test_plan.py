@@ -55,7 +55,7 @@ def test_history_tail_and_miss_are_mapped_to_fixed_hot_slots(spy_io) -> None:
     misses = torch.tensor([[[0, 1, 0, 0]]], dtype=torch.int32)
 
     with patch(
-        "vllm_ascend.dsa_offload.lookup.lookup_update",
+        "vllm_ascend.dsa_offload.lookup.lookup_update_batch",
         return_value=(mapped, misses),
     ) as lookup:
         plan = make_lookup_plan(
@@ -117,7 +117,7 @@ def test_graph_plan_keeps_dense_lookup_and_gather_metadata(spy_io) -> None:
     misses = torch.ones_like(semantic)
 
     with patch(
-        "vllm_ascend.dsa_offload.lookup.lookup_update",
+        "vllm_ascend.dsa_offload.lookup.lookup_update_batch",
         return_value=(slots, misses),
     ) as lookup:
         plan = make_lookup_plan(
@@ -186,8 +186,8 @@ def test_graph_prefetch_plan_uses_fixed_dense_gather_metadata(spy_io) -> None:
         [[1, 2], [3, 4], [5, 6]],
         dtype=torch.int32,
     )
-    slots = torch.zeros_like(semantic)
-    misses = torch.ones_like(semantic)
+    slots = torch.zeros((3, 1, 2), dtype=torch.int32)
+    misses = torch.ones_like(slots)
 
     with patch(
         "vllm_ascend.dsa_offload.lookup.lookup_update_batch",
@@ -201,13 +201,14 @@ def test_graph_prefetch_plan_uses_fixed_dense_gather_metadata(spy_io) -> None:
 
     assert lookup.call_args.args[1] is batch.request_rows
     assert lookup.call_args.args[2] is query_start_loc
-    assert torch.equal(lookup.call_args.args[3], semantic)
+    assert lookup.call_args.args[3] is batch.query_positions
+    assert torch.equal(lookup.call_args.args[4], semantic.unsqueeze(1))
     assert plan.query_request_rows.tolist() == [1, 1, -1]
     assert plan.query_indices is not None
     assert torch.equal(plan.query_indices, semantic)
     assert plan.lookup_slots is not None
     assert plan.dense_miss_mask is not None
-    assert plan.dense_miss_mask.tolist() == misses.tolist()
+    assert plan.dense_miss_mask.tolist() == misses.reshape(3, 2).tolist()
     assert plan.miss_positions.numel() == 0
 
     load_prefetch_misses(

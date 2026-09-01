@@ -19,7 +19,6 @@ from .hot_cache import HotCacheLayout, HotCacheState
 from .io import IOBackend, make_storage_ids, require_block_keys
 from .ops import (
     LookupState,
-    lookup_update,
     lookup_update_batch,
     turbo_prefetch_lookup_update_batch,
 )
@@ -314,10 +313,7 @@ def pack_decode_metadata(batch: DSAOffloadBatch) -> PackedDecodeMetadata:
         dtype=torch.int32,
         device=device,
     )
-    query_positions = batch.query_positions.index_select(
-        0,
-        token_indices,
-    ).to(torch.int32)
+    query_positions = batch.query_positions.index_select(0, token_indices)
     if token_indices.numel() == 0:
         query_request_rows = request_rows.new_empty((0,))
         query_batch_indices = request_indices.new_empty((0,))
@@ -394,7 +390,7 @@ def make_lookup_plan(
     graph_mode = batch.graph_query_start_loc is not None
     use_dense_gather = hasattr(batch.io_backend, "gather_history_misses")
     state = batch.lookup_states[cohort.cohort_id]
-    mapped_indices, miss_out = lookup_update(
+    mapped_indices, miss_out = lookup_update_batch(
         state,
         batch.request_rows,
         batch.query_start_loc,
@@ -495,34 +491,10 @@ def make_prefetch_lookup_plan(
         else packed.query_start_loc
     )
     assert query_start_loc is not None
-    packed_positions = (
-        batch.query_positions.to(torch.int32)
-        if graph_mode
-        else packed.query_positions
-    )
-    verify_starts = packed_positions[
-        query_start_loc[:-1].to(torch.int64)
-    ]
+    packed_positions = batch.query_positions if graph_mode else packed.query_positions
     query_lengths = (
         query_start_loc[1:] - query_start_loc[:-1]
     ).to(torch.int64)
-    expanded_verify_starts = torch.repeat_interleave(
-        verify_starts,
-        query_lengths,
-        output_size=query_indices.shape[0],
-    )
-    tail_starts = (
-        torch.div(
-            expanded_verify_starts,
-            batch.layout.block_size,
-            rounding_mode="floor",
-        )
-        * batch.layout.block_size
-    )
-    valid_mask = (query_indices >= 0) & (query_indices < INDEX_CAPACITY)
-    lookup_mask = (
-        valid_mask & (query_indices < tail_starts.unsqueeze(1))
-    ).to(torch.int32).contiguous()
     state = batch.lookup_states[cohort.cohort_id]
     request_rows = batch.request_rows if graph_mode else packed.request_rows
     query_request_rows = torch.repeat_interleave(
@@ -530,34 +502,53 @@ def make_prefetch_lookup_plan(
         query_lengths,
         output_size=query_indices.shape[0],
     )
-    if batch.is_mtp:
-        lookup = (
-            turbo_prefetch_lookup_update_batch
-            if batch.enable_turbo_prefetch_lookup
-            else lookup_update_batch
+    use_turbo = batch.is_mtp and batch.enable_turbo_prefetch_lookup
+    if use_turbo:
+        verify_starts = packed_positions[
+            query_start_loc[:-1].to(torch.int64)
+        ]
+        expanded_verify_starts = torch.repeat_interleave(
+            verify_starts,
+            query_lengths,
+            output_size=query_indices.shape[0],
         )
-        slot_out, miss_out = lookup(
+        tail_starts = (
+            torch.div(
+                expanded_verify_starts,
+                batch.layout.block_size,
+                rounding_mode="floor",
+            )
+            * batch.layout.block_size
+        )
+        lookup_mask = (
+            (query_indices >= 0)
+            & (query_indices < INDEX_CAPACITY)
+            & (query_indices < tail_starts.unsqueeze(1))
+        ).to(torch.int32).contiguous()
+        slot_out, miss_out = turbo_prefetch_lookup_update_batch(
             state,
             request_rows,
             query_start_loc,
             query_indices,
             lookup_mask,
         )
+        mapped_slot_out = batch.layout.lookup_offsets(slot_out)
+        active = miss_out.bool() & lookup_mask.bool()
     else:
-        slot_out, miss_out = lookup_update_batch(
+        mapped_indices, miss_mask = lookup_update_batch(
             state,
             request_rows,
             query_start_loc,
-            query_indices,
-            lookup_mask,
+            packed_positions,
+            query_indices.unsqueeze(1),
+            block_size=batch.layout.block_size,
+            tail_base=batch.layout.tail_base,
+            fallback_slot=batch.layout.fallback_slot,
+            staging_base=batch.layout.staging_base,
+            decode_mode=int(batch.is_mtp),
         )
-
-    active = (
-        miss_out.bool()
-        & lookup_mask.bool()
-        & (slot_out >= 0)
-        & (slot_out < LOOKUP_SLOTS)
-    )
+        mapped_slot_out = mapped_indices.reshape(query_indices.shape)
+        active = miss_mask.reshape(query_indices.shape).bool()
     if graph_mode or use_dense_gather:
         miss_positions = query_indices.new_empty((0,), dtype=torch.int64)
         miss_logical_blocks = query_indices.new_empty((0,), dtype=torch.int64)
@@ -570,9 +561,7 @@ def make_prefetch_lookup_plan(
         )
         miss_positions = query_indices[active].to(torch.int64)
         miss_rows = expanded_rows[active].to(torch.int64)
-        miss_slots = batch.layout.lookup_offsets(
-            slot_out[active].to(torch.int64)
-        )
+        miss_slots = mapped_slot_out[active].to(torch.int64)
         miss_destination_slots = (
             batch.layout.hot_block_base
             + miss_rows * batch.layout.hot_blocks_per_row
@@ -589,9 +578,7 @@ def make_prefetch_lookup_plan(
     return PrefetchLookupPlan(
         query_indices=query_indices if use_dense_gather else None,
         lookup_slots=(
-            batch.layout.lookup_offsets(slot_out)
-            if use_dense_gather
-            else None
+            mapped_slot_out if use_dense_gather else None
         ),
         dense_miss_mask=(
             active.to(torch.int32).contiguous()

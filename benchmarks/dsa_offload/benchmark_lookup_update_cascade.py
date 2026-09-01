@@ -6,7 +6,7 @@ import statistics
 
 import torch
 
-from vllm_ascend.dsa_offload.ops import LookupState, lookup_update
+from vllm_ascend.dsa_offload.ops import LookupState, lookup_update_batch
 from vllm_ascend.utils import enable_custom_op
 
 enable_custom_op()
@@ -105,7 +105,7 @@ def main() -> None:
 
     def run() -> tuple[torch.Tensor, torch.Tensor]:
         state, request_rows, query_start_loc, positions, topk = inputs
-        return lookup_update(
+        return lookup_update_batch(
             state,
             request_rows,
             query_start_loc,

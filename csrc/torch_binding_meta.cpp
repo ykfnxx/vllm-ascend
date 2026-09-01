@@ -1823,7 +1823,7 @@ void store_kv_block(
 
 } 
 
-std::tuple<at::Tensor, at::Tensor> dsa_offload_lookup_update(
+std::tuple<at::Tensor, at::Tensor> dsa_offload_lookup_update_batch(
     at::Tensor& index,
     at::Tensor& slot_to_index,
     at::Tensor& free_slots,
@@ -1855,31 +1855,6 @@ std::tuple<at::Tensor, at::Tensor> dsa_offload_lookup_update(
     return {
         at::empty_like(semantic_topk),
         at::empty_like(semantic_topk),
-    };
-}
-
-std::tuple<at::Tensor, at::Tensor> dsa_offload_lookup_update_batch(
-    at::Tensor& index,
-    at::Tensor& slot_to_index,
-    at::Tensor& free_slots,
-    at::Tensor& free_head,
-    const at::Tensor& request_rows,
-    const at::Tensor& query_start_loc,
-    const at::Tensor& query_indices,
-    const at::Tensor& lookup_mask,
-    int64_t req_num)
-{
-    (void)index;
-    (void)slot_to_index;
-    (void)free_slots;
-    (void)free_head;
-    (void)request_rows;
-    (void)query_start_loc;
-    (void)lookup_mask;
-    (void)req_num;
-    return {
-        at::empty_like(query_indices),
-        at::empty_like(query_indices),
     };
 }
 
@@ -2129,8 +2104,6 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
      // store_kv_block
     ops.impl("store_kv_block_pre", &vllm_ascend::meta::store_kv_block_metadata);
     ops.impl("store_kv_block", &vllm_ascend::meta::store_kv_block);
-    ops.impl("dsa_offload_lookup_update",
-             &vllm_ascend::meta::dsa_offload_lookup_update);
     ops.impl("dsa_offload_lookup_update_batch",
              &vllm_ascend::meta::dsa_offload_lookup_update_batch);
     ops.impl("asu_kv_gather",

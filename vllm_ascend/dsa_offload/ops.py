@@ -17,7 +17,7 @@ class LookupState:
 LookupOutput = tuple[torch.Tensor, torch.Tensor]
 
 
-def lookup_update(
+def lookup_update_batch(
     state: LookupState,
     request_rows: torch.Tensor,
     query_start_loc: torch.Tensor,
@@ -30,7 +30,7 @@ def lookup_update(
     staging_base: int,
     decode_mode: int,
 ) -> LookupOutput:
-    return torch.ops._C_ascend.dsa_offload_lookup_update(
+    return torch.ops._C_ascend.dsa_offload_lookup_update_batch(
         state.index,
         state.slot_to_index,
         state.free_slots,
@@ -45,26 +45,6 @@ def lookup_update(
         fallback_slot,
         staging_base,
         decode_mode,
-    )
-
-
-def lookup_update_batch(
-    state: LookupState,
-    request_rows: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    query_indices: torch.Tensor,
-    lookup_mask: torch.Tensor,
-) -> LookupOutput:
-    return torch.ops._C_ascend.dsa_offload_lookup_update_batch(
-        state.index,
-        state.slot_to_index,
-        state.free_slots,
-        state.free_head,
-        request_rows,
-        query_start_loc,
-        query_indices,
-        lookup_mask,
-        request_rows.shape[0],
     )
 
 

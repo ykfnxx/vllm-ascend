@@ -89,7 +89,6 @@ assert repo in package.parents, (repo, package)
 
 importlib.import_module("vllm_ascend.vllm_ascend_C")
 required = [
-    "dsa_offload_lookup_update",
     "dsa_offload_lookup_update_batch",
 ]
 missing = [name for name in required if not hasattr(torch.ops._C_ascend, name)]
