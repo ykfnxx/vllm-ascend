@@ -10,7 +10,7 @@ import torch
 if TYPE_CHECKING:
     from .hot_cache import HotCacheLayout
 
-_STORAGE_KEY_DOMAIN = b"dsa-offload-mla-v1"
+_STORAGE_KEY_DOMAIN = b"dsa-offload-mla-v2"
 _INT63_MASK = (1 << 63) - 1
 
 
@@ -53,35 +53,39 @@ class IOBackend(Protocol):
     def close(self) -> None: ...
 
 
-def make_storage_id(block_hash: bytes, layer_id: int) -> int:
-    digest = hashlib.sha256(_STORAGE_KEY_DOMAIN + block_hash + layer_id.to_bytes(4, "big", signed=False)).digest()
+def make_storage_id(block_key: int, layer_id: int) -> int:
+    digest = hashlib.sha256(
+        _STORAGE_KEY_DOMAIN
+        + block_key.to_bytes(8, "big", signed=False)
+        + layer_id.to_bytes(4, "big", signed=False)
+    ).digest()
     storage_id = int.from_bytes(digest[:8], "big") & _INT63_MASK
     return storage_id or 1
 
 
 def make_storage_ids(
-    block_hashes: Sequence[bytes],
+    block_keys: Sequence[int],
     layer_id: int,
     *,
     device: torch.device | str,
 ) -> torch.Tensor:
     return torch.tensor(
-        [make_storage_id(block_hash, layer_id) for block_hash in block_hashes],
+        [make_storage_id(block_key, layer_id) for block_key in block_keys],
         dtype=torch.int64,
         device=device,
     )
 
 
-def require_block_hashes(
-    block_hashes: Sequence[bytes],
+def require_block_keys(
+    block_keys: Sequence[int],
     required_blocks: int,
     *,
     context: str,
 ) -> None:
-    available_blocks = len(block_hashes)
+    available_blocks = len(block_keys)
     if available_blocks < required_blocks:
         raise RuntimeError(
-            f"DSA Offload {context} requires {required_blocks} block hashes, "
+            f"DSA Offload {context} requires {required_blocks} block keys, "
             f"but only {available_blocks} are available."
         )
 

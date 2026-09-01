@@ -515,8 +515,9 @@ class GroupedPrefetchRuntime:
             )
             for layer_id in target_layer_ids
         }
-        self._row_hashes: list[tuple[bytes, ...] | None] = [
-            None
+        self._row_committed_counts = [0] * max_num_seqs
+        self._row_candidate_keys: list[tuple[int, ...]] = [
+            ()
         ] * max_num_seqs
         self._prefetch_stream: object | None = None
         self._outgoing: dict[str, GroupedPrefetchController] = {}
@@ -607,27 +608,48 @@ class GroupedPrefetchRuntime:
         for request_index in batch.decode_request_indices:
             request_id = batch.request_ids[request_index]
             row_id = batch.hot_cache.request_to_row[request_id]
-            block_hashes = tuple(batch.block_hashes(request_index))
-            if self._row_hashes[row_id] == block_hashes:
+            committed = batch.committed_block_keys[request_id]
+            candidate = tuple(
+                batch.candidate_block_keys.get(request_id, ())
+            )
+            previous_count = self._row_committed_counts[row_id]
+            previous_candidate = self._row_candidate_keys[row_id]
+            if (
+                len(committed) == previous_count
+                and candidate == previous_candidate
+            ):
                 continue
-            previous_count = len(self._row_hashes[row_id] or ())
             for layer_id, table in self.storage_ids.items():
-                ids = make_storage_ids(
-                    block_hashes,
+                committed_ids = make_storage_ids(
+                    committed[previous_count:],
                     layer_id,
                     device=table.device,
                 )
-                table[row_id, : ids.numel()].copy_(ids)
-                if ids.numel() < previous_count:
-                    table[row_id, ids.numel() : previous_count].fill_(
+                table[
+                    row_id,
+                    previous_count : len(committed),
+                ].copy_(committed_ids)
+                candidate_ids = make_storage_ids(
+                    candidate,
+                    layer_id,
+                    device=table.device,
+                )
+                table[
+                    row_id,
+                    len(committed) : len(committed) + len(candidate),
+                ].copy_(candidate_ids)
+                previous_total = previous_count + len(previous_candidate)
+                current_total = len(committed) + len(candidate)
+                if current_total < previous_total:
+                    table[row_id, current_total:previous_total].fill_(
                         _INVALID_STORAGE_ID
                     )
-            self._row_hashes[row_id] = block_hashes
+            self._row_committed_counts[row_id] = len(committed)
+            self._row_candidate_keys[row_id] = candidate
 
     def clear_request_row(self, row_id: int) -> None:
-        for table in self.storage_ids.values():
-            table[row_id].fill_(_INVALID_STORAGE_ID)
-        self._row_hashes[row_id] = None
+        self._row_committed_counts[row_id] = 0
+        self._row_candidate_keys[row_id] = ()
 
     def start(
         self,

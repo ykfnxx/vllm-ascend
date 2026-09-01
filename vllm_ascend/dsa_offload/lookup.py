@@ -17,7 +17,7 @@ from .constants import (
     RESIDENT_SLOTS,
 )
 from .hot_cache import HotCacheLayout, HotCacheState
-from .io import IOBackend, make_storage_ids, require_block_hashes
+from .io import IOBackend, make_storage_ids, require_block_keys
 from .ops import (
     LookupState,
     lookup_update,
@@ -198,12 +198,14 @@ class DSAOffloadBatch:
     lookup_states: dict[str, LookupState]
     request_ids: tuple[str, ...]
     request_rows: torch.Tensor
+    request_rows_cpu: tuple[int, ...]
     decode_request_indices: tuple[int, ...]
     query_ranges: tuple[tuple[int, int], ...]
     query_positions: torch.Tensor
+    query_positions_cpu: Sequence[int]
     is_mtp: bool
-    committed_block_hashes: Mapping[str, Sequence[bytes]]
-    candidate_block_hashes: Mapping[str, Sequence[bytes]]
+    committed_block_keys: Mapping[str, Sequence[int]]
+    candidate_block_keys: Mapping[str, Sequence[int]]
     prefill_state: object | None = None
     sfa_workspace: "SFAAddressingWorkspace | None" = None
     decode_request_indices_tensor: torch.Tensor | None = None
@@ -214,10 +216,10 @@ class DSAOffloadBatch:
     enable_turbo_prefetch_lookup: bool = False
     lookup_plans: dict[str, LookupPlan] = field(default_factory=dict)
 
-    def block_hashes(self, request_index: int) -> Sequence[bytes]:
+    def block_keys(self, request_index: int) -> Sequence[int]:
         request_id = self.request_ids[request_index]
-        committed = self.committed_block_hashes[request_id]
-        candidate = self.candidate_block_hashes.get(request_id)
+        committed = self.committed_block_keys[request_id]
+        candidate = self.candidate_block_keys.get(request_id)
         return committed if candidate is None else (*committed, *candidate)
 
 
@@ -231,9 +233,11 @@ def build_dsa_offload_batch(
     request_ids: Sequence[str],
     query_counts: Sequence[int],
     query_positions: torch.Tensor,
+    query_positions_cpu: Sequence[int],
     is_mtp: bool,
-    committed_block_hashes: Mapping[str, Sequence[bytes]],
-    candidate_block_hashes: Mapping[str, Sequence[bytes]],
+    committed_block_keys: Mapping[str, Sequence[int]],
+    candidate_block_keys: Mapping[str, Sequence[int]],
+    request_rows: torch.Tensor | None = None,
     prefill_state: object | None = None,
     sfa_workspace: "SFAAddressingWorkspace | None" = None,
     prefetch_runtime: object | None = None,
@@ -246,11 +250,13 @@ def build_dsa_offload_batch(
         row_values = [-1] * len(request_ids)
     else:
         row_values = [hot_cache.request_to_row.get(request_id, -1) for request_id in request_ids]
-    request_rows = torch.tensor(
-        row_values,
-        dtype=torch.int32,
-        device=query_positions.device,
-    )
+    request_rows_cpu = tuple(row_values)
+    if request_rows is None:
+        request_rows = torch.tensor(
+            row_values,
+            dtype=torch.int32,
+            device=query_positions.device,
+        )
     decode_request_indices = tuple(index for index, row_id in enumerate(row_values) if row_id >= 0)
     batch = DSAOffloadBatch(
         layout=layout,
@@ -260,12 +266,14 @@ def build_dsa_offload_batch(
         lookup_states=lookup_states,
         request_ids=tuple(request_ids),
         request_rows=request_rows,
+        request_rows_cpu=request_rows_cpu,
         decode_request_indices=decode_request_indices,
         query_ranges=query_ranges,
         query_positions=query_positions,
+        query_positions_cpu=query_positions_cpu,
         is_mtp=is_mtp,
-        committed_block_hashes=committed_block_hashes,
-        candidate_block_hashes=candidate_block_hashes,
+        committed_block_keys=committed_block_keys,
+        candidate_block_keys=candidate_block_keys,
         prefill_state=prefill_state,
         sfa_workspace=sfa_workspace,
         decode_request_indices_tensor=torch.tensor(
@@ -768,14 +776,14 @@ def load_plan_misses(
         if request_logical_blocks.numel() == 0:
             continue
         request_id = batch.request_ids[request_index]
-        block_hashes = batch.block_hashes(request_index)
-        require_block_hashes(
-            block_hashes,
+        block_keys = batch.block_keys(request_index)
+        require_block_keys(
+            block_keys,
             int(request_logical_blocks.max().item()) + 1,
             context=f"miss load for request {request_id}",
         )
         request_storage_ids = make_storage_ids(
-            block_hashes,
+            block_keys,
             layer_id,
             device=plan.miss_logical_blocks.device,
         )

@@ -15,7 +15,7 @@ from .constants import (
     REPLACEABLE_SLOTS,
     RESIDENT_SLOTS,
 )
-from .io import make_storage_ids, require_block_hashes
+from .io import make_storage_ids, require_block_keys
 
 if TYPE_CHECKING:
     from .lookup import DSAOffloadBatch
@@ -212,22 +212,22 @@ def _put_tail_block(
     batch: "DSAOffloadBatch",
     request_index: int,
     logical_block: int,
-    block_hash_resolver: Callable[..., bytes] | None = None,
+    block_key_resolver: Callable[..., int] | None = None,
 ) -> None:
     hot_cache = batch.hot_cache
-    row_id = int(batch.request_rows[request_index].item())
+    row_id = batch.request_rows_cpu[request_index]
     source_block_id = hot_cache.layout.row_block_base(row_id) + hot_cache.layout.tail_block_offset
-    block_hashes = batch.block_hashes(request_index)
+    block_keys = batch.block_keys(request_index)
     request_id = batch.request_ids[request_index]
-    if block_hash_resolver is None:
-        require_block_hashes(
-            block_hashes,
+    if block_key_resolver is None:
+        require_block_keys(
+            block_keys,
             logical_block + 1,
             context=f"Decode tail commit for request {request_id}",
         )
-        block_hash = block_hashes[logical_block]
+        block_key = block_keys[logical_block]
     else:
-        block_hash = block_hash_resolver(
+        block_key = block_key_resolver(
             request_index=request_index,
             logical_block=logical_block,
         )
@@ -235,7 +235,7 @@ def _put_tail_block(
         for layer_name, layer_id in zip(cohort.layer_names, cohort.layer_ids):
             device = hot_cache.layer_caches[layer_name][0].device
             storage_ids = make_storage_ids(
-                [block_hash],
+                [block_key],
                 layer_id,
                 device=device,
             )
@@ -252,26 +252,26 @@ def _put_tail_block(
 
 def commit_decode_tail(
     batch: "DSAOffloadBatch | None",
-    block_hash_resolver: Callable[..., bytes] | None = None,
+    block_key_resolver: Callable[..., int] | None = None,
 ) -> None:
     if batch is None or batch.hot_cache is None or batch.is_mtp:
         return
     for request_index in batch.decode_request_indices:
         begin, end = batch.query_ranges[request_index]
-        position = int(batch.query_positions[end - 1].item())
+        position = int(batch.query_positions_cpu[end - 1])
         if (position + 1) % batch.layout.block_size == 0:
             _put_tail_block(
                 batch=batch,
                 request_index=request_index,
                 logical_block=position // batch.layout.block_size,
-                block_hash_resolver=block_hash_resolver,
+                block_key_resolver=block_key_resolver,
             )
 
 
 def commit_mtp_tail(
     batch: "DSAOffloadBatch | None",
     accepted_token_counts: Sequence[int],
-    block_hash_resolver: Callable[..., bytes] | None = None,
+    block_key_resolver: Callable[..., int] | None = None,
 ) -> None:
     if batch is None or batch.hot_cache is None or not batch.is_mtp:
         return
@@ -280,11 +280,11 @@ def commit_mtp_tail(
         if accepted == 0:
             continue
         begin, _ = batch.query_ranges[request_index]
-        row_id = int(batch.request_rows[request_index].item())
+        row_id = batch.request_rows_cpu[request_index]
         row_slot_base = batch.layout.global_slot(row_id, 0)
         copied = 0
         while copied < accepted:
-            position = int(batch.query_positions[begin + copied].item())
+            position = int(batch.query_positions_cpu[begin + copied])
             tail_offset = position % batch.layout.block_size
             copy_count = min(
                 accepted - copied,
@@ -312,5 +312,5 @@ def commit_mtp_tail(
                     batch=batch,
                     request_index=request_index,
                     logical_block=position // batch.layout.block_size,
-                    block_hash_resolver=block_hash_resolver,
+                    block_key_resolver=block_key_resolver,
                 )

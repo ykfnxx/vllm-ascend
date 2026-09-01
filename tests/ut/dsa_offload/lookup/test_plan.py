@@ -37,12 +37,14 @@ def test_history_tail_and_miss_are_mapped_to_fixed_hot_slots(spy_io) -> None:
         lookup_states={"leader": state},
         request_ids=("decode",),
         request_rows=torch.tensor([0], dtype=torch.int32),
+        request_rows_cpu=(0,),
         decode_request_indices=(0,),
         query_ranges=((0, 1),),
         query_positions=torch.tensor([8], dtype=torch.int64),
+        query_positions_cpu=(8,),
         is_mtp=False,
-        committed_block_hashes={"decode": [b"h0", b"h1"]},
-        candidate_block_hashes={},
+        committed_block_keys={"decode": [101, 102]},
+        candidate_block_keys={},
     )
     semantic = torch.tensor([[1, 5, 8, -1]], dtype=torch.int32)
     slots = torch.tensor([[0, 8192, -1, -1]], dtype=torch.int32)
@@ -85,12 +87,14 @@ def test_graph_plan_keeps_dense_lookup_and_gather_metadata(spy_io) -> None:
         lookup_states={"leader": state},
         request_ids=("first", "second"),
         request_rows=torch.tensor([1, 0], dtype=torch.int32),
+        request_rows_cpu=(1, 0),
         decode_request_indices=(0, 1),
         query_ranges=((0, 2), (2, 3)),
         query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
+        query_positions_cpu=(8, 9, 12),
         is_mtp=False,
-        committed_block_hashes={"first": [], "second": []},
-        candidate_block_hashes={},
+        committed_block_keys={"first": [], "second": []},
+        candidate_block_keys={},
         graph_query_start_loc=query_start_loc,
         enable_turbo_lookup=True,
     )
@@ -152,12 +156,14 @@ def test_graph_prefetch_plan_uses_fixed_dense_gather_metadata(spy_io) -> None:
         lookup_states={"leader": state},
         request_ids=("first", "second"),
         request_rows=torch.tensor([1, -1], dtype=torch.int32),
+        request_rows_cpu=(1, -1),
         decode_request_indices=(0, 1),
         query_ranges=((0, 2), (2, 3)),
         query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
+        query_positions_cpu=(8, 9, 12),
         is_mtp=False,
-        committed_block_hashes={"first": [], "second": []},
-        candidate_block_hashes={},
+        committed_block_keys={"first": [], "second": []},
+        candidate_block_keys={},
         graph_query_start_loc=query_start_loc,
         enable_turbo_prefetch_lookup=True,
     )
@@ -206,7 +212,7 @@ def test_graph_prefetch_plan_uses_fixed_dense_gather_metadata(spy_io) -> None:
     assert torch.equal(gather_calls[0]["token_positions"], semantic)
 
 
-def test_candidate_hashes_extend_committed_prefix(spy_io) -> None:
+def test_candidate_keys_extend_committed_prefix(spy_io) -> None:
     batch = DSAOffloadBatch(
         layout=HotCacheLayout(4, 1, 2),
         hot_cache=None,
@@ -215,15 +221,17 @@ def test_candidate_hashes_extend_committed_prefix(spy_io) -> None:
         lookup_states={},
         request_ids=("request",),
         request_rows=torch.tensor([-1], dtype=torch.int32),
+        request_rows_cpu=(-1,),
         decode_request_indices=(),
         query_ranges=((0, 1),),
         query_positions=torch.tensor([0]),
+        query_positions_cpu=(0,),
         is_mtp=True,
-        committed_block_hashes={"request": [b"committed-0", b"committed-1"]},
-        candidate_block_hashes={"request": [b"candidate-2"]},
+        committed_block_keys={"request": [101, 102]},
+        candidate_block_keys={"request": [103]},
     )
 
-    assert batch.block_hashes(0) == (b"committed-0", b"committed-1", b"candidate-2")
+    assert batch.block_keys(0) == (101, 102, 103)
 
 
 def test_lookup_hit_does_not_call_io(spy_io) -> None:
@@ -235,12 +243,14 @@ def test_lookup_hit_does_not_call_io(spy_io) -> None:
         lookup_states={},
         request_ids=("request",),
         request_rows=torch.tensor([0], dtype=torch.int32),
+        request_rows_cpu=(0,),
         decode_request_indices=(0,),
         query_ranges=((0, 1),),
         query_positions=torch.tensor([0]),
+        query_positions_cpu=(0,),
         is_mtp=False,
-        committed_block_hashes={"request": []},
-        candidate_block_hashes={},
+        committed_block_keys={"request": []},
+        candidate_block_keys={},
     )
     empty = torch.empty(0, dtype=torch.int64)
     plan = LookupPlan(
@@ -261,7 +271,7 @@ def test_lookup_hit_does_not_call_io(spy_io) -> None:
     assert spy_io.get_calls == []
 
 
-def test_lookup_miss_rejects_missing_block_hash(spy_io) -> None:
+def test_lookup_miss_rejects_missing_block_key(spy_io) -> None:
     batch = DSAOffloadBatch(
         layout=HotCacheLayout(4, 1, 1),
         hot_cache=None,
@@ -270,12 +280,14 @@ def test_lookup_miss_rejects_missing_block_hash(spy_io) -> None:
         lookup_states={},
         request_ids=("request",),
         request_rows=torch.tensor([0], dtype=torch.int32),
+        request_rows_cpu=(0,),
         decode_request_indices=(0,),
         query_ranges=((0, 1),),
         query_positions=torch.tensor([0]),
+        query_positions_cpu=(0,),
         is_mtp=False,
-        committed_block_hashes={"request": []},
-        candidate_block_hashes={},
+        committed_block_keys={"request": []},
+        candidate_block_keys={},
     )
     plan = LookupPlan(
         mapped_indices=torch.empty((1, 0), dtype=torch.int32),
@@ -292,6 +304,6 @@ def test_lookup_miss_rejects_missing_block_hash(spy_io) -> None:
 
     with pytest.raises(
         RuntimeError,
-        match=r"miss load for request request requires 2 block hashes",
+        match=r"miss load for request request requires 2 block keys",
     ):
         load_plan_misses(plan, 0, batch)

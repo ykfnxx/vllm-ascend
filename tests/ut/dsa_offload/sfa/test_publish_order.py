@@ -26,7 +26,7 @@ def test_final_prefill_order_is_indexer_put_capture_then_sfa() -> None:
         scheduled_token_counts=(1,),
         stored_token_counts=(4,),
         publish_requests=(True,),
-        committed_block_hashes={"request": [b"block"]},
+        committed_block_keys={"request": [101]},
         io_backend=io,
         tp_rank=0,
     )
@@ -38,12 +38,14 @@ def test_final_prefill_order_is_indexer_put_capture_then_sfa() -> None:
         lookup_states={},
         request_ids=("request",),
         request_rows=torch.tensor([-1], dtype=torch.int32),
+        request_rows_cpu=(-1,),
         decode_request_indices=(),
         query_ranges=((0, 1),),
         query_positions=torch.tensor([3]),
+        query_positions_cpu=(3,),
         is_mtp=False,
-        committed_block_hashes={"request": [b"block"]},
-        candidate_block_hashes={},
+        committed_block_keys={"request": [101]},
+        candidate_block_keys={},
         prefill_state=publish,
     )
 
