@@ -2985,9 +2985,15 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
             "Tensor(c!) free_slots, "
             "Tensor(d!) free_head, "
             "Tensor request_rows, "
-            "Tensor query_indices, "
-            "Tensor lookup_mask, "
-            "int req_num"
+            "Tensor query_start_loc, "
+            "Tensor query_positions, "
+            "Tensor semantic_topk, "
+            "int req_num, "
+            "int block_size, "
+            "int tail_base, "
+            "int fallback_slot, "
+            "int staging_base, "
+            "int decode_mode"
         ") -> (Tensor, Tensor)"
     );
     ops.impl(

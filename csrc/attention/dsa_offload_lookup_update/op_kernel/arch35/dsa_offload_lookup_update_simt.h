@@ -16,30 +16,40 @@
 namespace DsaOffloadLookupUpdate {
 
 constexpr uint32_t kPoolEntryScalar = 0U;
-constexpr uint32_t kFreeHeadScalar = 1U;
-constexpr uint32_t kCursorScalar = 2U;
-constexpr uint32_t kLastVictimScalar = 3U;
+constexpr uint32_t kCursorScalar = 1U;
+constexpr uint32_t kLastVictimScalar = 2U;
+constexpr uint32_t kSafeAllocScalar = 3U;
+constexpr uint32_t kQueryBeginScalar = 4U;
+constexpr uint32_t kQueryEndScalar = 5U;
+constexpr uint32_t kVerifyStartScalar = 6U;
 
 __simt_callee__ inline void ProtectSlot(
     __ubuf__ uint32_t* protected_bits,
     uint32_t slot)
 {
-    const uint32_t word = slot >> 5U;
-    const uint32_t bit = 1U << (slot & 31U);
-    asc_atomic_or(protected_bits + word, bit);
+    asc_atomic_or(
+        protected_bits + (slot >> 5U),
+        1U << (slot & 31U));
 }
 
 __simt_callee__ inline bool IsProtectedSlot(
     __ubuf__ const uint32_t* protected_bits,
     uint32_t slot)
 {
-    const uint32_t word = slot >> 5U;
-    const uint32_t bit = 1U << (slot & 31U);
-    return (protected_bits[word] & bit) != 0U;
+    return (protected_bits[slot >> 5U] &
+            (1U << (slot & 31U))) != 0U;
 }
 
-// Return the exclusive prefix for this thread. The final warp total contains
-// the block-wide sum after this function returns.
+__simt_callee__ inline int32_t MapSlot(
+    int32_t slot,
+    uint32_t replaceable_base)
+{
+    return slot < static_cast<int32_t>(DSA_OFFLOAD_RESIDENT_SLOTS)
+        ? slot
+        : slot - static_cast<int32_t>(DSA_OFFLOAD_RESIDENT_SLOTS) +
+              static_cast<int32_t>(replaceable_base);
+}
+
 __simt_callee__ inline int32_t BlockExclusiveScan(
     int32_t value,
     __ubuf__ int32_t* warp_totals)
@@ -47,13 +57,11 @@ __simt_callee__ inline int32_t BlockExclusiveScan(
     const uint32_t tid = static_cast<uint32_t>(threadIdx.x);
     const uint32_t lane = tid & (DSA_OFFLOAD_WARP_SIZE - 1U);
     const uint32_t warp = tid / DSA_OFFLOAD_WARP_SIZE;
-
     int32_t inclusive = value;
     for (uint32_t delta = 1U;
          delta < DSA_OFFLOAD_WARP_SIZE;
          delta <<= 1U) {
-        const int32_t upstream =
-            asc_shfl_up(inclusive, delta);
+        const int32_t upstream = asc_shfl_up(inclusive, delta);
         if (lane >= delta) {
             inclusive += upstream;
         }
@@ -62,12 +70,9 @@ __simt_callee__ inline int32_t BlockExclusiveScan(
         warp_totals[warp] = inclusive;
     }
     asc_syncthreads();
-
     if (warp == 0U) {
         int32_t warp_inclusive =
-            lane < DSA_OFFLOAD_WARP_COUNT
-                ? warp_totals[lane]
-                : 0;
+            lane < DSA_OFFLOAD_WARP_COUNT ? warp_totals[lane] : 0;
         for (uint32_t delta = 1U;
              delta < DSA_OFFLOAD_WARP_SIZE;
              delta <<= 1U) {
@@ -82,266 +87,135 @@ __simt_callee__ inline int32_t BlockExclusiveScan(
         }
     }
     asc_syncthreads();
-
-    const int32_t warp_prefix =
-        warp == 0U ? 0 : warp_totals[warp - 1U];
-    return warp_prefix + inclusive - value;
+    return (warp == 0U ? 0 : warp_totals[warp - 1U]) +
+           inclusive - value;
 }
 
-__simt_callee__ inline void DsaOffloadLookupUpdateOneRequest(
-    __gm__ int32_t* index,
-    __gm__ int32_t* slot_to_index,
-    __gm__ int32_t* free_slots,
-    __gm__ int32_t* free_head,
-    __gm__ int32_t* req_pool_entries,
-    __gm__ int32_t* query_index,
-    __gm__ int32_t* lookup_mask,
-    __gm__ int32_t* slot_out,
-    __gm__ int32_t* miss_out,
-    __ubuf__ uint32_t* shared_scratch,
-    uint32_t req_id,
-    uint32_t pool_capacity,
-    bool reuse_scratch)
+__simt_callee__ inline void CopyPrefillQueries(
+    __gm__ int32_t* semantic_topk,
+    __gm__ int32_t* mapped_indices,
+    __gm__ int32_t* miss_mask,
+    uint32_t query_begin,
+    uint32_t query_end)
 {
     const uint32_t tid = static_cast<uint32_t>(threadIdx.x);
-    const uint32_t thread_count =
-        static_cast<uint32_t>(blockDim.x);
     constexpr uint32_t query_chunk =
-        DSA_OFFLOAD_QUERY_COUNT / DSA_OFFLOAD_SIMT_THREADS;
+        DSA_OFFLOAD_QUERY_WIDTH / DSA_OFFLOAD_SIMT_THREADS;
+    const uint32_t entry_begin = tid * query_chunk;
+    for (uint32_t query_id = query_begin;
+         query_id < query_end;
+         ++query_id) {
+        const uint64_t query_base =
+            static_cast<uint64_t>(query_id) *
+            DSA_OFFLOAD_QUERY_WIDTH;
+#pragma unroll
+        for (uint32_t entry = 0U; entry < query_chunk; ++entry) {
+            const uint64_t offset = query_base + entry_begin + entry;
+            mapped_indices[offset] = semantic_topk[offset];
+            miss_mask[offset] = 0;
+        }
+    }
+}
+
+__simt_callee__ inline void ProcessQuery(
+    __gm__ int32_t* request_index,
+    __gm__ int32_t* request_slot_to_index,
+    __gm__ int32_t* request_free_slots,
+    __gm__ int32_t* request_free_head,
+    __gm__ int64_t* query_positions,
+    __gm__ int32_t* semantic_topk,
+    __gm__ int32_t* mapped_indices,
+    __gm__ int32_t* miss_mask,
+    __ubuf__ uint32_t* protected_bits,
+    __ubuf__ int32_t* warp_totals,
+    __ubuf__ int32_t* scalars,
+    uint32_t query_id,
+    uint32_t block_size,
+    uint32_t replaceable_base,
+    uint32_t tail_base,
+    uint32_t fallback_slot,
+    uint32_t staging_base,
+    uint32_t decode_mode)
+{
+    const uint32_t tid = static_cast<uint32_t>(threadIdx.x);
+    constexpr uint32_t query_chunk =
+        DSA_OFFLOAD_QUERY_WIDTH / DSA_OFFLOAD_SIMT_THREADS;
     constexpr uint32_t slot_chunk =
         DSA_OFFLOAD_SLOT_COUNT / DSA_OFFLOAD_SIMT_THREADS;
-
     const uint64_t query_base =
-        static_cast<uint64_t>(req_id) * DSA_OFFLOAD_QUERY_COUNT;
-    const uint32_t query_begin = tid * query_chunk;
+        static_cast<uint64_t>(query_id) * DSA_OFFLOAD_QUERY_WIDTH;
+    const uint32_t entry_begin = tid * query_chunk;
+    const int64_t current_position = query_positions[query_id];
+    const int64_t verify_start =
+        static_cast<int64_t>(scalars[kVerifyStartScalar]);
+    const int64_t tail_start =
+        verify_start / static_cast<int64_t>(block_size) * block_size;
 
-    int32_t query_values[query_chunk];
-    int32_t query_masks[query_chunk];
-    int32_t local_slots[query_chunk];
+    int32_t tokens[query_chunk];
+    int32_t local_mapped[query_chunk];
+    int32_t miss_candidates[query_chunk];
     int32_t local_misses[query_chunk];
 #pragma unroll
-    for (uint32_t local_entry = 0U;
-         local_entry < query_chunk;
-         ++local_entry) {
-        const uint64_t offset =
-            query_base + query_begin + local_entry;
-        query_values[local_entry] = query_index[offset];
-        query_masks[local_entry] = lookup_mask[offset];
-        local_slots[local_entry] = DSA_OFFLOAD_NOT_FOUND;
-        local_misses[local_entry] = 0;
-    }
-
-    __ubuf__ uint32_t* protected_bits = shared_scratch;
-    __ubuf__ int32_t* warp_totals =
-        reinterpret_cast<__ubuf__ int32_t*>(
-            protected_bits + DSA_OFFLOAD_PROTECTED_WORDS);
-    __ubuf__ int32_t* scalars =
-        warp_totals + DSA_OFFLOAD_WARP_COUNT;
-
-    for (uint32_t word = tid;
-         word < DSA_OFFLOAD_PROTECTED_WORDS;
-         word += thread_count) {
-        protected_bits[word] = 0U;
-    }
-    if (tid == 0U) {
-        const int32_t pool_entry_value =
-            req_pool_entries[req_id];
-        scalars[kPoolEntryScalar] = pool_entry_value;
-        scalars[kFreeHeadScalar] = 0;
-        scalars[kCursorScalar] = 0;
-        scalars[kLastVictimScalar] =
-            DSA_OFFLOAD_NOT_FOUND;
-        if (pool_entry_value >= 0 &&
-            pool_entry_value <
-                static_cast<int32_t>(pool_capacity)) {
-            __gm__ int32_t* request_free_head =
-                free_head +
-                static_cast<uint64_t>(pool_entry_value) *
-                    DSA_OFFLOAD_FREE_HEAD_STRIDE;
-            scalars[kFreeHeadScalar] =
-                request_free_head[0];
-            int32_t cursor = request_free_head[1];
-            if (cursor < 0 ||
-                cursor >= static_cast<int32_t>(
-                              DSA_OFFLOAD_SLOT_COUNT)) {
-                cursor = 0;
-            }
-            scalars[kCursorScalar] = cursor;
-        }
-    }
-    asc_syncthreads();
-
-    const int32_t pool_entry_value =
-        scalars[kPoolEntryScalar];
-    if (pool_entry_value < 0 ||
-        pool_entry_value >=
-            static_cast<int32_t>(pool_capacity)) {
-#pragma unroll
-        for (uint32_t local_entry = 0U;
-             local_entry < query_chunk;
-             ++local_entry) {
-            const uint64_t offset =
-                query_base + query_begin + local_entry;
-            slot_out[offset] = local_slots[local_entry];
-            miss_out[offset] = local_misses[local_entry];
-        }
-        return;
-    }
-    if (scalars[kFreeHeadScalar] != 0) {
-        // This fused operator owns the complete lookup/maintain transaction.
-        // A non-zero entry head means the row was left mid-transaction by a
-        // different producer; fail closed instead of consuming a partial list.
-#pragma unroll
-        for (uint32_t local_entry = 0U;
-             local_entry < query_chunk;
-             ++local_entry) {
-            const uint64_t offset =
-                query_base + query_begin + local_entry;
-            slot_out[offset] = local_slots[local_entry];
-            miss_out[offset] = local_misses[local_entry];
-        }
-        return;
-    }
-
-    const uint32_t pool_entry =
-        static_cast<uint32_t>(pool_entry_value);
-    __gm__ int32_t* request_index =
-        index +
-        static_cast<uint64_t>(pool_entry) *
-            DSA_OFFLOAD_INDEX_CAPACITY;
-    __gm__ int32_t* request_slot_to_index =
-        slot_to_index +
-        static_cast<uint64_t>(pool_entry) *
-            DSA_OFFLOAD_SLOT_COUNT;
-    __gm__ int32_t* request_free_slots =
-        free_slots +
-        static_cast<uint64_t>(pool_entry) *
-            DSA_OFFLOAD_FREE_SLOT_COUNT;
-    __gm__ int32_t* request_free_head =
-        free_head +
-        static_cast<uint64_t>(pool_entry) *
-            DSA_OFFLOAD_FREE_HEAD_STRIDE;
-
-    // First pass: return resident hits and mark active misses. The framework
-    // supplies one pool row per request and unique active query positions, so
-    // a missing token has exactly one owner in this invocation. No claim is
-    // installed in the index table and no atomic arbitration is required.
-#pragma unroll
-    for (uint32_t local_entry = 0U;
-         local_entry < query_chunk;
-         ++local_entry) {
-        if (query_masks[local_entry] == 0) {
-            continue;
-        }
-        const int32_t token = query_values[local_entry];
+    for (uint32_t entry = 0U; entry < query_chunk; ++entry) {
+        const int32_t token =
+            semantic_topk[query_base + entry_begin + entry];
+        tokens[entry] = token;
+        local_mapped[entry] = DSA_OFFLOAD_NOT_FOUND;
+        miss_candidates[entry] = 0;
+        local_misses[entry] = 0;
         if (token < 0 ||
-            token >= static_cast<int32_t>(
-                         DSA_OFFLOAD_INDEX_CAPACITY)) {
+            token >= static_cast<int32_t>(DSA_OFFLOAD_INDEX_CAPACITY)) {
             continue;
         }
-
-        __gm__ int32_t* token_slot =
-            request_index + static_cast<uint32_t>(token);
-        int32_t observed = *token_slot;
-        if (observed >= 0 &&
-            observed <
-                static_cast<int32_t>(DSA_OFFLOAD_SLOT_COUNT)) {
-            local_slots[local_entry] = observed;
-            ProtectSlot(
-                protected_bits,
-                static_cast<uint32_t>(observed));
-            continue;
+        if (static_cast<int64_t>(token) < tail_start) {
+            local_mapped[entry] = static_cast<int32_t>(fallback_slot);
+            const int32_t slot =
+                request_index[static_cast<uint32_t>(token)];
+            if (slot == DSA_OFFLOAD_NOT_FOUND) {
+                miss_candidates[entry] = 1;
+            } else {
+                local_mapped[entry] = MapSlot(slot, replaceable_base);
+                ProtectSlot(protected_bits, static_cast<uint32_t>(slot));
+            }
+        } else if (decode_mode == 0U) {
+            if (static_cast<int64_t>(token) <= current_position) {
+                local_mapped[entry] =
+                    static_cast<int32_t>(tail_base) +
+                    token - static_cast<int32_t>(tail_start);
+            }
+        } else if (static_cast<int64_t>(token) < verify_start) {
+            local_mapped[entry] =
+                static_cast<int32_t>(tail_base) +
+                token - static_cast<int32_t>(tail_start);
+        } else if (static_cast<int64_t>(token) <= current_position) {
+            local_mapped[entry] =
+                static_cast<int32_t>(staging_base) +
+                token - static_cast<int32_t>(verify_start);
         }
-
-        local_misses[local_entry] = 1;
     }
-    // Count misses per contiguous query chunk. BlockExclusiveScan preserves
-    // input order for free-list allocation.
+
     int32_t local_miss_count = 0;
 #pragma unroll
-    for (uint32_t local_entry = 0U;
-         local_entry < query_chunk;
-         ++local_entry) {
-        if (local_misses[local_entry] == 0) {
-            continue;
-        }
-        ++local_miss_count;
+    for (uint32_t entry = 0U; entry < query_chunk; ++entry) {
+        local_miss_count += miss_candidates[entry];
     }
     const int32_t miss_prefix =
         BlockExclusiveScan(local_miss_count, warp_totals);
     const int32_t total_misses =
         warp_totals[DSA_OFFLOAD_WARP_COUNT - 1U];
-    const int32_t head_start =
-        scalars[kFreeHeadScalar];
-
-    int32_t local_rank = 0;
-#pragma unroll
-    for (uint32_t local_entry = 0U;
-         local_entry < query_chunk;
-         ++local_entry) {
-        if (local_misses[local_entry] == 0) {
-            continue;
-        }
-        const int32_t token = query_values[local_entry];
-
-        const int32_t miss_rank =
-            miss_prefix + local_rank;
-        ++local_rank;
-        const int32_t free_offset = head_start + miss_rank;
-        if (free_offset < 0 ||
-            free_offset >=
-                static_cast<int32_t>(
-                    DSA_OFFLOAD_FREE_SLOT_COUNT)) {
-            local_misses[local_entry] = 0;
-            continue;
-        }
-        const int32_t slot =
-            request_free_slots[
-                static_cast<uint32_t>(free_offset)];
-        if (slot < 0 ||
-            slot >= static_cast<int32_t>(
-                        DSA_OFFLOAD_SLOT_COUNT)) {
-            local_misses[local_entry] = 0;
-            continue;
-        }
-        request_slot_to_index[
-            static_cast<uint32_t>(slot)] = token;
-        request_index[
-            static_cast<uint32_t>(token)] = slot;
-        local_slots[local_entry] = slot;
-        local_misses[local_entry] = 1;
-        ProtectSlot(
-            protected_bits,
-            static_cast<uint32_t>(slot));
-    }
-    asc_threadfence_block();
-    asc_syncthreads();
-
     if (total_misses == 0) {
-        // Only a block that owns another request will reuse protected_bits.
-        // Wait for every thread's final ProtectSlot before clearing it in the
-        // next iteration; no vector-pipeline barrier is required.
-        if (reuse_scratch) {
-            asc_syncthreads();
-        }
 #pragma unroll
-        for (uint32_t local_entry = 0U;
-             local_entry < query_chunk;
-             ++local_entry) {
-            const uint64_t offset =
-                query_base + query_begin + local_entry;
-            slot_out[offset] = local_slots[local_entry];
-            miss_out[offset] = local_misses[local_entry];
+        for (uint32_t entry = 0U; entry < query_chunk; ++entry) {
+            const uint64_t offset = query_base + entry_begin + entry;
+            mapped_indices[offset] = local_mapped[entry];
+            miss_mask[offset] = 0;
         }
         return;
     }
-    // Fused maintain phase. Scan occupied, non-protected slots in circular
-    // cursor order and compact them by per-thread counts. The first M slots
-    // replace the M free-list entries consumed above.
+
     const uint32_t scan_begin = tid * slot_chunk;
     const uint32_t scan_end = scan_begin + slot_chunk;
-    const uint32_t cursor =
-        static_cast<uint32_t>(scalars[kCursorScalar]);
+    const uint32_t cursor = static_cast<uint32_t>(scalars[kCursorScalar]);
     int32_t local_victim_count = 0;
     for (uint32_t position = scan_begin;
          position < scan_end;
@@ -351,16 +225,51 @@ __simt_callee__ inline void DsaOffloadLookupUpdateOneRequest(
             slot -= DSA_OFFLOAD_SLOT_COUNT;
         }
         if (!IsProtectedSlot(protected_bits, slot) &&
-            request_slot_to_index[slot] !=
-                DSA_OFFLOAD_NOT_FOUND) {
+            request_slot_to_index[slot] != DSA_OFFLOAD_NOT_FOUND) {
             ++local_victim_count;
         }
     }
-
     const int32_t victim_prefix =
         BlockExclusiveScan(local_victim_count, warp_totals);
+    const int32_t total_victims =
+        warp_totals[DSA_OFFLOAD_WARP_COUNT - 1U];
+    if (tid == 0U) {
+        int32_t safe_alloc = total_misses < total_victims
+            ? total_misses
+            : total_victims;
+        if (safe_alloc > static_cast<int32_t>(DSA_OFFLOAD_FREE_SLOT_COUNT)) {
+            safe_alloc = static_cast<int32_t>(DSA_OFFLOAD_FREE_SLOT_COUNT);
+        }
+        scalars[kSafeAllocScalar] = safe_alloc;
+        scalars[kLastVictimScalar] = DSA_OFFLOAD_NOT_FOUND;
+    }
+    asc_syncthreads();
+    const int32_t safe_alloc = scalars[kSafeAllocScalar];
+
+    int32_t local_rank = 0;
+#pragma unroll
+    for (uint32_t entry = 0U; entry < query_chunk; ++entry) {
+        if (miss_candidates[entry] == 0) {
+            continue;
+        }
+        const int32_t miss_rank = miss_prefix + local_rank++;
+        if (miss_rank >= safe_alloc) {
+            continue;
+        }
+        const int32_t token = tokens[entry];
+        const int32_t slot =
+            request_free_slots[static_cast<uint32_t>(miss_rank)];
+        request_slot_to_index[static_cast<uint32_t>(slot)] = token;
+        request_index[static_cast<uint32_t>(token)] = slot;
+        local_mapped[entry] = MapSlot(slot, replaceable_base);
+        local_misses[entry] = 1;
+        ProtectSlot(protected_bits, static_cast<uint32_t>(slot));
+    }
+    asc_threadfence_block();
+    asc_syncthreads();
+
     int32_t victim_rank = victim_prefix;
-    if (victim_prefix < total_misses) {
+    if (victim_prefix < safe_alloc) {
         for (uint32_t position = scan_begin;
              position < scan_end;
              ++position) {
@@ -371,30 +280,18 @@ __simt_callee__ inline void DsaOffloadLookupUpdateOneRequest(
             if (IsProtectedSlot(protected_bits, slot)) {
                 continue;
             }
-            const int32_t old_token =
-                request_slot_to_index[slot];
+            const int32_t old_token = request_slot_to_index[slot];
             if (old_token == DSA_OFFLOAD_NOT_FOUND) {
                 continue;
             }
-            if (victim_rank < total_misses) {
-                request_slot_to_index[slot] =
+            if (victim_rank < safe_alloc) {
+                request_slot_to_index[slot] = DSA_OFFLOAD_NOT_FOUND;
+                request_index[static_cast<uint32_t>(old_token)] =
                     DSA_OFFLOAD_NOT_FOUND;
-                if (old_token >= 0 &&
-                    old_token <
-                        static_cast<int32_t>(
-                            DSA_OFFLOAD_INDEX_CAPACITY) &&
-                    request_index[
-                        static_cast<uint32_t>(old_token)] ==
-                        static_cast<int32_t>(slot)) {
-                    request_index[
-                        static_cast<uint32_t>(old_token)] =
-                        DSA_OFFLOAD_NOT_FOUND;
-                }
-                request_free_slots[
-                    static_cast<uint32_t>(
-                        total_misses - 1 - victim_rank)] =
+                request_free_slots[static_cast<uint32_t>(
+                    safe_alloc - 1 - victim_rank)] =
                     static_cast<int32_t>(slot);
-                if (victim_rank == total_misses - 1) {
+                if (victim_rank == safe_alloc - 1) {
                     scalars[kLastVictimScalar] =
                         static_cast<int32_t>(slot);
                 }
@@ -404,27 +301,126 @@ __simt_callee__ inline void DsaOffloadLookupUpdateOneRequest(
     }
     asc_threadfence_block();
     asc_syncthreads();
-
-    if (tid == 0U) {
-        const int32_t last_victim =
-            scalars[kLastVictimScalar];
-        request_free_head[1] =
-            last_victim + 1 >=
-                    static_cast<int32_t>(
-                        DSA_OFFLOAD_SLOT_COUNT)
-                ? 0
-                : last_victim + 1;
+    if (tid == 0U && safe_alloc > 0) {
+        const int32_t next = scalars[kLastVictimScalar] + 1;
         request_free_head[0] = 0;
+        request_free_head[1] =
+            next == static_cast<int32_t>(DSA_OFFLOAD_SLOT_COUNT)
+            ? 0
+            : next;
+        scalars[kCursorScalar] = request_free_head[1];
     }
+    asc_syncthreads();
 
 #pragma unroll
-    for (uint32_t local_entry = 0U;
-         local_entry < query_chunk;
-         ++local_entry) {
-        const uint64_t offset =
-            query_base + query_begin + local_entry;
-        slot_out[offset] = local_slots[local_entry];
-        miss_out[offset] = local_misses[local_entry];
+    for (uint32_t entry = 0U; entry < query_chunk; ++entry) {
+        const uint64_t offset = query_base + entry_begin + entry;
+        mapped_indices[offset] = local_mapped[entry];
+        miss_mask[offset] = local_misses[entry];
+    }
+}
+
+__simt_callee__ inline void ProcessRequest(
+    __gm__ int32_t* index,
+    __gm__ int32_t* slot_to_index,
+    __gm__ int32_t* free_slots,
+    __gm__ int32_t* free_head,
+    __gm__ int32_t* request_rows,
+    __gm__ int32_t* query_start_loc,
+    __gm__ int64_t* query_positions,
+    __gm__ int32_t* semantic_topk,
+    __gm__ int32_t* mapped_indices,
+    __gm__ int32_t* miss_mask,
+    __ubuf__ uint32_t* shared_scratch,
+    uint32_t request_id,
+    uint32_t block_size,
+    uint32_t replaceable_base,
+    uint32_t tail_base,
+    uint32_t fallback_slot,
+    uint32_t staging_base,
+    uint32_t decode_mode)
+{
+    const uint32_t tid = static_cast<uint32_t>(threadIdx.x);
+    __ubuf__ uint32_t* protected_bits = shared_scratch;
+    __ubuf__ int32_t* warp_totals =
+        reinterpret_cast<__ubuf__ int32_t*>(
+            protected_bits + DSA_OFFLOAD_PROTECTED_WORDS);
+    __ubuf__ int32_t* scalars =
+        warp_totals + DSA_OFFLOAD_WARP_COUNT;
+    for (uint32_t word = tid;
+         word < DSA_OFFLOAD_PROTECTED_WORDS;
+         word += static_cast<uint32_t>(blockDim.x)) {
+        protected_bits[word] = 0U;
+    }
+    if (tid == 0U) {
+        const int32_t pool_entry = request_rows[request_id];
+        const int32_t query_begin = query_start_loc[request_id];
+        scalars[kPoolEntryScalar] = pool_entry;
+        scalars[kQueryBeginScalar] = query_begin;
+        scalars[kQueryEndScalar] = query_start_loc[request_id + 1U];
+        scalars[kCursorScalar] = pool_entry < 0
+            ? 0
+            : free_head[
+                  static_cast<uint64_t>(pool_entry) *
+                      DSA_OFFLOAD_FREE_HEAD_STRIDE +
+                  1U];
+        scalars[kVerifyStartScalar] =
+            static_cast<int32_t>(query_positions[query_begin]);
+    }
+    asc_syncthreads();
+
+    const uint32_t query_begin =
+        static_cast<uint32_t>(scalars[kQueryBeginScalar]);
+    const uint32_t query_end =
+        static_cast<uint32_t>(scalars[kQueryEndScalar]);
+    const int32_t pool_entry_value = scalars[kPoolEntryScalar];
+    if (pool_entry_value < 0) {
+        CopyPrefillQueries(
+            semantic_topk,
+            mapped_indices,
+            miss_mask,
+            query_begin,
+            query_end);
+        return;
+    }
+
+    const uint32_t pool_entry =
+        static_cast<uint32_t>(pool_entry_value);
+    __gm__ int32_t* request_index =
+        index + static_cast<uint64_t>(pool_entry) *
+                    DSA_OFFLOAD_INDEX_CAPACITY;
+    __gm__ int32_t* request_slot_to_index =
+        slot_to_index + static_cast<uint64_t>(pool_entry) *
+                            DSA_OFFLOAD_SLOT_COUNT;
+    __gm__ int32_t* request_free_slots =
+        free_slots + static_cast<uint64_t>(pool_entry) *
+                         DSA_OFFLOAD_FREE_SLOT_COUNT;
+    __gm__ int32_t* request_free_head =
+        free_head + static_cast<uint64_t>(pool_entry) *
+                        DSA_OFFLOAD_FREE_HEAD_STRIDE;
+    for (uint32_t query_id = query_begin;
+         query_id < query_end;
+         ++query_id) {
+        ProcessQuery(
+            request_index,
+            request_slot_to_index,
+            request_free_slots,
+            request_free_head,
+            query_positions,
+            semantic_topk,
+            mapped_indices,
+            miss_mask,
+            protected_bits,
+            warp_totals,
+            scalars,
+            query_id,
+            block_size,
+            replaceable_base,
+            tail_base,
+            fallback_slot,
+            staging_base,
+            decode_mode);
+        asc_syncthreads();
     }
 }
 
@@ -434,35 +430,47 @@ DsaOffloadLookupUpdateSimt(
     __gm__ int32_t* slot_to_index,
     __gm__ int32_t* free_slots,
     __gm__ int32_t* free_head,
-    __gm__ int32_t* req_pool_entries,
-    __gm__ int32_t* query_index,
-    __gm__ int32_t* lookup_mask,
-    __gm__ int32_t* slot_out,
-    __gm__ int32_t* miss_out,
+    __gm__ int32_t* request_rows,
+    __gm__ int32_t* query_start_loc,
+    __gm__ int64_t* query_positions,
+    __gm__ int32_t* semantic_topk,
+    __gm__ int32_t* mapped_indices,
+    __gm__ int32_t* miss_mask,
     __ubuf__ uint32_t* shared_scratch,
     uint32_t req_num,
-    uint32_t pool_capacity)
+    uint32_t block_size,
+    uint32_t replaceable_base,
+    uint32_t tail_base,
+    uint32_t fallback_slot,
+    uint32_t staging_base,
+    uint32_t decode_mode)
 {
     const uint32_t request_stride =
         static_cast<uint32_t>(gridDim.x);
-    for (uint32_t req_id =
+    for (uint32_t request_id =
              static_cast<uint32_t>(blockIdx.x);
-         req_id < req_num;
-         req_id += request_stride) {
-        DsaOffloadLookupUpdateOneRequest(
+         request_id < req_num;
+         request_id += request_stride) {
+        ProcessRequest(
             index,
             slot_to_index,
             free_slots,
             free_head,
-            req_pool_entries,
-            query_index,
-            lookup_mask,
-            slot_out,
-            miss_out,
+            request_rows,
+            query_start_loc,
+            query_positions,
+            semantic_topk,
+            mapped_indices,
+            miss_mask,
             shared_scratch,
-            req_id,
-            pool_capacity,
-            req_id + request_stride < req_num);
+            request_id,
+            block_size,
+            replaceable_base,
+            tail_base,
+            fallback_slot,
+            staging_base,
+            decode_mode);
+        asc_syncthreads();
     }
 }
 

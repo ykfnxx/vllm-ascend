@@ -41,6 +41,7 @@ def test_final_prefill_order_is_indexer_put_capture_then_sfa() -> None:
         request_rows_cpu=(-1,),
         decode_request_indices=(),
         query_ranges=((0, 1),),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         query_positions=torch.tensor([3]),
         query_positions_cpu=(3,),
         is_mtp=False,

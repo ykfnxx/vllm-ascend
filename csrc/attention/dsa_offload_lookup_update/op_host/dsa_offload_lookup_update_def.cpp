@@ -27,6 +27,16 @@ void AddInt32Output(OpDef& op, const char* name)
         .UnknownShapeFormat({ge::FORMAT_ND});
 }
 
+void AddInt64Input(OpDef& op, const char* name)
+{
+    op.Input(name)
+        .ParamType(REQUIRED)
+        .DataType({ge::DT_INT64})
+        .Format({ge::FORMAT_ND})
+        .UnknownShapeFormat({ge::FORMAT_ND})
+        .AutoContiguous();
+}
+
 }  // namespace
 
 class DsaOffloadLookupUpdate : public OpDef {
@@ -37,12 +47,18 @@ public:
         AddInt32Input(*this, "slotToIndex");
         AddInt32Input(*this, "freeSlots");
         AddInt32Input(*this, "freeHead");
-        AddInt32Input(*this, "reqPoolEntries");
-        AddInt32Input(*this, "queryIndex");
-        AddInt32Input(*this, "lookupMask");
-        AddInt32Output(*this, "slotOut");
-        AddInt32Output(*this, "missOut");
+        AddInt32Input(*this, "requestRows");
+        AddInt32Input(*this, "queryStartLoc");
+        AddInt64Input(*this, "queryPositions");
+        AddInt32Input(*this, "semanticTopk");
+        AddInt32Output(*this, "mappedIndices");
+        AddInt32Output(*this, "missMask");
         this->Attr("req_num").AttrType(REQUIRED).Int();
+        this->Attr("block_size").AttrType(REQUIRED).Int();
+        this->Attr("tail_base").AttrType(REQUIRED).Int();
+        this->Attr("fallback_slot").AttrType(REQUIRED).Int();
+        this->Attr("staging_base").AttrType(REQUIRED).Int();
+        this->Attr("decode_mode").AttrType(REQUIRED).Int();
 
         this->AICore().AddConfig("ascend950");
     }

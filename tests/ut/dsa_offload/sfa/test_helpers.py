@@ -39,6 +39,9 @@ def make_mixed_batch(spy_io, *, is_mtp: bool = False):
         lookup_states={},
         request_ids=("prefill", "decode"),
         query_counts=(2, 2 if is_mtp else 1),
+        query_start_loc=torch.tensor(
+            [0, 2, 4 if is_mtp else 3], dtype=torch.int32
+        ),
         query_positions=torch.tensor(
             [0, 1, 5, 6] if is_mtp else [0, 1, 5],
             dtype=torch.int64,
@@ -90,6 +93,7 @@ def test_prefetch_target_key_write_updates_mean_cache() -> None:
         request_rows_cpu=(0,),
         decode_request_indices=(0,),
         query_ranges=((0, 1),),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         query_positions=torch.tensor([8], dtype=torch.int64),
         query_positions_cpu=(8,),
         is_mtp=False,
@@ -166,6 +170,7 @@ def test_graph_mtp_mapping_uses_runtime_request_rows(spy_io) -> None:
         request_rows_cpu=(1, 0),
         decode_request_indices=(0, 1),
         query_ranges=((0, 2), (2, 3)),
+        query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
         query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
         query_positions_cpu=(8, 9, 12),
         is_mtp=True,
@@ -201,9 +206,6 @@ def test_leader_looks_up_once_and_follower_performs_own_get(spy_io) -> None:
         miss_destination_slots=empty,
         miss_batch_indices=empty.to(torch.int32),
         query_request_rows=empty.to(torch.int32),
-        tail_mask=torch.empty(0, dtype=torch.bool),
-        fallback_mask=torch.empty(0, dtype=torch.bool),
-        staging_mask=torch.empty(0, dtype=torch.bool),
     )
     events = ["indexer"]
 
@@ -281,6 +283,7 @@ def test_fixed_hot_addressing_does_not_depend_on_model_block_table_width() -> No
         lookup_states={},
         request_ids=("prefill", "decode"),
         query_counts=(1, 1),
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
         query_positions=torch.tensor([0, 4095], dtype=torch.int64),
         query_positions_cpu=(0, 4095),
         is_mtp=False,

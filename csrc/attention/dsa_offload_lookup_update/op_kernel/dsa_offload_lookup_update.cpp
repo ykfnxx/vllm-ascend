@@ -13,11 +13,12 @@ extern "C" __global__ __aicore__ void dsa_offload_lookup_update(
     GM_ADDR slot_to_index,
     GM_ADDR free_slots,
     GM_ADDR free_head,
-    GM_ADDR req_pool_entries,
-    GM_ADDR query_index,
-    GM_ADDR lookup_mask,
-    GM_ADDR slot_out,
-    GM_ADDR miss_out,
+    GM_ADDR request_rows,
+    GM_ADDR query_start_loc,
+    GM_ADDR query_positions,
+    GM_ADDR semantic_topk,
+    GM_ADDR mapped_indices,
+    GM_ADDR miss_mask,
     GM_ADDR user_workspace,
     GM_ADDR tiling)
 {
@@ -26,11 +27,12 @@ extern "C" __global__ __aicore__ void dsa_offload_lookup_update(
     (void)slot_to_index;
     (void)free_slots;
     (void)free_head;
-    (void)req_pool_entries;
-    (void)query_index;
-    (void)lookup_mask;
-    (void)slot_out;
-    (void)miss_out;
+    (void)request_rows;
+    (void)query_start_loc;
+    (void)query_positions;
+    (void)semantic_topk;
+    (void)mapped_indices;
+    (void)miss_mask;
     (void)user_workspace;
     (void)tiling;
 #else
@@ -53,13 +55,19 @@ extern "C" __global__ __aicore__ void dsa_offload_lookup_update(
         reinterpret_cast<__gm__ int32_t*>(slot_to_index),
         reinterpret_cast<__gm__ int32_t*>(free_slots),
         reinterpret_cast<__gm__ int32_t*>(free_head),
-        reinterpret_cast<__gm__ int32_t*>(req_pool_entries),
-        reinterpret_cast<__gm__ int32_t*>(query_index),
-        reinterpret_cast<__gm__ int32_t*>(lookup_mask),
-        reinterpret_cast<__gm__ int32_t*>(slot_out),
-        reinterpret_cast<__gm__ int32_t*>(miss_out),
+        reinterpret_cast<__gm__ int32_t*>(request_rows),
+        reinterpret_cast<__gm__ int32_t*>(query_start_loc),
+        reinterpret_cast<__gm__ int64_t*>(query_positions),
+        reinterpret_cast<__gm__ int32_t*>(semantic_topk),
+        reinterpret_cast<__gm__ int32_t*>(mapped_indices),
+        reinterpret_cast<__gm__ int32_t*>(miss_mask),
         shared_scratch,
         tiling_data.reqNum,
-        tiling_data.poolCapacity);
+        tiling_data.blockSize,
+        tiling_data.replaceableBase,
+        tiling_data.tailBase,
+        tiling_data.fallbackSlot,
+        tiling_data.stagingBase,
+        tiling_data.decodeMode);
 #endif
 }

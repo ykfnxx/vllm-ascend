@@ -31,6 +31,9 @@ def make_batch(spy_io, *, position: int, is_mtp: bool, committed, candidate):
         request_rows_cpu=(row,),
         decode_request_indices=(0,),
         query_ranges=((0, 3 if is_mtp else 1),),
+        query_start_loc=torch.tensor(
+            [0, 3 if is_mtp else 1], dtype=torch.int32
+        ),
         query_positions=torch.tensor(
             [position, position + 1, position + 2] if is_mtp else [position],
             dtype=torch.int64,

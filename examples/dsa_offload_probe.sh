@@ -532,15 +532,9 @@ namespace = torch.ops._C_ascend
 required_ops = [
     "dsa_offload_lookup_update",
 ]
-if mtp_tokens:
-    required_ops.extend(
-        [
-            "dsa_offload_lookup_update_batch",
-            "dsa_sparse_turbo_lookup_update_batch",
-        ]
-    )
 if prefetch_enabled:
     required_ops.extend([
+        "dsa_offload_lookup_update_batch",
         "npu_lightning_indexer_hi_cached",
         "npu_scatter_nd_update_mean",
         "prefetch_qli_fusion",

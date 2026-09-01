@@ -1829,20 +1829,32 @@ std::tuple<at::Tensor, at::Tensor> dsa_offload_lookup_update(
     at::Tensor& free_slots,
     at::Tensor& free_head,
     const at::Tensor& request_rows,
-    const at::Tensor& query_indices,
-    const at::Tensor& lookup_mask,
-    int64_t req_num)
+    const at::Tensor& query_start_loc,
+    const at::Tensor& query_positions,
+    const at::Tensor& semantic_topk,
+    int64_t req_num,
+    int64_t block_size,
+    int64_t tail_base,
+    int64_t fallback_slot,
+    int64_t staging_base,
+    int64_t decode_mode)
 {
     (void)index;
     (void)slot_to_index;
     (void)free_slots;
     (void)free_head;
     (void)request_rows;
-    (void)lookup_mask;
+    (void)query_start_loc;
+    (void)query_positions;
     (void)req_num;
+    (void)block_size;
+    (void)tail_base;
+    (void)fallback_slot;
+    (void)staging_base;
+    (void)decode_mode;
     return {
-        at::empty_like(query_indices),
-        at::empty_like(query_indices),
+        at::empty_like(semantic_topk),
+        at::empty_like(semantic_topk),
     };
 }
 

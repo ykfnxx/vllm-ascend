@@ -20,7 +20,6 @@ class DSAOffloadConfig:
     kv_transfer_config: Any | None
     enable_prefetch_with_hidden_states: bool
     prefetch_top_k: int
-    enable_turbo_lookup: bool
     enable_turbo_prefetch_lookup: bool
 
     @property
@@ -61,9 +60,6 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
             "dsa_offload.prefetch_top_k must be in "
             f"[{PREFETCH_TOP_K_MIN}, {QUERY_WIDTH}]."
         )
-    enable_turbo_lookup = raw_config.get("enable_turbo_lookup", True)
-    if not isinstance(enable_turbo_lookup, bool):
-        raise TypeError("dsa_offload.enable_turbo_lookup must be a boolean.")
     enable_turbo_prefetch_lookup = raw_config.get(
         "enable_turbo_prefetch_lookup",
         True,
@@ -153,7 +149,6 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
         kv_transfer_config=kv_transfer_config,
         enable_prefetch_with_hidden_states=enable_prefetch,
         prefetch_top_k=prefetch_top_k,
-        enable_turbo_lookup=enable_turbo_lookup,
         enable_turbo_prefetch_lookup=enable_turbo_prefetch_lookup,
     )
 

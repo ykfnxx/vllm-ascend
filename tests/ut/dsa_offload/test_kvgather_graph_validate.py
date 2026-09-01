@@ -41,7 +41,7 @@ def test_graph_profile_validator_accepts_required_runtime_evidence(
     ) as output:
         writer = csv.writer(output)
         writer.writerow(["Name"])
-        writer.writerow(["dsa_sparse_turbo_lookup_update_batch"])
+        writer.writerow(["dsa_offload_lookup_update"])
         writer.writerow(["aclnnAsuKvGather"])
         writer.writerow(["SparseFlashAttention"])
 
@@ -57,7 +57,7 @@ def test_graph_profile_validator_accepts_required_runtime_evidence(
     assert summary["decode_graph"] == "FULL_DECODE_ONLY"
     assert summary["decode_graph_replayed"] is True
     assert summary["profile_evidence"] == {
-        "lookup_update_batch": True,
+        "lookup_update": True,
         "asu_kv_gather": True,
         "sparse_flash_attention": True,
     }

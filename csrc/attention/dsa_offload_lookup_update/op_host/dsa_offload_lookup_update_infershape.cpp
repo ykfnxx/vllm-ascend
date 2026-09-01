@@ -11,9 +11,9 @@
 namespace ops {
 
 namespace {
-constexpr size_t kQueryIndexInput = 5;
-constexpr size_t kSlotOutOutput = 0;
-constexpr size_t kMissOutOutput = 1;
+constexpr size_t kSemanticTopkInput = 7;
+constexpr size_t kMappedIndicesOutput = 0;
+constexpr size_t kMissMaskOutput = 1;
 }
 
 static ge::graphStatus InferShapeForDsaOffloadLookupUpdate(
@@ -23,11 +23,11 @@ static ge::graphStatus InferShapeForDsaOffloadLookupUpdate(
         return ge::GRAPH_FAILED;
     }
     const gert::Shape* query_shape =
-        context->GetInputShape(kQueryIndexInput);
+        context->GetInputShape(kSemanticTopkInput);
     gert::Shape* slot_shape =
-        context->GetOutputShape(kSlotOutOutput);
+        context->GetOutputShape(kMappedIndicesOutput);
     gert::Shape* miss_shape =
-        context->GetOutputShape(kMissOutOutput);
+        context->GetOutputShape(kMissMaskOutput);
     if (query_shape == nullptr || slot_shape == nullptr ||
         miss_shape == nullptr) {
         return ge::GRAPH_FAILED;
@@ -48,8 +48,8 @@ static ge::graphStatus InferDataTypeForDsaOffloadLookupUpdate(
     if (context == nullptr) {
         return ge::GRAPH_FAILED;
     }
-    context->SetOutputDataType(kSlotOutOutput, ge::DT_INT32);
-    context->SetOutputDataType(kMissOutOutput, ge::DT_INT32);
+    context->SetOutputDataType(kMappedIndicesOutput, ge::DT_INT32);
+    context->SetOutputDataType(kMissMaskOutput, ge::DT_INT32);
     return ge::GRAPH_SUCCESS;
 }
 

@@ -40,19 +40,23 @@ def test_history_tail_and_miss_are_mapped_to_fixed_hot_slots(spy_io) -> None:
         request_rows_cpu=(0,),
         decode_request_indices=(0,),
         query_ranges=((0, 1),),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         query_positions=torch.tensor([8], dtype=torch.int64),
         query_positions_cpu=(8,),
         is_mtp=False,
         committed_block_keys={"decode": [101, 102]},
         candidate_block_keys={},
     )
-    semantic = torch.tensor([[1, 5, 8, -1]], dtype=torch.int32)
-    slots = torch.tensor([[0, 8192, -1, -1]], dtype=torch.int32)
-    misses = torch.tensor([[0, 1, 0, 0]], dtype=torch.int32)
+    semantic = torch.tensor([[[1, 5, 8, -1]]], dtype=torch.int32)
+    mapped = torch.tensor(
+        [[[0, layout.replaceable_base, layout.tail_base, -1]]],
+        dtype=torch.int32,
+    )
+    misses = torch.tensor([[[0, 1, 0, 0]]], dtype=torch.int32)
 
     with patch(
         "vllm_ascend.dsa_offload.lookup.lookup_update",
-        return_value=(slots, misses),
+        return_value=(mapped, misses),
     ) as lookup:
         plan = make_lookup_plan(
             semantic_topk=semantic,
@@ -60,8 +64,15 @@ def test_history_tail_and_miss_are_mapped_to_fixed_hot_slots(spy_io) -> None:
             batch=batch,
         )
 
-    assert lookup.call_args.args[3].tolist() == [[1, 1, 0, 0]]
-    assert plan.mapped_indices.tolist() == [[0, layout.replaceable_base, layout.tail_base, -1]]
+    assert lookup.call_args.args[4] is semantic
+    assert lookup.call_args.kwargs == {
+        "block_size": layout.block_size,
+        "tail_base": layout.tail_base,
+        "fallback_slot": layout.fallback_slot,
+        "staging_base": layout.staging_base,
+        "decode_mode": 0,
+    }
+    assert plan.mapped_indices is mapped
     assert plan.miss_positions.tolist() == [5]
     assert plan.miss_logical_blocks.tolist() == [1]
     assert plan.miss_block_offsets.tolist() == [1]
@@ -90,16 +101,16 @@ def test_graph_plan_keeps_dense_lookup_and_gather_metadata(spy_io) -> None:
         request_rows_cpu=(1, 0),
         decode_request_indices=(0, 1),
         query_ranges=((0, 2), (2, 3)),
+        query_start_loc=query_start_loc,
         query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
         query_positions_cpu=(8, 9, 12),
         is_mtp=False,
         committed_block_keys={"first": [], "second": []},
         candidate_block_keys={},
         graph_query_start_loc=query_start_loc,
-        enable_turbo_lookup=True,
     )
     semantic = torch.tensor(
-        [[1, 2], [3, 4], [5, 6]],
+        [[[1, 2]], [[3, 4]], [[5, 6]]],
         dtype=torch.int32,
     )
     slots = torch.zeros_like(semantic)
@@ -116,14 +127,16 @@ def test_graph_plan_keeps_dense_lookup_and_gather_metadata(spy_io) -> None:
         )
 
     assert lookup.call_args.args[1] is batch.request_rows
-    assert torch.equal(lookup.call_args.args[2], semantic)
+    assert lookup.call_args.args[2] is query_start_loc
+    assert lookup.call_args.args[4] is semantic
+    assert plan.mapped_indices is slots
     assert plan.query_request_rows.tolist() == [1, 1, 0]
     assert plan.query_indices is not None
-    assert torch.equal(plan.query_indices, semantic)
+    assert torch.equal(plan.query_indices, semantic.reshape(3, 2))
     assert plan.lookup_slots is not None
-    assert plan.lookup_slots.tolist() == slots.tolist()
+    assert plan.lookup_slots.tolist() == slots.reshape(3, 2).tolist()
     assert plan.dense_miss_mask is not None
-    assert plan.dense_miss_mask.tolist() == misses.tolist()
+    assert plan.dense_miss_mask.tolist() == misses.reshape(3, 2).tolist()
     assert plan.miss_positions.numel() == 0
 
 
@@ -159,6 +172,7 @@ def test_graph_prefetch_plan_uses_fixed_dense_gather_metadata(spy_io) -> None:
         request_rows_cpu=(1, -1),
         decode_request_indices=(0, 1),
         query_ranges=((0, 2), (2, 3)),
+        query_start_loc=query_start_loc,
         query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
         query_positions_cpu=(8, 9, 12),
         is_mtp=False,
@@ -176,7 +190,7 @@ def test_graph_prefetch_plan_uses_fixed_dense_gather_metadata(spy_io) -> None:
     misses = torch.ones_like(semantic)
 
     with patch(
-        "vllm_ascend.dsa_offload.lookup.lookup_update",
+        "vllm_ascend.dsa_offload.lookup.lookup_update_batch",
         return_value=(slots, misses),
     ) as lookup:
         plan = make_prefetch_lookup_plan(
@@ -186,7 +200,8 @@ def test_graph_prefetch_plan_uses_fixed_dense_gather_metadata(spy_io) -> None:
         )
 
     assert lookup.call_args.args[1] is batch.request_rows
-    assert torch.equal(lookup.call_args.args[2], semantic)
+    assert lookup.call_args.args[2] is query_start_loc
+    assert torch.equal(lookup.call_args.args[3], semantic)
     assert plan.query_request_rows.tolist() == [1, 1, -1]
     assert plan.query_indices is not None
     assert torch.equal(plan.query_indices, semantic)
@@ -224,6 +239,7 @@ def test_candidate_keys_extend_committed_prefix(spy_io) -> None:
         request_rows_cpu=(-1,),
         decode_request_indices=(),
         query_ranges=((0, 1),),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         query_positions=torch.tensor([0]),
         query_positions_cpu=(0,),
         is_mtp=True,
@@ -246,6 +262,7 @@ def test_lookup_hit_does_not_call_io(spy_io) -> None:
         request_rows_cpu=(0,),
         decode_request_indices=(0,),
         query_ranges=((0, 1),),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         query_positions=torch.tensor([0]),
         query_positions_cpu=(0,),
         is_mtp=False,
@@ -261,9 +278,6 @@ def test_lookup_hit_does_not_call_io(spy_io) -> None:
         miss_destination_slots=empty,
         miss_batch_indices=empty.to(torch.int32),
         query_request_rows=torch.tensor([0], dtype=torch.int32),
-        tail_mask=torch.empty((1, 0), dtype=torch.bool),
-        fallback_mask=torch.empty((1, 0), dtype=torch.bool),
-        staging_mask=torch.empty((1, 0), dtype=torch.bool),
     )
 
     load_plan_misses(plan, 0, batch)
@@ -283,6 +297,7 @@ def test_lookup_miss_rejects_missing_block_key(spy_io) -> None:
         request_rows_cpu=(0,),
         decode_request_indices=(0,),
         query_ranges=((0, 1),),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
         query_positions=torch.tensor([0]),
         query_positions_cpu=(0,),
         is_mtp=False,
@@ -297,9 +312,6 @@ def test_lookup_miss_rejects_missing_block_key(spy_io) -> None:
         miss_destination_slots=torch.tensor([0], dtype=torch.int64),
         miss_batch_indices=torch.tensor([0], dtype=torch.int32),
         query_request_rows=torch.tensor([0], dtype=torch.int32),
-        tail_mask=torch.empty((1, 0), dtype=torch.bool),
-        fallback_mask=torch.empty((1, 0), dtype=torch.bool),
-        staging_mask=torch.empty((1, 0), dtype=torch.bool),
     )
 
     with pytest.raises(

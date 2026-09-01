@@ -936,13 +936,7 @@ class NPUModelRunner(GPUModelRunner):
                     self.speculative_config is not None
                     and self.speculative_config.method == "mtp"
                 )
-                main_lookup_op = (
-                    "dsa_sparse_turbo_lookup_update_batch"
-                    if is_mtp and config.enable_turbo_lookup
-                    else "dsa_offload_lookup_update_batch"
-                    if is_mtp
-                    else "dsa_offload_lookup_update"
-                )
+                main_lookup_op = "dsa_offload_lookup_update"
                 request_rows = self._dsa_offload_request_rows
                 assert request_rows is not None
                 request_rows.np[:] = np.arange(
@@ -997,8 +991,6 @@ class NPUModelRunner(GPUModelRunner):
                 "dsa_sparse_turbo_prefetch_lookup_update_batch"
                 if is_mtp and config.enable_turbo_prefetch_lookup
                 else "dsa_offload_lookup_update_batch"
-                if is_mtp
-                else "dsa_offload_lookup_update"
             )
             logger.info(
                 "DSA_OFFLOAD_GRAPH_PREFETCH_ACTIVE "
@@ -1217,6 +1209,9 @@ class NPUModelRunner(GPUModelRunner):
             lookup_states=self._dsa_offload_lookup_states,
             request_ids=request_ids,
             query_counts=query_counts,
+            query_start_loc=self.query_start_loc.gpu[
+                : len(row_values) + 1
+            ],
             query_positions=self.positions[:total_num_scheduled_tokens],
             query_positions_cpu=self._positions_np_buf[
                 :total_num_scheduled_tokens
@@ -1230,7 +1225,6 @@ class NPUModelRunner(GPUModelRunner):
             prefill_state=prefill_state,
             sfa_workspace=self._dsa_offload_sfa_workspace,
             prefetch_runtime=self._dsa_offload_prefetch_runtime,
-            enable_turbo_lookup=config.enable_turbo_lookup,
             enable_turbo_prefetch_lookup=(
                 config.enable_turbo_prefetch_lookup
             ),
@@ -1275,6 +1269,7 @@ class NPUModelRunner(GPUModelRunner):
             request_rows_cpu=tuple(range(num_reqs)),
             decode_request_indices=tuple(range(num_reqs)),
             query_ranges=query_ranges,
+            query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
             query_positions=self.positions[:total_num_scheduled_tokens],
             query_positions_cpu=tuple(range(total_num_scheduled_tokens)),
             is_mtp=bool(
@@ -1291,12 +1286,14 @@ class NPUModelRunner(GPUModelRunner):
             ),
             graph_query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
             prefetch_runtime=self._dsa_offload_prefetch_runtime,
-            enable_turbo_lookup=config.enable_turbo_lookup,
             enable_turbo_prefetch_lookup=(
                 config.enable_turbo_prefetch_lookup
             ),
         )
-        graph_batch.packed_decode = pack_graph_decode_metadata(graph_batch)
+        if self._dsa_offload_prefetch_runtime is not None:
+            graph_batch.packed_decode = pack_graph_decode_metadata(
+                graph_batch
+            )
         self._dsa_offload_graph_batches[batch_desc] = graph_batch
         return graph_batch
 
