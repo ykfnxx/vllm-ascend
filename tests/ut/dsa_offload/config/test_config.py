@@ -73,6 +73,23 @@ def test_feature_gate_and_valid_config() -> None:
     assert config.has_connector
     assert config.kv_role == "kv_both"
     assert config.is_producer and config.is_consumer
+    assert config.enable_turbo_fused_lookup
+    assert config.enable_turbo_fused_prefetch_lookup
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "enable_turbo_fused_lookup",
+        "enable_turbo_fused_prefetch_lookup",
+    ],
+)
+def test_fused_lookup_flags_require_boolean(name: str) -> None:
+    vllm_config = make_config()
+    vllm_config.additional_config["dsa_offload"][name] = 1
+
+    with pytest.raises(TypeError, match=name):
+        load_dsa_offload_config(vllm_config)
 
 
 def test_connector_free_config_uses_local_mixed_role() -> None:

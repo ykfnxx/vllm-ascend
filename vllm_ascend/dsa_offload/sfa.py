@@ -105,70 +105,161 @@ class SFAAddressingWorkspace:
         return effective_block_table, effective_kv_lengths
 
 
+def _prepare_sfa_addressing_view(
+    *,
+    batch: _lookup.DSAOffloadBatch,
+    default_block_table: torch.Tensor,
+    default_actual_seq_lengths_kv: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compose only when the current KV-cache metadata source changes."""
+
+    prepared = batch.prepared_step_addressing
+    if prepared is None:
+        prepared = _lookup.PreparedStepAddressing()
+        batch.prepared_step_addressing = prepared
+    sources = prepared.sfa_view_sources
+    if sources is None or (
+        sources[0] is not default_block_table
+        or sources[1] is not default_actual_seq_lengths_kv
+    ):
+        workspace = batch.sfa_workspace
+        if workspace is None:
+            raise RuntimeError(
+                "DSA Offload Decode requires a persistent SFA addressing "
+                "workspace."
+            )
+        (
+            prepared.sfa_block_table,
+            prepared.sfa_actual_seq_lengths_kv,
+        ) = workspace.compose(
+            default_block_table=default_block_table,
+            default_actual_seq_lengths_kv=default_actual_seq_lengths_kv,
+            batch=batch,
+        )
+        prepared.sfa_view_sources = (
+            default_block_table,
+            default_actual_seq_lengths_kv,
+        )
+    assert prepared.sfa_block_table is not None
+    assert prepared.sfa_actual_seq_lengths_kv is not None
+    return (
+        prepared.sfa_block_table,
+        prepared.sfa_actual_seq_lengths_kv,
+    )
+
+
 def prepare_main_slot_mapping(
     *,
     batch: _lookup.DSAOffloadBatch | None,
     default_slot_mapping: torch.Tensor,
+    default_block_table: torch.Tensor | None = None,
+    default_actual_seq_lengths_kv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if batch is None or not batch.decode_request_indices:
         return default_slot_mapping
 
-    main_slot_mapping = default_slot_mapping.clone()
-    if batch.graph_query_start_loc is not None:
-        query_lengths = (
-            batch.graph_query_start_loc[1:]
-            - batch.graph_query_start_loc[:-1]
-        ).to(torch.int64)
-        total_queries = batch.query_positions.shape[0]
-        query_rows = torch.repeat_interleave(
-            batch.request_rows,
-            query_lengths,
-            output_size=total_queries,
-        ).to(torch.int64)
-        query_starts = torch.repeat_interleave(
-            batch.graph_query_start_loc[:-1],
-            query_lengths,
-            output_size=total_queries,
+    if (default_block_table is None) != (
+        default_actual_seq_lengths_kv is None
+    ):
+        raise ValueError(
+            "DSA Offload step addressing requires both block table and KV lengths."
         )
-        if batch.is_mtp:
-            row_offsets = (
-                batch.layout.staging_base
-                + torch.arange(
-                    total_queries,
-                    dtype=torch.int32,
-                    device=main_slot_mapping.device,
-                )
-                - query_starts
-            )
-        else:
-            row_offsets = batch.layout.tail_base + torch.remainder(
-                batch.query_positions,
-                batch.layout.block_size,
-            )
-        row_blocks = (
-            batch.layout.hot_block_base
-            + query_rows * batch.layout.hot_blocks_per_row
-        )
-        main_slot_mapping[:total_queries] = (
-            row_blocks * batch.layout.block_size + row_offsets
-        )
-        return main_slot_mapping
 
-    for request_index in batch.decode_request_indices:
-        begin, end = batch.query_ranges[request_index]
-        row_id = int(batch.request_rows[request_index].item())
-        if batch.is_mtp:
-            row_offsets = batch.layout.staging_base + torch.arange(
-                end - begin,
-                dtype=torch.int64,
-                device=main_slot_mapping.device,
+    # Materialize shared Decode metadata on the main stream before grouped
+    # prefetch can start on its side stream.  Later exact and prefetch Lookup
+    # planning therefore consume the same ready tensors without a new join.
+    addressing = _lookup.get_packed_addressing_metadata(batch)
+    main_uses_fused_lookup = (
+        batch.is_mtp
+        and batch.enable_turbo_lookup
+        and batch.enable_turbo_fused_lookup
+    )
+    prefetch_uses_fused_lookup = (
+        batch.is_mtp
+        and batch.enable_turbo_prefetch_lookup
+        and batch.enable_turbo_fused_prefetch_lookup
+    )
+    if not main_uses_fused_lookup or (
+        batch.prefetch_runtime is not None
+        and not prefetch_uses_fused_lookup
+    ):
+        _lookup.get_expanded_lookup_boundaries(batch)
+    prepared = batch.prepared_step_addressing
+    if prepared is None:
+        prepared = _lookup.PreparedStepAddressing()
+        batch.prepared_step_addressing = prepared
+
+    slot_mapping_key = id(default_slot_mapping)
+    cached_mapping = prepared.main_slot_mappings.get(slot_mapping_key)
+    main_slot_mapping = (
+        cached_mapping[1]
+        if cached_mapping is not None
+        and cached_mapping[0] is default_slot_mapping
+        else None
+    )
+    if main_slot_mapping is None:
+        main_slot_mapping = default_slot_mapping.clone()
+        if batch.graph_query_start_loc is not None:
+            total_queries = addressing.query_positions.shape[0]
+            query_rows = addressing.query_request_rows_long
+            if batch.is_mtp:
+                expanded_query_starts = addressing.expanded_query_starts
+                assert expanded_query_starts is not None
+                row_offsets = (
+                    batch.layout.staging_base
+                    + torch.arange(
+                        total_queries,
+                        dtype=torch.int32,
+                        device=main_slot_mapping.device,
+                    )
+                    - expanded_query_starts
+                )
+            else:
+                row_offsets = batch.layout.tail_base + torch.remainder(
+                    addressing.query_positions,
+                    batch.layout.block_size,
+                )
+            row_blocks = (
+                batch.layout.hot_block_base
+                + query_rows * batch.layout.hot_blocks_per_row
+            )
+            main_slot_mapping[:total_queries] = (
+                row_blocks * batch.layout.block_size + row_offsets
             )
         else:
-            row_offsets = batch.layout.tail_base + torch.remainder(
-                batch.query_positions[begin:end],
-                batch.layout.block_size,
-            )
-        main_slot_mapping[begin:end] = batch.layout.row_block_base(row_id) * batch.layout.block_size + row_offsets
+            for request_index in batch.decode_request_indices:
+                begin, end = batch.query_ranges[request_index]
+                row_id = int(batch.request_rows[request_index].item())
+                if batch.is_mtp:
+                    row_offsets = batch.layout.staging_base + torch.arange(
+                        end - begin,
+                        dtype=torch.int64,
+                        device=main_slot_mapping.device,
+                    )
+                else:
+                    row_offsets = batch.layout.tail_base + torch.remainder(
+                        batch.query_positions[begin:end],
+                        batch.layout.block_size,
+                    )
+                main_slot_mapping[begin:end] = (
+                    batch.layout.row_block_base(row_id)
+                    * batch.layout.block_size
+                    + row_offsets
+                )
+        prepared.main_slot_mappings[slot_mapping_key] = (
+            default_slot_mapping,
+            main_slot_mapping,
+        )
+
+    if default_block_table is not None:
+        _lookup.get_decode_block_table(batch, default_block_table)
+        assert default_actual_seq_lengths_kv is not None
+        _prepare_sfa_addressing_view(
+            batch=batch,
+            default_block_table=default_block_table,
+            default_actual_seq_lengths_kv=default_actual_seq_lengths_kv,
+        )
+
     return main_slot_mapping
 
 
@@ -255,18 +346,15 @@ def resolve_sfa_inputs(
     _lookup.load_plan_misses(plan, layer_id, batch)
     if batch.prefetch_runtime is not None:
         batch.prefetch_runtime.release_after_exact_load(layer_name)
-    workspace = batch.sfa_workspace
-    if workspace is None:
-        raise RuntimeError("DSA Offload Decode requires a persistent SFA addressing workspace.")
-    sfa_block_table, actual_seq_lengths_kv = workspace.compose(
+    sfa_block_table, sfa_actual_seq_lengths_kv = _prepare_sfa_addressing_view(
+        batch=batch,
         default_block_table=default_block_table,
         default_actual_seq_lengths_kv=default_actual_seq_lengths_kv,
-        batch=batch,
     )
     return SFAAddressingView(
         sparse_indices=plan.mapped_indices,
         block_table=sfa_block_table,
-        actual_seq_lengths_kv=actual_seq_lengths_kv,
+        actual_seq_lengths_kv=sfa_actual_seq_lengths_kv,
     )
 
 

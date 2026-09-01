@@ -1687,6 +1687,8 @@ class AscendSFAImpl(MLAAttentionImpl):
         main_slot_mapping = prepare_main_slot_mapping(
             batch=attn_metadata.dsa_offload_batch,
             default_slot_mapping=slot_mapping_sfa,
+            default_block_table=attn_metadata.block_table,
+            default_actual_seq_lengths_kv=actual_seq_lengths_key,
         )
 
         # Inputs and outputs may be padded for CUDA graphs

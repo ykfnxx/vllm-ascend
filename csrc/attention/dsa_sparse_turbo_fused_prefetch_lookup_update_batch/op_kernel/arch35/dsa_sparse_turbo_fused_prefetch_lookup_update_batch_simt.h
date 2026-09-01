@@ -24,9 +24,7 @@ constexpr uint32_t kQueryBeginScalar = 5U;
 constexpr uint32_t kQueryEndScalar = 6U;
 constexpr uint32_t kAllocBaseScalar = 7U;
 constexpr uint32_t kRefillCounterScalar = 8U;
-constexpr uint32_t kVerifyStartScalar = 9U;
-constexpr uint32_t kTailStartScalar = 10U;
-constexpr uint32_t kRequestRowScalar = 11U;
+constexpr uint32_t kTailStartScalar = 9U;
 
 // Framework-equivalent invalid index sentinel (INVALID_INDEX = -1 in
 // vllm_ascend/dsa_offload/lookup.py).
@@ -293,9 +291,9 @@ __simt_callee__ inline void PrefetchMaintain(
 // The prefetch stream only touches history KV (framework lookup_mask =
 // valid && token < tail_start); tail/staging/current-token entries never
 // enter the Lookup state.  Non-history entries get destination = -1 and
-// miss_mask = 0.  History hits and allocated misses map to the global
-// destination slot (row base + logical offset), exactly the framework's
-// plan.lookup_slots consumed by the dense prefetch Gather.
+// miss_mask = 0.  History hits and allocated misses map to the logical row
+// offset, exactly the framework's plan.lookup_slots consumed together with
+// request_rows and destination_block_table by the dense prefetch Gather.
 //
 // The maintain semantics (Plan 2/3, overflow fallback) are inherited
 // unchanged from the turbo_prefetch baseline.
@@ -324,14 +322,11 @@ __simt_callee__ inline void ProcessQuery(
         DSA_SPARSE_TURBO_FUSED_QUERY_WIDTH;
     const uint32_t query_begin = tid * query_chunk;
 
-    const int32_t verify_start = scalars[kVerifyStartScalar];
     const int32_t tail_start = scalars[kTailStartScalar];
-    (void)verify_start;
 
     int32_t query_values[query_chunk];
     int32_t query_is_history[query_chunk];
     int32_t local_destinations[query_chunk];
-    int32_t local_slots[query_chunk];
     int32_t local_miss_candidates[query_chunk];
     int32_t local_misses[query_chunk];
 #pragma unroll
@@ -342,7 +337,6 @@ __simt_callee__ inline void ProcessQuery(
             query_base + query_begin + local_entry;
         const int32_t token = query_index[offset];
         query_values[local_entry] = token;
-        local_slots[local_entry] = DSA_SPARSE_TURBO_FUSED_NOT_FOUND;
         local_miss_candidates[local_entry] = 0;
         local_misses[local_entry] = 0;
         if (token < 0 ||
@@ -373,7 +367,6 @@ __simt_callee__ inline void ProcessQuery(
         if (observed >= 0 &&
             observed < static_cast<int32_t>(
                            DSA_SPARSE_TURBO_FUSED_SLOT_COUNT)) {
-            local_slots[local_entry] = observed;
             local_destinations[local_entry] = LookupOffset(
                 observed, replaceable_base);
             ProtectSlot(protected_bits,
@@ -459,7 +452,6 @@ __simt_callee__ inline void ProcessQuery(
             static_cast<uint32_t>(slot)] = token;
         request_index[
             static_cast<uint32_t>(token)] = slot;
-        local_slots[local_entry] = slot;
         local_destinations[local_entry] = LookupOffset(
             slot, replaceable_base);
         local_misses[local_entry] = 1;
@@ -545,8 +537,7 @@ __simt_callee__ inline void ProcessRequest(
     __gm__ int32_t* request_rows,
     __gm__ int32_t* query_start_loc,
     __gm__ int32_t* query_index,
-    __gm__ int32_t* query_positions,
-    __gm__ int32_t* verify_starts,
+    __gm__ int32_t* tail_starts,
     __gm__ int32_t* destination_slots,
     __gm__ int32_t* miss_mask,
     __ubuf__ uint32_t* shared_scratch,
@@ -555,7 +546,6 @@ __simt_callee__ inline void ProcessRequest(
     uint32_t query_num,
     bool reuse_scratch,
     uint32_t index_capacity,
-    int32_t block_size,
     int32_t replaceable_base)
 {
     const uint32_t tid = static_cast<uint32_t>(threadIdx.x);
@@ -587,9 +577,7 @@ __simt_callee__ inline void ProcessRequest(
         scalars[kQueryEndScalar] = query_end;
         scalars[kAllocBaseScalar] = 0;
         scalars[kRefillCounterScalar] = 0;
-        scalars[kVerifyStartScalar] = 0;
         scalars[kTailStartScalar] = 0;
-        scalars[kRequestRowScalar] = pool_entry;
         if (pool_entry >= 0 &&
             pool_entry < static_cast<int32_t>(pool_capacity)) {
             __gm__ int32_t* request_free_head =
@@ -603,14 +591,9 @@ __simt_callee__ inline void ProcessRequest(
                 cursor = 0;
             }
             scalars[kCursorScalar] = cursor;
-            // Fused classification anchors: loaded once per request, consumed
-            // by every query of the request.  tail_start mirrors the
-            // framework's floor(verify_start / block_size) * block_size.
-            const int32_t verify_start = verify_starts[req_id];
-            scalars[kVerifyStartScalar] = verify_start;
-            const int32_t tail_start =
-                (verify_start / block_size) * block_size;
-            scalars[kTailStartScalar] = tail_start;
+            // Prepared once per Decode step by the framework and shared with
+            // the exact lookup path.
+            scalars[kTailStartScalar] = tail_starts[req_id];
         }
     }
     asc_syncthreads();
@@ -703,8 +686,7 @@ DsaSparseTurboFusedPrefetchLookupUpdateBatchSimt(
     __gm__ int32_t* request_rows,
     __gm__ int32_t* query_start_loc,
     __gm__ int32_t* query_index,
-    __gm__ int32_t* query_positions,
-    __gm__ int32_t* verify_starts,
+    __gm__ int32_t* tail_starts,
     __gm__ int32_t* destination_slots,
     __gm__ int32_t* miss_mask,
     __ubuf__ uint32_t* shared_scratch,
@@ -712,7 +694,6 @@ DsaSparseTurboFusedPrefetchLookupUpdateBatchSimt(
     uint32_t pool_capacity,
     uint32_t query_num,
     uint32_t index_capacity,
-    int32_t block_size,
     int32_t replaceable_base)
 {
     const uint32_t request_stride = static_cast<uint32_t>(gridDim.x);
@@ -727,8 +708,7 @@ DsaSparseTurboFusedPrefetchLookupUpdateBatchSimt(
             request_rows,
             query_start_loc,
             query_index,
-            query_positions,
-            verify_starts,
+            tail_starts,
             destination_slots,
             miss_mask,
             shared_scratch,
@@ -737,7 +717,6 @@ DsaSparseTurboFusedPrefetchLookupUpdateBatchSimt(
             query_num,
             req_id + request_stride < req_num,
             index_capacity,
-            block_size,
             replaceable_base);
     }
 }

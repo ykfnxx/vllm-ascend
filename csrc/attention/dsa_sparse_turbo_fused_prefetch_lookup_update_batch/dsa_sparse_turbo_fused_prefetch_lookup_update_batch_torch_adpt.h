@@ -17,12 +17,10 @@ dsa_sparse_turbo_fused_prefetch_lookup_update_batch(
     const at::Tensor& request_rows,
     const at::Tensor& query_start_loc,
     const at::Tensor& query_index,
-    const at::Tensor& query_positions,
-    const at::Tensor& verify_starts,
+    const at::Tensor& tail_starts,
     int64_t req_num,
     int64_t block_size)
 {
-    constexpr int64_t kIndexCapacity = 128 * 1024;
     constexpr int64_t kSlotCount = 10 * 1024;
     constexpr int64_t kFreeSlotCount = 2 * 1024;
     constexpr int64_t kQueryWidth = 2 * 1024;
@@ -42,10 +40,8 @@ dsa_sparse_turbo_fused_prefetch_lookup_update_batch(
                 "query_start_loc must be int32");
     TORCH_CHECK(query_index.scalar_type() == at::kInt,
                 "query_index must be int32");
-    TORCH_CHECK(query_positions.scalar_type() == at::kInt,
-                "query_positions must be int32");
-    TORCH_CHECK(verify_starts.scalar_type() == at::kInt,
-                "verify_starts must be int32");
+    TORCH_CHECK(tail_starts.scalar_type() == at::kInt,
+                "tail_starts must be int32");
     TORCH_CHECK(req_num > 0, "req_num must be greater than 0");
     TORCH_CHECK(block_size > 0, "block_size must be greater than 0");
     TORCH_CHECK(index.dim() == 2 &&
@@ -76,12 +72,9 @@ dsa_sparse_turbo_fused_prefetch_lookup_update_batch(
                     query_index.size(0) >= req_num &&
                     query_index.size(1) == kQueryWidth,
                 "query_index must have shape [T, 2048] with T >= req_num");
-    TORCH_CHECK(query_positions.dim() == 1 &&
-                    query_positions.size(0) == query_index.size(0),
-                "query_positions must have shape [T]");
-    TORCH_CHECK(verify_starts.dim() == 1 &&
-                    verify_starts.size(0) == req_num,
-                "verify_starts must have shape [req_num]");
+    TORCH_CHECK(tail_starts.dim() == 1 &&
+                    tail_starts.size(0) == req_num,
+                "tail_starts must have shape [req_num]");
     TORCH_CHECK(index.is_contiguous() &&
                     slot_to_index.is_contiguous() &&
                     free_slots.is_contiguous() &&
@@ -89,8 +82,7 @@ dsa_sparse_turbo_fused_prefetch_lookup_update_batch(
                     request_rows.is_contiguous() &&
                     query_start_loc.is_contiguous() &&
                     query_index.is_contiguous() &&
-                    query_positions.is_contiguous() &&
-                    verify_starts.is_contiguous(),
+                    tail_starts.is_contiguous(),
                 "all dsa_sparse_turbo_fused_prefetch_lookup_update_batch tensors must be contiguous");
     const auto device = index.device();
     TORCH_CHECK(slot_to_index.device() == device &&
@@ -99,8 +91,7 @@ dsa_sparse_turbo_fused_prefetch_lookup_update_batch(
                     request_rows.device() == device &&
                     query_start_loc.device() == device &&
                     query_index.device() == device &&
-                    query_positions.device() == device &&
-                    verify_starts.device() == device,
+                    tail_starts.device() == device,
                 "all dsa_sparse_turbo_fused_prefetch_lookup_update_batch tensors must be on one device");
 
     at::Tensor destination_slots = at::empty_like(query_index);
@@ -114,8 +105,7 @@ dsa_sparse_turbo_fused_prefetch_lookup_update_batch(
         request_rows,
         query_start_loc,
         query_index,
-        query_positions,
-        verify_starts,
+        tail_starts,
         req_num,
         block_size,
         destination_slots,

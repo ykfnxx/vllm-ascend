@@ -57,15 +57,16 @@ mapped_indices, miss_mask = torch.ops._C_ascend.dsa_sparse_turbo_fused_lookup_up
     query_indices,    # [query_num, 2048] int32
     query_positions,  # [query_num] int32
     verify_starts,    # [req_num] int32
+    tail_starts,      # [req_num] int32
     req_num,          # int attr
     block_size,       # int attr
     is_mtp,           # int attr（1=MTP，0=non-MTP）
 )
 ```
 
-- `verify_starts[req]` 与 `query_positions[query]` 与框架
-  `make_lookup_plan` 使用的 `packed_positions` 同源（graph 模式取
-  `batch.query_positions`，eager 取 `packed.query_positions`）。
+- `query_positions`、`verify_starts` 和 `tail_starts` 直接复用框架每个
+  Decode 步在主流生成的 `PackedAddressingMetadata`。算子不再重复执行
+  `floor(verify_start / block_size) * block_size`。
 - layout 常量（`tail_base`/`staging_base`/`fallback_slot`/`replaceable_base`）
   由 host tiling 按内建常量推导，attr 只传 `block_size`：
 
@@ -83,10 +84,9 @@ staging_base      = fallback_slot + 1
 
 ### 2.2 核内分类语义（与框架 where 链逐位对齐）
 
-每 request 一次读取 `verify_start = verify_starts[req]`，计算
-`tail_start = floor(verify_start / block_size) * block_size`（一次整数除法）；
-每个 query 读取 `current_position = query_positions[query_id]`。对每个
-Top-K token：
+每 request 一次读取 `verify_start = verify_starts[req]` 和
+`tail_start = tail_starts[req]`；每个 query 读取
+`current_position = query_positions[query_id]`。对每个 Top-K token：
 
 ```
 token < 0 或 token >= index_capacity          → mapped = INVALID(-1),      miss = 0
@@ -136,7 +136,11 @@ flush（累计分配逼近 FREE_SLOT_COUNT 时提前 maintain）、溢出撤销
 - **状态副作用**：index/slot_to_index/free_slots/free_head 的写入与
   turbo 完全相同（分类不影响状态机）。
 
-## 4. 验证结果（2026-08-31，A5 实机）
+## 4. 原始分支验证结果（2026-08-31，A5 实机）
+
+以下结果来自精简 ABI 前的同语义 kernel。当前版本新增框架提供的
+`tail_starts` 并删除只写不读的线程局部数组，需重新编译后复跑本目录测试；
+框架侧已补充参数接线、fallback 选择和 eager logical-slot 回归测试。
 
 `test/sanity_check.py` 全绿：与 turbo 基线 + 框架公式重建逐位对拍
 （Q=1 输出+后状态位精确；Q=4 位精确 + 不变量；flush 压力全分配、head=0），

@@ -23,6 +23,7 @@ aclnnDsaSparseTurboFusedLookupUpdateBatchGetWorkspaceSize(
     const aclTensor* queryIndex,
     const aclTensor* queryPositions,
     const aclTensor* verifyStarts,
+    const aclTensor* tailStarts,
     int64_t reqNum,
     int64_t blockSize,
     int64_t isMtp,

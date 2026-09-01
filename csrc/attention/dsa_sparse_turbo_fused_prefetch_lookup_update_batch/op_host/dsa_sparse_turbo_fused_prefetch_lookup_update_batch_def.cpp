@@ -40,8 +40,7 @@ public:
         AddInt32Input(*this, "requestRows");
         AddInt32Input(*this, "queryStartLoc");
         AddInt32Input(*this, "queryIndex");
-        AddInt32Input(*this, "queryPositions");
-        AddInt32Input(*this, "verifyStarts");
+        AddInt32Input(*this, "tailStarts");
         AddInt32Output(*this, "destinationSlots");
         AddInt32Output(*this, "missMask");
         this->Attr("req_num").AttrType(REQUIRED).Int();

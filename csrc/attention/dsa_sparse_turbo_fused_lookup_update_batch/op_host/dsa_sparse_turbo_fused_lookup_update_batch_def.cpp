@@ -42,6 +42,7 @@ public:
         AddInt32Input(*this, "queryIndex");
         AddInt32Input(*this, "queryPositions");
         AddInt32Input(*this, "verifyStarts");
+        AddInt32Input(*this, "tailStarts");
         AddInt32Output(*this, "mappedIndices");
         AddInt32Output(*this, "missMask");
         this->Attr("req_num").AttrType(REQUIRED).Int();

@@ -127,7 +127,13 @@ def test_mixed_batch_keeps_prefill_mapping_and_redirects_decode_tail(spy_io) -> 
         batch=batch,
         default_slot_mapping=default,
     )
+    reused = prepare_main_slot_mapping(
+        batch=batch,
+        default_slot_mapping=default,
+    )
 
+    assert batch.packed_addressing is not None
+    assert reused is mapped
     assert mapped[:2].tolist() == [10, 11]
     assert mapped[2].item() == batch.layout.global_slot(row, batch.layout.tail_base + 1)
     assert default.tolist() == [10, 11, 12]
@@ -146,6 +152,48 @@ def test_mtp_verification_writes_staging_without_touching_prefill(spy_io) -> Non
         batch.layout.global_slot(row, batch.layout.staging_base),
         batch.layout.global_slot(row, batch.layout.staging_base + 1),
     ]
+
+
+def test_step_addressing_reuses_only_matching_metadata_group(spy_io) -> None:
+    batch, _ = make_mixed_batch(spy_io, is_mtp=True)
+    workspace = batch.sfa_workspace
+    assert workspace is not None
+    slots = torch.tensor([10, 11, 12, 13], dtype=torch.int64)
+    block_table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    seq_lens = torch.tensor([2, 6], dtype=torch.int32)
+
+    with patch.object(
+        workspace,
+        "compose",
+        wraps=workspace.compose,
+    ) as compose:
+        first = prepare_main_slot_mapping(
+            batch=batch,
+            default_slot_mapping=slots,
+            default_block_table=block_table,
+            default_actual_seq_lengths_kv=seq_lens,
+        )
+        second = prepare_main_slot_mapping(
+            batch=batch,
+            default_slot_mapping=slots,
+            default_block_table=block_table,
+            default_actual_seq_lengths_kv=seq_lens,
+        )
+
+        assert second is first
+        compose.assert_called_once()
+
+        other_slots = slots.clone()
+        other_block_table = block_table.clone()
+        third = prepare_main_slot_mapping(
+            batch=batch,
+            default_slot_mapping=other_slots,
+            default_block_table=other_block_table,
+            default_actual_seq_lengths_kv=seq_lens,
+        )
+
+    assert third is not first
+    assert compose.call_count == 2
 
 
 def test_graph_mtp_mapping_uses_runtime_request_rows(spy_io) -> None:
@@ -194,9 +242,6 @@ def test_leader_looks_up_once_and_follower_performs_own_get(spy_io) -> None:
         miss_destination_slots=empty,
         miss_batch_indices=empty.to(torch.int32),
         query_request_rows=empty.to(torch.int32),
-        tail_mask=torch.empty(0, dtype=torch.bool),
-        fallback_mask=torch.empty(0, dtype=torch.bool),
-        staging_mask=torch.empty(0, dtype=torch.bool),
     )
     events = ["indexer"]
 

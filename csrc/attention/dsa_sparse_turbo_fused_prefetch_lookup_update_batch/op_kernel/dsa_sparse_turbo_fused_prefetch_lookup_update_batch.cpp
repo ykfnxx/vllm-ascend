@@ -16,8 +16,7 @@ extern "C" __global__ __aicore__ void dsa_sparse_turbo_fused_prefetch_lookup_upd
     GM_ADDR request_rows,
     GM_ADDR query_start_loc,
     GM_ADDR query_index,
-    GM_ADDR query_positions,
-    GM_ADDR verify_starts,
+    GM_ADDR tail_starts,
     GM_ADDR destination_slots,
     GM_ADDR miss_mask,
     GM_ADDR user_workspace,
@@ -31,8 +30,7 @@ extern "C" __global__ __aicore__ void dsa_sparse_turbo_fused_prefetch_lookup_upd
     (void)request_rows;
     (void)query_start_loc;
     (void)query_index;
-    (void)query_positions;
-    (void)verify_starts;
+    (void)tail_starts;
     (void)destination_slots;
     (void)miss_mask;
     (void)user_workspace;
@@ -57,8 +55,7 @@ extern "C" __global__ __aicore__ void dsa_sparse_turbo_fused_prefetch_lookup_upd
         reinterpret_cast<__gm__ int32_t*>(request_rows),
         reinterpret_cast<__gm__ int32_t*>(query_start_loc),
         reinterpret_cast<__gm__ int32_t*>(query_index),
-        reinterpret_cast<__gm__ int32_t*>(query_positions),
-        reinterpret_cast<__gm__ int32_t*>(verify_starts),
+        reinterpret_cast<__gm__ int32_t*>(tail_starts),
         reinterpret_cast<__gm__ int32_t*>(destination_slots),
         reinterpret_cast<__gm__ int32_t*>(miss_mask),
         shared_scratch,
@@ -66,7 +63,6 @@ extern "C" __global__ __aicore__ void dsa_sparse_turbo_fused_prefetch_lookup_upd
         tiling_data.poolCapacity,
         tiling_data.queryNum,
         tiling_data.indexCapacity,
-        tiling_data.blockSize,
         tiling_data.replaceableBase);
 #endif
 }
