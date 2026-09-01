@@ -22,6 +22,8 @@ class DSAOffloadConfig:
     prefetch_top_k: int
     enable_turbo_lookup: bool
     enable_turbo_prefetch_lookup: bool
+    enable_turbo_fused_lookup: bool
+    enable_turbo_fused_prefetch_lookup: bool
 
     @property
     def has_connector(self) -> bool:
@@ -71,6 +73,22 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
     if not isinstance(enable_turbo_prefetch_lookup, bool):
         raise TypeError(
             "dsa_offload.enable_turbo_prefetch_lookup must be a boolean."
+        )
+    enable_turbo_fused_lookup = raw_config.get(
+        "enable_turbo_fused_lookup",
+        True,
+    )
+    if not isinstance(enable_turbo_fused_lookup, bool):
+        raise TypeError(
+            "dsa_offload.enable_turbo_fused_lookup must be a boolean."
+        )
+    enable_turbo_fused_prefetch_lookup = raw_config.get(
+        "enable_turbo_fused_prefetch_lookup",
+        True,
+    )
+    if not isinstance(enable_turbo_fused_prefetch_lookup, bool):
+        raise TypeError(
+            "dsa_offload.enable_turbo_fused_prefetch_lookup must be a boolean."
         )
 
     from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
@@ -155,6 +173,8 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
         prefetch_top_k=prefetch_top_k,
         enable_turbo_lookup=enable_turbo_lookup,
         enable_turbo_prefetch_lookup=enable_turbo_prefetch_lookup,
+        enable_turbo_fused_lookup=enable_turbo_fused_lookup,
+        enable_turbo_fused_prefetch_lookup=enable_turbo_fused_prefetch_lookup,
     )
 
 

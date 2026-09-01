@@ -9,6 +9,10 @@ OPERATOR_NAMES = (
     "dsa_offload_lookup_update_batch",
     "asu_kv_gather",
 )
+FUSED_OPERATOR_NAMES = (
+    "dsa_sparse_turbo_fused_lookup_update_batch",
+    "dsa_sparse_turbo_fused_prefetch_lookup_update_batch",
+)
 
 
 def test_native_sources_use_only_dsa_offload_names() -> None:
@@ -27,7 +31,7 @@ def test_native_sources_use_only_dsa_offload_names() -> None:
 
 
 def test_native_operator_directories_match_kernel_names() -> None:
-    for operator_name in OPERATOR_NAMES:
+    for operator_name in (*OPERATOR_NAMES, *FUSED_OPERATOR_NAMES):
         operator_root = ROOT / "csrc" / "attention" / operator_name
         kernel_source = operator_root / "op_kernel" / f"{operator_name}.cpp"
 
@@ -39,7 +43,7 @@ def test_torch_and_meta_registrations_exist() -> None:
     binding = (ROOT / "csrc" / "torch_binding.cpp").read_text(encoding="utf-8")
     meta = (ROOT / "csrc" / "torch_binding_meta.cpp").read_text(encoding="utf-8")
 
-    for operator_name in OPERATOR_NAMES:
+    for operator_name in (*OPERATOR_NAMES, *FUSED_OPERATOR_NAMES):
         assert f'"{operator_name}(' in binding
         assert f'ops.impl(\n        "{operator_name}"' in binding
         assert f'ops.impl("{operator_name}"' in meta
@@ -50,6 +54,6 @@ def test_only_a5_build_selects_dsa_offload() -> None:
     a5_branch = build_script.split('elif [[ "$SOC_VERSION" =~ ^ascend950 ]]', 1)[1].split("else", 1)[0]
     earlier_branches = build_script.split('elif [[ "$SOC_VERSION" =~ ^ascend950 ]]', 1)[0]
 
-    for operator_name in OPERATOR_NAMES:
+    for operator_name in (*OPERATOR_NAMES, *FUSED_OPERATOR_NAMES):
         assert f'"{operator_name}"' in a5_branch
         assert f'"{operator_name}"' not in earlier_branches

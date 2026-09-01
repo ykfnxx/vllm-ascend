@@ -1948,6 +1948,67 @@ std::tuple<at::Tensor, at::Tensor> dsa_sparse_turbo_prefetch_lookup_update_batch
     };
 }
 
+std::tuple<at::Tensor, at::Tensor> dsa_sparse_turbo_fused_lookup_update_batch(
+    at::Tensor& index,
+    at::Tensor& slot_to_index,
+    at::Tensor& free_slots,
+    at::Tensor& free_head,
+    const at::Tensor& request_rows,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& query_index,
+    const at::Tensor& query_positions,
+    const at::Tensor& verify_starts,
+    const at::Tensor& tail_starts,
+    int64_t req_num,
+    int64_t block_size,
+    int64_t is_mtp)
+{
+    (void)index;
+    (void)slot_to_index;
+    (void)free_slots;
+    (void)free_head;
+    (void)request_rows;
+    (void)query_start_loc;
+    (void)query_positions;
+    (void)verify_starts;
+    (void)tail_starts;
+    (void)req_num;
+    (void)block_size;
+    (void)is_mtp;
+    return {
+        at::empty_like(query_index),
+        at::empty_like(query_index),
+    };
+}
+
+std::tuple<at::Tensor, at::Tensor>
+dsa_sparse_turbo_fused_prefetch_lookup_update_batch(
+    at::Tensor& index,
+    at::Tensor& slot_to_index,
+    at::Tensor& free_slots,
+    at::Tensor& free_head,
+    const at::Tensor& request_rows,
+    const at::Tensor& query_start_loc,
+    const at::Tensor& query_index,
+    const at::Tensor& tail_starts,
+    int64_t req_num,
+    int64_t block_size)
+{
+    (void)index;
+    (void)slot_to_index;
+    (void)free_slots;
+    (void)free_head;
+    (void)request_rows;
+    (void)query_start_loc;
+    (void)tail_starts;
+    (void)req_num;
+    (void)block_size;
+    return {
+        at::empty_like(query_index),
+        at::empty_like(query_index),
+    };
+}
+
 std::tuple<at::Tensor, at::Tensor> prefetch_qli_fusion(
     const at::Tensor& hidden_states,
     const at::Tensor& wqkv,
@@ -2127,6 +2188,10 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
              &vllm_ascend::meta::dsa_sparse_turbo_lookup_update_batch);
     ops.impl("dsa_sparse_turbo_prefetch_lookup_update_batch",
              &vllm_ascend::meta::dsa_sparse_turbo_prefetch_lookup_update_batch);
+    ops.impl("dsa_sparse_turbo_fused_lookup_update_batch",
+             &vllm_ascend::meta::dsa_sparse_turbo_fused_lookup_update_batch);
+    ops.impl("dsa_sparse_turbo_fused_prefetch_lookup_update_batch",
+             &vllm_ascend::meta::dsa_sparse_turbo_fused_prefetch_lookup_update_batch);
     // npu_fused_gdn_gating
     ops.impl("npu_fused_gdn_gating", &vllm_ascend::meta::npu_fused_gdn_gating_meta);
 }

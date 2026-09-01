@@ -229,6 +229,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "asu_kv_gather"
         "dsa_sparse_turbo_lookup_update_batch"
         "dsa_sparse_turbo_prefetch_lookup_update_batch"
+        "dsa_sparse_turbo_fused_lookup_update_batch"
+        "dsa_sparse_turbo_fused_prefetch_lookup_update_batch"
         "lightning_indexer_hi_cached"
         "scatter_nd_update_mean"
         "prefetch_qli_fusion"
