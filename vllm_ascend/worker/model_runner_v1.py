@@ -403,6 +403,7 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_offload_batch = None
         self._dsa_offload_ordered_layers = ()
         self._dsa_offload_prefetch_runtime: GroupedPrefetchRuntime | None = None
+        self._dsa_offload_gather_stream = None
         set_weight_prefetch_method(self.ascend_config.weight_prefetch_config)
 
         # Dump / PrecisionDebugger configuration now comes from AscendConfig
@@ -828,6 +829,7 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_offload_decode_hash_state = None
         self._dsa_offload_batch = None
         self._dsa_offload_prefetch_runtime = None
+        self._dsa_offload_gather_stream = None
         super().shutdown()
 
     def _initialize_dsa_offload(
@@ -908,6 +910,14 @@ class NPUModelRunner(GPUModelRunner):
                 self._dsa_offload_cohorts,
                 self.max_num_reqs,
                 self.device,
+            )
+            # One dedicated, graph-stable stream carries every KV Gather
+            # transfer so gathers never occupy the compute stream.  See
+            # dsa_offload/gather.py.
+            self._dsa_offload_gather_stream = (
+                torch.npu.Stream()
+                if config.enable_cohort_kvgather and self.device.type == "npu"
+                else None
             )
             if (
                 config.io_backend in {"mock", "kvgather_sim"}
@@ -1217,6 +1227,8 @@ class NPUModelRunner(GPUModelRunner):
             prefill_state=prefill_state,
             sfa_workspace=self._dsa_offload_sfa_workspace,
             prefetch_runtime=self._dsa_offload_prefetch_runtime,
+            gather_stream=self._dsa_offload_gather_stream,
+            enable_cohort_kvgather=config.enable_cohort_kvgather,
             enable_turbo_lookup=config.enable_turbo_lookup,
             enable_turbo_prefetch_lookup=(
                 config.enable_turbo_prefetch_lookup
@@ -1244,6 +1256,7 @@ class NPUModelRunner(GPUModelRunner):
         existing = self._dsa_offload_graph_batches.get(batch_desc)
         if existing is not None:
             existing.lookup_plans.clear()
+            existing.gather_events.clear()
             # A new capture must emit the Decode-step metadata producers again.
             # Graph replay itself does not run this Python path; it re-executes
             # the captured producers from the updated graph-stable inputs.
@@ -1289,6 +1302,8 @@ class NPUModelRunner(GPUModelRunner):
             ),
             graph_query_start_loc=self.query_start_loc.gpu[: num_reqs + 1],
             prefetch_runtime=self._dsa_offload_prefetch_runtime,
+            gather_stream=self._dsa_offload_gather_stream,
+            enable_cohort_kvgather=config.enable_cohort_kvgather,
             enable_turbo_lookup=config.enable_turbo_lookup,
             enable_turbo_prefetch_lookup=(
                 config.enable_turbo_prefetch_lookup

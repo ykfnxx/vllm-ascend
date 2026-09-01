@@ -75,6 +75,23 @@ def test_feature_gate_and_valid_config() -> None:
     assert config.is_producer and config.is_consumer
     assert config.enable_turbo_fused_lookup
     assert config.enable_turbo_fused_prefetch_lookup
+    assert not config.enable_cohort_kvgather
+
+
+def test_cohort_kvgather_flag_and_role_gate() -> None:
+    vllm_config = make_config()
+    vllm_config.additional_config["dsa_offload"]["enable_cohort_kvgather"] = True
+
+    config = load_dsa_offload_config(vllm_config)
+
+    assert config is not None
+    assert config.enable_cohort_kvgather
+
+    producer_only = make_config()
+    producer_only.additional_config["dsa_offload"]["enable_cohort_kvgather"] = True
+    producer_only.kv_transfer_config.kv_role = "kv_producer"
+    with pytest.raises(ValueError, match="KV consumer role"):
+        load_dsa_offload_config(producer_only)
 
 
 @pytest.mark.parametrize(
@@ -82,6 +99,7 @@ def test_feature_gate_and_valid_config() -> None:
     [
         "enable_turbo_fused_lookup",
         "enable_turbo_fused_prefetch_lookup",
+        "enable_cohort_kvgather",
     ],
 )
 def test_fused_lookup_flags_require_boolean(name: str) -> None:

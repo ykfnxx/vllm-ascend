@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import torch
 
+from . import gather as _gather
 from . import lookup as _lookup
 from . import pd as _pd
 
@@ -333,6 +334,7 @@ def resolve_sfa_inputs(
 
     cohort = next(cohort for cohort in batch.cohorts if layer_name in cohort.layer_names)
     plan = batch.lookup_plans.get(cohort.cohort_id)
+    layer_id = cohort.layer_ids[cohort.layer_names.index(layer_name)]
     if plan is None:
         if batch.prefetch_runtime is not None:
             batch.prefetch_runtime.wait_before_exact_lookup(layer_name)
@@ -342,8 +344,27 @@ def resolve_sfa_inputs(
             batch=batch,
         )
         batch.lookup_plans[cohort.cohort_id] = plan
-    layer_id = cohort.layer_ids[cohort.layer_names.index(layer_name)]
-    _lookup.load_plan_misses(plan, layer_id, batch)
+        if batch.enable_cohort_kvgather:
+            # The leader's own gather stays a standalone call site: it will
+            # later be fused with neighbouring operators.  The follower
+            # gathers are an independent block so the fusion cannot disturb
+            # their early issue.
+            _gather.issue_leader_gather(plan=plan, layer_id=layer_id, batch=batch)
+            _gather.issue_follower_gathers(
+                plan=plan,
+                cohort=cohort,
+                leader_layer_id=layer_id,
+                batch=batch,
+            )
+    if not batch.enable_cohort_kvgather:
+        _lookup.load_plan_misses(plan, layer_id, batch)
+    else:
+        if layer_id not in batch.gather_events:
+            # Defensive fallback: keep the legacy in-layer load if the cohort
+            # start did not issue this layer's gather.
+            _lookup.load_plan_misses(plan, layer_id, batch)
+        # The sparse attention below depends only on this layer's own gather.
+        _gather.wait_layer_gather(batch=batch, layer_id=layer_id)
     if batch.prefetch_runtime is not None:
         batch.prefetch_runtime.release_after_exact_load(layer_name)
     sfa_block_table, sfa_actual_seq_lengths_kv = _prepare_sfa_addressing_view(

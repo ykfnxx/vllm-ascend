@@ -254,6 +254,13 @@ class DSAOffloadBatch:
     enable_turbo_fused_lookup: bool = False
     enable_turbo_fused_prefetch_lookup: bool = False
     lookup_plans: dict[str, LookupPlan] = field(default_factory=dict)
+    # Dedicated KV Gather stream (graph-stable, owned by the model runner)
+    # plus each layer's per-step gather completion event on it.  A None event
+    # marks an inline gather on the compute stream (no dedicated stream,
+    # e.g. CPU-only test environments).  See dsa_offload/gather.py.
+    gather_stream: object | None = None
+    gather_events: dict[int, object | None] = field(default_factory=dict)
+    enable_cohort_kvgather: bool = False
 
     def block_hashes(self, request_index: int) -> Sequence[bytes]:
         request_id = self.request_ids[request_index]
@@ -278,6 +285,8 @@ def build_dsa_offload_batch(
     prefill_state: object | None = None,
     sfa_workspace: "SFAAddressingWorkspace | None" = None,
     prefetch_runtime: object | None = None,
+    gather_stream: object | None = None,
+    enable_cohort_kvgather: bool = False,
     enable_turbo_lookup: bool = False,
     enable_turbo_prefetch_lookup: bool = False,
     enable_turbo_fused_lookup: bool = False,
@@ -317,6 +326,8 @@ def build_dsa_offload_batch(
             device=query_positions.device,
         ),
         prefetch_runtime=prefetch_runtime,
+        gather_stream=gather_stream,
+        enable_cohort_kvgather=enable_cohort_kvgather,
         enable_turbo_lookup=enable_turbo_lookup,
         enable_turbo_prefetch_lookup=enable_turbo_prefetch_lookup,
         enable_turbo_fused_lookup=enable_turbo_fused_lookup,
