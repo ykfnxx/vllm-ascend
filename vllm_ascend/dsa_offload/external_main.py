@@ -5,7 +5,6 @@ from collections.abc import Mapping
 from dataclasses import replace
 
 from vllm.v1.kv_cache_interface import (
-    HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -56,21 +55,14 @@ def add_decode_external_main_cache(
 
     group_id = indexer_group_ids[0]
     indexer_group = kv_cache_config.kv_cache_groups[group_id]
-    indexer_specs = _expand_group_specs(indexer_group)
-    # vLLM groups the MTP hidden-state cache with the Indexer cache when
-    # both resolve to the same full-attention allocation class. Keep that
-    # scheduler-owned cache in the group while rejecting unrelated specs.
-    if not all(
-        isinstance(spec, (AscendSFAIndexerCacheSpec, HiddenStateCacheSpec))
-        for spec in indexer_specs.values()
-    ):
-        raise ValueError(
-            "The DSA Offload Decode Indexer group may contain only Indexer "
-            "and MTP hidden-state specs."
-        )
+    scheduler_specs = _expand_group_specs(indexer_group)
+    # The scheduler may group other compatible FullAttention caches with the
+    # Indexer cache. In particular, MTP contributes both a draft MLA cache and
+    # an Indexer cache. Preserve every scheduler-owned spec and restore only
+    # the target model's external Main MLA specs below.
 
     main_layer_names = set(main_specs)
-    if set(indexer_specs) & main_layer_names:
+    if set(scheduler_specs) & main_layer_names:
         raise ValueError(
             "DSA Offload Main layers must be absent from the scheduler KV-cache group."
         )
@@ -88,7 +80,7 @@ def add_decode_external_main_cache(
             "DSA Offload Main and Indexer caches must use the same block size."
         )
 
-    combined_specs: dict[str, KVCacheSpec] = dict(indexer_specs)
+    combined_specs: dict[str, KVCacheSpec] = dict(scheduler_specs)
     combined_specs.update(main_specs)
     kv_cache_config.kv_cache_groups[group_id] = replace(
         indexer_group,

@@ -154,27 +154,30 @@ def test_decode_main_requires_one_indexer_group(monkeypatch) -> None:
         )
 
 
-def test_decode_main_accepts_mtp_hidden_state_in_indexer_group(
+def test_decode_main_preserves_mtp_specs_in_indexer_group(
     monkeypatch,
 ) -> None:
     api = load_external_main_module(monkeypatch)
     indexer = api.IndexerSpec(block_size=16, page_size_bytes=64)
     hidden = api.HiddenSpec(block_size=16, page_size_bytes=128)
+    draft_main = api.MainSpec(block_size=16, page_size_bytes=256)
     main = api.MainSpec(block_size=16, page_size_bytes=256)
     config = api.Config(
         num_blocks=100,
         kv_cache_tensors=[
             api.Tensor(size=6400, shared_by=["indexer"]),
             api.Tensor(size=12800, shared_by=["mtp_hidden"]),
+            api.Tensor(size=25600, shared_by=["mtp_main"]),
         ],
         kv_cache_groups=[
             api.Group(
-                layer_names=["indexer", "mtp_hidden"],
+                layer_names=["indexer", "mtp_hidden", "mtp_main"],
                 kv_cache_spec=api.UniformSpec(
                     block_size=16,
                     kv_cache_specs={
                         "indexer": indexer,
                         "mtp_hidden": hidden,
+                        "mtp_main": draft_main,
                     },
                 ),
             ),
@@ -189,10 +192,16 @@ def test_decode_main_accepts_mtp_hidden_state_in_indexer_group(
 
     assert group_id == 0
     group = config.kv_cache_groups[0]
-    assert set(group.layer_names) == {"indexer", "mtp_hidden", "main"}
+    assert set(group.layer_names) == {
+        "indexer",
+        "mtp_hidden",
+        "mtp_main",
+        "main",
+    }
     assert set(group.kv_cache_spec.kv_cache_specs) == {
         "indexer",
         "mtp_hidden",
+        "mtp_main",
         "main",
     }
     assert config.kv_cache_tensors[-1] == api.Tensor(
