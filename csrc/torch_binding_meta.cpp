@@ -1958,6 +1958,7 @@ std::tuple<at::Tensor, at::Tensor> dsa_sparse_turbo_fused_lookup_update_batch(
     const at::Tensor& query_index,
     const at::Tensor& query_positions,
     const at::Tensor& verify_starts,
+    const at::Tensor& tail_starts,
     int64_t req_num,
     int64_t block_size,
     int64_t is_mtp)
@@ -1970,6 +1971,7 @@ std::tuple<at::Tensor, at::Tensor> dsa_sparse_turbo_fused_lookup_update_batch(
     (void)query_start_loc;
     (void)query_positions;
     (void)verify_starts;
+    (void)tail_starts;
     (void)req_num;
     (void)block_size;
     (void)is_mtp;
@@ -1979,7 +1981,8 @@ std::tuple<at::Tensor, at::Tensor> dsa_sparse_turbo_fused_lookup_update_batch(
     };
 }
 
-std::tuple<at::Tensor, at::Tensor> dsa_sparse_turbo_fused_prefetch_lookup_update_batch(
+std::tuple<at::Tensor, at::Tensor>
+dsa_sparse_turbo_fused_prefetch_lookup_update_batch(
     at::Tensor& index,
     at::Tensor& slot_to_index,
     at::Tensor& free_slots,
@@ -1987,8 +1990,7 @@ std::tuple<at::Tensor, at::Tensor> dsa_sparse_turbo_fused_prefetch_lookup_update
     const at::Tensor& request_rows,
     const at::Tensor& query_start_loc,
     const at::Tensor& query_index,
-    const at::Tensor& query_positions,
-    const at::Tensor& verify_starts,
+    const at::Tensor& tail_starts,
     int64_t req_num,
     int64_t block_size)
 {
@@ -1998,8 +2000,7 @@ std::tuple<at::Tensor, at::Tensor> dsa_sparse_turbo_fused_prefetch_lookup_update
     (void)free_head;
     (void)request_rows;
     (void)query_start_loc;
-    (void)query_positions;
-    (void)verify_starts;
+    (void)tail_starts;
     (void)req_num;
     (void)block_size;
     return {

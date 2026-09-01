@@ -13,7 +13,6 @@ struct DsaSparseTurboFusedPrefetchLookupUpdateBatchTilingData {
     uint32_t poolCapacity;
     uint32_t queryNum;
     uint32_t indexCapacity;
-    int32_t blockSize;
     int32_t replaceableBase;
 };
 

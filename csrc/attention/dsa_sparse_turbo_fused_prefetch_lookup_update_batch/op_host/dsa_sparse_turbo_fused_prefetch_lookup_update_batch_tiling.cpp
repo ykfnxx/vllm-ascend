@@ -23,14 +23,12 @@ constexpr uint32_t kFreeHead = 3;
 constexpr uint32_t kRequestRows = 4;
 constexpr uint32_t kQueryStartLoc = 5;
 constexpr uint32_t kQueryIndex = 6;
-constexpr uint32_t kQueryPositions = 7;
-constexpr uint32_t kVerifyStarts = 8;
+constexpr uint32_t kTailStarts = 7;
 constexpr uint32_t kDestinationSlotsOut = 0;
 constexpr uint32_t kMissMaskOut = 1;
 constexpr uint32_t kReqNumAttr = 0;
 constexpr uint32_t kBlockSizeAttr = 1;
 
-constexpr int64_t kIndexCapacity = 128 * 1024;
 constexpr int64_t kSlotCount = 10 * 1024;
 constexpr int64_t kFreeSlotCount = 2 * 1024;
 constexpr int64_t kQueryWidth = 2 * 1024;
@@ -209,8 +207,7 @@ static ge::graphStatus DsaSparseTurboFusedPrefetchLookupUpdateBatchTilingFunc(
     int64_t query_offsets = 0;
     int64_t query_num = 0;
     int64_t query_width = 0;
-    int64_t query_positions = 0;
-    int64_t verify_entries = 0;
+    int64_t tail_entries = 0;
     if (!GetInputOneDim(
             context, kRequestRows, "requestRows",
             req_entries) ||
@@ -225,13 +222,9 @@ static ge::graphStatus DsaSparseTurboFusedPrefetchLookupUpdateBatchTilingFunc(
         query_num < req_num || query_width != kQueryWidth ||
         query_num > std::numeric_limits<uint32_t>::max() ||
         !GetInputOneDim(
-            context, kQueryPositions, "queryPositions",
-            query_positions) ||
-        query_positions != query_num ||
-        !GetInputOneDim(
-            context, kVerifyStarts, "verifyStarts",
-            verify_entries) ||
-        verify_entries != req_num ||
+            context, kTailStarts, "tailStarts",
+            tail_entries) ||
+        tail_entries != req_num ||
         !RequireInputShape(
             context, kSlotToIndex, "slotToIndex",
             pool_capacity, kSlotCount) ||
@@ -272,7 +265,6 @@ static ge::graphStatus DsaSparseTurboFusedPrefetchLookupUpdateBatchTilingFunc(
     tiling_data->poolCapacity = static_cast<uint32_t>(pool_capacity);
     tiling_data->queryNum = static_cast<uint32_t>(query_num);
     tiling_data->indexCapacity = static_cast<uint32_t>(index_width);
-    tiling_data->blockSize = static_cast<int32_t>(block_size);
     tiling_data->replaceableBase = static_cast<int32_t>(
         ((8 * 1024 + block_size - 1) / block_size) * block_size);
 

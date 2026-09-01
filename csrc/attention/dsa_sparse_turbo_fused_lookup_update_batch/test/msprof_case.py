@@ -10,9 +10,9 @@ launch distinguishable by Op Name.
 
 Workload alignment: the baseline receives the framework-generated history
 lookup_mask (valid && token < tail_start); the fused op receives the same
-request/query layout via verify_starts + query_positions and classifies
-in-kernel.  Both process exactly the same history token set, so the kernel
-durations are directly comparable.
+request/query layout via query_positions + verify_starts + tail_starts and
+classifies in-kernel.  Both process exactly the same history token set, so
+the kernel durations are directly comparable.
 
 Usage (wrapped by msprof):
     msprof --output=... --ai-core=on --aic-mode=task-based --task-time=on \
@@ -39,9 +39,7 @@ BLOCK_SIZE = 128
 
 def build_inputs(batch, index_capacity, hit_rate, qpr, seed):
     """Clean A5 state: resident tail window bidirectionally valid, plus the
-    fused op's verify_starts / query_positions (verify start anchored inside
-    the resident window; tail_start = floor(verify / BLOCK_SIZE) * BLOCK_SIZE
-    splits the resident window into history (below) and tail/staging (above)."""
+    fused op's compact verify/tail anchors and per-query positions."""
     g = torch.Generator("cpu").manual_seed(seed)
     dev = torch.device(DEV)
     total_queries = batch * qpr
@@ -82,9 +80,10 @@ def build_inputs(batch, index_capacity, hit_rate, qpr, seed):
     # baseline history mask: valid && token < tail_start (same token set the
     # fused kernel classifies as history)
     tail_start = (verify_start // BLOCK_SIZE) * BLOCK_SIZE
+    tail_starts = torch.full((batch,), tail_start, dtype=torch.int32, device=dev)
     mask = ((query >= 0) & (query < index_capacity) & (query < tail_start)
             ).to(torch.int32).contiguous()
-    return (query, query_positions, verify_starts, index, sti, free_slots,
+    return (query, query_positions, verify_starts, tail_starts, index, sti, free_slots,
             free_head, req_pool, qsl, mask)
 
 
@@ -101,7 +100,7 @@ def main():
     ap.add_argument("--n", type=int, default=50)
     args = ap.parse_args()
 
-    (q, qpos, vstarts, idx, sti, fs, fh, rp, qsl, mask) = build_inputs(
+    (q, qpos, vstarts, tstarts, idx, sti, fs, fh, rp, qsl, mask) = build_inputs(
         args.batch, args.capacity, args.hit, args.qpr, seed=20260827)
     bs = args.batch
     mtp = 1
@@ -112,7 +111,9 @@ def main():
 
     def fused_args():
         i, s, f, h = clone(idx, sti, fs, fh)
-        return (i, s, f, h, rp, qsl, q, qpos, vstarts, bs, BLOCK_SIZE, mtp)
+        return (
+            i, s, f, h, rp, qsl, q, qpos, vstarts, tstarts,
+            bs, BLOCK_SIZE, mtp)
 
     # warmup both (steady state for msprof)
     for _ in range(20):

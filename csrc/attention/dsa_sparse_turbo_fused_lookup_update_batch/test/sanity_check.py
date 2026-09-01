@@ -92,10 +92,11 @@ def build_state(req_num, index_capacity, hit_rate, queries_per_request, seed,
     req_pool = torch.arange(req_num, dtype=torch.int32, device=dev)
     qsl = torch.arange(req_num + 1, dtype=torch.int32, device=dev) * queries_per_request
     verify_starts = torch.full((req_num,), verify_start, dtype=torch.int32, device=dev)
+    tail_starts = torch.full((req_num,), tail_start, dtype=torch.int32, device=dev)
     query_positions = (
         torch.arange(total_queries, dtype=torch.int32, device=dev) + verify_start
     )
-    return (query, query_positions, verify_starts, index, sti,
+    return (query, query_positions, verify_starts, tail_starts, index, sti,
             free_slots, free_head, req_pool, qsl)
 
 
@@ -109,10 +110,10 @@ def run_turbo(op_name, index, sti, fs, fh, rp, qsl, query, mask):
 
 
 def run_fused_main(index, sti, fs, fh, req_rows, qsl, query, qpos, vstarts,
-                   req_num, is_mtp):
+                   tstarts, req_num, is_mtp):
     return torch.ops._C_ascend.dsa_sparse_turbo_fused_lookup_update_batch(
         index, sti, fs, fh, req_rows, qsl, query, qpos, vstarts,
-        req_num, BLOCK_SIZE, is_mtp)
+        tstarts, req_num, BLOCK_SIZE, is_mtp)
 
 
 def rebuild_main_mapped(topk, slot_out, miss_out, query_positions,
@@ -184,7 +185,7 @@ def check_invariants(op_name, index, sti, fs, fh, mapped, miss, query, req_pool,
 
 def run_case(index_capacity, hit, qpr, seed, is_mtp, req_num=2):
     failures = []
-    q, qpos, vstarts, idx, sti, fs, fh, rp, qsl = build_state(
+    q, qpos, vstarts, tstarts, idx, sti, fs, fh, rp, qsl = build_state(
         req_num, index_capacity, hit, qpr, seed, mtp=is_mtp)
     # ---- fused (full classification) vs turbo + framework rebuild ----
     # The turbo baseline receives the framework-generated history lookup_mask
@@ -200,8 +201,9 @@ def run_case(index_capacity, hit, qpr, seed, is_mtp, req_num=2):
                          i1, s1, f1, h1, rp, qsl, q, mask)
     mapped_ref, miss_ref = rebuild_main_mapped(
         q, so1, mo1, qpos, vstarts, qsl, index_capacity, is_mtp)
-    mapped, miss = run_fused_main(i2, s2, f2, h2, rp, qsl, q, qpos, vstarts,
-                                  rp.shape[0], int(is_mtp))
+    mapped, miss = run_fused_main(
+        i2, s2, f2, h2, rp, qsl, q, qpos, vstarts, tstarts,
+        rp.shape[0], int(is_mtp))
     out_ok = (
         torch.equal(mapped, mapped_ref) and torch.equal(miss, miss_ref)
         and torch.equal(i1, i2) and torch.equal(s1, s2)
@@ -240,7 +242,7 @@ def main():
     # the flush must replenish mid-request so no history miss is dropped.
     for index_capacity in (128 * 1024, 1024 * 1024):
         for is_mtp in (True, False):
-            q, qpos, vstarts, idx, sti, fs, fh, rp, qsl = build_state(
+            q, qpos, vstarts, tstarts, idx, sti, fs, fh, rp, qsl = build_state(
                 2, index_capacity, 0.30, 3, 3, mtp=is_mtp)
             tail_start_q = ((vstarts[0].item() // BLOCK_SIZE) * BLOCK_SIZE)
             mask = (
@@ -252,8 +254,9 @@ def main():
             mapped_ref, miss_ref = rebuild_main_mapped(
                 q, so1, mo1, qpos, vstarts, qsl, index_capacity, is_mtp)
             i2, s2, f2, h2 = clone(idx, sti, fs, fh)
-            mapped, miss = run_fused_main(i2, s2, f2, h2, rp, qsl, q, qpos, vstarts,
-                                          rp.shape[0], int(is_mtp))
+            mapped, miss = run_fused_main(
+                i2, s2, f2, h2, rp, qsl, q, qpos, vstarts, tstarts,
+                rp.shape[0], int(is_mtp))
             ok = (torch.equal(mapped, mapped_ref) and torch.equal(miss, miss_ref)
                   and torch.all(h2[:, 0] == 0))
             try:

@@ -131,6 +131,7 @@ def turbo_fused_lookup_update_batch(
     query_indices: torch.Tensor,
     query_positions: torch.Tensor,
     verify_starts: torch.Tensor,
+    tail_starts: torch.Tensor,
     block_size: int,
     is_mtp: int,
 ) -> LookupOutput:
@@ -144,6 +145,7 @@ def turbo_fused_lookup_update_batch(
         query_indices,
         query_positions,
         verify_starts,
+        tail_starts,
         request_rows.shape[0],
         block_size,
         is_mtp,
@@ -155,8 +157,7 @@ def turbo_fused_prefetch_lookup_update_batch(
     request_rows: torch.Tensor,
     query_start_loc: torch.Tensor,
     query_indices: torch.Tensor,
-    query_positions: torch.Tensor,
-    verify_starts: torch.Tensor,
+    tail_starts: torch.Tensor,
     block_size: int,
 ) -> LookupOutput:
     return torch.ops._C_ascend.dsa_sparse_turbo_fused_prefetch_lookup_update_batch(
@@ -167,8 +168,7 @@ def turbo_fused_prefetch_lookup_update_batch(
         request_rows,
         query_start_loc,
         query_indices,
-        query_positions,
-        verify_starts,
+        tail_starts,
         request_rows.shape[0],
         block_size,
     )

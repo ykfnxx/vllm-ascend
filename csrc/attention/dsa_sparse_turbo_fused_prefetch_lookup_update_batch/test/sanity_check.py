@@ -85,10 +85,8 @@ def build_state(req_num, index_capacity, hit_rate, queries_per_request, seed,
     req_pool = torch.arange(req_num, dtype=torch.int32, device=dev)
     qsl = torch.arange(req_num + 1, dtype=torch.int32, device=dev) * queries_per_request
     verify_starts = torch.full((req_num,), verify_start, dtype=torch.int32, device=dev)
-    query_positions = (
-        torch.arange(total_queries, dtype=torch.int32, device=dev) + verify_start
-    )
-    return (query, query_positions, verify_starts, index, sti,
+    tail_starts = torch.full((req_num,), tail_start, dtype=torch.int32, device=dev)
+    return (query, verify_starts, tail_starts, index, sti,
             free_slots, free_head, req_pool, qsl)
 
 
@@ -101,10 +99,10 @@ def run_turbo_prefetch(index, sti, fs, fh, rp, qsl, query, mask):
         index, sti, fs, fh, rp, qsl, query, mask, rp.shape[0])
 
 
-def run_fused_prefetch(index, sti, fs, fh, req_rows, qsl, query, qpos, vstarts,
+def run_fused_prefetch(index, sti, fs, fh, req_rows, qsl, query, tstarts,
                        req_num):
     return torch.ops._C_ascend.dsa_sparse_turbo_fused_prefetch_lookup_update_batch(
-        index, sti, fs, fh, req_rows, qsl, query, qpos, vstarts,
+        index, sti, fs, fh, req_rows, qsl, query, tstarts,
         req_num, BLOCK_SIZE)
 
 
@@ -162,7 +160,7 @@ def check_invariants(op_name, index, sti, fs, fh, dest, miss, query, req_pool, q
 
 def run_case(index_capacity, hit, qpr, seed, req_num=2):
     failures = []
-    q, qpos, vstarts, idx, sti, fs, fh, rp, qsl = build_state(
+    q, vstarts, tstarts, idx, sti, fs, fh, rp, qsl = build_state(
         req_num, index_capacity, hit, qpr, seed)
     tail_start_q = ((vstarts[0].item() // BLOCK_SIZE) * BLOCK_SIZE)
     mask = (
@@ -173,8 +171,8 @@ def run_case(index_capacity, hit, qpr, seed, req_num=2):
     so1, mo1 = run_turbo_prefetch(i1, s1, f1, h1, rp, qsl, q, mask)
     dest_ref, miss_ref = rebuild_prefetch_dest(
         q, so1, mo1, vstarts, qsl, rp, index_capacity)
-    dest, miss = run_fused_prefetch(i2, s2, f2, h2, rp, qsl, q, qpos, vstarts,
-                                    rp.shape[0])
+    dest, miss = run_fused_prefetch(
+        i2, s2, f2, h2, rp, qsl, q, tstarts, rp.shape[0])
     # Post-state: index is deterministic (allocations are identical); the
     # free-list/cursor/slot_to_index eviction order is non-deterministic for
     # the prefetch maintain (Plan-2 atomics) — compared only via invariants.
@@ -214,7 +212,7 @@ def main():
     # baseline — validated by invariants plus the miss count (all input
     # history misses must be allocated).
     for index_capacity in (128 * 1024, 1024 * 1024):
-        q, qpos, vstarts, idx, sti, fs, fh, rp, qsl = build_state(
+        q, vstarts, tstarts, idx, sti, fs, fh, rp, qsl = build_state(
             2, index_capacity, 0.30, 3, 3)
         tail_start_q = ((vstarts[0].item() // BLOCK_SIZE) * BLOCK_SIZE)
         mask = (
@@ -230,8 +228,8 @@ def main():
              & (idxc[qp, qc.clamp(min=0)] == NOT_FOUND)).sum().item()
         )
         i2, s2, f2, h2 = clone(idx, sti, fs, fh)
-        dest, miss = run_fused_prefetch(i2, s2, f2, h2, rp, qsl, q, qpos, vstarts,
-                                        rp.shape[0])
+        dest, miss = run_fused_prefetch(
+            i2, s2, f2, h2, rp, qsl, q, tstarts, rp.shape[0])
         torch.npu.synchronize()
         ok = True
         try:

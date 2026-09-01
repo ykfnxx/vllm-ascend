@@ -25,13 +25,13 @@ constexpr uint32_t kQueryStartLoc = 5;
 constexpr uint32_t kQueryIndex = 6;
 constexpr uint32_t kQueryPositions = 7;
 constexpr uint32_t kVerifyStarts = 8;
+constexpr uint32_t kTailStarts = 9;
 constexpr uint32_t kMappedIndicesOut = 0;
 constexpr uint32_t kMissMaskOut = 1;
 constexpr uint32_t kReqNumAttr = 0;
 constexpr uint32_t kBlockSizeAttr = 1;
 constexpr uint32_t kIsMtpAttr = 2;
 
-constexpr int64_t kIndexCapacity = 128 * 1024;
 constexpr int64_t kSlotCount = 10 * 1024;
 constexpr int64_t kFreeSlotCount = 2 * 1024;
 constexpr int64_t kQueryWidth = 2 * 1024;
@@ -228,6 +228,7 @@ static ge::graphStatus DsaSparseTurboFusedLookupUpdateBatchTilingFunc(
     int64_t query_width = 0;
     int64_t query_positions = 0;
     int64_t verify_entries = 0;
+    int64_t tail_entries = 0;
     if (!GetInputOneDim(
             context, kRequestRows, "requestRows",
             req_entries) ||
@@ -249,6 +250,10 @@ static ge::graphStatus DsaSparseTurboFusedLookupUpdateBatchTilingFunc(
             context, kVerifyStarts, "verifyStarts",
             verify_entries) ||
         verify_entries != req_num ||
+        !GetInputOneDim(
+            context, kTailStarts, "tailStarts",
+            tail_entries) ||
+        tail_entries != req_num ||
         !RequireInputShape(
             context, kSlotToIndex, "slotToIndex",
             pool_capacity, kSlotCount) ||
@@ -292,7 +297,6 @@ static ge::graphStatus DsaSparseTurboFusedLookupUpdateBatchTilingFunc(
     // Hot Cache layout constants, mirroring the framework's HotCacheLayout
     // (vllm_ascend/dsa_offload/hot_cache.py) with RESIDENT_SLOTS=8192 and
     // REPLACEABLE_SLOTS=2048 baked into the op.
-    tiling_data->blockSize = static_cast<int32_t>(block_size);
     tiling_data->isMtp = static_cast<int32_t>(is_mtp);
     tiling_data->replaceableBase = static_cast<int32_t>(
         CeilDiv(kResidentSlots, block_size) * block_size);

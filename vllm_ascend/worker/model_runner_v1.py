@@ -918,7 +918,11 @@ class NPUModelRunner(GPUModelRunner):
                     and self.speculative_config.method == "mtp"
                 )
                 main_lookup_op = (
-                    "dsa_sparse_turbo_lookup_update_batch"
+                    "dsa_sparse_turbo_fused_lookup_update_batch"
+                    if is_mtp
+                    and config.enable_turbo_lookup
+                    and config.enable_turbo_fused_lookup
+                    else "dsa_sparse_turbo_lookup_update_batch"
                     if is_mtp and config.enable_turbo_lookup
                     else "dsa_offload_lookup_update_batch"
                     if is_mtp
@@ -972,7 +976,11 @@ class NPUModelRunner(GPUModelRunner):
                 and self.speculative_config.method == "mtp"
             )
             prefetch_lookup_op = (
-                "dsa_sparse_turbo_prefetch_lookup_update_batch"
+                "dsa_sparse_turbo_fused_prefetch_lookup_update_batch"
+                if is_mtp
+                and config.enable_turbo_prefetch_lookup
+                and config.enable_turbo_fused_prefetch_lookup
+                else "dsa_sparse_turbo_prefetch_lookup_update_batch"
                 if is_mtp and config.enable_turbo_prefetch_lookup
                 else "dsa_offload_lookup_update_batch"
                 if is_mtp
@@ -1240,6 +1248,7 @@ class NPUModelRunner(GPUModelRunner):
             # Graph replay itself does not run this Python path; it re-executes
             # the captured producers from the updated graph-stable inputs.
             existing.packed_addressing = None
+            existing.prepared_step_addressing = None
             return existing
 
         config = self.dsa_offload_config

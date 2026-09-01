@@ -24,8 +24,7 @@ destination_slots, miss_mask = torch.ops._C_ascend.dsa_sparse_turbo_fused_prefet
     request_rows,     # [req_num] int32
     query_start_loc,  # [req_num + 1] int32
     query_indices,    # [query_num, 2048] int32
-    query_positions,  # [query_num] int32
-    verify_starts,    # [req_num] int32
+    tail_starts,      # [req_num] int32
     req_num,          # int attr
     block_size,       # int attr
 )
@@ -34,6 +33,10 @@ destination_slots, miss_mask = torch.ops._C_ascend.dsa_sparse_turbo_fused_prefet
 `destination_slots` 输出的是**逻辑 slot offset**（= 框架 `plan.lookup_slots`，
 `layout.lookup_offsets(slot_out)` 对全部 token），row 前缀由 dense Gather
 内部按 `request_rows` 组合——与 `load_prefetch_misses` 的接线逐位兼容。
+
+预取分类只需要历史区间右边界，因此原接口中的 `query_positions` 完全未被
+kernel 使用，`verify_starts` 也只是为了再次计算 `tail_start`。精简后直接消费
+框架共享的 compact `tail_starts[B]`，不传无用张量，也不在算子内重复整除。
 
 
 ### 2.2 核内语义
@@ -75,7 +78,11 @@ token < tail_start（history）                     → lookup 路径：
 - Q=1 时输出与 turbo_prefetch/batch 位精确（继承）；后状态
   free_slots/cursor 非位精确（驱逐序非确定）——预取流不要求。
 
-## 4. 验证结果（2026-08-31，A5 实机）
+## 4. 原始分支验证结果（2026-08-31，A5 实机）
+
+以下结果来自精简 ABI 前的同语义 kernel。当前版本改为直接接收框架生成的
+`tail_starts`，并删除未使用的输入和只写不读的线程局部数组，需重新编译后复跑
+本目录测试。
 
 `test/sanity_check.py` 全绿：与 turbo_prefetch 基线 + 框架公式重建逐位对拍
 （Q=1 输出位精确 + 后状态 index 一致；Q=4 位精确 + 不变量；flush 压力
