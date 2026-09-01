@@ -179,6 +179,26 @@ class PackedDecodeMetadata:
 
 
 @dataclass(frozen=True)
+class PackedAddressingMetadata:
+    """Decode-step addressing metadata shared by every SFA cohort.
+
+    The compact request boundaries and their packed-query expansions depend
+    only on the current Decode step.  They do not depend on a layer's Top-K or
+    LookupState, so the exact and prefetch paths can safely share them.
+    """
+
+    query_lengths: torch.Tensor
+    query_request_rows: torch.Tensor
+    query_request_rows_long: torch.Tensor
+    query_positions: torch.Tensor
+    verify_starts: torch.Tensor
+    tail_starts: torch.Tensor
+    expanded_verify_starts: torch.Tensor
+    expanded_tail_starts: torch.Tensor
+    expanded_query_starts: torch.Tensor
+
+
+@dataclass(frozen=True)
 class PrefetchLookupPlan:
     query_indices: torch.Tensor | None
     lookup_slots: torch.Tensor | None
@@ -211,6 +231,7 @@ class DSAOffloadBatch:
     decode_request_indices_tensor: torch.Tensor | None = None
     graph_query_start_loc: torch.Tensor | None = None
     packed_decode: PackedDecodeMetadata | None = None
+    packed_addressing: PackedAddressingMetadata | None = None
     prefetch_runtime: object | None = None
     enable_turbo_lookup: bool = False
     enable_turbo_prefetch_lookup: bool = False
@@ -389,45 +410,133 @@ def pack_graph_decode_metadata(batch: DSAOffloadBatch) -> PackedDecodeMetadata:
     )
 
 
+def get_packed_addressing_metadata(
+    batch: DSAOffloadBatch,
+) -> PackedAddressingMetadata:
+    """Return metadata computed once for the current Decode forward.
+
+    Eager execution creates a new ``DSAOffloadBatch`` for every step.  During
+    full-graph capture this function emits the metadata operations once; graph
+    replay then recomputes their outputs from the graph-stable request rows,
+    query starts and positions that the model runner updates for every step.
+    """
+
+    cached = batch.packed_addressing
+    if cached is not None:
+        return cached
+
+    packed = batch.packed_decode
+    if packed is None:
+        packed = (
+            pack_graph_decode_metadata(batch)
+            if batch.graph_query_start_loc is not None
+            else pack_decode_metadata(batch)
+        )
+        batch.packed_decode = packed
+
+    query_start_loc = packed.query_start_loc
+    query_lengths = (query_start_loc[1:] - query_start_loc[:-1]).to(
+        torch.int64
+    )
+    total_queries = packed.token_indices.shape[0]
+    if batch.graph_query_start_loc is not None:
+        query_request_rows = torch.repeat_interleave(
+            packed.request_rows,
+            query_lengths,
+            output_size=total_queries,
+        )
+    else:
+        query_request_rows = packed.query_request_rows
+    query_request_rows = query_request_rows.to(torch.int32).contiguous()
+    query_positions = packed.query_positions.to(torch.int32).contiguous()
+    verify_starts = query_positions[
+        query_start_loc[:-1].to(torch.int64)
+    ].to(torch.int32)
+    # The fused ops classify in-kernel from the compact verify_starts (one
+    # tail_start division per request inside the kernel).  When every MTP
+    # path of this step is fused, the framework-level expanded tail/verify
+    # series have no consumer and are skipped — the only remaining tail_start
+    # work is the kernel-side division.
+    fused_full = (
+        batch.is_mtp
+        and batch.enable_turbo_fused_lookup
+        and batch.enable_turbo_fused_prefetch_lookup
+    )
+    if fused_full:
+        tail_starts = verify_starts.new_empty((0,))
+        expanded_verify_starts = verify_starts.new_empty((0,))
+        expanded_tail_starts = verify_starts.new_empty((0,))
+    else:
+        tail_starts = (
+            torch.div(
+                verify_starts,
+                batch.layout.block_size,
+                rounding_mode="floor",
+            )
+            * batch.layout.block_size
+        )
+        expanded_verify_starts = torch.repeat_interleave(
+            verify_starts,
+            query_lengths,
+            output_size=total_queries,
+        )
+        expanded_tail_starts = torch.repeat_interleave(
+            tail_starts,
+            query_lengths,
+            output_size=total_queries,
+        )
+    expanded_query_starts = torch.repeat_interleave(
+        query_start_loc[:-1],
+        query_lengths,
+        output_size=total_queries,
+    )
+    cached = PackedAddressingMetadata(
+        query_lengths=query_lengths,
+        query_request_rows=query_request_rows,
+        query_request_rows_long=query_request_rows.to(torch.int64),
+        query_positions=query_positions,
+        verify_starts=verify_starts,
+        tail_starts=tail_starts,
+        expanded_verify_starts=expanded_verify_starts,
+        expanded_tail_starts=expanded_tail_starts,
+        expanded_query_starts=expanded_query_starts,
+    )
+    batch.packed_addressing = cached
+    return cached
+
+
 def make_lookup_plan(
     *,
     semantic_topk: torch.Tensor,
     cohort: IndexCacheCohort,
     batch: DSAOffloadBatch,
 ) -> LookupPlan:
+    addressing = get_packed_addressing_metadata(batch)
+    packed = batch.packed_decode
+    assert packed is not None
     topk_shape = semantic_topk.shape
     semantic = semantic_topk.reshape(semantic_topk.shape[0], -1)
     graph_mode = batch.graph_query_start_loc is not None
     use_dense_gather = hasattr(batch.io_backend, "gather_history_misses")
     if graph_mode:
         packed_topk = semantic.to(torch.int32).contiguous()
-        packed_positions = batch.query_positions.to(torch.int32).contiguous()
-        query_start_loc = batch.graph_query_start_loc
-        request_rows = batch.request_rows
-        query_lengths_tensor = (
-            query_start_loc[1:] - query_start_loc[:-1]
-        ).to(torch.int64)
-        query_request_rows = torch.repeat_interleave(
-            request_rows,
-            query_lengths_tensor,
-            output_size=packed_topk.shape[0],
-        )
+        query_start_loc = packed.query_start_loc
+        request_rows = packed.request_rows
         query_batch_indices = None
     else:
-        packed = batch.packed_decode or pack_decode_metadata(batch)
         packed_topk = semantic.index_select(0, packed.token_indices).to(
             torch.int32
         )
-        packed_positions = packed.query_positions
         query_start_loc = packed.query_start_loc
-        query_lengths_tensor = (
-            query_start_loc[1:] - query_start_loc[:-1]
-        ).to(torch.int64)
         request_rows = packed.request_rows
-        query_request_rows = packed.query_request_rows
         query_batch_indices = packed.query_batch_indices
 
-    verify_starts = packed_positions[query_start_loc[:-1].long()]
+    verify_starts = addressing.verify_starts
+    packed_positions = addressing.query_positions
+    query_request_rows = addressing.query_request_rows
+    expanded_verify_starts = addressing.expanded_verify_starts
+    tail_starts = addressing.expanded_tail_starts
+    current_positions = addressing.query_positions.unsqueeze(1)
     state = batch.lookup_states[cohort.cohort_id]
     if batch.is_mtp and batch.enable_turbo_fused_lookup:
         # Stage-3 3B fused op: in-kernel classification + address mapping.
@@ -459,20 +568,6 @@ def make_lookup_plan(
             merged_indices = semantic.clone()
             merged_indices.index_copy_(0, packed.token_indices, mapped)
     else:
-        expanded_verify_starts = torch.repeat_interleave(
-            verify_starts,
-            query_lengths_tensor,
-            output_size=packed_topk.shape[0],
-        )
-        tail_starts = (
-            torch.div(
-                expanded_verify_starts,
-                batch.layout.block_size,
-                rounding_mode="floor",
-            )
-            * batch.layout.block_size
-        )
-        current_positions = packed_positions.unsqueeze(1)
         valid_mask = (packed_topk >= 0) & (packed_topk < INDEX_CAPACITY)
         history_mask = valid_mask & (packed_topk < tail_starts.unsqueeze(1))
         tail_mask = (
@@ -604,7 +699,9 @@ def make_prefetch_lookup_plan(
     cohort: IndexCacheCohort,
     batch: DSAOffloadBatch,
 ) -> PrefetchLookupPlan:
-    packed = batch.packed_decode or pack_decode_metadata(batch)
+    addressing = get_packed_addressing_metadata(batch)
+    packed = batch.packed_decode
+    assert packed is not None
     graph_mode = batch.graph_query_start_loc is not None
     use_dense_gather = hasattr(batch.io_backend, "gather_history_misses")
     query_indices = semantic_topk.reshape(semantic_topk.shape[0], -1).to(
@@ -614,30 +711,14 @@ def make_prefetch_lookup_plan(
         raise ValueError(
             "DSA Offload prefetch Top-K rows must match packed Decode queries."
         )
-    query_start_loc = (
-        batch.graph_query_start_loc
-        if graph_mode
-        else packed.query_start_loc
-    )
-    assert query_start_loc is not None
-    packed_positions = (
-        batch.query_positions.to(torch.int32)
-        if graph_mode
-        else packed.query_positions
-    )
-    verify_starts = packed_positions[
-        query_start_loc[:-1].to(torch.int64)
-    ]
-    query_lengths = (
-        query_start_loc[1:] - query_start_loc[:-1]
-    ).to(torch.int64)
+    query_start_loc = packed.query_start_loc
+    packed_positions = addressing.query_positions
+    verify_starts = addressing.verify_starts
+    tail_starts = addressing.expanded_tail_starts
+    query_lengths = addressing.query_lengths
     state = batch.lookup_states[cohort.cohort_id]
-    request_rows = batch.request_rows if graph_mode else packed.request_rows
-    query_request_rows = torch.repeat_interleave(
-        request_rows,
-        query_lengths,
-        output_size=query_indices.shape[0],
-    )
+    request_rows = packed.request_rows
+    query_request_rows = addressing.query_request_rows
     if batch.is_mtp:
         if batch.enable_turbo_fused_prefetch_lookup:
             # Stage-3 3B fused prefetch op: in-kernel history classification
@@ -657,19 +738,6 @@ def make_prefetch_lookup_plan(
             )
             fused_prefetch = True
         else:
-            expanded_verify_starts = torch.repeat_interleave(
-                verify_starts,
-                query_lengths,
-                output_size=query_indices.shape[0],
-            )
-            tail_starts = (
-                torch.div(
-                    expanded_verify_starts,
-                    batch.layout.block_size,
-                    rounding_mode="floor",
-                )
-                * batch.layout.block_size
-            )
             valid_mask = (query_indices >= 0) & (query_indices < INDEX_CAPACITY)
             lookup_mask = (
                 valid_mask & (query_indices < tail_starts.unsqueeze(1))
@@ -688,19 +756,6 @@ def make_prefetch_lookup_plan(
             )
             fused_prefetch = False
     else:
-        expanded_verify_starts = torch.repeat_interleave(
-            verify_starts,
-            query_lengths,
-            output_size=query_indices.shape[0],
-        )
-        tail_starts = (
-            torch.div(
-                expanded_verify_starts,
-                batch.layout.block_size,
-                rounding_mode="floor",
-            )
-            * batch.layout.block_size
-        )
         valid_mask = (query_indices >= 0) & (query_indices < INDEX_CAPACITY)
         lookup_mask = (
             valid_mask & (query_indices < tail_starts.unsqueeze(1))

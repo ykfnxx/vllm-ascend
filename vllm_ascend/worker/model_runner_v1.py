@@ -1236,6 +1236,10 @@ class NPUModelRunner(GPUModelRunner):
         existing = self._dsa_offload_graph_batches.get(batch_desc)
         if existing is not None:
             existing.lookup_plans.clear()
+            # A new capture must emit the Decode-step metadata producers again.
+            # Graph replay itself does not run this Python path; it re-executes
+            # the captured producers from the updated graph-stable inputs.
+            existing.packed_addressing = None
             return existing
 
         config = self.dsa_offload_config

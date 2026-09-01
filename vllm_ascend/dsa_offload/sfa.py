@@ -114,22 +114,13 @@ def prepare_main_slot_mapping(
         return default_slot_mapping
 
     main_slot_mapping = default_slot_mapping.clone()
+    # Materialize shared Decode metadata on the main stream before grouped
+    # prefetch can start on its side stream.  Later exact and prefetch Lookup
+    # planning therefore consume the same ready tensors without a new join.
+    addressing = _lookup.get_packed_addressing_metadata(batch)
     if batch.graph_query_start_loc is not None:
-        query_lengths = (
-            batch.graph_query_start_loc[1:]
-            - batch.graph_query_start_loc[:-1]
-        ).to(torch.int64)
-        total_queries = batch.query_positions.shape[0]
-        query_rows = torch.repeat_interleave(
-            batch.request_rows,
-            query_lengths,
-            output_size=total_queries,
-        ).to(torch.int64)
-        query_starts = torch.repeat_interleave(
-            batch.graph_query_start_loc[:-1],
-            query_lengths,
-            output_size=total_queries,
-        )
+        total_queries = addressing.query_positions.shape[0]
+        query_rows = addressing.query_request_rows_long
         if batch.is_mtp:
             row_offsets = (
                 batch.layout.staging_base
@@ -138,11 +129,11 @@ def prepare_main_slot_mapping(
                     dtype=torch.int32,
                     device=main_slot_mapping.device,
                 )
-                - query_starts
+                - addressing.expanded_query_starts
             )
         else:
             row_offsets = batch.layout.tail_base + torch.remainder(
-                batch.query_positions,
+                addressing.query_positions,
                 batch.layout.block_size,
             )
         row_blocks = (

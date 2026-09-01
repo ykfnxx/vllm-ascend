@@ -28,6 +28,7 @@ from .io import make_storage_ids
 from .lookup import (
     DSAOffloadBatch,
     IndexCacheCohort,
+    get_packed_addressing_metadata,
     load_prefetch_misses,
     make_prefetch_lookup_plan,
 )
@@ -265,10 +266,9 @@ class _PredictionTarget:
                 )
 
         base_cache, key_mean = _indexer_cache_parts(impl)
-        query_lengths = packed.query_start_loc[1:]
-        historical_lengths = packed.query_positions[
-            packed.query_start_loc[:-1].to(torch.int64)
-        ].to(torch.int32)
+        addressing = get_packed_addressing_metadata(batch)
+        cumulative_query_lengths = packed.query_start_loc[1:]
+        historical_lengths = addressing.verify_starts
         decode_block_table = block_table.index_select(
             0,
             packed.request_indices.to(torch.int64),
@@ -290,7 +290,7 @@ class _PredictionTarget:
                     impl.c8_k_scale_cache_dtype
                 ).view(query_shape[:-1]),
                 key_dequant_scale=base_cache[1].squeeze(2),
-                actual_seq_lengths_query=query_lengths,
+                actual_seq_lengths_query=cumulative_query_lengths,
                 actual_seq_lengths_key=historical_lengths,
                 block_table=decode_block_table,
                 query_quant_mode=0,
@@ -308,7 +308,7 @@ class _PredictionTarget:
                 key=base_cache[0],
                 weights=weights,
                 key_mean=key_mean,
-                actual_seq_lengths_query=query_lengths,
+                actual_seq_lengths_query=cumulative_query_lengths,
                 actual_seq_lengths_key=historical_lengths,
                 block_table=decode_block_table,
                 layout_query="TND",

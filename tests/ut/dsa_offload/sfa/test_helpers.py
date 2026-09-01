@@ -128,6 +128,7 @@ def test_mixed_batch_keeps_prefill_mapping_and_redirects_decode_tail(spy_io) -> 
         default_slot_mapping=default,
     )
 
+    assert batch.packed_addressing is not None
     assert mapped[:2].tolist() == [10, 11]
     assert mapped[2].item() == batch.layout.global_slot(row, batch.layout.tail_base + 1)
     assert default.tolist() == [10, 11, 12]
