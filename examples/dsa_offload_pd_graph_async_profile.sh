@@ -26,6 +26,7 @@ Optional environment variables:
   LOG_DIR, PROFILE_DIR, PREFILL_HTTP_PORT, DECODE_HTTP_PORT,
   PREFILL_KV_PORT, DECODE_KV_PORT, PROMPT_TOKEN_ID, WARMUP_INPUT_LENGTH,
   WARMUP_OUTPUT_LENGTH, PROFILE_DELAY_ITERATIONS, PROFILE_DECODE_STEPS,
+  PYSPY_PROFILE, PYSPY_RATE, PYSPY_BIN, PYSPY_SUDO,
   BLOCK_SIZE, MTP_SPECULATIVE_TOKENS, PREFILL_CHUNK_SIZE,
   GPU_MEMORY_UTILIZATION, STARTUP_TIMEOUT, REQUEST_TIMEOUT,
   LOCAL_SHM_DIR, LOCAL_SHM_NAMESPACE, LOCAL_SHM_TIMEOUT
@@ -34,6 +35,10 @@ Prefill runs eager with prefix caching and the mock backend. Decode always
 enables npugraph_ex FULL_DECODE_ONLY Graph, --async-scheduling, and no prefix
 caching. Hidden-state prefetch is disabled. A short request warms Graph before
 the measured Decode-only Level1 + PipeUtilization profile starts.
+
+Set PYSPY_PROFILE=1 to record the Decode API server, EngineCore, and Worker
+during measured Decode into decode-cpu.speedscope.json. Set PYSPY_SUDO=1 when
+Linux ptrace policy requires non-interactive sudo for process attachment.
 
 kvio is not accepted because its compact GET metadata is dynamic and cannot
 run in FULL_DECODE_ONLY Graph mode.
@@ -78,6 +83,10 @@ BLOCK_SIZE="${BLOCK_SIZE:-128}"
 MTP_SPECULATIVE_TOKENS="${MTP_SPECULATIVE_TOKENS:-1}"
 PROFILE_DELAY_ITERATIONS="${PROFILE_DELAY_ITERATIONS:-2}"
 PROFILE_DECODE_STEPS="${PROFILE_DECODE_STEPS:-64}"
+PYSPY_PROFILE="${PYSPY_PROFILE:-0}"
+PYSPY_RATE="${PYSPY_RATE:-200}"
+PYSPY_BIN="${PYSPY_BIN:-py-spy}"
+PYSPY_SUDO="${PYSPY_SUDO:-0}"
 PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-1800}"
@@ -106,6 +115,10 @@ PROFILE_DIR="$(realpath "$PROFILE_DIR")"
 if find "$PROFILE_DIR" -mindepth 1 -print -quit | grep -q .; then
     echo "Profile directory must be empty: $PROFILE_DIR" >&2
     exit 2
+fi
+PYSPY_OUTPUT="$PROFILE_DIR/decode-cpu.speedscope.json"
+if [[ "$PYSPY_PROFILE" == "1" ]]; then
+    command -v "$PYSPY_BIN" >/dev/null
 fi
 
 CUSTOM_OP_VENDOR_PATH="$REPO_ROOT/vllm_ascend/_cann_ops_custom/vendors/custom_transformer"
@@ -328,6 +341,19 @@ wait_for_health Decode \
     "http://127.0.0.1:$DECODE_HTTP_PORT/health" \
     "$DECODE_PID" "$DECODE_LOG"
 
+PYSPY_ARGS=()
+if [[ "$PYSPY_PROFILE" == "1" ]]; then
+    PYSPY_ARGS=(
+        --decode-pid "$DECODE_PID"
+        --pyspy-output "$PYSPY_OUTPUT"
+        --pyspy-bin "$PYSPY_BIN"
+        --pyspy-rate "$PYSPY_RATE"
+    )
+    if [[ "$PYSPY_SUDO" == "1" ]]; then
+        PYSPY_ARGS+=(--pyspy-sudo)
+    fi
+fi
+
 PROFILE_STARTED="1"
 python3 "$PROFILE_CLIENT" \
     --model "$SERVED_MODEL_NAME" \
@@ -340,7 +366,8 @@ python3 "$PROFILE_CLIENT" \
     --output-length "$OUTPUT_LENGTH" \
     --token-id "$PROMPT_TOKEN_ID" \
     --timeout "$REQUEST_TIMEOUT" \
-    --response-path "$PROFILE_RESPONSE"
+    --response-path "$PROFILE_RESPONSE" \
+    "${PYSPY_ARGS[@]}"
 PROFILE_STARTED="0"
 
 python3 - "$PROFILE_DIR" <<'PY'
@@ -368,7 +395,7 @@ python3 - "$PROFILE_RESPONSE" "$DECODE_LOG" "$PROFILE_DIR" \
     "$BATCH_SIZE" "$INPUT_LENGTH" "$OUTPUT_LENGTH" \
     "$MODEL" "$PREFILL_DEVICE" "$DECODE_DEVICE" "$IO_BACKEND" \
     "$MTP_SPECULATIVE_TOKENS" "$PROFILE_DELAY_ITERATIONS" \
-    "$PROFILE_DECODE_STEPS" <<'PY'
+    "$PROFILE_DECODE_STEPS" "$PYSPY_PROFILE" "$PYSPY_OUTPUT" <<'PY'
 import csv
 import json
 import re
@@ -389,6 +416,8 @@ from pathlib import Path
     mtp_speculative_tokens,
     profile_delay_iterations,
     profile_decode_steps,
+    pyspy_profile,
+    pyspy_output,
 ) = sys.argv[1:]
 batch_size = int(batch_size)
 input_length = int(input_length)
@@ -396,6 +425,7 @@ output_length = int(output_length)
 mtp_speculative_tokens = int(mtp_speculative_tokens)
 profile_delay_iterations = int(profile_delay_iterations)
 profile_decode_steps = int(profile_decode_steps)
+pyspy_profile = pyspy_profile == "1"
 
 responses = json.loads(Path(response_path).read_text(encoding="utf-8"))
 if len(responses) != batch_size:
@@ -425,6 +455,9 @@ required_log_markers = (
 missing_log_markers = [marker for marker in required_log_markers if marker not in decode_log]
 if missing_log_markers:
     raise RuntimeError("Decode log is missing markers: " + ", ".join(missing_log_markers))
+
+if pyspy_profile:
+    json.loads(Path(pyspy_output).read_text(encoding="utf-8"))
 
 outputs = sorted(Path(profile_dir).rglob("ASCEND_PROFILER_OUTPUT"))
 if not outputs:
@@ -470,6 +503,8 @@ print(json.dumps({
     "mtp_speculative_tokens": mtp_speculative_tokens,
     "profile_delay_iterations": profile_delay_iterations,
     "profile_decode_steps": profile_decode_steps,
+    "pyspy_profile": pyspy_profile,
+    "pyspy_output": pyspy_output if pyspy_profile else None,
     "async_scheduling": True,
     "profile_scope": "decode_only",
     "profile_outputs": [str(path) for path in outputs],

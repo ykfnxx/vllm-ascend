@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
+import subprocess
 import threading
 import time
 import urllib.request
@@ -119,6 +121,40 @@ def run_decode_batch(
         return list(executor.map(decode, requests))
 
 
+def start_pyspy(args: argparse.Namespace) -> subprocess.Popen | None:
+    if args.pyspy_output is None:
+        return None
+    command = [
+        args.pyspy_bin,
+        "record",
+        "--pid",
+        str(args.decode_pid),
+        "--subprocesses",
+        "--threads",
+        "--rate",
+        str(args.pyspy_rate),
+        "--format",
+        "speedscope",
+        "--output",
+        str(args.pyspy_output),
+    ]
+    if args.pyspy_sudo:
+        command = ["sudo", "--non-interactive", *command]
+    process = subprocess.Popen(command)
+    time.sleep(0.5)
+    if process.poll() is not None:
+        raise RuntimeError("py-spy failed to attach to the Decode service")
+    return process
+
+
+def stop_pyspy(process: subprocess.Popen | None) -> None:
+    if process is None:
+        return
+    process.send_signal(signal.SIGINT)
+    if process.wait() != 0:
+        raise RuntimeError("py-spy failed to write the Decode CPU profile")
+
+
 def profile(args: argparse.Namespace) -> None:
     prefill_url = f"http://127.0.0.1:{args.prefill_port}/v1/completions"
     decode_url = f"http://127.0.0.1:{args.decode_port}/v1/completions"
@@ -158,12 +194,16 @@ def profile(args: argparse.Namespace) -> None:
         timeout=args.timeout,
     )
 
-    print("Starting Decode-only profile...", flush=True)
-    post_control(f"{profile_url}/start_profile", args.timeout)
+    pyspy = start_pyspy(args)
     try:
-        responses = run_decode_batch(decode_url, measured, args.timeout)
+        print("Starting Decode-only profile...", flush=True)
+        post_control(f"{profile_url}/start_profile", args.timeout)
+        try:
+            responses = run_decode_batch(decode_url, measured, args.timeout)
+        finally:
+            post_control(f"{profile_url}/stop_profile", args.timeout)
     finally:
-        post_control(f"{profile_url}/stop_profile", args.timeout)
+        stop_pyspy(pyspy)
 
     args.response_path.write_text(
         json.dumps(responses, separators=(",", ":")),
@@ -184,6 +224,11 @@ def main() -> None:
     parser.add_argument("--token-id", type=int, required=True)
     parser.add_argument("--timeout", type=float, required=True)
     parser.add_argument("--response-path", type=Path, required=True)
+    parser.add_argument("--decode-pid", type=int)
+    parser.add_argument("--pyspy-output", type=Path)
+    parser.add_argument("--pyspy-bin", default="py-spy")
+    parser.add_argument("--pyspy-rate", type=int, default=200)
+    parser.add_argument("--pyspy-sudo", action="store_true")
     profile(parser.parse_args())
 
 
