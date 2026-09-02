@@ -44,6 +44,7 @@ BLOCK_SIZE="128"
 MTP_SPECULATIVE_TOKENS="0"
 ENABLE_PREFETCH_WITH_HIDDEN_STATES="0"
 PREFETCH_TOP_K="2048"
+ENABLE_COHORT_KVGATHER="0"
 CUDAGRAPH_MODE="FULL_DECODE_ONLY"
 GPU_MEMORY_UTILIZATION="0.50"
 STARTUP_TIMEOUT="900"
@@ -87,6 +88,10 @@ Core options:
                               Enable grouped hidden-state prefetch on Decode.
   --prefetch-top-k N          Predicted Top-K width, range [128, 2048].
                               Default: 2048
+  --enable-cohort-kvgather    Enable cross-layer cohort KV Gather on Decode:
+                              follower-layer gathers are issued back-to-back
+                              on a dedicated stream right after the cohort
+                              leader's lookup.
   --cudagraph-mode MODE       FULL_DECODE_ONLY or NONE.
                               Default: FULL_DECODE_ONLY
   --max-model-len N           Context limit. Default: 4096
@@ -266,6 +271,10 @@ while (($# > 0)); do
             ;;
         --enable-prefetch-with-hidden-states)
             ENABLE_PREFETCH_WITH_HIDDEN_STATES="1"
+            shift
+            ;;
+        --enable-cohort-kvgather)
+            ENABLE_COHORT_KVGATHER="1"
             shift
             ;;
         --prefetch-top-k)
@@ -742,6 +751,7 @@ launch_server() {
     local kv_config
     local profiler_config
     local prefetch_enabled="false"
+    local cohort_kvgather_enabled="false"
     local dsa_config
     local -a kv_transfer_args=()
     local -a profiler_args=()
@@ -805,7 +815,11 @@ PY
         && "$ENABLE_PREFETCH_WITH_HIDDEN_STATES" == "1" ]]; then
         prefetch_enabled="true"
     fi
-    dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_offload\":{\"io_backend\":\"$IO_BACKEND\",\"kvio_model_id\":$KVIO_MODEL_ID,\"enable_prefetch_with_hidden_states\":$prefetch_enabled,\"prefetch_top_k\":$PREFETCH_TOP_K}}"
+    if [[ "$kv_role" != "kv_producer" \
+        && "$ENABLE_COHORT_KVGATHER" == "1" ]]; then
+        cohort_kvgather_enabled="true"
+    fi
+    dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_offload\":{\"io_backend\":\"$IO_BACKEND\",\"kvio_model_id\":$KVIO_MODEL_ID,\"enable_prefetch_with_hidden_states\":$prefetch_enabled,\"prefetch_top_k\":$PREFETCH_TOP_K,\"enable_cohort_kvgather\":$cohort_kvgather_enabled}}"
     if [[ "$VERIFY_PATH" == "1" ]] \
         && [[ "$kv_role" != "kv_producer" || "$IO_BACKEND" == "kvio" ]]; then
         mkdir -p "$profile_dir"
@@ -829,7 +843,7 @@ PY
     fi
 
     echo "Starting $service_name on physical NPU $device_id..."
-    echo "  hidden_state_prefetch=$prefetch_enabled prefetch_top_k=$PREFETCH_TOP_K graph_mode=$CUDAGRAPH_MODE"
+    echo "  hidden_state_prefetch=$prefetch_enabled prefetch_top_k=$PREFETCH_TOP_K cohort_kvgather=$cohort_kvgather_enabled graph_mode=$CUDAGRAPH_MODE"
     env \
         "${COMMON_NETWORK_ENV[@]}" \
         "ASCEND_RT_VISIBLE_DEVICES=$device_id" \
