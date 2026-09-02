@@ -221,6 +221,7 @@ from vllm_ascend.dsa_offload.lookup import (
     pack_graph_decode_metadata,
     scan_index_cache_cohorts,
 )
+from vllm_ascend.dsa_offload.metadata import apply_block_hash_update
 from vllm_ascend.dsa_offload.pd import (
     PrefillPublishState,
     admit_from_handoff,
@@ -1002,29 +1003,18 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
     ) -> None:
         hash_state = self._dsa_offload_decode_hash_state
-
-        def record(request_id: str, scheduler_hashes: Sequence[bytes]) -> None:
-            current = self._dsa_offload_committed_hashes.get(request_id, ())
-            self._dsa_offload_committed_hashes[request_id] = (
-                hash_state.reconcile(
+        updates = scheduler_output.block_hash_updates
+        if updates is not None:
+            for request_id, update in updates.items():
+                committed_hashes = self._dsa_offload_committed_hashes.setdefault(
                     request_id,
-                    current,
-                    scheduler_hashes,
+                    [],
                 )
-                if hash_state is not None
-                else list(scheduler_hashes)
-            )
-
-        for request_data in scheduler_output.scheduled_new_reqs:
-            record(request_data.req_id, request_data.block_hashes)
-        cached = scheduler_output.scheduled_cached_reqs
-        for request_id, block_hashes in zip(
-            cached.req_ids,
-            cached.block_hashes,
-        ):
-            record(request_id, block_hashes)
-        for request_id, block_hashes in scheduler_output.dsa_offload_connector_block_hashes.items():
-            record(request_id, block_hashes)
+                apply_block_hash_update(
+                    request_id,
+                    committed_hashes,
+                    update,
+                )
         if hash_state is not None:
             hash_state.update_contexts(scheduler_output.dsa_offload_decode_hash_contexts)
         self._dsa_offload_candidate_hashes = (
