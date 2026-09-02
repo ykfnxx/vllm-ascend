@@ -25,14 +25,16 @@ Arguments:
 Optional environment variables:
   LOG_DIR, PROFILE_DIR, PREFILL_HTTP_PORT, DECODE_HTTP_PORT,
   PREFILL_KV_PORT, DECODE_KV_PORT, PROMPT_TOKEN_ID, WARMUP_INPUT_LENGTH,
+  WARMUP_OUTPUT_LENGTH, PROFILE_DELAY_ITERATIONS, PROFILE_DECODE_STEPS,
   BLOCK_SIZE, MTP_SPECULATIVE_TOKENS, PREFILL_CHUNK_SIZE,
   GPU_MEMORY_UTILIZATION, STARTUP_TIMEOUT, REQUEST_TIMEOUT,
   LOCAL_SHM_DIR, LOCAL_SHM_NAMESPACE, LOCAL_SHM_TIMEOUT
 
 Prefill runs eager with prefix caching and the mock backend. Decode always
-enables FULL_DECODE_ONLY Graph, --async-scheduling, and no prefix caching.
-A short request warms Graph, then the measured Prefill handoffs complete before
-the Decode-only Level1 + PipeUtilization profile starts.
+enables npugraph_ex FULL_DECODE_ONLY Graph, grouped hidden-state prefetch,
+--async-scheduling, and no prefix caching. Grouped prefetch requires 2 + 4N
+model layers, with at least 10 layers. A short request warms Graph before the
+measured Decode-only Level1 + PipeUtilization profile starts.
 
 kvio is not accepted because its compact GET metadata is dynamic and cannot
 run in FULL_DECODE_ONLY Graph mode.
@@ -75,6 +77,8 @@ DECODE_KV_PORT="${DECODE_KV_PORT:-30100}"
 PROMPT_TOKEN_ID="${PROMPT_TOKEN_ID:-100}"
 BLOCK_SIZE="${BLOCK_SIZE:-128}"
 MTP_SPECULATIVE_TOKENS="${MTP_SPECULATIVE_TOKENS:-1}"
+PROFILE_DELAY_ITERATIONS="${PROFILE_DELAY_ITERATIONS:-2}"
+PROFILE_DECODE_STEPS="${PROFILE_DECODE_STEPS:-64}"
 PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-4096}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-1800}"
@@ -83,8 +87,16 @@ LOCAL_SHM_DIR="${LOCAL_SHM_DIR:-/dev/shm/vllm-ascend-local-kv}"
 LOCAL_SHM_NAMESPACE="${LOCAL_SHM_NAMESPACE:-dsa-offload-graph-async-$$}"
 LOCAL_SHM_TIMEOUT="${LOCAL_SHM_TIMEOUT:-120}"
 SERVED_MODEL_NAME="dsa-offload-profile"
+VERIFY_WIDTH=$((MTP_SPECULATIVE_TOKENS + 1))
+MIN_PROFILE_OUTPUT_LENGTH=$(((PROFILE_DELAY_ITERATIONS + PROFILE_DECODE_STEPS + 1) * VERIFY_WIDTH))
+if ((OUTPUT_LENGTH < MIN_PROFILE_OUTPUT_LENGTH)); then
+    echo "OUTPUT_LENGTH must be at least $MIN_PROFILE_OUTPUT_LENGTH for" \
+        "$PROFILE_DELAY_ITERATIONS delayed + $PROFILE_DECODE_STEPS profiled Decode steps" >&2
+    exit 2
+fi
 MAX_MODEL_LEN=$((((INPUT_LENGTH + OUTPUT_LENGTH + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE))
 WARMUP_INPUT_LENGTH="${WARMUP_INPUT_LENGTH:-$((INPUT_LENGTH < 2051 ? INPUT_LENGTH : 2051))}"
+WARMUP_OUTPUT_LENGTH="${WARMUP_OUTPUT_LENGTH:-$((VERIFY_WIDTH * 2))}"
 
 LOG_DIR="${LOG_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/dsa-pd-graph-profile.XXXXXX")}"
 mkdir -p "$LOG_DIR"
@@ -155,7 +167,8 @@ wait_for_health() {
     return 1
 }
 
-PROFILER_CONFIG="$(python3 - "$PROFILE_DIR" <<'PY'
+PROFILER_CONFIG="$(python3 - "$PROFILE_DIR" "$PROFILE_DELAY_ITERATIONS" \
+    "$PROFILE_DECODE_STEPS" <<'PY'
 import json
 import sys
 
@@ -163,6 +176,9 @@ print(json.dumps({
     "profiler": "torch",
     "torch_profiler_dir": sys.argv[1],
     "torch_profiler_with_stack": False,
+    "ignore_frontend": True,
+    "delay_iterations": int(sys.argv[2]),
+    "max_iterations": int(sys.argv[3]),
 }))
 PY
 )"
@@ -261,8 +277,8 @@ COMMON_ENV=(
 )
 PREFILL_DSA_CONFIG='{"ascend_compilation_config":{"enable_npugraph_ex":false},"dsa_offload":{"io_backend":"mock"}}'
 DECODE_DSA_CONFIG="{\"ascend_compilation_config\":\
-{\"enable_npugraph_ex\":false},\"dsa_offload\":\
-{\"io_backend\":\"$IO_BACKEND\"}}"
+{\"enable_npugraph_ex\":true},\"dsa_offload\":\
+{\"io_backend\":\"$IO_BACKEND\",\"enable_prefetch_with_hidden_states\":true}}"
 
 echo "Starting eager Prefill on physical NPU $PREFILL_DEVICE..."
 env "${COMMON_ENV[@]}" "ASCEND_RT_VISIBLE_DEVICES=$PREFILL_DEVICE" \
@@ -285,7 +301,7 @@ env "${COMMON_ENV[@]}" "ASCEND_RT_VISIBLE_DEVICES=$PREFILL_DEVICE" \
 PREFILL_PID=$!
 CHILD_PIDS+=("$PREFILL_PID")
 
-echo "Starting Graph + async Decode on physical NPU $DECODE_DEVICE..."
+echo "Starting npugraph_ex + prefetch + async Decode on physical NPU $DECODE_DEVICE..."
 env "${COMMON_ENV[@]}" "ASCEND_RT_VISIBLE_DEVICES=$DECODE_DEVICE" \
     vllm serve "$MODEL" \
     --host 0.0.0.0 --port "$DECODE_HTTP_PORT" \
@@ -320,6 +336,7 @@ python3 "$PROFILE_CLIENT" \
     --decode-port "$DECODE_HTTP_PORT" \
     --batch-size "$BATCH_SIZE" \
     --warmup-input-length "$WARMUP_INPUT_LENGTH" \
+    --warmup-output-length "$WARMUP_OUTPUT_LENGTH" \
     --input-length "$INPUT_LENGTH" \
     --output-length "$OUTPUT_LENGTH" \
     --token-id "$PROMPT_TOKEN_ID" \
@@ -350,7 +367,9 @@ PY
 
 python3 - "$PROFILE_RESPONSE" "$DECODE_LOG" "$PROFILE_DIR" \
     "$BATCH_SIZE" "$INPUT_LENGTH" "$OUTPUT_LENGTH" \
-    "$MODEL" "$PREFILL_DEVICE" "$DECODE_DEVICE" "$IO_BACKEND" <<'PY'
+    "$MODEL" "$PREFILL_DEVICE" "$DECODE_DEVICE" "$IO_BACKEND" \
+    "$MTP_SPECULATIVE_TOKENS" "$PROFILE_DELAY_ITERATIONS" \
+    "$PROFILE_DECODE_STEPS" <<'PY'
 import csv
 import json
 import re
@@ -368,10 +387,16 @@ from pathlib import Path
     prefill_device,
     decode_device,
     io_backend,
+    mtp_speculative_tokens,
+    profile_delay_iterations,
+    profile_decode_steps,
 ) = sys.argv[1:]
 batch_size = int(batch_size)
 input_length = int(input_length)
 output_length = int(output_length)
+mtp_speculative_tokens = int(mtp_speculative_tokens)
+profile_delay_iterations = int(profile_delay_iterations)
+profile_decode_steps = int(profile_decode_steps)
 
 responses = json.loads(Path(response_path).read_text(encoding="utf-8"))
 if len(responses) != batch_size:
@@ -392,8 +417,16 @@ graph_marker = (
     if io_backend == "kvgather_sim"
     else "DSA_OFFLOAD_MOCK_GRAPH_ACTIVE"
 )
-if graph_marker not in decode_log or "Replaying aclgraph" not in decode_log:
-    raise RuntimeError("Decode log does not prove DSA Offload Graph replay")
+required_log_markers = (
+    graph_marker,
+    "Replaying aclgraph",
+    "enable_npugraph_ex is enabled",
+    "DSA_OFFLOAD_GRAPH_PREFETCH_ACTIVE",
+    "Max profiling iterations reached",
+)
+missing_log_markers = [marker for marker in required_log_markers if marker not in decode_log]
+if missing_log_markers:
+    raise RuntimeError("Decode log is missing markers: " + ", ".join(missing_log_markers))
 
 outputs = sorted(Path(profile_dir).rglob("ASCEND_PROFILER_OUTPUT"))
 if not outputs:
@@ -419,6 +452,8 @@ for output in outputs:
 
 normalized = re.sub(r"[^a-z0-9]", "", operator_text.lower())
 required = ["lookupupdate", "sparseflashattention"]
+if mtp_speculative_tokens > 0:
+    required.append("prefetchlookupupdate")
 if io_backend == "kvgather_sim":
     required.append("asukvgather")
 missing = [name for name in required if name not in normalized]
@@ -434,6 +469,11 @@ print(json.dumps({
     "input_length": input_length,
     "output_length": output_length,
     "graph_mode": "FULL_DECODE_ONLY",
+    "npugraph_ex": True,
+    "hidden_state_prefetch": True,
+    "mtp_speculative_tokens": mtp_speculative_tokens,
+    "profile_delay_iterations": profile_delay_iterations,
+    "profile_decode_steps": profile_decode_steps,
     "async_scheduling": True,
     "profile_scope": "decode_only",
     "profile_outputs": [str(path) for path in outputs],

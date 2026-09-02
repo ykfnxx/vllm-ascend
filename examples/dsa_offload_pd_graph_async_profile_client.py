@@ -126,7 +126,8 @@ def profile(args: argparse.Namespace) -> None:
 
     print(
         f"Warming Decode Graph with input={args.warmup_input_length} "
-        f"batch={args.batch_size} outside the profiling window...",
+        f"output={args.warmup_output_length} batch={args.batch_size} "
+        "outside the profiling window...",
         flush=True,
     )
     warmup = prepare_decode_requests(
@@ -135,7 +136,7 @@ def profile(args: argparse.Namespace) -> None:
         model=args.model,
         batch_size=args.batch_size,
         input_length=args.warmup_input_length,
-        output_length=args.output_length,
+        output_length=args.warmup_output_length,
         token_id=args.token_id,
         timeout=args.timeout,
     )
@@ -177,6 +178,7 @@ def main() -> None:
     parser.add_argument("--decode-port", type=int, required=True)
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--warmup-input-length", type=int, required=True)
+    parser.add_argument("--warmup-output-length", type=int, required=True)
     parser.add_argument("--input-length", type=int, required=True)
     parser.add_argument("--output-length", type=int, required=True)
     parser.add_argument("--token-id", type=int, required=True)
