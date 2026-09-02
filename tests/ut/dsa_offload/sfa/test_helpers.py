@@ -20,7 +20,7 @@ from vllm_ascend.dsa_offload.sfa import (
 )
 
 
-def make_mixed_batch(spy_io, *, is_mtp: bool = False):
+def make_mixed_batch(spy_io, *, is_mtp: bool = False, enable_cohort_kvgather: bool = False):
     layout = HotCacheLayout(4, 2, 3)
     cache = torch.empty((layout.hot_blocks, 4, 1))
     hot_cache = HotCacheState(layout, {"leader": (cache,), "follower": (cache,)})
@@ -44,6 +44,7 @@ def make_mixed_batch(spy_io, *, is_mtp: bool = False):
             dtype=torch.int64,
         ),
         is_mtp=is_mtp,
+        enable_cohort_kvgather=enable_cohort_kvgather,
         committed_block_keys={"prefill": [], "decode": [101]},
         candidate_block_keys={},
         sfa_workspace=SFAAddressingWorkspace.create(
@@ -297,6 +298,65 @@ def test_leader_looks_up_once_and_follower_performs_own_get(spy_io) -> None:
         "get:3",
         "sfa:leader",
         "get:4",
+        "sfa:follower",
+    ]
+
+
+def test_cohort_kvgather_issues_follower_gather_at_leader(spy_io) -> None:
+    batch, row = make_mixed_batch(spy_io, enable_cohort_kvgather=True)
+    assert batch.hot_cache is not None
+    mapped = torch.tensor([[8, 9]], dtype=torch.int32)
+    table = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    seq_lens = torch.tensor([2, 6], dtype=torch.int32)
+    empty = torch.empty(0, dtype=torch.int64)
+    plan = LookupPlan(
+        mapped_indices=mapped,
+        miss_positions=empty,
+        miss_logical_blocks=empty,
+        miss_block_offsets=empty,
+        miss_destination_slots=empty,
+        miss_batch_indices=empty.to(torch.int32),
+        query_request_rows=empty.to(torch.int32),
+    )
+    events = ["indexer"]
+
+    def make_plan(**kwargs):
+        events.append("lookup")
+        return plan
+
+    def load_misses(plan, layer_id, batch):
+        events.append(f"get:{layer_id}")
+
+    with (
+        patch("vllm_ascend.dsa_offload.lookup.make_lookup_plan", side_effect=make_plan) as lookup,
+        patch("vllm_ascend.dsa_offload.lookup.load_plan_misses", side_effect=load_misses),
+    ):
+        resolve_sfa_inputs(
+            layer_name="leader",
+            semantic_topk=mapped,
+            default_block_table=table,
+            default_actual_seq_lengths_kv=seq_lens,
+            batch=batch,
+        )
+        events.append("sfa:leader")
+        resolve_sfa_inputs(
+            layer_name="follower",
+            semantic_topk=mapped,
+            default_block_table=table,
+            default_actual_seq_lengths_kv=seq_lens,
+            batch=batch,
+        )
+        events.append("sfa:follower")
+
+    lookup.assert_called_once()
+    # The follower's gather is issued back-to-back right after the leader's
+    # lookup instead of inside the follower layer's forward.
+    assert events == [
+        "indexer",
+        "lookup",
+        "get:3",
+        "get:4",
+        "sfa:leader",
         "sfa:follower",
     ]
 

@@ -24,6 +24,7 @@ class DSAOffloadConfig:
     enable_turbo_prefetch_lookup: bool
     enable_turbo_fused_lookup: bool
     enable_turbo_fused_prefetch_lookup: bool
+    enable_cohort_kvgather: bool
 
     @property
     def has_connector(self) -> bool:
@@ -90,6 +91,9 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
         raise TypeError(
             "dsa_offload.enable_turbo_fused_prefetch_lookup must be a boolean."
         )
+    enable_cohort_kvgather = raw_config.get("enable_cohort_kvgather", False)
+    if not isinstance(enable_cohort_kvgather, bool):
+        raise TypeError("dsa_offload.enable_cohort_kvgather must be a boolean.")
 
     from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
@@ -141,6 +145,11 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
         if prefill["tp_size"] != decode["tp_size"]:
             raise ValueError("DSA Offload requires equal Prefill and Decode TP sizes.")
 
+    if enable_cohort_kvgather and kv_role not in {"kv_consumer", "kv_both"}:
+        raise ValueError(
+            "dsa_offload.enable_cohort_kvgather requires a KV consumer role."
+        )
+
     parallel_config = vllm_config.parallel_config
     if (
         parallel_config.pipeline_parallel_size != 1
@@ -175,6 +184,7 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
         enable_turbo_prefetch_lookup=enable_turbo_prefetch_lookup,
         enable_turbo_fused_lookup=enable_turbo_fused_lookup,
         enable_turbo_fused_prefetch_lookup=enable_turbo_fused_prefetch_lookup,
+        enable_cohort_kvgather=enable_cohort_kvgather,
     )
 
 
