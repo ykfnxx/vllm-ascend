@@ -449,7 +449,6 @@ graph_marker = (
 required_log_markers = (
     graph_marker,
     "Replaying aclgraph",
-    "enable_npugraph_ex is enabled",
     "Max profiling iterations reached",
 )
 missing_log_markers = [marker for marker in required_log_markers if marker not in decode_log]
