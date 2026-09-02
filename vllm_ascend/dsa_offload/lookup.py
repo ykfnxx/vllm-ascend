@@ -241,6 +241,7 @@ class DSAOffloadBatch:
     is_mtp: bool
     committed_block_hashes: Mapping[str, Sequence[bytes]]
     candidate_block_hashes: Mapping[str, Sequence[bytes]]
+    query_end_positions: tuple[int, ...] = ()
     prefill_state: object | None = None
     sfa_workspace: "SFAAddressingWorkspace | None" = None
     decode_request_indices_tensor: torch.Tensor | None = None
@@ -272,6 +273,7 @@ def build_dsa_offload_batch(
     request_ids: Sequence[str],
     query_counts: Sequence[int],
     query_positions: torch.Tensor,
+    query_positions_cpu: Sequence[int],
     is_mtp: bool,
     committed_block_hashes: Mapping[str, Sequence[bytes]],
     candidate_block_hashes: Mapping[str, Sequence[bytes]],
@@ -309,6 +311,9 @@ def build_dsa_offload_batch(
         is_mtp=is_mtp,
         committed_block_hashes=committed_block_hashes,
         candidate_block_hashes=candidate_block_hashes,
+        query_end_positions=tuple(
+            int(query_positions_cpu[end - 1]) for end in query_ends
+        ),
         prefill_state=prefill_state,
         sfa_workspace=sfa_workspace,
         decode_request_indices_tensor=torch.tensor(

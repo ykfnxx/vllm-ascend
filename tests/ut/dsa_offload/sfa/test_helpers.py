@@ -43,6 +43,7 @@ def make_mixed_batch(spy_io, *, is_mtp: bool = False):
             [0, 1, 5, 6] if is_mtp else [0, 1, 5],
             dtype=torch.int64,
         ),
+        query_positions_cpu=([0, 1, 5, 6] if is_mtp else [0, 1, 5]),
         is_mtp=is_mtp,
         committed_block_hashes={"prefill": [], "decode": [b"block"]},
         candidate_block_hashes={},
@@ -320,6 +321,7 @@ def test_fixed_hot_addressing_does_not_depend_on_model_block_table_width() -> No
         request_ids=("prefill", "decode"),
         query_counts=(1, 1),
         query_positions=torch.tensor([0, 4095], dtype=torch.int64),
+        query_positions_cpu=(0, 4095),
         is_mtp=False,
         committed_block_hashes={"prefill": [], "decode": []},
         candidate_block_hashes={},
@@ -334,6 +336,7 @@ def test_fixed_hot_addressing_does_not_depend_on_model_block_table_width() -> No
         batch=batch,
     )
 
+    assert batch.query_end_positions == (0, 4095)
     assert effective_table.shape == (2, 82)
     assert effective_table[0, :32].tolist() == ordinary_table[0].tolist()
     assert torch.count_nonzero(effective_table[0, 32:]) == 0

@@ -1209,6 +1209,9 @@ class NPUModelRunner(GPUModelRunner):
             request_ids=request_ids,
             query_counts=query_counts,
             query_positions=self.positions[:total_num_scheduled_tokens],
+            query_positions_cpu=self._positions_np_buf[
+                :total_num_scheduled_tokens
+            ],
             is_mtp=bool(
                 scheduler_output.scheduled_spec_decode_tokens
             ),

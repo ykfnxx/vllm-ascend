@@ -37,11 +37,14 @@ def make_batch(spy_io, *, position: int, is_mtp: bool, committed, candidate):
         is_mtp=is_mtp,
         committed_block_hashes={"request": committed},
         candidate_block_hashes={"request": candidate},
+        query_end_positions=(position + 2 if is_mtp else position,),
     )
     return batch, cache
 
 
-def test_decode_put_happens_only_when_tail_becomes_full(spy_io) -> None:
+def test_decode_put_uses_cpu_position_and_happens_only_when_tail_becomes_full(
+    spy_io,
+) -> None:
     partial, _ = make_batch(
         spy_io,
         position=2,
@@ -49,6 +52,7 @@ def test_decode_put_happens_only_when_tail_becomes_full(spy_io) -> None:
         committed=[b"block-0"],
         candidate=[],
     )
+    partial.query_positions = None
     commit_decode_tail(partial)
     assert spy_io.put_calls == []
 
@@ -67,6 +71,7 @@ def test_decode_put_happens_only_when_tail_becomes_full(spy_io) -> None:
         original_put(**kwargs)
 
     spy_io.put_blocks = ordered_put
+    full.query_positions = None
     commit_decode_tail(full)
     assert events == ["model", "put"]
     assert spy_io.put_calls[-1]["storage_ids"].tolist() == [make_storage_id(b"block-0", 6)]
