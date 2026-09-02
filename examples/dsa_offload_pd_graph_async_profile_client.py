@@ -121,16 +121,46 @@ def run_decode_batch(
         return list(executor.map(decode, requests))
 
 
+def find_engine_core_pid(decode_pid: int) -> int:
+    processes = {}
+    output = subprocess.check_output(
+        ("ps", "-eo", "pid=,ppid=,args="),
+        text=True,
+    )
+    for line in output.splitlines():
+        pid, ppid, command = line.strip().split(maxsplit=2)
+        processes[int(pid)] = (int(ppid), command)
+
+    descendants = {decode_pid}
+    while children := {
+        pid
+        for pid, (ppid, _) in processes.items()
+        if ppid in descendants and pid not in descendants
+    }:
+        descendants.update(children)
+
+    matches = [
+        pid
+        for pid in descendants
+        if "::EngineCore" in processes[pid][1].split(maxsplit=1)[0]
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Expected one Decode EngineCore below PID {decode_pid}, got {matches}"
+        )
+    return matches[0]
+
+
 def start_pyspy(args: argparse.Namespace) -> subprocess.Popen | None:
     if args.pyspy_output is None:
         return None
+    engine_core_pid = find_engine_core_pid(args.decode_pid)
+    print(f"Recording EngineCore PID {engine_core_pid} with py-spy...", flush=True)
     command = [
         args.pyspy_bin,
         "record",
         "--pid",
-        str(args.decode_pid),
-        "--subprocesses",
-        "--threads",
+        str(engine_core_pid),
         "--rate",
         str(args.pyspy_rate),
         "--format",
@@ -143,7 +173,7 @@ def start_pyspy(args: argparse.Namespace) -> subprocess.Popen | None:
     process = subprocess.Popen(command)
     time.sleep(0.5)
     if process.poll() is not None:
-        raise RuntimeError("py-spy failed to attach to the Decode service")
+        raise RuntimeError("py-spy failed to attach to Decode EngineCore")
     return process
 
 
@@ -227,7 +257,7 @@ def main() -> None:
     parser.add_argument("--decode-pid", type=int)
     parser.add_argument("--pyspy-output", type=Path)
     parser.add_argument("--pyspy-bin", default="py-spy")
-    parser.add_argument("--pyspy-rate", type=int, default=200)
+    parser.add_argument("--pyspy-rate", type=int, default=25)
     parser.add_argument("--pyspy-sudo", action="store_true")
     profile(parser.parse_args())
 

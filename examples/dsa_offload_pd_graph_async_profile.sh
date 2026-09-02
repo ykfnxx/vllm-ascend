@@ -36,9 +36,9 @@ enables npugraph_ex FULL_DECODE_ONLY Graph, --async-scheduling, and no prefix
 caching. Hidden-state prefetch is disabled. A short request warms Graph before
 the measured Decode-only Level1 + PipeUtilization profile starts.
 
-Set PYSPY_PROFILE=1 to record the Decode API server, EngineCore, and Worker
-during measured Decode into decode-cpu.speedscope.json. Set PYSPY_SUDO=1 when
-Linux ptrace policy requires non-interactive sudo for process attachment.
+Set PYSPY_PROFILE=1 to record only Decode EngineCore during measured Decode
+into decode-enginecore-cpu.speedscope.json. Set PYSPY_SUDO=1 when Linux ptrace
+policy requires non-interactive sudo for process attachment.
 
 kvio is not accepted because its compact GET metadata is dynamic and cannot
 run in FULL_DECODE_ONLY Graph mode.
@@ -84,7 +84,7 @@ MTP_SPECULATIVE_TOKENS="${MTP_SPECULATIVE_TOKENS:-1}"
 PROFILE_DELAY_ITERATIONS="${PROFILE_DELAY_ITERATIONS:-2}"
 PROFILE_DECODE_STEPS="${PROFILE_DECODE_STEPS:-64}"
 PYSPY_PROFILE="${PYSPY_PROFILE:-0}"
-PYSPY_RATE="${PYSPY_RATE:-200}"
+PYSPY_RATE="${PYSPY_RATE:-25}"
 PYSPY_BIN="${PYSPY_BIN:-py-spy}"
 PYSPY_SUDO="${PYSPY_SUDO:-0}"
 PREFILL_CHUNK_SIZE="${PREFILL_CHUNK_SIZE:-4096}"
@@ -116,7 +116,7 @@ if find "$PROFILE_DIR" -mindepth 1 -print -quit | grep -q .; then
     echo "Profile directory must be empty: $PROFILE_DIR" >&2
     exit 2
 fi
-PYSPY_OUTPUT="$PROFILE_DIR/decode-cpu.speedscope.json"
+PYSPY_OUTPUT="$PROFILE_DIR/decode-enginecore-cpu.speedscope.json"
 if [[ "$PYSPY_PROFILE" == "1" ]]; then
     command -v "$PYSPY_BIN" >/dev/null
 fi
