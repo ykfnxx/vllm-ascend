@@ -1,27 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
-from __future__ import annotations
-
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
-
-from .metadata import DecodeHashContext, make_block_key
 
 if TYPE_CHECKING:
     import torch
 
     from .lookup import DSAOffloadBatch
 
+DecodeHashContext = tuple[
+    int,
+    bytes | None,
+    tuple[int, ...],
+    tuple[Any, ...] | None,
+]
+
+
 @dataclass
 class DecodeBlockHashState:
     block_size: int
     block_hasher: Callable[[bytes | None, Sequence[int], tuple[Any, ...] | None], bytes]
     contexts: dict[str, DecodeHashContext] = field(default_factory=dict)
-    canonical_tails: dict[str, tuple[int, bytes]] = field(
-        default_factory=dict
-    )
 
     @classmethod
     def create(cls, block_size: int, hash_name: str) -> "DecodeBlockHashState":
@@ -56,22 +57,38 @@ class DecodeBlockHashState:
     ) -> None:
         self.contexts.update(contexts)
 
+    def reconcile(
+        self,
+        request_id: str,
+        current_hashes: Sequence[bytes],
+        scheduler_hashes: Sequence[bytes],
+    ) -> list[bytes]:
+        current = list(current_hashes)
+        scheduler = list(scheduler_hashes)
+        common = min(len(current), len(scheduler))
+        if current[:common] != scheduler[:common]:
+            raise RuntimeError(
+                "DSA Offload Decode block hashes diverged from the scheduler "
+                f"for request {request_id}."
+            )
+        return scheduler if len(scheduler) > len(current) else current
+
     def resolve(
         self,
         *,
         batch: "DSAOffloadBatch",
         query_token_ids: "torch.Tensor",
-        committed_block_keys: dict[str, list[int]],
+        committed_block_hashes: dict[str, list[bytes]],
         request_index: int,
         logical_block: int,
-    ) -> int:
+    ) -> bytes:
         request_id = batch.request_ids[request_index]
-        committed = committed_block_keys[request_id]
+        committed = committed_block_hashes[request_id]
         if logical_block < len(committed):
             return committed[logical_block]
         if logical_block != len(committed):
             raise RuntimeError(
-                "DSA Offload Decode cannot resolve a non-contiguous block key "
+                "DSA Offload Decode cannot resolve a non-contiguous block hash "
                 f"for request {request_id}: block={logical_block}, "
                 f"committed={len(committed)}."
             )
@@ -89,12 +106,8 @@ class DecodeBlockHashState:
                 f"required_block={logical_block}."
             )
 
-        previous_tail = self.canonical_tails.get(request_id)
-        if (
-            previous_tail is not None
-            and previous_tail[0] == logical_block - 1
-            and parent_hash != previous_tail[1]
-        ):
+        expected_parent = committed[-1] if committed else None
+        if parent_hash != expected_parent:
             raise RuntimeError(
                 "DSA Offload Decode parent block hash diverged for request "
                 f"{request_id} at block {logical_block}."
@@ -135,12 +148,9 @@ class DecodeBlockHashState:
             [int(token_id) for token_id in tokens],
             extra_keys,
         )
-        block_key = make_block_key(block_hash)
-        committed.append(block_key)
-        self.canonical_tails[request_id] = (logical_block, block_hash)
-        return block_key
+        committed.append(block_hash)
+        return block_hash
 
     def release(self, request_ids: set[str]) -> None:
         for request_id in request_ids:
             self.contexts.pop(request_id, None)
-            self.canonical_tails.pop(request_id, None)

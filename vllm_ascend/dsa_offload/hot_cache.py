@@ -15,7 +15,7 @@ from .constants import (
     REPLACEABLE_SLOTS,
     RESIDENT_SLOTS,
 )
-from .io import make_storage_ids, require_block_keys
+from .io import make_storage_ids, require_block_hashes
 
 if TYPE_CHECKING:
     from .lookup import DSAOffloadBatch
@@ -212,22 +212,22 @@ def _put_tail_block(
     batch: "DSAOffloadBatch",
     request_index: int,
     logical_block: int,
-    block_key_resolver: Callable[..., int] | None = None,
+    block_hash_resolver: Callable[..., bytes] | None = None,
 ) -> None:
     hot_cache = batch.hot_cache
     row_id = int(batch.request_rows[request_index].item())
     source_block_id = hot_cache.layout.row_block_base(row_id) + hot_cache.layout.tail_block_offset
-    block_keys = batch.block_keys(request_index)
+    block_hashes = batch.block_hashes(request_index)
     request_id = batch.request_ids[request_index]
-    if block_key_resolver is None:
-        require_block_keys(
-            block_keys,
+    if block_hash_resolver is None:
+        require_block_hashes(
+            block_hashes,
             logical_block + 1,
             context=f"Decode tail commit for request {request_id}",
         )
-        block_key = block_keys[logical_block]
+        block_hash = block_hashes[logical_block]
     else:
-        block_key = block_key_resolver(
+        block_hash = block_hash_resolver(
             request_index=request_index,
             logical_block=logical_block,
         )
@@ -235,7 +235,7 @@ def _put_tail_block(
         for layer_name, layer_id in zip(cohort.layer_names, cohort.layer_ids):
             device = hot_cache.layer_caches[layer_name][0].device
             storage_ids = make_storage_ids(
-                [block_key],
+                [block_hash],
                 layer_id,
                 device=device,
             )
@@ -252,7 +252,7 @@ def _put_tail_block(
 
 def commit_decode_tail(
     batch: "DSAOffloadBatch | None",
-    block_key_resolver: Callable[..., int] | None = None,
+    block_hash_resolver: Callable[..., bytes] | None = None,
 ) -> None:
     if batch is None or batch.hot_cache is None or batch.is_mtp:
         return
@@ -264,14 +264,14 @@ def commit_decode_tail(
                 batch=batch,
                 request_index=request_index,
                 logical_block=position // batch.layout.block_size,
-                block_key_resolver=block_key_resolver,
+                block_hash_resolver=block_hash_resolver,
             )
 
 
 def commit_mtp_tail(
     batch: "DSAOffloadBatch | None",
     accepted_token_counts: Sequence[int],
-    block_key_resolver: Callable[..., int] | None = None,
+    block_hash_resolver: Callable[..., bytes] | None = None,
 ) -> None:
     if batch is None or batch.hot_cache is None or not batch.is_mtp:
         return
@@ -312,5 +312,5 @@ def commit_mtp_tail(
                     batch=batch,
                     request_index=request_index,
                     logical_block=position // batch.layout.block_size,
-                    block_key_resolver=block_key_resolver,
+                    block_hash_resolver=block_hash_resolver,
                 )
