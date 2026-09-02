@@ -76,6 +76,23 @@ def test_feature_gate_and_valid_config() -> None:
     assert config.enable_turbo_fused_lookup
     assert config.enable_turbo_fused_prefetch_lookup
     assert not config.enable_cohort_kvgather
+    assert config.cohort_kvgather_aiv_limit == 4
+
+
+def test_cohort_kvgather_aiv_limit_validation() -> None:
+    vllm_config = make_config()
+    vllm_config.additional_config["dsa_offload"]["cohort_kvgather_aiv_limit"] = 8
+
+    config = load_dsa_offload_config(vllm_config)
+
+    assert config is not None
+    assert config.cohort_kvgather_aiv_limit == 8
+
+    for bad, error in ((True, TypeError), (0, ValueError)):
+        vllm_config = make_config()
+        vllm_config.additional_config["dsa_offload"]["cohort_kvgather_aiv_limit"] = bad
+        with pytest.raises(error, match="cohort_kvgather_aiv_limit"):
+            load_dsa_offload_config(vllm_config)
 
 
 def test_cohort_kvgather_flag_and_role_gate() -> None:

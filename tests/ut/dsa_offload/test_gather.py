@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -147,3 +148,26 @@ def test_dedicated_stream_issues_cohort_gathers_back_to_back() -> None:
     }
     # The compute stream waited on exactly the requested layer's event.
     hub.compute.wait_event.assert_called_once_with(layer_events[2])
+
+
+def test_limit_gather_stream_aiv(monkeypatch) -> None:
+    import acl
+
+    stream = SimpleNamespace(npu_stream=12345)
+    set_limit = MagicMock(return_value=0)
+    monkeypatch.setattr(acl.rt, "set_stream_res_limit", set_limit, raising=False)
+
+    gather_mod.limit_gather_stream_aiv(stream, 4)
+
+    # type 1 = AIV
+    set_limit.assert_called_once_with(12345, 1, 4)
+
+    # A non-zero return code degrades to an unlimited stream, no exception.
+    monkeypatch.setattr(
+        acl.rt, "set_stream_res_limit", MagicMock(return_value=7), raising=False
+    )
+    gather_mod.limit_gather_stream_aiv(stream, 4)
+
+    # A missing pyACL degrades the same way.
+    monkeypatch.setitem(sys.modules, "acl", None)
+    gather_mod.limit_gather_stream_aiv(stream, 4)

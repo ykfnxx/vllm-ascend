@@ -43,6 +43,8 @@ DECODE_DP_RPC_PORT="19200"
 BOTH_DP_RPC_PORT="19300"
 PROMPT_TOKENS="2333"
 PROMPT_TOKEN_ID="100"
+INPUT_JSONL=""
+BATCH_SIZE="2"
 MAX_TOKENS="4"
 MAX_MODEL_LEN="4096"
 BLOCK_SIZE="128"
@@ -50,6 +52,7 @@ MTP_SPECULATIVE_TOKENS="0"
 ENABLE_PREFETCH_WITH_HIDDEN_STATES="0"
 PREFETCH_TOP_K="2048"
 ENABLE_COHORT_KVGATHER="0"
+COHORT_KVGATHER_AIV_LIMIT="4"
 CUDAGRAPH_MODE="FULL_DECODE_ONLY"
 GPU_MEMORY_UTILIZATION="0.50"
 STARTUP_TIMEOUT="900"
@@ -95,6 +98,15 @@ Core options:
                               the DP group and requires data-parallel-size > 1.
   --prompt-tokens N           Non-block-aligned history workload. Default: 2333
   --prompt-token-id ID        Repeated vocabulary token ID. Default: 100
+  --input-jsonl PATH          Drive the workload from a LongBench-style JSONL
+                              file (fields: context, input, _prompt_tokens).
+                              Only the first entry is sent, duplicated
+                              batch-size times, with prefix caching enabled so
+                              the copies share the prefix KV.  Replaces the
+                              synthetic prompt-tokens workloads.
+                              Relative paths also resolve next to this script.
+  --batch-size N              Concurrent sequences per engine and the number
+                              of JSONL entries submitted. Default: 2
   --max-tokens N              Decode tokens for the main workload. Default: 4
   --mtp-speculative-tokens N  Enable MTP with N draft tokens, range [0, 15].
   --enable-prefetch-with-hidden-states
@@ -105,6 +117,9 @@ Core options:
                               follower-layer gathers are issued back-to-back
                               on a dedicated stream right after the cohort
                               leader's lookup.
+  --cohort-kvgather-aiv-limit N
+                              AIV cores the dedicated KV Gather stream may
+                              occupy. Default: 4
   --cudagraph-mode MODE       FULL_DECODE_ONLY or NONE.
                               Default: FULL_DECODE_ONLY
   --max-model-len N           Context limit. Default: 4096
@@ -143,8 +158,11 @@ Workloads:
   4. kv_both only: overlapping requests to make mixed Prefill/Decode possible.
 
 Validation boundary:
-  Prefix caching stays disabled so repeated prompts exercise DSA Offload rather
-  than vLLM prefix reuse; DSA block hashes are generated independently.
+  Prefix caching stays disabled for the synthetic workloads so repeated
+  prompts exercise DSA Offload rather than vLLM prefix reuse; DSA block
+  hashes are generated independently.  The --input-jsonl performance probe is
+  the exception: it replays one prompt batch-size times and enables prefix
+  caching so the copies share the prefix KV instead of exhausting memory.
   mock is intentionally the default. With a split P/D connector it can still
   exercise the partial-tail handoff, but it does not perform capacity-layer
   full-block PUT or token GET. With --connector none it validates local cache
@@ -280,6 +298,16 @@ while (($# > 0)); do
             MAX_TOKENS="$2"
             shift 2
             ;;
+        --input-jsonl)
+            require_value "$@"
+            INPUT_JSONL="$2"
+            shift 2
+            ;;
+        --batch-size)
+            require_value "$@"
+            BATCH_SIZE="$2"
+            shift 2
+            ;;
         --mtp-speculative-tokens)
             require_value "$@"
             MTP_SPECULATIVE_TOKENS="$2"
@@ -292,6 +320,11 @@ while (($# > 0)); do
         --enable-cohort-kvgather)
             ENABLE_COHORT_KVGATHER="1"
             shift
+            ;;
+        --cohort-kvgather-aiv-limit)
+            require_value "$@"
+            COHORT_KVGATHER_AIV_LIMIT="$2"
+            shift 2
             ;;
         --data-parallel-size)
             require_value "$@"
@@ -476,6 +509,8 @@ for value_and_name in \
     "$KVIO_MODEL_ID:kvio-model-id" \
     "$PROMPT_TOKENS:prompt-tokens" \
     "$PROMPT_TOKEN_ID:prompt-token-id" \
+    "$BATCH_SIZE:batch-size" \
+    "$COHORT_KVGATHER_AIV_LIMIT:cohort-kvgather-aiv-limit" \
     "$MAX_TOKENS:max-tokens" \
     "$MTP_SPECULATIVE_TOKENS:mtp-speculative-tokens" \
     "$PREFETCH_TOP_K:prefetch-top-k" \
@@ -502,6 +537,24 @@ fi
 if ((DATA_PARALLEL_SIZE == 0)); then
     echo "data-parallel-size must be positive." >&2
     exit 2
+fi
+if ((BATCH_SIZE == 0)); then
+    echo "batch-size must be positive." >&2
+    exit 2
+fi
+if ((COHORT_KVGATHER_AIV_LIMIT == 0)); then
+    echo "cohort-kvgather-aiv-limit must be positive." >&2
+    exit 2
+fi
+if [[ -n "$INPUT_JSONL" ]]; then
+    if [[ -r "$INPUT_JSONL" ]]; then
+        INPUT_JSONL="$(cd "$(dirname "$INPUT_JSONL")" && pwd)/$(basename "$INPUT_JSONL")"
+    elif [[ -r "$SCRIPT_DIR/$INPUT_JSONL" ]]; then
+        INPUT_JSONL="$SCRIPT_DIR/$INPUT_JSONL"
+    else
+        echo "input-jsonl is not a readable file: $INPUT_JSONL (looked in the working directory and $SCRIPT_DIR)" >&2
+        exit 2
+    fi
 fi
 if ((BLOCK_SIZE == 0 || MAX_TOKENS == 0)); then
     echo "block-size and max-tokens must be positive." >&2
@@ -839,6 +892,16 @@ launch_server() {
     local -a profiler_args=()
     local -a speculative_args=()
     local -a parallel_args=(--tensor-parallel-size 1)
+    local -a prefix_caching_args=(--no-enable-prefix-caching)
+    local prefix_caching_enabled="false"
+
+    if [[ -n "$INPUT_JSONL" ]]; then
+        # The JSONL probe replays one prompt batch-size times; prefix caching
+        # lets every copy share the same prefix KV blocks instead of
+        # allocating a full 64K cache per request.
+        prefix_caching_args=()
+        prefix_caching_enabled="true"
+    fi
 
     if ((DATA_PARALLEL_SIZE > 1)); then
         parallel_args+=(
@@ -916,7 +979,7 @@ PY
         && "$ENABLE_COHORT_KVGATHER" == "1" ]]; then
         cohort_kvgather_enabled="true"
     fi
-    dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_offload\":{\"io_backend\":\"$IO_BACKEND\",\"kvio_model_id\":$KVIO_MODEL_ID,\"enable_prefetch_with_hidden_states\":$prefetch_enabled,\"prefetch_top_k\":$PREFETCH_TOP_K,\"enable_cohort_kvgather\":$cohort_kvgather_enabled}}"
+    dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_offload\":{\"io_backend\":\"$IO_BACKEND\",\"kvio_model_id\":$KVIO_MODEL_ID,\"enable_prefetch_with_hidden_states\":$prefetch_enabled,\"prefetch_top_k\":$PREFETCH_TOP_K,\"enable_cohort_kvgather\":$cohort_kvgather_enabled,\"cohort_kvgather_aiv_limit\":$COHORT_KVGATHER_AIV_LIMIT}}"
     if [[ "$VERIFY_PATH" == "1" ]] \
         && [[ "$kv_role" != "kv_producer" || "$IO_BACKEND" == "kvio" ]]; then
         mkdir -p "$profile_dir"
@@ -940,7 +1003,7 @@ PY
     fi
 
     echo "Starting $service_name on physical NPU $device_id..."
-    echo "  hidden_state_prefetch=$prefetch_enabled prefetch_top_k=$PREFETCH_TOP_K cohort_kvgather=$cohort_kvgather_enabled dp=$DATA_PARALLEL_SIZE ep=$ENABLE_EXPERT_PARALLEL graph_mode=$CUDAGRAPH_MODE"
+    echo "  hidden_state_prefetch=$prefetch_enabled prefetch_top_k=$PREFETCH_TOP_K cohort_kvgather=$cohort_kvgather_enabled aiv_limit=$COHORT_KVGATHER_AIV_LIMIT dp=$DATA_PARALLEL_SIZE ep=$ENABLE_EXPERT_PARALLEL prefix_caching=$prefix_caching_enabled graph_mode=$CUDAGRAPH_MODE"
     env \
         "${COMMON_NETWORK_ENV[@]}" \
         "ASCEND_RT_VISIBLE_DEVICES=$device_id" \
@@ -952,12 +1015,12 @@ PY
         "${parallel_args[@]}" \
         --block-size "$BLOCK_SIZE" \
         --max-model-len "$MAX_MODEL_LEN" \
-        --max-num-seqs 2 \
+        --max-num-seqs "$BATCH_SIZE" \
         --max-num-batched-tokens "$MAX_MODEL_LEN" \
         --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
         --seed 0 \
         --trust-remote-code \
-        --no-enable-prefix-caching \
+        "${prefix_caching_args[@]}" \
         --compilation-config "{\"cudagraph_mode\":\"$CUDAGRAPH_MODE\"}" \
         --additional-config "$dsa_config" \
         "${kv_transfer_args[@]}" \
@@ -1083,7 +1146,11 @@ if [[ "$VERIFY_PATH" == "1" ]]; then
     PROFILE_STARTED="1"
 fi
 
-echo "Submitting aligned, partial-tail, and repeated-history workloads..."
+if [[ -n "$INPUT_JSONL" ]]; then
+    echo "Submitting $BATCH_SIZE concurrent JSONL workload(s) from $INPUT_JSONL..."
+else
+    echo "Submitting aligned, partial-tail, and repeated-history workloads..."
+fi
 python3 - \
     "$REQUEST_BASE_URL" \
     "$SERVED_MODEL_NAME" \
@@ -1093,7 +1160,10 @@ python3 - \
     "$PROMPT_TOKEN_ID" \
     "$MAX_TOKENS" \
     "$SCENARIO" \
-    "$SKIP_CONCURRENT" <<'PY'
+    "$SKIP_CONCURRENT" \
+    "$INPUT_JSONL" \
+    "$BATCH_SIZE" \
+    "$MAX_MODEL_LEN" <<'PY'
 from __future__ import annotations
 
 import json
@@ -1114,6 +1184,9 @@ from pathlib import Path
     max_tokens_raw,
     scenario,
     skip_concurrent_raw,
+    input_jsonl,
+    batch_size_raw,
+    max_model_len_raw,
 ) = sys.argv[1:]
 output_dir = Path(output_dir_raw)
 aligned_tokens = int(aligned_tokens_raw)
@@ -1121,17 +1194,11 @@ tail_tokens = int(tail_tokens_raw)
 token_id = int(token_id_raw)
 max_tokens = int(max_tokens_raw)
 skip_concurrent = bool(int(skip_concurrent_raw))
+batch_size = int(batch_size_raw)
+max_model_len = int(max_model_len_raw)
 
 
-def submit(name: str, prompt_tokens: int, output_tokens: int) -> dict:
-    payload = {
-        "model": model_name,
-        "prompt": [token_id] * prompt_tokens,
-        "max_tokens": output_tokens,
-        "temperature": 0.0,
-        "ignore_eos": True,
-        "stream": False,
-    }
+def _post(name: str, payload: dict) -> tuple[dict, float]:
     request_path = output_dir / f"request-{name}.json"
     response_path = output_dir / f"response-{name}.json"
     request_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -1156,11 +1223,10 @@ def submit(name: str, prompt_tokens: int, output_tokens: int) -> dict:
     usage = parsed.get("usage")
     if not isinstance(usage, dict):
         raise RuntimeError(f"{name} response has no usage object")
-    if usage.get("prompt_tokens") != prompt_tokens:
-        raise RuntimeError(
-            f"{name} prompt token mismatch: {usage.get('prompt_tokens')} != "
-            f"{prompt_tokens}"
-        )
+    return usage, start
+
+
+def _summarize(name: str, usage: dict, output_tokens: int, start: float) -> dict:
     if usage.get("completion_tokens") != output_tokens:
         raise RuntimeError(
             f"{name} completion token mismatch: "
@@ -1168,7 +1234,7 @@ def submit(name: str, prompt_tokens: int, output_tokens: int) -> dict:
         )
     summary = {
         "name": name,
-        "prompt_tokens": prompt_tokens,
+        "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": output_tokens,
         "elapsed_seconds": round(time.monotonic() - start, 3),
     }
@@ -1176,29 +1242,98 @@ def submit(name: str, prompt_tokens: int, output_tokens: int) -> dict:
     return summary
 
 
-summaries = [
-    submit("aligned-full-blocks", aligned_tokens, 1),
-    submit("partial-tail-multistep", tail_tokens, max_tokens),
-    submit("repeat-history", tail_tokens, min(max_tokens, 2)),
-]
+def submit(name: str, prompt_tokens: int, output_tokens: int) -> dict:
+    payload = {
+        "model": model_name,
+        "prompt": [token_id] * prompt_tokens,
+        "max_tokens": output_tokens,
+        "temperature": 0.0,
+        "ignore_eos": True,
+        "stream": False,
+    }
+    usage, start = _post(name, payload)
+    if usage.get("prompt_tokens") != prompt_tokens:
+        raise RuntimeError(
+            f"{name} prompt token mismatch: {usage.get('prompt_tokens')} != "
+            f"{prompt_tokens}"
+        )
+    return _summarize(name, usage, output_tokens, start)
 
-if scenario == "both" and not skip_concurrent:
-    concurrent_tokens = max(max_tokens, 8)
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(
-            submit,
-            "concurrent-long",
-            tail_tokens,
-            concurrent_tokens,
+
+def submit_text(name: str, prompt: str, output_tokens: int) -> dict:
+    payload = {
+        "model": model_name,
+        "prompt": prompt,
+        "max_tokens": output_tokens,
+        "temperature": 0.0,
+        "ignore_eos": True,
+        "stream": False,
+    }
+    usage, start = _post(name, payload)
+    return _summarize(name, usage, output_tokens, start)
+
+
+if input_jsonl:
+    entries = []
+    with open(input_jsonl, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+    if not entries:
+        raise SystemExit(f"{input_jsonl} holds no entries.")
+    # Performance probe: only the first entry is sent, duplicated batch-size
+    # times.  The engine runs with prefix caching enabled so every copy shares
+    # the same prefix KV blocks instead of allocating its own.
+    entry = entries[0]
+    for field in ("context", "input"):
+        if not isinstance(entry.get(field), str):
+            raise SystemExit(
+                f"Entry 0 of {input_jsonl} lacks a string {field!r} field."
+            )
+    expected = entry.get("_prompt_tokens")
+    if isinstance(expected, int) and expected + max_tokens > max_model_len:
+        raise SystemExit(
+            f"Entry {entry.get('_id', 0)} needs {expected} prompt tokens "
+            f"+ {max_tokens} output tokens, exceeding max-model-len "
+            f"{max_model_len}."
         )
-        time.sleep(0.1)
-        second = executor.submit(
-            submit,
-            "concurrent-new-prefill",
-            aligned_tokens,
-            2,
-        )
-        summaries.extend((first.result(), second.result()))
+    prompt = entry["context"] + "\n\n" + entry["input"]
+    with ThreadPoolExecutor(max_workers=batch_size) as executor:
+        futures = [
+            executor.submit(
+                submit_text,
+                f"jsonl-{index}-{entry.get('_id', 0)}",
+                prompt,
+                max_tokens,
+            )
+            for index in range(batch_size)
+        ]
+        summaries = [future.result() for future in futures]
+else:
+    summaries = [
+        submit("aligned-full-blocks", aligned_tokens, 1),
+        submit("partial-tail-multistep", tail_tokens, max_tokens),
+        submit("repeat-history", tail_tokens, min(max_tokens, 2)),
+    ]
+
+    if scenario == "both" and not skip_concurrent:
+        concurrent_tokens = max(max_tokens, 8)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(
+                submit,
+                "concurrent-long",
+                tail_tokens,
+                concurrent_tokens,
+            )
+            time.sleep(0.1)
+            second = executor.submit(
+                submit,
+                "concurrent-new-prefill",
+                aligned_tokens,
+                2,
+            )
+            summaries.extend((first.result(), second.result()))
 
 (output_dir / "workload-summary.json").write_text(
     json.dumps(summaries, indent=2, sort_keys=True),

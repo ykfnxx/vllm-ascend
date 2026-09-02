@@ -25,6 +25,7 @@ class DSAOffloadConfig:
     enable_turbo_fused_lookup: bool
     enable_turbo_fused_prefetch_lookup: bool
     enable_cohort_kvgather: bool
+    cohort_kvgather_aiv_limit: int
 
     @property
     def has_connector(self) -> bool:
@@ -94,6 +95,13 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
     enable_cohort_kvgather = raw_config.get("enable_cohort_kvgather", False)
     if not isinstance(enable_cohort_kvgather, bool):
         raise TypeError("dsa_offload.enable_cohort_kvgather must be a boolean.")
+    cohort_kvgather_aiv_limit = raw_config.get("cohort_kvgather_aiv_limit", 4)
+    if isinstance(cohort_kvgather_aiv_limit, bool) or not isinstance(
+        cohort_kvgather_aiv_limit, int
+    ):
+        raise TypeError("dsa_offload.cohort_kvgather_aiv_limit must be an integer.")
+    if cohort_kvgather_aiv_limit < 1:
+        raise ValueError("dsa_offload.cohort_kvgather_aiv_limit must be positive.")
 
     from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
@@ -185,6 +193,7 @@ def load_dsa_offload_config(vllm_config: object) -> DSAOffloadConfig | None:
         enable_turbo_fused_lookup=enable_turbo_fused_lookup,
         enable_turbo_fused_prefetch_lookup=enable_turbo_fused_prefetch_lookup,
         enable_cohort_kvgather=enable_cohort_kvgather,
+        cohort_kvgather_aiv_limit=cohort_kvgather_aiv_limit,
     )
 
 

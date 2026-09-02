@@ -203,6 +203,7 @@ from vllm_ascend.dsa_offload.decode_hash import DecodeBlockHashState
 from vllm_ascend.dsa_offload.external_main import (
     add_decode_external_main_cache,
 )
+from vllm_ascend.dsa_offload.gather import limit_gather_stream_aiv
 from vllm_ascend.dsa_offload.hot_cache import (
     HotCacheLayout,
     HotCacheState,
@@ -920,6 +921,14 @@ class NPUModelRunner(GPUModelRunner):
                 if config.enable_cohort_kvgather and self.device.type == "npu"
                 else None
             )
+            if self._dsa_offload_gather_stream is not None:
+                # Without a per-stream limit the gather kernels would occupy
+                # every AIV and starve the compute stream they overlap with;
+                # a few AIV cores already saturate the transfer bandwidth.
+                limit_gather_stream_aiv(
+                    self._dsa_offload_gather_stream,
+                    config.cohort_kvgather_aiv_limit,
+                )
             if (
                 config.io_backend in {"mock", "kvgather_sim"}
                 and self.compilation_config.cudagraph_mode.has_full_cudagraphs()

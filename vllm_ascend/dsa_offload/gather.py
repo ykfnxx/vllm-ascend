@@ -25,9 +25,47 @@ stream and ``wait_layer_gather`` degenerates to a no-op.
 """
 
 import torch
+from vllm.logger import logger
 
 from . import lookup as _lookup
 from .lookup import DSAOffloadBatch, IndexCacheCohort, LookupPlan
+
+# aclrtDevResLimitType values for acl.rt.set_stream_res_limit: 0 = AIC, 1 = AIV.
+_ACL_RT_STREAM_RES_AIV = 1
+
+
+def limit_gather_stream_aiv(stream, aiv_limit: int) -> None:
+    """Cap the dedicated KV Gather stream at ``aiv_limit`` AIV cores.
+
+    Without a per-stream resource limit the runtime lets the gather kernels
+    occupy every AIV on the device, starving the compute stream when the two
+    overlap.  KV Gather saturates the HBM/RDMA bandwidth with only a few AIV
+    cores, so the surplus occupation is pure contention.  Failure to apply
+    the limit (old CANN, unsupported device) degrades to an unlimited stream.
+    """
+    try:
+        import acl
+
+        ret = acl.rt.set_stream_res_limit(
+            stream.npu_stream, _ACL_RT_STREAM_RES_AIV, aiv_limit
+        )
+    except Exception as exc:
+        logger.warning(
+            "DSA Offload cannot limit the KV Gather stream to %d AIV cores "
+            "(%s); the stream runs without a resource limit.",
+            aiv_limit,
+            exc,
+        )
+        return
+    if ret != 0:
+        logger.warning(
+            "DSA Offload acl.rt.set_stream_res_limit(AIV, %d) failed with "
+            "error %d; the KV Gather stream runs without a resource limit.",
+            aiv_limit,
+            ret,
+        )
+        return
+    logger.info("DSA Offload KV Gather stream limited to %d AIV cores.", aiv_limit)
 
 
 def issue_leader_gather(
