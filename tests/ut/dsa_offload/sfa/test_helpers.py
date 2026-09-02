@@ -45,8 +45,8 @@ def make_mixed_batch(spy_io, *, is_mtp: bool = False, enable_cohort_kvgather: bo
         ),
         is_mtp=is_mtp,
         enable_cohort_kvgather=enable_cohort_kvgather,
-        committed_block_hashes={"prefill": [], "decode": [b"block"]},
-        candidate_block_hashes={},
+        committed_block_keys={"prefill": [], "decode": [101]},
+        candidate_block_keys={},
         sfa_workspace=SFAAddressingWorkspace.create(
             max_num_seqs=layout.max_num_seqs,
             max_block_table_width=layout.hot_blocks_per_row,
@@ -89,8 +89,8 @@ def test_prefetch_target_key_write_updates_mean_cache() -> None:
         query_ranges=((0, 1),),
         query_positions=torch.tensor([8], dtype=torch.int64),
         is_mtp=False,
-        committed_block_hashes={"decode": []},
-        candidate_block_hashes={},
+        committed_block_keys={"decode": []},
+        candidate_block_keys={},
         prefetch_runtime=runtime,
     )
     key_cache = torch.empty((2, 4, 1, 8))
@@ -211,8 +211,8 @@ def test_graph_mtp_mapping_uses_runtime_request_rows(spy_io) -> None:
         query_ranges=((0, 2), (2, 3)),
         query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
         is_mtp=True,
-        committed_block_hashes={"first": [], "second": []},
-        candidate_block_hashes={},
+        committed_block_keys={"first": [], "second": []},
+        candidate_block_keys={},
         graph_query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
     )
 
@@ -381,8 +381,8 @@ def test_fixed_hot_addressing_does_not_depend_on_model_block_table_width() -> No
         query_counts=(1, 1),
         query_positions=torch.tensor([0, 4095], dtype=torch.int64),
         is_mtp=False,
-        committed_block_hashes={"prefill": [], "decode": []},
-        candidate_block_hashes={},
+        committed_block_keys={"prefill": [], "decode": []},
+        candidate_block_keys={},
         sfa_workspace=workspace,
     )
     ordinary_table = torch.arange(64, dtype=torch.int32).reshape(2, 32)

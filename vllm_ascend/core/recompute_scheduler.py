@@ -52,7 +52,7 @@ from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
 from vllm_ascend.dsa_offload.scheduler import (
     DSAOffloadAdmissionBudget,
-    attach_block_hashes,
+    attach_dsa_offload_metadata,
     consume_publish_metadata,
     dsa_offload_consumer_enabled,
     dsa_offload_enabled,
@@ -900,7 +900,7 @@ class RecomputeScheduler(Scheduler):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
-        return attach_block_hashes(self, scheduler_output)
+        return attach_dsa_offload_metadata(self, scheduler_output)
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput

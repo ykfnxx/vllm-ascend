@@ -513,7 +513,7 @@ class GroupedPrefetchRuntime:
             )
             for layer_id in target_layer_ids
         }
-        self._row_hashes: list[tuple[bytes, ...] | None] = [
+        self._row_keys: list[tuple[int, ...] | None] = [
             None
         ] * max_num_seqs
         self._prefetch_stream: object | None = None
@@ -605,13 +605,13 @@ class GroupedPrefetchRuntime:
         for request_index in batch.decode_request_indices:
             request_id = batch.request_ids[request_index]
             row_id = batch.hot_cache.request_to_row[request_id]
-            block_hashes = tuple(batch.block_hashes(request_index))
-            if self._row_hashes[row_id] == block_hashes:
+            block_keys = tuple(batch.block_keys(request_index))
+            if self._row_keys[row_id] == block_keys:
                 continue
-            previous_count = len(self._row_hashes[row_id] or ())
+            previous_count = len(self._row_keys[row_id] or ())
             for layer_id, table in self.storage_ids.items():
                 ids = make_storage_ids(
-                    block_hashes,
+                    block_keys,
                     layer_id,
                     device=table.device,
                 )
@@ -620,12 +620,12 @@ class GroupedPrefetchRuntime:
                     table[row_id, ids.numel() : previous_count].fill_(
                         _INVALID_STORAGE_ID
                     )
-            self._row_hashes[row_id] = block_hashes
+            self._row_keys[row_id] = block_keys
 
     def clear_request_row(self, row_id: int) -> None:
         for table in self.storage_ids.values():
             table[row_id].fill_(_INVALID_STORAGE_ID)
-        self._row_hashes[row_id] = None
+        self._row_keys[row_id] = None
 
     def start(
         self,

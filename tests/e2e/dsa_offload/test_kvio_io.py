@@ -6,6 +6,7 @@ import torch
 
 from vllm_ascend.dsa_offload.io import make_storage_ids
 from vllm_ascend.dsa_offload.kvio import KVIOBackend
+from vllm_ascend.dsa_offload.metadata import make_block_key
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 pytestmark = [
@@ -26,7 +27,11 @@ def test_real_block_put_and_discrete_token_get() -> None:
     backend.register_get_cache(layer_id=0, block_size=block_size, cache_planes=(destination,))
     backend.finalize_registration()
 
-    storage_ids = make_storage_ids([bytes(range(32))], 0, device=source.device)
+    storage_ids = make_storage_ids(
+        [make_block_key(bytes(range(32)))],
+        0,
+        device=source.device,
+    )
     backend.put_blocks(
         layer_id=0,
         storage_ids=storage_ids,
