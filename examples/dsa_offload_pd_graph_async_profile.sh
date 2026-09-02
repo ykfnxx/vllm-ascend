@@ -31,10 +31,9 @@ Optional environment variables:
   LOCAL_SHM_DIR, LOCAL_SHM_NAMESPACE, LOCAL_SHM_TIMEOUT
 
 Prefill runs eager with prefix caching and the mock backend. Decode always
-enables npugraph_ex FULL_DECODE_ONLY Graph, grouped hidden-state prefetch,
---async-scheduling, and no prefix caching. Grouped prefetch requires 2 + 4N
-model layers, with at least 10 layers. A short request warms Graph before the
-measured Decode-only Level1 + PipeUtilization profile starts.
+enables npugraph_ex FULL_DECODE_ONLY Graph, --async-scheduling, and no prefix
+caching. Hidden-state prefetch is disabled. A short request warms Graph before
+the measured Decode-only Level1 + PipeUtilization profile starts.
 
 kvio is not accepted because its compact GET metadata is dynamic and cannot
 run in FULL_DECODE_ONLY Graph mode.
@@ -278,7 +277,7 @@ COMMON_ENV=(
 PREFILL_DSA_CONFIG='{"ascend_compilation_config":{"enable_npugraph_ex":false},"dsa_offload":{"io_backend":"mock"}}'
 DECODE_DSA_CONFIG="{\"ascend_compilation_config\":\
 {\"enable_npugraph_ex\":true},\"dsa_offload\":\
-{\"io_backend\":\"$IO_BACKEND\",\"enable_prefetch_with_hidden_states\":true}}"
+{\"io_backend\":\"$IO_BACKEND\",\"enable_prefetch_with_hidden_states\":false}}"
 
 echo "Starting eager Prefill on physical NPU $PREFILL_DEVICE..."
 env "${COMMON_ENV[@]}" "ASCEND_RT_VISIBLE_DEVICES=$PREFILL_DEVICE" \
@@ -301,7 +300,7 @@ env "${COMMON_ENV[@]}" "ASCEND_RT_VISIBLE_DEVICES=$PREFILL_DEVICE" \
 PREFILL_PID=$!
 CHILD_PIDS+=("$PREFILL_PID")
 
-echo "Starting npugraph_ex + prefetch + async Decode on physical NPU $DECODE_DEVICE..."
+echo "Starting npugraph_ex + async Decode on physical NPU $DECODE_DEVICE..."
 env "${COMMON_ENV[@]}" "ASCEND_RT_VISIBLE_DEVICES=$DECODE_DEVICE" \
     vllm serve "$MODEL" \
     --host 0.0.0.0 --port "$DECODE_HTTP_PORT" \
@@ -421,7 +420,6 @@ required_log_markers = (
     graph_marker,
     "Replaying aclgraph",
     "enable_npugraph_ex is enabled",
-    "DSA_OFFLOAD_GRAPH_PREFETCH_ACTIVE",
     "Max profiling iterations reached",
 )
 missing_log_markers = [marker for marker in required_log_markers if marker not in decode_log]
@@ -452,8 +450,6 @@ for output in outputs:
 
 normalized = re.sub(r"[^a-z0-9]", "", operator_text.lower())
 required = ["lookupupdate", "sparseflashattention"]
-if mtp_speculative_tokens > 0:
-    required.append("prefetchlookupupdate")
 if io_backend == "kvgather_sim":
     required.append("asukvgather")
 missing = [name for name in required if name not in normalized]
@@ -470,7 +466,7 @@ print(json.dumps({
     "output_length": output_length,
     "graph_mode": "FULL_DECODE_ONLY",
     "npugraph_ex": True,
-    "hidden_state_prefetch": True,
+    "hidden_state_prefetch": False,
     "mtp_speculative_tokens": mtp_speculative_tokens,
     "profile_delay_iterations": profile_delay_iterations,
     "profile_decode_steps": profile_decode_steps,
