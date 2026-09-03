@@ -53,6 +53,7 @@ ENABLE_PREFETCH_WITH_HIDDEN_STATES="0"
 PREFETCH_TOP_K="2048"
 ENABLE_COHORT_KVGATHER="0"
 COHORT_KVGATHER_AIV_LIMIT="4"
+DSA_OFFLOAD_ENABLED="1"
 CUDAGRAPH_MODE="FULL_DECODE_ONLY"
 GPU_MEMORY_UTILIZATION="0.50"
 STARTUP_TIMEOUT="900"
@@ -120,6 +121,10 @@ Core options:
   --cohort-kvgather-aiv-limit N
                               AIV cores the dedicated KV Gather stream may
                               occupy. Default: 4
+  --no-dsa-offload            Full-HBM baseline: drop additional_config.dsa_offload
+                              entirely so all KV stays in HBM and the engine runs
+                              the plain DSA sparse path without lookup/update,
+                              prefetch, cohort kvgather, or io_backend I/O.
   --cudagraph-mode MODE       FULL_DECODE_ONLY or NONE.
                               Default: FULL_DECODE_ONLY
   --max-model-len N           Context limit. Default: 4096
@@ -325,6 +330,10 @@ while (($# > 0)); do
             require_value "$@"
             COHORT_KVGATHER_AIV_LIMIT="$2"
             shift 2
+            ;;
+        --no-dsa-offload)
+            DSA_OFFLOAD_ENABLED="0"
+            shift
             ;;
         --data-parallel-size)
             require_value "$@"
@@ -546,6 +555,24 @@ if ((COHORT_KVGATHER_AIV_LIMIT == 0)); then
     echo "cohort-kvgather-aiv-limit must be positive." >&2
     exit 2
 fi
+if [[ "$DSA_OFFLOAD_ENABLED" == "0" ]]; then
+    if [[ "$IO_BACKEND" != "mock" ]]; then
+        echo "--no-dsa-offload drops io_backend I/O; --io-backend requires DSA Offload." >&2
+        exit 2
+    fi
+    if [[ "$ENABLE_PREFETCH_WITH_HIDDEN_STATES" == "1" ]]; then
+        echo "--no-dsa-offload drops grouped hidden-state prefetch." >&2
+        exit 2
+    fi
+    if [[ "$ENABLE_COHORT_KVGATHER" == "1" ]]; then
+        echo "--no-dsa-offload drops cohort KV Gather." >&2
+        exit 2
+    fi
+    if [[ "$VERIFY_PATH" == "1" ]]; then
+        echo "--verify-path requires DSA Offload operator evidence; cannot combine with --no-dsa-offload." >&2
+        exit 2
+    fi
+fi
 if [[ -n "$INPUT_JSONL" ]]; then
     if [[ -r "$INPUT_JSONL" ]]; then
         INPUT_JSONL="$(cd "$(dirname "$INPUT_JSONL")" && pwd)/$(basename "$INPUT_JSONL")"
@@ -607,7 +634,8 @@ PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
     "$IO_BACKEND" \
     "$PROMPT_TOKEN_ID" \
     "$MTP_SPECULATIVE_TOKENS" \
-    "$ENABLE_PREFETCH_WITH_HIDDEN_STATES" <<'PY'
+    "$ENABLE_PREFETCH_WITH_HIDDEN_STATES" \
+    "$DSA_OFFLOAD_ENABLED" <<'PY'
 from __future__ import annotations
 
 import importlib
@@ -621,6 +649,7 @@ io_backend = sys.argv[3]
 prompt_token_id = int(sys.argv[4])
 mtp_tokens = int(sys.argv[5])
 prefetch_enabled = bool(int(sys.argv[6]))
+dsa_offload_enabled = bool(int(sys.argv[7]))
 
 model_path = Path(model_name)
 if model_path.is_dir() and (model_path / "config.json").is_file():
@@ -672,37 +701,39 @@ if repo_root not in package_path.parents:
 
 importlib.import_module("vllm_ascend.vllm_ascend_C")
 namespace = torch.ops._C_ascend
-required_ops = [
-    "dsa_offload_lookup_update",
-]
-if mtp_tokens:
-    required_ops.extend(
-        [
-            "dsa_offload_lookup_update_batch",
-            "dsa_sparse_turbo_lookup_update_batch",
-            "dsa_sparse_turbo_fused_lookup_update_batch",
-        ]
-    )
-if prefetch_enabled:
-    required_ops.extend([
-        "npu_lightning_indexer_hi_cached",
-        "npu_scatter_nd_update_mean",
-        "prefetch_qli_fusion",
-    ])
+required_ops = []
+if dsa_offload_enabled:
+    required_ops = [
+        "dsa_offload_lookup_update",
+    ]
     if mtp_tokens:
         required_ops.extend(
             [
-                "dsa_sparse_turbo_prefetch_lookup_update_batch",
-                "dsa_sparse_turbo_fused_prefetch_lookup_update_batch",
+                "dsa_offload_lookup_update_batch",
+                "dsa_sparse_turbo_lookup_update_batch",
+                "dsa_sparse_turbo_fused_lookup_update_batch",
             ]
         )
-if io_backend == "kvio":
-    required_ops.extend(["npu_get_put_batch", "npu_send_wait"])
-    rdma_kv_ops = importlib.import_module("rdma_kv_ops")
-    if not hasattr(rdma_kv_ops, "aiv_init"):
-        raise SystemExit("rdma_kv_ops does not expose aiv_init")
-elif io_backend == "kvgather_sim":
-    required_ops.append("asu_kv_gather")
+    if prefetch_enabled:
+        required_ops.extend([
+            "npu_lightning_indexer_hi_cached",
+            "npu_scatter_nd_update_mean",
+            "prefetch_qli_fusion",
+        ])
+        if mtp_tokens:
+            required_ops.extend(
+                [
+                    "dsa_sparse_turbo_prefetch_lookup_update_batch",
+                    "dsa_sparse_turbo_fused_prefetch_lookup_update_batch",
+                ]
+            )
+    if io_backend == "kvio":
+        required_ops.extend(["npu_get_put_batch", "npu_send_wait"])
+        rdma_kv_ops = importlib.import_module("rdma_kv_ops")
+        if not hasattr(rdma_kv_ops, "aiv_init"):
+            raise SystemExit("rdma_kv_ops does not expose aiv_init")
+    elif io_backend == "kvgather_sim":
+        required_ops.append("asu_kv_gather")
 
 missing = [name for name in required_ops if not hasattr(namespace, name)]
 if missing:
@@ -754,7 +785,8 @@ python3 - \
     "$MAX_TOKENS" \
     "$MTP_SPECULATIVE_TOKENS" \
     "$ENABLE_PREFETCH_WITH_HIDDEN_STATES" \
-    "$PREFETCH_TOP_K" <<'PY'
+    "$PREFETCH_TOP_K" \
+    "$DSA_OFFLOAD_ENABLED" <<'PY'
 import json
 import sys
 
@@ -774,6 +806,7 @@ import sys
     mtp_speculative_tokens,
     enable_prefetch_with_hidden_states,
     prefetch_top_k,
+    dsa_offload_enabled,
 ) = sys.argv[1:]
 manifest = {
     "branch": branch,
@@ -782,6 +815,7 @@ manifest = {
     "scenario": scenario,
     "connector": connector,
     "io_backend": io_backend,
+    "dsa_offload_enabled": bool(int(dsa_offload_enabled)),
     "kvio_model_id": int(kvio_model_id),
     "block_size": int(block_size),
     "aligned_prompt_tokens": int(aligned_prompt_tokens),
@@ -979,7 +1013,11 @@ PY
         && "$ENABLE_COHORT_KVGATHER" == "1" ]]; then
         cohort_kvgather_enabled="true"
     fi
-    dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_offload\":{\"io_backend\":\"$IO_BACKEND\",\"kvio_model_id\":$KVIO_MODEL_ID,\"enable_prefetch_with_hidden_states\":$prefetch_enabled,\"prefetch_top_k\":$PREFETCH_TOP_K,\"enable_cohort_kvgather\":$cohort_kvgather_enabled,\"cohort_kvgather_aiv_limit\":$COHORT_KVGATHER_AIV_LIMIT}}"
+    if [[ "$DSA_OFFLOAD_ENABLED" == "1" ]]; then
+        dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_offload\":{\"io_backend\":\"$IO_BACKEND\",\"kvio_model_id\":$KVIO_MODEL_ID,\"enable_prefetch_with_hidden_states\":$prefetch_enabled,\"prefetch_top_k\":$PREFETCH_TOP_K,\"enable_cohort_kvgather\":$cohort_kvgather_enabled,\"cohort_kvgather_aiv_limit\":$COHORT_KVGATHER_AIV_LIMIT}}"
+    else
+        dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false}"
+    fi
     if [[ "$VERIFY_PATH" == "1" ]] \
         && [[ "$kv_role" != "kv_producer" || "$IO_BACKEND" == "kvio" ]]; then
         mkdir -p "$profile_dir"
@@ -1003,7 +1041,7 @@ PY
     fi
 
     echo "Starting $service_name on physical NPU $device_id..."
-    echo "  hidden_state_prefetch=$prefetch_enabled prefetch_top_k=$PREFETCH_TOP_K cohort_kvgather=$cohort_kvgather_enabled aiv_limit=$COHORT_KVGATHER_AIV_LIMIT dp=$DATA_PARALLEL_SIZE ep=$ENABLE_EXPERT_PARALLEL prefix_caching=$prefix_caching_enabled graph_mode=$CUDAGRAPH_MODE"
+    echo "  dsa_offload=$DSA_OFFLOAD_ENABLED hidden_state_prefetch=$prefetch_enabled prefetch_top_k=$PREFETCH_TOP_K cohort_kvgather=$cohort_kvgather_enabled aiv_limit=$COHORT_KVGATHER_AIV_LIMIT dp=$DATA_PARALLEL_SIZE ep=$ENABLE_EXPERT_PARALLEL prefix_caching=$prefix_caching_enabled graph_mode=$CUDAGRAPH_MODE"
     env \
         "${COMMON_NETWORK_ENV[@]}" \
         "ASCEND_RT_VISIBLE_DEVICES=$device_id" \
@@ -1531,24 +1569,29 @@ PY
 fi
 
 echo
-echo "PASS: DSA Offload $SCENARIO scenario completed with connector=$CONNECTOR and io_backend=$IO_BACKEND."
-if [[ "$ENABLE_PREFETCH_WITH_HIDDEN_STATES" == "1" ]]; then
-    if [[ "$VERIFY_PATH" == "1" ]]; then
-        echo "VALIDATED: grouped hidden-state prefetch lookup and Indexer execution with prefetch_top_k=$PREFETCH_TOP_K."
-    else
-        echo "EXERCISED: grouped hidden-state prefetch with prefetch_top_k=$PREFETCH_TOP_K."
-        echo "STILL NEEDED: rerun with --verify-path for prefetch operator evidence."
-    fi
-fi
-if [[ "$IO_BACKEND" == "mock" ]]; then
-    echo "VALIDATED: config/bootstrap, request lifecycle, lookup, Hot Cache/SFA path, and role-specific control flow."
-    echo "NOT VALIDATED: capacity-layer full-block PUT/token GET or output accuracy; rerun with --io-backend kvio."
-elif [[ "$IO_BACKEND" == "kvgather_sim" ]]; then
-    echo "VALIDATED: config/bootstrap, request lifecycle, lookup, Hot Cache/SFA path, and ASU KV Gather execution."
-    echo "NOT VALIDATED: external payload correctness; kvgather_sim uses synthetic zero source blocks."
+if [[ "$DSA_OFFLOAD_ENABLED" == "0" ]]; then
+    echo "PASS: full-HBM baseline (no DSA Offload) $SCENARIO scenario completed with connector=$CONNECTOR."
+    echo "All KV stayed in HBM; no offload lookup/update, prefetch, cohort kvgather, or io_backend I/O ran."
 else
-    echo "VALIDATED: config/bootstrap, request lifecycle, lookup, Hot Cache/SFA path, and KVIO PUT/GET execution."
-    echo "STILL NEEDED: compare output tokens with a known-good non-offload baseline for accuracy sign-off."
+    echo "PASS: DSA Offload $SCENARIO scenario completed with connector=$CONNECTOR and io_backend=$IO_BACKEND."
+    if [[ "$ENABLE_PREFETCH_WITH_HIDDEN_STATES" == "1" ]]; then
+        if [[ "$VERIFY_PATH" == "1" ]]; then
+            echo "VALIDATED: grouped hidden-state prefetch lookup and Indexer execution with prefetch_top_k=$PREFETCH_TOP_K."
+        else
+            echo "EXERCISED: grouped hidden-state prefetch with prefetch_top_k=$PREFETCH_TOP_K."
+            echo "STILL NEEDED: rerun with --verify-path for prefetch operator evidence."
+        fi
+    fi
+    if [[ "$IO_BACKEND" == "mock" ]]; then
+        echo "VALIDATED: config/bootstrap, request lifecycle, lookup, Hot Cache/SFA path, and role-specific control flow."
+        echo "NOT VALIDATED: capacity-layer full-block PUT/token GET or output accuracy; rerun with --io-backend kvio."
+    elif [[ "$IO_BACKEND" == "kvgather_sim" ]]; then
+        echo "VALIDATED: config/bootstrap, request lifecycle, lookup, Hot Cache/SFA path, and ASU KV Gather execution."
+        echo "NOT VALIDATED: external payload correctness; kvgather_sim uses synthetic zero source blocks."
+    else
+        echo "VALIDATED: config/bootstrap, request lifecycle, lookup, Hot Cache/SFA path, and KVIO PUT/GET execution."
+        echo "STILL NEEDED: compare output tokens with a known-good non-offload baseline for accuracy sign-off."
+    fi
 fi
 echo "Focused diagnostics:"
 if [[ "$SCENARIO" == "pd" ]]; then
