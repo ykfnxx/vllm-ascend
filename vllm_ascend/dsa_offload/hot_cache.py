@@ -257,8 +257,7 @@ def commit_decode_tail(
     if batch is None or batch.hot_cache is None or batch.is_mtp:
         return
     for request_index in batch.decode_request_indices:
-        begin, end = batch.query_ranges[request_index]
-        position = int(batch.query_positions[end - 1].item())
+        position = batch.query_end_positions[request_index]
         if (position + 1) % batch.layout.block_size == 0:
             _put_tail_block(
                 batch=batch,

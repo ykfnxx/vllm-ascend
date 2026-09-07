@@ -38,6 +38,9 @@ def load_scheduler_module(monkeypatch):
     modules["vllm_ascend.dsa_offload.pd"].DSA_OFFLOAD_PD_HANDOFF_KEY = "dsa_offload_handoff"
     for module in modules.values():
         module.__path__ = []
+    modules["vllm_ascend.dsa_offload"].__path__ = [
+        str(ROOT / "vllm_ascend" / "dsa_offload")
+    ]
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
 
@@ -146,6 +149,7 @@ def test_scheduler_attaches_committed_load_only_and_new_candidate_hashes(
 
     scheduler = Scheduler()
     scheduler.vllm_config = SimpleNamespace(additional_config={"dsa_offload": {}})
+    scheduler.block_size = 2
     scheduler.requests = {
         "new": make_request([b"new-0"], [1]),
         "cached": make_request([b"cached-0"], [2]),
@@ -157,9 +161,11 @@ def test_scheduler_attaches_committed_load_only_and_new_candidate_hashes(
 
     output = scheduler.schedule()
 
-    assert output.scheduled_new_reqs[0].block_hashes == [b"new-0"]
-    assert output.scheduled_cached_reqs.block_hashes == [[b"cached-0"]]
-    assert output.dsa_offload_connector_block_hashes == {"load": [b"load-0"]}
+    assert set(output.block_hash_updates) == {"new", "cached", "load", "mtp"}
+    assert output.block_hash_updates["load"].hashes == (b"load-0",)
+    assert not hasattr(output.scheduled_new_reqs[0], "block_hashes")
+    assert not hasattr(output.scheduled_cached_reqs, "block_hashes")
+    assert not hasattr(output, "dsa_offload_connector_block_hashes")
     assert output.dsa_offload_candidate_block_hashes == {"mtp": [b"candidate-1"]}
     assert seen_candidates[0]._all_token_ids == [5, 6, 7, 8]
     assert seen_candidates[0].block_hashes == [b"committed-0"]
@@ -192,7 +198,7 @@ def test_connector_free_scheduler_has_no_remote_handoff_hashes(
 
     output = module.attach_block_hashes(scheduler, scheduler.output)
 
-    assert output.dsa_offload_connector_block_hashes == {}
+    assert set(output.block_hash_updates) == {"new", "cached"}
 
 
 def test_async_scheduler_attaches_incomplete_decode_block_context(
@@ -259,18 +265,22 @@ def test_connector_free_scheduler_generates_incremental_dsa_hashes(
 
     module.attach_block_hashes(scheduler, output)
 
-    assert output.scheduled_new_reqs[0].block_hashes == [bytes([1, 2])]
+    assert output.block_hash_updates["request"].hashes == (bytes([1, 2]),)
     assert request.block_hashes == []
 
-    request._all_token_ids.append(4)
-    request.all_token_ids.append(4)
     output.scheduled_new_reqs = []
     output.scheduled_cached_reqs = SimpleNamespace(req_ids=["request"])
     module.attach_block_hashes(scheduler, output)
 
-    assert output.scheduled_cached_reqs.block_hashes == [
-        [bytes([1, 2]), bytes([3, 4])]
-    ]
+    assert output.block_hash_updates is None
+
+    request._all_token_ids.append(4)
+    request.all_token_ids.append(4)
+    module.attach_block_hashes(scheduler, output)
+
+    update = output.block_hash_updates["request"]
+    assert update.base_count == 1
+    assert update.hashes == (bytes([3, 4]),)
     assert request.block_hashes == []
 
 
@@ -278,6 +288,7 @@ def test_connector_free_mtp_uses_dsa_hash_state(monkeypatch) -> None:
     module, Scheduler = load_scheduler_module(monkeypatch)
     scheduler = Scheduler()
     scheduler.vllm_config = SimpleNamespace(additional_config={"dsa_offload": {}})
+    scheduler.block_size = 2
     request = make_request([], [1, 2, 3])
     scheduler.requests = {"request": request}
     scheduler._vllm_ascend_dsa_offload_hash_state = make_fallback_hash_state(
@@ -293,7 +304,7 @@ def test_connector_free_mtp_uses_dsa_hash_state(monkeypatch) -> None:
 
     module.attach_block_hashes(scheduler, output)
 
-    assert output.scheduled_new_reqs[0].block_hashes == [bytes([1, 2])]
+    assert output.block_hash_updates["request"].hashes == (bytes([1, 2]),)
     assert output.dsa_offload_candidate_block_hashes == {
         "request": [bytes([3, 4])]
     }
@@ -316,7 +327,7 @@ def test_connector_free_hash_state_is_released(monkeypatch) -> None:
 
     module.attach_block_hashes(scheduler, output)
 
-    assert output.scheduled_new_reqs[0].block_hashes == [bytes([1, 2])]
+    assert output.block_hash_updates["request"].hashes == (bytes([1, 2]),)
     assert state.committed_by_request == {}
 
 
