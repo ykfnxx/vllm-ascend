@@ -9,7 +9,7 @@ import torch
 
 from .constants import QUERY_WIDTH, RESIDENT_SLOTS
 from .hot_cache import HotCacheLayout, HotCacheState
-from .io import IOBackend, make_storage_ids, require_block_keys
+from .io import IOBackend, make_storage_ids, require_block_hashes
 from .lookup import (
     IndexCacheCohort,
     clear_lookup_row,
@@ -134,7 +134,7 @@ class PrefillPublishState:
     scheduled_token_counts: tuple[int, ...]
     stored_token_counts: tuple[int, ...]
     publish_requests: tuple[bool, ...]
-    committed_block_keys: Mapping[str, Sequence[int]]
+    committed_block_hashes: Mapping[str, Sequence[bytes]]
     io_backend: IOBackend
     tp_rank: int
     layer_topk: dict[str, dict[str, list[int]]] = field(default_factory=dict)
@@ -170,15 +170,15 @@ class PrefillPublishState:
             if should_publish:
                 full_block_count = stored_token_count // block_size
                 if full_block_count:
-                    request_keys = self.committed_block_keys[request_id]
-                    require_block_keys(
-                        request_keys,
+                    request_hashes = self.committed_block_hashes[request_id]
+                    require_block_hashes(
+                        request_hashes,
                         full_block_count,
                         context=f"Prefill publish for request {request_id}",
                     )
                     source_block_ids = block_table[request_index, :full_block_count].to(torch.int64)
                     storage_ids = make_storage_ids(
-                        request_keys[:full_block_count],
+                        request_hashes[:full_block_count],
                         layer_id,
                         device=source_block_ids.device,
                     )
@@ -291,12 +291,12 @@ def _initialize_hot_row(
     cohorts: Sequence[IndexCacheCohort],
     lookup_states: Mapping[str, LookupState],
     layer_ids: Mapping[str, int],
-    committed_block_keys: Sequence[int],
+    committed_block_hashes: Sequence[bytes],
     io_backend: IOBackend,
 ) -> int:
     full_block_count = stored_token_count // block_size
-    require_block_keys(
-        committed_block_keys,
+    require_block_hashes(
+        committed_block_hashes,
         full_block_count,
         context=f"Hot Cache admission for request {request_id}",
     )
@@ -324,7 +324,7 @@ def _initialize_hot_row(
         )
         if positions.numel():
             storage_ids = make_storage_ids(
-                committed_block_keys,
+                committed_block_hashes,
                 layer_id,
                 device=cache_planes[0].device,
             )
@@ -363,7 +363,7 @@ def admit_from_handoff(
     cohorts: Sequence[IndexCacheCohort],
     lookup_states: Mapping[str, LookupState],
     layer_ids: Mapping[str, int],
-    committed_block_keys: Sequence[int],
+    committed_block_hashes: Sequence[bytes],
     io_backend: IOBackend,
 ) -> int:
     row_id = _initialize_hot_row(
@@ -375,7 +375,7 @@ def admit_from_handoff(
         cohorts=cohorts,
         lookup_states=lookup_states,
         layer_ids=layer_ids,
-        committed_block_keys=committed_block_keys,
+        committed_block_hashes=committed_block_hashes,
         io_backend=io_backend,
     )
     hot_cache.mark_ready(request_id)
@@ -389,7 +389,7 @@ def admit_local_from_prefill(
     cohorts: Sequence[IndexCacheCohort],
     lookup_states: Mapping[str, LookupState],
     layer_ids: Mapping[str, int],
-    committed_block_keys: Sequence[int],
+    committed_block_hashes: Sequence[bytes],
     io_backend: IOBackend,
 ) -> int:
     expected_layers = set(layer_ids)
@@ -419,7 +419,7 @@ def admit_local_from_prefill(
             cohorts=cohorts,
             lookup_states=lookup_states,
             layer_ids=layer_ids,
-            committed_block_keys=committed_block_keys,
+            committed_block_hashes=committed_block_hashes,
             io_backend=io_backend,
         )
         tail_tokens = handoff.stored_token_count % handoff.block_size
