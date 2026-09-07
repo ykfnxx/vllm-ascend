@@ -608,16 +608,34 @@ class GroupedPrefetchRuntime:
             block_hashes = tuple(batch.block_hashes(request_index))
             if self._row_hashes[row_id] == block_hashes:
                 continue
-            previous_count = len(self._row_hashes[row_id] or ())
-            for layer_id, table in self.storage_ids.items():
-                ids = make_storage_ids(
-                    block_hashes,
-                    layer_id,
-                    device=table.device,
+            previous_hashes = self._row_hashes[row_id] or ()
+            previous_count = len(previous_hashes)
+            # Keep unchanged history in place, including candidate hashes that
+            # have become committed. Merge adjacent changes into one copy.
+            changed_ranges: list[tuple[int, int]] = []
+            begin = None
+            for index, block_hash in enumerate(block_hashes):
+                changed = (
+                    index >= previous_count
+                    or previous_hashes[index] != block_hash
                 )
-                table[row_id, : ids.numel()].copy_(ids)
-                if ids.numel() < previous_count:
-                    table[row_id, ids.numel() : previous_count].fill_(
+                if changed and begin is None:
+                    begin = index
+                elif not changed and begin is not None:
+                    changed_ranges.append((begin, index))
+                    begin = None
+            if begin is not None:
+                changed_ranges.append((begin, len(block_hashes)))
+            for layer_id, table in self.storage_ids.items():
+                for begin, end in changed_ranges:
+                    ids = make_storage_ids(
+                        block_hashes[begin:end],
+                        layer_id,
+                        device=table.device,
+                    )
+                    table[row_id, begin:end].copy_(ids)
+                if len(block_hashes) < previous_count:
+                    table[row_id, len(block_hashes) : previous_count].fill_(
                         _INVALID_STORAGE_ID
                     )
             self._row_hashes[row_id] = block_hashes
