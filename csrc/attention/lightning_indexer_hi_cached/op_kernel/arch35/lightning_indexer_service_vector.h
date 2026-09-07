@@ -199,6 +199,9 @@ private:
                                           const LocalTensor<float> &scores,
                                           const LocalTensor<int32_t> &realIndices,
                                           int32_t inputLen, int32_t topCount);
+    __aicore__ inline void AccumulateDecodeStage2TopK(const LocalTensor<float> &scores,
+                                                       const LocalTensor<int32_t> &indices,
+                                                       int32_t localChunkIdx, bool isLastChunk);
     __aicore__ inline void MergeTopKLists(const LocalTensor<float> &dst, int32_t dstCapacity,
                                           const LocalTensor<float> &first, int32_t firstCapacity,
                                           int32_t firstCount,
@@ -212,7 +215,10 @@ __aicore__ inline void LIVector<LIT>::InitBuffers(TPipe *pipe)
     uint32_t outNeedBufSize = (BASE_TOPK * 2) * 2 * sizeof(float);
     uint32_t reduceCacheSize = REDUCE_BANK_CONFLICT_OFFSETS + groupInner_ * s2BaseSize_ * sizeof(float);
     outNeedBufSize = reduceCacheSize > outNeedBufSize ? reduceCacheSize : outNeedBufSize;
-    // Stage1 shares this queue between the output list and block score/index storage.
+    // Preserve the established Stage1 scratch layout for the embedded-mask
+    // path. Besides the output list, Stage1 temporarily uses block-sized
+    // score/index storage from this queue; shrinking it regresses ratio=32 at
+    // medium sequence lengths even though the old Stage2 list scan is gone.
     uint32_t hiScratchSize =
         (constInfo_.sparseCount + constInfo_.maxBlockNumPerBatch) * sizeof(int32_t);
     outNeedBufSize = hiScratchSize > outNeedBufSize ? hiScratchSize : outNeedBufSize;
@@ -220,7 +226,9 @@ __aicore__ inline void LIVector<LIT>::InitBuffers(TPipe *pipe)
     pipe->InitBuffer(inQueue_, 2,
                      groupInner_ * s2BaseSize_ * sizeof(float) + s2BaseSize_ * sizeof(float)); // 69KB mm_out_ub
     pipe->InitBuffer(outQueue_, 1, outNeedBufSize);                                            // 32KB  extract
-    // Each local row owns independent running-TopK and four-tile cache storage.
+    // Keep independent storage for each local row's running TopK and its
+    // four-tile cache. A5 uses S1=4, so reusing the old single-region formula
+    // would place SortedBasicBlock_ exactly past the end of this TBuf.
     pipe->InitBuffer(sortOutBuf_, localTopKRowNum_ * BASE_TOPK * TOPK_LIST_COMPONENTS * 2 * sizeof(float));
     pipe->InitBuffer(indexBuf_, s2BaseSize_ * sizeof(int32_t));                                // 2KB
     pipe->InitBuffer(reduceOutBuf_, s2BaseSize_ * 2 * sizeof(float));                          // 4KB
@@ -386,6 +394,37 @@ __aicore__ inline void LIVector<LIT>::SelectTileTopK(const LocalTensor<float> &d
 {
     SelectTopKList(dst, scores, realIndices, inputLen,
                    LICommon::Min(topCount, s2BaseSize_), s2BaseSize_);
+}
+
+template <typename LIT>
+__aicore__ inline void LIVector<LIT>::AccumulateDecodeStage2TopK(
+    const LocalTensor<float> &scores, const LocalTensor<int32_t> &indices,
+    int32_t localChunkIdx, bool isLastChunk)
+{
+    // Decouple the native 128-token Cube tile from the TopK window. Reuse one
+    // Stage1 score/index table; no additional UB or cross-core state is needed.
+    int32_t tilesPerWindow = BASE_TOPK / s2BaseSize_;
+    int32_t windowTileIdx = localChunkIdx % tilesPerWindow;
+    int32_t offset = windowTileIdx * s2BaseSize_;
+    Adds(SortedBasicBlock_[offset], scores, 0.0f, s2BaseSize_);
+    Adds(GetTopKIndices(SortedBasicBlock_, BASE_TOPK)[offset], indices, 0, s2BaseSize_);
+    PipeBarrier<PIPE_V>();
+    if (windowTileIdx + 1 != tilesPerWindow && !isLastChunk) {
+        return;
+    }
+
+    int32_t windowCount = offset + s2BaseSize_;
+    int32_t previousCount = LICommon::Min(
+        static_cast<int32_t>(BASE_TOPK), (localChunkIdx - windowTileIdx) * s2BaseSize_);
+    if (previousCount == 0) {
+        // All candidates fit. Their order is not consumed by the VF merge;
+        // quantization can wait until an actual selection is required.
+        CopyTopKList(globalTopkUb_, BASE_TOPK, SortedBasicBlock_, BASE_TOPK, windowCount);
+    } else {
+        MergeTopKLists(globalTopkUb_, BASE_TOPK,
+                       globalTopkUb_, BASE_TOPK, previousCount,
+                       SortedBasicBlock_, BASE_TOPK, windowCount, BASE_TOPK);
+    }
 }
 
 template <typename LIT>
@@ -944,8 +983,12 @@ __aicore__ inline void LIVector<LIT>::SelectStage1BlocksImpl(const LICommon::Run
             int32_t scoredBlockCount = GetScoredBlockCount(totalBlockNum);
             constexpr int32_t STAGE1_SORT_LEN = 32;
             int32_t stage1BlockScoreTableRequiredLen = LICommon::Align(totalBlockNum, STAGE1_SORT_LEN);
-            // Stage1 stores the complete block score/index table in Stage2's
-            // per-row cache region. One row holds BASE_TOPK scores and indices.
+            // Stage1 and Stage2 execute serially. Keep the complete block
+            // score/index table in Stage2's per-row cache region so TopM no
+            // longer reduces the table capacity. The previous tail-sharing
+            // layout switched to the streaming fallback at TopM=1024 for a
+            // 128K sequence, which exposed an invalid dynamic-list layout on
+            // A5. One row here holds BASE_TOPK scores plus BASE_TOPK indices.
             int32_t stage1BlockScoreTableLimit = BASE_TOPK;
             int32_t stage1BlockScoreTableLen =
                 LICommon::Min(stage1BlockScoreTableRequiredLen, stage1BlockScoreTableLimit);
@@ -1510,48 +1553,56 @@ __aicore__ inline void LIVector<LIT>::SelectDecodeStage2HiTokens(const LICommon:
     }
     PipeBarrier<PIPE_V>();
 
-    LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
-    int64_t globalTopkUbCacheIdx = localChunkIdx % 4;
-    LocalTensor<float> cacheSortedBlock =
-        SortedBasicBlock_[globalTopkUbCacheIdx * s2BaseSize_ * 2];
-    if (hasHiBlock) {
-        int32_t validTokenCount = 0;
-        for (int32_t localBlockIdx = 0; localBlockIdx < blocksPerChunk; ++localBlockIdx) {
-            validTokenCount += selectedTokenCount[localBlockIdx];
-        }
-        SelectTileTopK(cacheSortedBlock, sortScoreUb, sortIndiceUbInt,
-                       s2BaseSize_, validTokenCount);
+    if (constInfo_.sparseCount == BASE_TOPK) {
+        // Scores and indices already mask every invalid tail slot. Keeping
+        // these slots in the window preserves the -inf/-1 padding contract.
+        AccumulateDecodeStage2TopK(sortScoreUb, sortIndiceUbInt, localChunkIdx,
+                                   chunkIdx == groupEndChunk - 1);
     } else {
-        InitTopKList(cacheSortedBlock, s2BaseSize_);
-    }
-
-    bool isChunkGroupEnd = (globalTopkUbCacheIdx == 3) || (chunkIdx == groupEndChunk - 1);
-    if (isChunkGroupEnd) {
-        int32_t groupListCount = static_cast<int32_t>(globalTopkUbCacheIdx + 1);
-        int32_t groupCandidateCount = s2BaseSize_;
-        CopyTopKList(tmpSortBuf, BASE_TOPK, SortedBasicBlock_, s2BaseSize_, s2BaseSize_);
-        for (int32_t listIdx = 1; listIdx < groupListCount; ++listIdx) {
-            int32_t nextCandidateCount = LICommon::Min(BASE_TOPK, groupCandidateCount + s2BaseSize_);
-            MergeTopKLists(tmpSortBuf, BASE_TOPK,
-                           tmpSortBuf, BASE_TOPK, groupCandidateCount,
-                           SortedBasicBlock_[listIdx * s2BaseSize_ * TOPK_LIST_COMPONENTS],
-                           s2BaseSize_, s2BaseSize_, nextCandidateCount);
-            groupCandidateCount = nextCandidateCount;
-        }
-        int32_t previousCandidateCount = LICommon::Min(
-            BASE_TOPK, LICommon::Max(0, localChunkIdx - static_cast<int32_t>(globalTopkUbCacheIdx)) * s2BaseSize_);
-        if (previousCandidateCount == 0) {
-            DataCopy(globalTopkUb_, tmpSortBuf, BASE_TOPK * TOPK_LIST_COMPONENTS);
+        LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
+        int64_t globalTopkUbCacheIdx = localChunkIdx % 4;
+        LocalTensor<float> cacheSortedBlock =
+            SortedBasicBlock_[globalTopkUbCacheIdx * s2BaseSize_ * 2];
+        if (hasHiBlock) {
+            int32_t validTokenCount = 0;
+            for (int32_t localBlockIdx = 0; localBlockIdx < blocksPerChunk; ++localBlockIdx) {
+                validTokenCount += selectedTokenCount[localBlockIdx];
+            }
+            SelectTileTopK(cacheSortedBlock, sortScoreUb, sortIndiceUbInt,
+                           s2BaseSize_, validTokenCount);
         } else {
-            int32_t mergedCandidateCount = LICommon::Min(
-                BASE_TOPK, previousCandidateCount + groupCandidateCount);
-            MergeTopKLists(globalTopkUb_, BASE_TOPK,
-                           globalTopkUb_, BASE_TOPK, previousCandidateCount,
-                           tmpSortBuf, BASE_TOPK, groupCandidateCount, mergedCandidateCount);
+            InitTopKList(cacheSortedBlock, s2BaseSize_);
         }
+
+        bool isChunkGroupEnd = (globalTopkUbCacheIdx == 3) || (chunkIdx == groupEndChunk - 1);
+        if (isChunkGroupEnd) {
+            int32_t groupListCount = static_cast<int32_t>(globalTopkUbCacheIdx + 1);
+            int32_t groupCandidateCount = s2BaseSize_;
+            CopyTopKList(tmpSortBuf, BASE_TOPK, SortedBasicBlock_, s2BaseSize_, s2BaseSize_);
+            for (int32_t listIdx = 1; listIdx < groupListCount; ++listIdx) {
+                int32_t nextCandidateCount = LICommon::Min(BASE_TOPK, groupCandidateCount + s2BaseSize_);
+                MergeTopKLists(tmpSortBuf, BASE_TOPK,
+                               tmpSortBuf, BASE_TOPK, groupCandidateCount,
+                               SortedBasicBlock_[listIdx * s2BaseSize_ * TOPK_LIST_COMPONENTS],
+                               s2BaseSize_, s2BaseSize_, nextCandidateCount);
+                groupCandidateCount = nextCandidateCount;
+            }
+            int32_t previousCandidateCount = LICommon::Min(
+                BASE_TOPK, LICommon::Max(0, localChunkIdx - static_cast<int32_t>(globalTopkUbCacheIdx)) * s2BaseSize_);
+            if (previousCandidateCount == 0) {
+                DataCopy(globalTopkUb_, tmpSortBuf, BASE_TOPK * TOPK_LIST_COMPONENTS);
+            } else {
+                int32_t mergedCandidateCount = LICommon::Min(
+                    BASE_TOPK, previousCandidateCount + groupCandidateCount);
+                MergeTopKLists(globalTopkUb_, BASE_TOPK,
+                               globalTopkUb_, BASE_TOPK, previousCandidateCount,
+                               tmpSortBuf, BASE_TOPK, groupCandidateCount, mergedCandidateCount);
+            }
+        }
+        PipeBarrier<PIPE_V>();
+        outQueue_.FreeTensor(tmpSortBuf);
     }
     PipeBarrier<PIPE_V>();
-    outQueue_.FreeTensor(tmpSortBuf);
 
     if (chunkIdx == groupEndChunk - 1) {
         if (writePartialTopk) {
@@ -1786,8 +1837,9 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
                     packedHiTokenCount < sortDataLen &&
                     (info.actS1Size <= 4 || packedSortLenForPadding >= cuS2LenVecAlign);
 
-                // Every live Stage2 path reaches this block as dense, packed HI,
-                // or dense-masked HI.
+                // The current dispatch normalizes every live Stage2 path into one
+                // of dense baseline, packed HI, or dense-masked HI before this
+                // point, so the old scalar fallback is no longer reachable.
                 {
                     PipeBarrier<PIPE_V>();
                     LocalTensor<float> reduceCacheBuf = outQueue_.AllocTensor<float>();

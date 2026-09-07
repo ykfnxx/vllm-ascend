@@ -60,10 +60,10 @@ __global__ __aicore__ void lightning_indexer_hi_cached(__gm__ uint8_t *query, __
     }
 #else
     if constexpr (DT_Q == LI_TPL_FP16 && DT_K == LI_TPL_FP16 && DT_OUT == LI_TPL_INT32) {
-        INVOKE_LI_NO_KFC_OP_IMPL(LIPreload, half, half, int32_t, PAGE_ATTENTION,
+        INVOKE_LI_NO_KFC_OP_IMPL(LIPreload, half, half, int32_t, PAGE_ATTENTION, 
                                  LI_LAYOUT(LAYOUT_T), LI_LAYOUT(K_LAYOUT_T));
     } else {
-        INVOKE_LI_NO_KFC_OP_IMPL(LIPreload, bfloat16_t, bfloat16_t, int32_t, PAGE_ATTENTION,
+        INVOKE_LI_NO_KFC_OP_IMPL(LIPreload, bfloat16_t, bfloat16_t, int32_t, PAGE_ATTENTION, 
                                  LI_LAYOUT(LAYOUT_T), LI_LAYOUT(K_LAYOUT_T));
     }
 #endif

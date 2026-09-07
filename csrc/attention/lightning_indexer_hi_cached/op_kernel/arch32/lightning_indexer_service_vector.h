@@ -186,7 +186,10 @@ __aicore__ inline void LIVector<LIT>::InitBuffers(TPipe *pipe)
     uint32_t outNeedBufSize = (BASE_TOPK * 2) * 2 * sizeof(float);
     uint32_t reduceCacheSize = REDUCE_BANK_CONFLICT_OFFSETS + groupInner_ * s2BaseSize_ * sizeof(float);
     outNeedBufSize = reduceCacheSize > outNeedBufSize ? reduceCacheSize : outNeedBufSize;
-    // Stage1 shares this queue between the output list and block score/index storage.
+    // Preserve the established Stage1 scratch layout for the embedded-mask
+    // path. Besides the output list, Stage1 temporarily uses block-sized
+    // score/index storage from this queue; shrinking it regresses ratio=32 at
+    // medium sequence lengths even though the old Stage2 list scan is gone.
     uint32_t hiScratchSize =
         (constInfo_.sparseCount + constInfo_.maxBlockNumPerBatch) * sizeof(int32_t);
     outNeedBufSize = hiScratchSize > outNeedBufSize ? hiScratchSize : outNeedBufSize;
@@ -1517,8 +1520,9 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
                     packedHiTokenCount < sortDataLen &&
                     (info.actS1Size <= 4 || packedSortLenForPadding >= cuS2LenVecAlign);
 
-                // Every live Stage2 path reaches this block as dense, packed HI,
-                // or dense-masked HI.
+                // The current dispatch normalizes every live Stage2 path into one
+                // of dense baseline, packed HI, or dense-masked HI before this
+                // point, so the old scalar fallback is no longer reachable.
                 {
                     PipeBarrier<PIPE_V>();
                     LocalTensor<float> reduceCacheBuf = outQueue_.AllocTensor<float>();
