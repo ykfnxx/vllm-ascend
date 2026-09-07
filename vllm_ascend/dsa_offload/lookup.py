@@ -17,7 +17,7 @@ from .constants import (
     RESIDENT_SLOTS,
 )
 from .hot_cache import HotCacheLayout, HotCacheState
-from .io import IOBackend, make_storage_ids, require_block_keys
+from .io import IOBackend, make_storage_ids, require_block_hashes
 from .ops import (
     LookupState,
     lookup_update,
@@ -239,8 +239,9 @@ class DSAOffloadBatch:
     query_ranges: tuple[tuple[int, int], ...]
     query_positions: torch.Tensor
     is_mtp: bool
-    committed_block_keys: Mapping[str, Sequence[int]]
-    candidate_block_keys: Mapping[str, Sequence[int]]
+    committed_block_hashes: Mapping[str, Sequence[bytes]]
+    candidate_block_hashes: Mapping[str, Sequence[bytes]]
+    query_end_positions: tuple[int, ...] = ()
     prefill_state: object | None = None
     sfa_workspace: "SFAAddressingWorkspace | None" = None
     decode_request_indices_tensor: torch.Tensor | None = None
@@ -262,10 +263,10 @@ class DSAOffloadBatch:
     gather_events: dict[int, object | None] = field(default_factory=dict)
     enable_cohort_kvgather: bool = False
 
-    def block_keys(self, request_index: int) -> Sequence[int]:
+    def block_hashes(self, request_index: int) -> Sequence[bytes]:
         request_id = self.request_ids[request_index]
-        committed = self.committed_block_keys[request_id]
-        candidate = self.candidate_block_keys.get(request_id)
+        committed = self.committed_block_hashes[request_id]
+        candidate = self.candidate_block_hashes.get(request_id)
         return committed if candidate is None else (*committed, *candidate)
 
 
@@ -279,9 +280,10 @@ def build_dsa_offload_batch(
     request_ids: Sequence[str],
     query_counts: Sequence[int],
     query_positions: torch.Tensor,
+    query_positions_cpu: Sequence[int],
     is_mtp: bool,
-    committed_block_keys: Mapping[str, Sequence[int]],
-    candidate_block_keys: Mapping[str, Sequence[int]],
+    committed_block_hashes: Mapping[str, Sequence[bytes]],
+    candidate_block_hashes: Mapping[str, Sequence[bytes]],
     prefill_state: object | None = None,
     sfa_workspace: "SFAAddressingWorkspace | None" = None,
     prefetch_runtime: object | None = None,
@@ -316,8 +318,11 @@ def build_dsa_offload_batch(
         query_ranges=query_ranges,
         query_positions=query_positions,
         is_mtp=is_mtp,
-        committed_block_keys=committed_block_keys,
-        candidate_block_keys=candidate_block_keys,
+        committed_block_hashes=committed_block_hashes,
+        candidate_block_hashes=candidate_block_hashes,
+        query_end_positions=tuple(
+            int(query_positions_cpu[end - 1]) for end in query_ends
+        ),
         prefill_state=prefill_state,
         sfa_workspace=sfa_workspace,
         decode_request_indices_tensor=torch.tensor(
@@ -990,14 +995,14 @@ def load_plan_misses(
         if request_logical_blocks.numel() == 0:
             continue
         request_id = batch.request_ids[request_index]
-        block_keys = batch.block_keys(request_index)
-        require_block_keys(
-            block_keys,
+        block_hashes = batch.block_hashes(request_index)
+        require_block_hashes(
+            block_hashes,
             int(request_logical_blocks.max().item()) + 1,
             context=f"miss load for request {request_id}",
         )
         request_storage_ids = make_storage_ids(
-            block_keys,
+            block_hashes,
             layer_id,
             device=plan.miss_logical_blocks.device,
         )
