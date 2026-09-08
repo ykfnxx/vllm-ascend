@@ -183,6 +183,112 @@ private:
     uint32_t topK_ = 0;
     uint32_t trunkLen_ = 0;
 };
+
+// Native LI's multi-trunk BF16 TopK, with indices in the compact HI token
+// stream. Logical token IDs are recovered only after the final selection.
+class LITopkStream {
+public:
+    static constexpr uint32_t TOPK = 2048;
+    static constexpr uint32_t TRUNK_LEN = 16384;
+
+    static __aicore__ inline uint32_t GetSharedTmpBufferSize()
+    {
+        return (2 * TOPK + 3 * 256 + 64) * sizeof(uint32_t) +
+               (TOPK + TRUNK_LEN) * sizeof(uint16_t);
+    }
+
+    __aicore__ inline void InitBuffers(const LocalTensor<uint32_t> &buffer)
+    {
+        historyIndices_[0] = buffer;
+        historyIndices_[1] = buffer[TOPK];
+        histograms_ = buffer[2 * TOPK];
+        idxHigh_ = histograms_[256];
+        idxLow_ = idxHigh_[256];
+        nkValue_ = idxLow_[256];
+        tmpIndices_ = nkValue_[64].template ReinterpretCast<uint16_t>();
+    }
+
+    __aicore__ inline void Select(const LocalTensor<uint16_t> &inputKeys,
+                                   const LocalTensor<uint16_t> &historyKeys,
+                                   const LocalTensor<uint32_t> &outputIndices,
+                                   uint32_t inputCount, uint32_t windowIdx, bool isLastWindow)
+    {
+        topkb16gather::LiTopKVF<true>(tmpIndices_, historyKeys, inputKeys,
+                                     histograms_, idxHigh_, idxLow_, nkValue_, TOPK, inputCount);
+        PipeBarrier<PIPE_V>();
+        uint32_t nextHistory = (windowIdx + 1) % 2;
+        if (windowIdx == 0) {
+            Cast(historyIndices_[nextHistory], tmpIndices_, RoundMode::CAST_NONE, TOPK);
+        } else {
+            topkb16gather::LiTopKGatherVF(historyIndices_[nextHistory], historyKeys, inputKeys,
+                                          tmpIndices_, historyIndices_[windowIdx % 2], TOPK,
+                                          windowIdx * TRUNK_LEN - TOPK, inputCount);
+        }
+        PipeBarrier<PIPE_V>();
+        if (isLastWindow) {
+            DataCopy(outputIndices, historyIndices_[nextHistory], TOPK);
+        } else {
+            DataCopy(inputKeys, historyKeys, TOPK);
+        }
+        PipeBarrier<PIPE_V>();
+    }
+
+private:
+    LocalTensor<uint32_t> historyIndices_[2];
+    LocalTensor<uint32_t> histograms_;
+    LocalTensor<uint32_t> idxHigh_;
+    LocalTensor<uint32_t> idxLow_;
+    LocalTensor<uint32_t> nkValue_;
+    LocalTensor<uint16_t> tmpIndices_;
+};
+
+__simd_vf__ void MapHiTokenIndicesVFImpl(__ubuf__ uint32_t *output,
+                                          __ubuf__ uint32_t *positions,
+                                          __ubuf__ uint32_t *blocks,
+                                          uint32_t blockCount, uint32_t keyLen, uint16_t loops)
+{
+    using namespace AscendC::MicroAPI;
+    MaskReg all = CreateMask<uint32_t, MaskPattern::ALL>();
+    RegTensor<uint32_t> zero;
+    RegTensor<uint32_t> invalid;
+    RegTensor<uint32_t> offsetMask;
+    Duplicate(zero, 0U, all);
+    Duplicate(invalid, 0xFFFFFFFFU, all);
+    Duplicate(offsetMask, 127U, all);
+    for (uint16_t i = 0; i < loops; ++i) {
+        RegTensor<uint32_t> position;
+        RegTensor<uint32_t> blockPos;
+        RegTensor<uint32_t> blockId;
+        RegTensor<uint32_t> offset;
+        RegTensor<uint32_t> token;
+        MaskReg validBlock;
+        MaskReg validToken;
+        LoadAlign(position, positions + i * 64);
+        ShiftRights(blockPos, position, static_cast<int16_t>(7), all);
+        Compares<uint32_t, CMPMODE::LT>(validBlock, blockPos, blockCount, all);
+        // Make padding positions safe even before the masked output select.
+        Select(blockPos, blockPos, zero, validBlock);
+        Gather(blockId, blocks, blockPos, all);
+        And(offset, position, offsetMask, all);
+        ShiftLefts(token, blockId, static_cast<int16_t>(7), all);
+        Add(token, token, offset, all);
+        Compares<uint32_t, CMPMODE::LT>(validToken, token, keyLen, all);
+        Select(token, token, invalid, validToken);
+        Select(token, token, invalid, validBlock);
+        StoreAlign(output + i * 64, token, all);
+    }
+}
+
+__aicore__ inline void MapHiTokenIndices(const LocalTensor<int32_t> &output,
+                                          const LocalTensor<uint32_t> &positions,
+                                          const LocalTensor<int32_t> &blocks,
+                                          uint32_t blockCount, uint32_t keyLen)
+{
+    MapHiTokenIndicesVFImpl(reinterpret_cast<__ubuf__ uint32_t *>(output.GetPhyAddr()),
+                            reinterpret_cast<__ubuf__ uint32_t *>(positions.GetPhyAddr()),
+                            reinterpret_cast<__ubuf__ uint32_t *>(blocks.GetPhyAddr()),
+                            blockCount, keyLen, LITopkStream::TOPK / 64);
+}
 } // namespace topk
 
 #endif // LIGHTNING_INDEXER_HI_CACHED_TOPK_H

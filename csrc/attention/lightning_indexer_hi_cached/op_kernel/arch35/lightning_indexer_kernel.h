@@ -123,6 +123,10 @@ protected:
     LICommon::SplitCoreInfo splitCoreInfo{};
     LICommon::SplitCoreInfo splitCoreInfoStage2{};
     bool decodeStage2HiFastPathEligible = false;
+    // Uniform, unpadded requests can map query rows without scanning metadata.
+    // Zero selects the general mapping for mixed lengths or metadata padding.
+    uint32_t decodeQueryTokensPerRequest = 0U;
+    uint32_t decodeStage2ChunkSize = S2_BASE_SIZE;
     bool stage1SingleScoreTile = false;
     bool stage1PartialTopkMergeSkippable = false;
     bool stage2PartialTopkMergeSkippable = false;
@@ -155,7 +159,7 @@ protected:
     __aicore__ inline bool CanSkipStage2PartialTopkMerge();
     __aicore__ inline bool CanUseDecodeStage2HiFastPath();
     __aicore__ inline uint32_t GetDecodeStage2HiFastPathRowNum();
-    __aicore__ inline uint32_t MapDecodeStage2HiFastPathRowToBN2(uint32_t rowOrdinal);
+    __aicore__ inline uint32_t MapDecodeStage2HiFastPathRowToBN2(uint32_t rowOrdinal, uint32_t &queryIdx);
     // ================================Process functions================================
     // Stage1 coarse filtering: AIC computes q * mean(k), AIV applies weights
     // and emits the selected HI block list/mask.
@@ -163,7 +167,7 @@ protected:
     // Stage2 token scoring: score original key tokens under the HI block
     // restriction and produce token-level topk.
     __aicore__ inline void RunStage2();
-    // Pure decode fast path that scores only the fixed HI block list instead
+    // Decode/MTP fast path that scores only the fixed HI block list instead
     // of replaying the full S2 tile schedule.
     __aicore__ inline bool RunDecodeStage2HiFastPath();
     // One Stage1 S2 tile: q * mean(k), followed by block-score reduction.
@@ -1028,7 +1032,8 @@ template <typename LIT>
 __aicore__ inline bool LIPreload<LIT>::CanSkipStage2PartialTopkMerge()
 {
     if constexpr (LAYOUT_T == LI_LAYOUT::TND && LIT::pageAttention) {
-        return stage2PartialTopkMergeSkippable;
+        // The compact path finishes its own per-query TopK, including split groups.
+        return decodeStage2HiFastPathEligible || stage2PartialTopkMergeSkippable;
     }
     return false;
 }
@@ -1039,29 +1044,58 @@ __aicore__ inline bool LIPreload<LIT>::CanUseDecodeStage2HiFastPath()
     if constexpr (!(LAYOUT_T == LI_LAYOUT::TND && LIT::pageAttention)) {
         return false;
     }
-    // Counts valid metadata rows whose query length is exactly one token.
-    // stage2WorkRowNum is different: it is expanded by N2 and gS1 tiles.
-    uint32_t singleTokenDecodeRowNum = 0;
+    // Short MTP requests also have independent per-query HI lists. Schedule
+    // those lists directly instead of scanning every physical S2 tile.
+    constexpr uint32_t MAX_DECODE_QUERY_TOKENS = 4;
+    uint32_t queryTokenNum = 0;
+    uint32_t firstQueryLen = 0;
+    bool uniformQueryLen = true;
+    bool hasMtpQuery = false;
+    // Reinterpret the existing [4 * G, 128] ping-pong slot as [G, 512].
+    // Aligned G keeps Fixpipe's padded M rows inside the same allocation.
+    bool canBatchMtpBlocks = constInfo.gSize % BLOCK_CUBE_SIZE == 0 &&
+                            constInfo.sparseCount == BASE_TOPK &&
+                            constInfo.hiBlockSize == S2_BASE_SIZE;
+    uint32_t mtpBlocksPerChunk = canBatchMtpBlocks ? S1_BASE_SIZE : 1U;
     uint32_t computeBatchSize = GetComputeBatchSize();
     for (uint32_t bIdx = 0; bIdx < computeBatchSize; ++bIdx) {
         uint32_t actS1Size = 0;
         uint32_t actS2Size = 0;
         GetS1S2ActualSeqLen(bIdx, actS1Size, actS2Size);
         if (actS1Size == 0) {
+            uniformQueryLen = false;
             continue;
         }
-        if (actS1Size != 1 || actS2Size == 0) {
+        if (actS1Size > MAX_DECODE_QUERY_TOKENS || actS2Size < actS1Size ||
+            (actS1Size > 1 && constInfo.kHeadNum != 1)) {
             return false;
         }
         // FULL_DECODE_ONLY graph capture may warm up with actual_k=[1,0,...].
         // That full-coverage degenerate case has no HI filtering benefit and
         // must use the stable dense Stage2 path instead of the HI fast path.
-        if (IsHiFullCoverage(actS2Size)) {
+        // Every MTP query needs a materialized Stage1 list. If even the first
+        // query has full coverage, retain the existing tiled path for this call.
+        uint32_t firstVisibleS2 = constInfo.attenMaskFlag ? actS2Size - actS1Size + 1 : actS2Size;
+        if (IsHiFullCoverage(firstVisibleS2)) {
             return false;
         }
-        ++singleTokenDecodeRowNum;
+        // Compare handshakes, not blocks: an MTP chunk can batch four blocks
+        // while the general path still synchronizes after each 128-token tile.
+        uint32_t visibleBlockNum = LICommon::CeilDiv(firstVisibleS2, static_cast<uint32_t>(constInfo.hiBlockSize));
+        uint32_t hiChunkNum = LICommon::CeilDiv(static_cast<uint32_t>(constInfo.hiBlockNum), mtpBlocksPerChunk);
+        if (actS1Size > 1 && static_cast<uint64_t>(hiChunkNum) * actS1Size > visibleBlockNum) {
+            return false;
+        }
+        hasMtpQuery = hasMtpQuery || actS1Size > 1;
+        if (firstQueryLen == 0) {
+            firstQueryLen = actS1Size;
+        }
+        uniformQueryLen = uniformQueryLen && actS1Size == firstQueryLen;
+        queryTokenNum += actS1Size;
     }
-    return singleTokenDecodeRowNum == constInfo.s1Size && singleTokenDecodeRowNum > 0;
+    decodeQueryTokensPerRequest = uniformQueryLen ? firstQueryLen : 0;
+    decodeStage2ChunkSize = hasMtpQuery ? mtpBlocksPerChunk * S2_BASE_SIZE : S2_BASE_SIZE;
+    return queryTokenNum == constInfo.s1Size && queryTokenNum > 0;
 }
 
 template <typename LIT>
@@ -1073,21 +1107,21 @@ __aicore__ inline uint32_t LIPreload<LIT>::GetDecodeStage2HiFastPathRowNum()
     if (!decodeStage2HiFastPathEligible) {
         return 0;
     }
-    if (constInfo.s1Size == GetComputeBatchSize()) {
-        return GetComputeBatchSize() * constInfo.kHeadNum;
-    }
-    return stage2WorkRowNum;
+    return constInfo.s1Size * constInfo.kHeadNum;
 }
 
 template <typename LIT>
-__aicore__ inline uint32_t LIPreload<LIT>::MapDecodeStage2HiFastPathRowToBN2(uint32_t rowOrdinal)
+__aicore__ inline uint32_t LIPreload<LIT>::MapDecodeStage2HiFastPathRowToBN2(uint32_t rowOrdinal,
+                                                                       uint32_t &queryIdx)
 {
+    queryIdx = 0;
     uint32_t totalRowNum = GetComputeBatchSize() * static_cast<uint32_t>(constInfo.kHeadNum);
     if constexpr (!(LAYOUT_T == LI_LAYOUT::TND && LIT::pageAttention)) {
         return totalRowNum;
     }
-    if (constInfo.s1Size == GetComputeBatchSize()) {
-        return rowOrdinal;
+    if (decodeQueryTokensPerRequest != 0) {
+        queryIdx = rowOrdinal % decodeQueryTokensPerRequest;
+        return rowOrdinal / decodeQueryTokensPerRequest;
     }
     uint32_t workRowOrdinal = 0;
     uint32_t actS1Size = 0;
@@ -1097,13 +1131,14 @@ __aicore__ inline uint32_t LIPreload<LIT>::MapDecodeStage2HiFastPathRowToBN2(uin
         if (bN2Idx % constInfo.kHeadNum == 0) {
             GetS1S2ActualSeqLen(bIdx, actS1Size, actS2Size);
         }
-        if (actS1Size != 1 || actS2Size == 0) {
+        if (actS1Size == 0 || actS2Size == 0) {
             continue;
         }
-        if (workRowOrdinal == rowOrdinal) {
+        if (rowOrdinal < workRowOrdinal + actS1Size) {
+            queryIdx = rowOrdinal - workRowOrdinal;
             return bN2Idx;
         }
-        ++workRowOrdinal;
+        workRowOrdinal += actS1Size;
     }
     return totalRowNum;
 }
@@ -1206,8 +1241,8 @@ __aicore__ inline void LIPreload<LIT>::RunStage1()
 template <typename LIT>
 __aicore__ inline bool LIPreload<LIT>::RunDecodeStage2HiFastPath()
 {
-    // Pure decode has one query row per batch. Once Stage1 has produced a
-    // stable HI block list, this path schedules only those HI chunks.
+    // Each decode/MTP query owns a stable Stage1 list. Schedule only its HI
+    // chunks, with the same per-query causal boundary as the tiled path.
     if constexpr (!(LAYOUT_T == LI_LAYOUT::TND && LIT::pageAttention)) {
         return false;
     }
@@ -1221,7 +1256,7 @@ __aicore__ inline bool LIPreload<LIT>::RunDecodeStage2HiFastPath()
     }
 
     constexpr uint32_t DECODE_HI_MAX_GROUP_NUM = 8;
-    uint32_t blocksPerChunkForGroup = constInfo.s2BaseSize / constInfo.hiBlockSize;
+    uint32_t blocksPerChunkForGroup = decodeStage2ChunkSize / constInfo.hiBlockSize;
     uint32_t configuredHiBlockCount = LICommon::Min(
         static_cast<uint32_t>(constInfo.hiBlockNum), static_cast<uint32_t>(constInfo.sparseCount));
     uint32_t configuredChunkCount = LICommon::Max(1U, LICommon::CeilDiv(configuredHiBlockCount, blocksPerChunkForGroup));
@@ -1246,9 +1281,11 @@ __aicore__ inline bool LIPreload<LIT>::RunDecodeStage2HiFastPath()
         return true;
     }
 
+    uint32_t stage2Loop = 0;
     for (uint32_t taskIdx = aiCoreIdx; taskIdx < totalTaskNum; taskIdx += GetBlockNum()) {
         uint32_t rowOrdinal = taskIdx / hiGroupNum;
-        uint32_t bN2Idx = MapDecodeStage2HiFastPathRowToBN2(rowOrdinal);
+        uint32_t queryIdx = 0;
+        uint32_t bN2Idx = MapDecodeStage2HiFastPathRowToBN2(rowOrdinal, queryIdx);
         if (bN2Idx >= GetComputeBatchSize() * static_cast<uint32_t>(constInfo.kHeadNum)) {
             continue;
         }
@@ -1270,8 +1307,18 @@ __aicore__ inline bool LIPreload<LIT>::RunDecodeStage2HiFastPath()
 
         LICommon::RunInfo runInfo;
         CalcRunInfo(0, 0, runInfo);
-        runInfo.actualSingleProcessSInnerSize = constInfo.s2BaseSize;
-        runInfo.actualSingleProcessSInnerSizeAlign = constInfo.s2BaseSize;
+        if (runInfo.actS1Size > 1) {
+            runInfo.tensorQueryOffset += static_cast<uint64_t>(queryIdx) * constInfo.qHeadNum * constInfo.headDim;
+            runInfo.tensorWeightsOffset += static_cast<uint64_t>(queryIdx) * constInfo.qHeadNum;
+            runInfo.indiceOutOffset += static_cast<uint64_t>(queryIdx) * constInfo.kHeadNum * constInfo.sparseCount;
+            if (constInfo.attenMaskFlag) {
+                runInfo.actS2Size -= runInfo.actS1Size - queryIdx - 1;
+            }
+            runInfo.actS1Size = 1;
+            runInfo.actMBaseSize = constInfo.gSize;
+        }
+        runInfo.actualSingleProcessSInnerSize = decodeStage2ChunkSize;
+        runInfo.actualSingleProcessSInnerSizeAlign = decodeStage2ChunkSize;
         runInfo.isFirstS2InnerLoop = true;
         runInfo.isLastS2InnerLoop = true;
         runInfo.isAllLoopEnd = true;
@@ -1282,7 +1329,7 @@ __aicore__ inline bool LIPreload<LIT>::RunDecodeStage2HiFastPath()
         uint32_t hiBlockCount = LICommon::Min(
             static_cast<uint32_t>(constInfo.hiBlockNum),
             LICommon::Min(static_cast<uint32_t>(constInfo.sparseCount), visibleHiBlockNum));
-        uint32_t blocksPerChunk = constInfo.s2BaseSize / constInfo.hiBlockSize;
+        uint32_t blocksPerChunk = decodeStage2ChunkSize / constInfo.hiBlockSize;
         uint32_t chunkCount = LICommon::CeilDiv(hiBlockCount, blocksPerChunk);
         if (chunkCount == 0) {
             continue;
@@ -1303,7 +1350,9 @@ __aicore__ inline bool LIPreload<LIT>::RunDecodeStage2HiFastPath()
         }
         for (uint32_t chunkIdx = groupStartChunk; chunkIdx < groupEndChunk; ++chunkIdx) {
             LICommon::RunInfo chunkRunInfo = runInfo;
-            chunkRunInfo.loop = chunkIdx;
+            // Keep ping-pong parity across MTP rows with odd chunk counts.
+            // The two C/V credits protect the last two chunks, not row ids.
+            chunkRunInfo.loop = decodeStage2ChunkSize > constInfo.s2BaseSize ? stage2Loop++ : chunkIdx;
             if ASCEND_IS_AIC {
                 CrossCoreWaitFlag(constInfo.syncV1C1);
                 uint32_t hiBlockStart = chunkIdx * blocksPerChunk;
@@ -1324,7 +1373,7 @@ __aicore__ inline bool LIPreload<LIT>::RunDecodeStage2HiFastPath()
                         static_cast<uint32_t>(constInfo.hiBlockSize), runInfo.actS2Size - tokenStart);
                     uint32_t packedOffset = localBlockIdx * constInfo.hiBlockSize;
                     matmulService.ComputeMm1ByRangeWithCachedQuery(
-                        chunkRunInfo, tokenStart, tokenCount, packedOffset, constInfo.s2BaseSize, 0);
+                        chunkRunInfo, tokenStart, tokenCount, packedOffset, decodeStage2ChunkSize, 0);
                 }
                 PipeBarrier<PIPE_FIX>();
                 CrossCoreSetFlag<LICommon::ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(constInfo.syncC1V1);
@@ -1378,7 +1427,7 @@ __aicore__ inline void LIPreload<LIT>::RunStage2()
     if constexpr (LAYOUT_T == LI_LAYOUT::TND && LIT::pageAttention) {
         uint32_t totalRowNum = GetDecodeStage2HiFastPathRowNum();
         constexpr uint32_t DECODE_HI_MAX_GROUP_NUM = 8;
-        uint32_t blocksPerChunkForGroup = constInfo.s2BaseSize / constInfo.hiBlockSize;
+        uint32_t blocksPerChunkForGroup = decodeStage2ChunkSize / constInfo.hiBlockSize;
         uint32_t configuredHiBlockCount = LICommon::Min(
             static_cast<uint32_t>(constInfo.hiBlockNum), static_cast<uint32_t>(constInfo.sparseCount));
         uint32_t configuredChunkCount =
@@ -1423,7 +1472,8 @@ __aicore__ inline void LIPreload<LIT>::RunStage2()
     }
 
     if ASCEND_IS_AIV {
-        if (!CanSkipStage1PartialTopkMerge()) {
+        bool useWideMtpChunks = decodeStage2HiFastPathEligible && decodeStage2ChunkSize > constInfo.s2BaseSize;
+        if (!CanSkipStage1PartialTopkMerge() || useWideMtpChunks) {
             // PartialTopkMerge resets the pipe to legacy LdMerge buffers.
             // Pure decode skips that merge, so keep the normal vector buffers
             // and avoid a second TPipe reset/init before Stage2.
@@ -1431,7 +1481,9 @@ __aicore__ inline void LIPreload<LIT>::RunStage2()
             vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, vec1ParamGm, blockIndiceGm, externalHiMaskGm,
                                                weightsGm, indiceOutGm, blockTableGm, keyGm, stage1MeanKeyGm,
                                                stage1MeanCacheGm, queryGm);
-            vectorService.InitBuffers(pipe);
+            // Wide MTP Stage2 needs one running TopK row, not the two local
+            // Stage1 rows. Reuse that UB budget for the wider score buffer.
+            vectorService.InitBuffers(pipe, useWideMtpChunks ? decodeStage2ChunkSize : 0U);
         }
         CrossCoreSetFlag<LICommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
         CrossCoreSetFlag<LICommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
