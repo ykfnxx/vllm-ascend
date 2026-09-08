@@ -53,6 +53,7 @@ ENABLE_PREFETCH_WITH_HIDDEN_STATES="0"
 PREFETCH_TOP_K="2048"
 ENABLE_COHORT_KVGATHER="0"
 COHORT_KVGATHER_AIV_LIMIT="4"
+FUSE_KVGATHER_SFA="0"
 DSA_OFFLOAD_ENABLED="1"
 CUDAGRAPH_MODE="FULL_DECODE_ONLY"
 GPU_MEMORY_UTILIZATION="0.50"
@@ -121,6 +122,10 @@ Core options:
   --cohort-kvgather-aiv-limit N
                               AIV cores the dedicated KV Gather stream may
                               occupy. Default: 4
+  --fuse-kvgather-sfa         Fuse KV Gather into Sparse Flash Attention on
+                              Decode (cohort leader layers, or every layer
+                              without cohort). Only applies with
+                              --io-backend kvgather_sim. Default: off.
   --no-dsa-offload            Full-HBM baseline: drop additional_config.dsa_offload
                               entirely so all KV stays in HBM and the engine runs
                               the plain DSA sparse path without lookup/update,
@@ -330,6 +335,10 @@ while (($# > 0)); do
             require_value "$@"
             COHORT_KVGATHER_AIV_LIMIT="$2"
             shift 2
+            ;;
+        --fuse-kvgather-sfa)
+            FUSE_KVGATHER_SFA="1"
+            shift
             ;;
         --no-dsa-offload)
             DSA_OFFLOAD_ENABLED="0"
@@ -635,7 +644,8 @@ PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 - \
     "$PROMPT_TOKEN_ID" \
     "$MTP_SPECULATIVE_TOKENS" \
     "$ENABLE_PREFETCH_WITH_HIDDEN_STATES" \
-    "$DSA_OFFLOAD_ENABLED" <<'PY'
+    "$DSA_OFFLOAD_ENABLED" \
+    "$FUSE_KVGATHER_SFA" <<'PY'
 from __future__ import annotations
 
 import importlib
@@ -650,6 +660,7 @@ prompt_token_id = int(sys.argv[4])
 mtp_tokens = int(sys.argv[5])
 prefetch_enabled = bool(int(sys.argv[6]))
 dsa_offload_enabled = bool(int(sys.argv[7]))
+fuse_kvgather_sfa = bool(int(sys.argv[8]))
 
 model_path = Path(model_name)
 if model_path.is_dir() and (model_path / "config.json").is_file():
@@ -734,6 +745,8 @@ if dsa_offload_enabled:
             raise SystemExit("rdma_kv_ops does not expose aiv_init")
     elif io_backend == "kvgather_sim":
         required_ops.append("asu_kv_gather")
+        if fuse_kvgather_sfa:
+            required_ops.append("fused_kv_gather_sparse_flash_attention")
 
 missing = [name for name in required_ops if not hasattr(namespace, name)]
 if missing:
@@ -753,6 +766,7 @@ print(
             ),
             "io_backend": io_backend,
             "enable_prefetch_with_hidden_states": prefetch_enabled,
+            "fuse_kvgather_sfa": fuse_kvgather_sfa,
             "vllm_ascend": str(package_path),
             "native_ops": required_ops,
         },
@@ -786,7 +800,8 @@ python3 - \
     "$MTP_SPECULATIVE_TOKENS" \
     "$ENABLE_PREFETCH_WITH_HIDDEN_STATES" \
     "$PREFETCH_TOP_K" \
-    "$DSA_OFFLOAD_ENABLED" <<'PY'
+    "$DSA_OFFLOAD_ENABLED" \
+    "$FUSE_KVGATHER_SFA" <<'PY'
 import json
 import sys
 
@@ -807,6 +822,7 @@ import sys
     enable_prefetch_with_hidden_states,
     prefetch_top_k,
     dsa_offload_enabled,
+    fuse_kvgather_sfa,
 ) = sys.argv[1:]
 manifest = {
     "branch": branch,
@@ -826,6 +842,7 @@ manifest = {
         int(enable_prefetch_with_hidden_states)
     ),
     "prefetch_top_k": int(prefetch_top_k),
+    "fuse_kvgather_sfa": bool(int(fuse_kvgather_sfa)),
 }
 with open(output_path, "w", encoding="utf-8") as output_file:
     json.dump(manifest, output_file, indent=2, sort_keys=True)
@@ -921,6 +938,7 @@ launch_server() {
     local profiler_config
     local prefetch_enabled="false"
     local cohort_kvgather_enabled="false"
+    local fuse_kvgather_sfa_enabled="false"
     local dsa_config
     local -a kv_transfer_args=()
     local -a profiler_args=()
@@ -1013,8 +1031,13 @@ PY
         && "$ENABLE_COHORT_KVGATHER" == "1" ]]; then
         cohort_kvgather_enabled="true"
     fi
+    if [[ "$kv_role" != "kv_producer" \
+        && "$FUSE_KVGATHER_SFA" == "1" \
+        && "$IO_BACKEND" == "kvgather_sim" ]]; then
+        fuse_kvgather_sfa_enabled="true"
+    fi
     if [[ "$DSA_OFFLOAD_ENABLED" == "1" ]]; then
-        dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_offload\":{\"io_backend\":\"$IO_BACKEND\",\"kvio_model_id\":$KVIO_MODEL_ID,\"enable_prefetch_with_hidden_states\":$prefetch_enabled,\"prefetch_top_k\":$PREFETCH_TOP_K,\"enable_cohort_kvgather\":$cohort_kvgather_enabled,\"cohort_kvgather_aiv_limit\":$COHORT_KVGATHER_AIV_LIMIT}}"
+        dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_offload\":{\"io_backend\":\"$IO_BACKEND\",\"kvio_model_id\":$KVIO_MODEL_ID,\"enable_prefetch_with_hidden_states\":$prefetch_enabled,\"prefetch_top_k\":$PREFETCH_TOP_K,\"enable_cohort_kvgather\":$cohort_kvgather_enabled,\"cohort_kvgather_aiv_limit\":$COHORT_KVGATHER_AIV_LIMIT,\"fuse_kvgather_sfa\":$fuse_kvgather_sfa_enabled}}"
     else
         dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false}"
     fi
@@ -1041,7 +1064,7 @@ PY
     fi
 
     echo "Starting $service_name on physical NPU $device_id..."
-    echo "  dsa_offload=$DSA_OFFLOAD_ENABLED hidden_state_prefetch=$prefetch_enabled prefetch_top_k=$PREFETCH_TOP_K cohort_kvgather=$cohort_kvgather_enabled aiv_limit=$COHORT_KVGATHER_AIV_LIMIT dp=$DATA_PARALLEL_SIZE ep=$ENABLE_EXPERT_PARALLEL prefix_caching=$prefix_caching_enabled graph_mode=$CUDAGRAPH_MODE"
+    echo "  dsa_offload=$DSA_OFFLOAD_ENABLED hidden_state_prefetch=$prefetch_enabled prefetch_top_k=$PREFETCH_TOP_K cohort_kvgather=$cohort_kvgather_enabled aiv_limit=$COHORT_KVGATHER_AIV_LIMIT fuse_kvgather_sfa=$fuse_kvgather_sfa_enabled dp=$DATA_PARALLEL_SIZE ep=$ENABLE_EXPERT_PARALLEL prefix_caching=$prefix_caching_enabled graph_mode=$CUDAGRAPH_MODE"
     env \
         "${COMMON_NETWORK_ENV[@]}" \
         "ASCEND_RT_VISIBLE_DEVICES=$device_id" \
@@ -1431,7 +1454,8 @@ PY
         "$MTP_SPECULATIVE_TOKENS" \
         "$PREFILL_PROFILE_DIR" \
         "$DECODE_PROFILE_DIR" \
-        "$BOTH_PROFILE_DIR" <<'PY'
+        "$BOTH_PROFILE_DIR" \
+        "$FUSE_KVGATHER_SFA" <<'PY'
 from __future__ import annotations
 
 import re
@@ -1446,8 +1470,10 @@ from pathlib import Path
     prefill_raw,
     decode_raw,
     both_raw,
+    fuse_kvgather_sfa_raw,
 ) = sys.argv[1:]
 prefetch_enabled = bool(int(prefetch_enabled_raw))
+fuse_kvgather_sfa = bool(int(fuse_kvgather_sfa_raw))
 mtp_enabled = int(mtp_speculative_tokens_raw) > 0
 profile_files = {
     "Prefill": Path(prefill_raw),
@@ -1544,11 +1570,18 @@ if io_backend == "kvio":
             "Prefill KVIO PUT",
         )
 elif io_backend == "kvgather_sim":
-    require_any(
-        decode_profile,
-        ("asukvgather", "aclnnasukvgather"),
-        f"{decode_name} ASU KV Gather",
-    )
+    if fuse_kvgather_sfa:
+        require_any(
+            decode_profile,
+            ("fusedkvgathersparseflashattention",),
+            f"{decode_name} fused KV Gather + Sparse Flash Attention",
+        )
+    else:
+        require_any(
+            decode_profile,
+            ("asukvgather", "aclnnasukvgather"),
+            f"{decode_name} ASU KV Gather",
+        )
 
 print(
     "PASS: profiler contains DSA lookup/update and Sparse Flash Attention"
@@ -1560,7 +1593,11 @@ print(
     + (
         " plus KVIO PUT/GET"
         if io_backend == "kvio"
-        else " plus ASU KV Gather"
+        else (
+            " plus fused KV Gather + SFA"
+            if fuse_kvgather_sfa
+            else " plus ASU KV Gather"
+        )
         if io_backend == "kvgather_sim"
         else ""
     )

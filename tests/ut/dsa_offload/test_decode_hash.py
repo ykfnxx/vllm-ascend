@@ -7,7 +7,6 @@ import pytest
 import torch
 
 from vllm_ascend.dsa_offload.decode_hash import DecodeBlockHashState
-from vllm_ascend.dsa_offload.metadata import make_block_key
 
 
 def test_resolve_builds_missing_hash_from_context_and_worker_tokens() -> None:
@@ -28,16 +27,16 @@ def test_resolve_builds_missing_hash_from_context_and_worker_tokens() -> None:
     )
     committed = {"request": []}
 
-    block_key = state.resolve(
+    block_hash = state.resolve(
         batch=batch,
         query_token_ids=torch.tensor([12, 13, 99]),
-        committed_block_keys=committed,
+        committed_block_hashes=committed,
         request_index=0,
         logical_block=0,
     )
 
-    assert block_key == make_block_key(b"generated")
-    assert committed == {"request": [make_block_key(b"generated")]}
+    assert block_hash == b"generated"
+    assert committed == {"request": [b"generated"]}
     assert calls == [(None, [10, 11, 12, 13], ("extra",))]
 
 
@@ -54,7 +53,7 @@ def test_resolve_rejects_incomplete_worker_token_context() -> None:
         state.resolve(
             batch=batch,
             query_token_ids=torch.tensor([13]),
-            committed_block_keys={"request": []},
+            committed_block_hashes={"request": []},
             request_index=0,
             logical_block=0,
         )
@@ -62,7 +61,6 @@ def test_resolve_rejects_incomplete_worker_token_context() -> None:
 
 def test_resolve_rejects_parent_that_diverges_from_worker_tail() -> None:
     state = DecodeBlockHashState(2, lambda *_: b"next")
-    state.canonical_tails["request"] = (0, b"worker-tail")
     state.update_contexts(
         {"request": (1, b"scheduler-tail", (20,), None)}
     )
@@ -76,7 +74,7 @@ def test_resolve_rejects_parent_that_diverges_from_worker_tail() -> None:
         state.resolve(
             batch=batch,
             query_token_ids=torch.tensor([21]),
-            committed_block_keys={"request": [101]},
+            committed_block_hashes={"request": [b"worker-tail"]},
             request_index=0,
             logical_block=1,
         )

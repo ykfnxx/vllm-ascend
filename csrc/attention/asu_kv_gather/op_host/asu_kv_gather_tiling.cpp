@@ -348,7 +348,9 @@ static ge::graphStatus AsuKvGatherTilingFunc(gert::TilingContext* context)
     tiling.set_destinationPhysicalBlockCount(
         static_cast<uint32_t>(destination_kv_storage.GetDim(0)));
     // Swap 延迟抖动使用固定的基线延迟和随机种子。
-    tiling.set_jitterEnable(1U);
+    // 基准对比时关闭抖动: set_jitterEnable(0) 使 kernel 运行时直接跳过
+    // (kSwapJitterEnabled=false 为编译期保证), 避免 swap 模拟延迟污染耗时。
+    tiling.set_jitterEnable(0U);
     tiling.set_jitterSeed(kSwapJitterSeed);
     const uint64_t pair_count =
         static_cast<uint64_t>(*req_num) *

@@ -90,6 +90,19 @@ class KVGatherSimBackend:
     def finalize_registration(self) -> None:
         return
 
+    def host_cache_planes(
+        self,
+        *,
+        layer_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sim Host-side KV/RoPE planes consumed by the fused kvgather+SFA op."""
+        layer = self._layers[int(layer_id)]
+        return layer.source_kv, layer.source_rope
+
+    def host_block_table(self, *, layer_id: int) -> torch.Tensor:
+        """Sim Host-side block table consumed by the fused kvgather+SFA op."""
+        return self._layers[int(layer_id)].source_block_table
+
     def put_blocks(
         self,
         *,

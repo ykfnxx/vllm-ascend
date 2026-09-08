@@ -1,0 +1,79 @@
+{
+  "fused_sfa_accuracy_verified": false,
+  "shape": {
+    "batch_size": 12,
+    "host_miss_rate": 0.1,
+    "miss_layout": "interleaved",
+    "query_rows": 48,
+    "sequence_length": 65536,
+    "sfa_included": true,
+    "speculative_tokens": 3,
+    "topk": 2048
+  },
+  "timings": {
+    "AsuKvGatherInstallFromHost": {
+      "max_us": 229.85999286174774,
+      "mean_us": 198.75133484601974,
+      "median_us": 198.06000590324402,
+      "min_us": 195.19999623298645,
+      "p95_us": 199.66000318527222
+    },
+    "AsuKvGatherInstallFromStaging": {
+      "max_us": 99.7999981045723,
+      "mean_us": 88.07999913891156,
+      "median_us": 86.99999749660492,
+      "min_us": 72.02000170946121,
+      "p95_us": 98.54000061750412
+    },
+    "DsaKVGather": {
+      "max_us": 463.1600081920624,
+      "mean_us": 426.9600023825963,
+      "median_us": 425.929993391037,
+      "min_us": 421.5799868106842,
+      "p95_us": 429.98000979423523
+    },
+    "DsaLookup": {
+      "max_us": 253.1599998474121,
+      "mean_us": 242.77066588401794,
+      "median_us": 241.96000397205353,
+      "min_us": 238.6000007390976,
+      "p95_us": 250.45999884605408
+    },
+    "DsaUpdate": {
+      "max_us": 313.4399950504303,
+      "mean_us": 265.39200146993,
+      "median_us": 263.26000690460205,
+      "min_us": 260.58000326156616,
+      "p95_us": 270.6199884414673
+    },
+    "DsaUpdateOverlappedWithFusedSFA": {
+      "max_us": 742.4399852752686,
+      "mean_us": 729.5639971892039,
+      "median_us": 732.1899831295013,
+      "min_us": 616.2400245666504,
+      "p95_us": 741.8599724769592
+    },
+    "DsaUpdateThenFusedSFA": {
+      "max_us": 549.3800044059753,
+      "mean_us": 512.8313362598419,
+      "median_us": 511.8200182914734,
+      "min_us": 507.3000192642212,
+      "p95_us": 514.4799947738647
+    },
+    "FusedKVGatherSparseFlashAttention": {
+      "max_us": 309.6199929714203,
+      "mean_us": 246.37399862209955,
+      "median_us": 244.73999440670013,
+      "min_us": 240.339994430542,
+      "p95_us": 246.3800013065338
+    },
+    "SparseFlashAttention": {
+      "max_us": 99.54000264406204,
+      "mean_us": 83.94533370931943,
+      "median_us": 82.85000175237656,
+      "min_us": 73.55999946594238,
+      "p95_us": 99.16000068187714
+    }
+  },
+  "trace_dir": null
+}

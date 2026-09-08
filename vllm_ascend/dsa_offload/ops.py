@@ -172,3 +172,57 @@ def turbo_fused_prefetch_lookup_update_batch(
         request_rows.shape[0],
         block_size,
     )
+
+
+def fused_kv_gather_sparse_flash_attention(
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+    hot_cache: tuple[torch.Tensor, torch.Tensor],
+    hot_block_table: torch.Tensor,
+    host_cache: tuple[torch.Tensor, torch.Tensor],
+    host_block_table: torch.Tensor,
+    query_pool_entries: torch.Tensor,
+    hot_source_rows: torch.Tensor,
+    route_plan: torch.Tensor,
+    install_staging_cache: tuple[torch.Tensor, torch.Tensor],
+    sparse_indices: torch.Tensor,
+    actual_seq_lengths_query: torch.Tensor,
+    actual_seq_lengths_kv: torch.Tensor,
+    *,
+    scale_value: float,
+    sparse_mode: int = 3,
+    return_softmax_lse: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run route-aware SFA without materializing a selection KV cache."""
+
+    hot_key, hot_rope = hot_cache
+    host_key, host_rope = host_cache
+    install_staging_key, install_staging_rope = install_staging_cache
+    return torch.ops._C_ascend.fused_kv_gather_sparse_flash_attention(
+        query,
+        hot_key,
+        hot_key,
+        sparse_indices,
+        scale_value,
+        hot_block_table,
+        actual_seq_lengths_query,
+        actual_seq_lengths_kv,
+        query_rope,
+        hot_rope,
+        host_key,
+        host_rope,
+        host_block_table,
+        query_pool_entries,
+        hot_source_rows,
+        route_plan,
+        install_staging_key,
+        install_staging_rope,
+        1,
+        "TND",
+        "PA_BSND",
+        sparse_mode,
+        torch.iinfo(torch.int64).max,
+        torch.iinfo(torch.int64).max,
+        2,
+        return_softmax_lse,
+    )

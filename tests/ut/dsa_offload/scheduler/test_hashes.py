@@ -150,7 +150,7 @@ def make_fallback_hash_state(module, block_size=2):
     return module._DSAOffloadHashState(block_hasher)
 
 
-def test_scheduler_attaches_committed_updates_and_candidate_keys(
+def test_scheduler_attaches_block_hash_updates_and_candidate_hashes(
     monkeypatch,
 ) -> None:
     module, Scheduler = load_scheduler_module(monkeypatch)
@@ -162,6 +162,7 @@ def test_scheduler_attaches_committed_updates_and_candidate_keys(
 
     scheduler = Scheduler()
     scheduler.vllm_config = SimpleNamespace(additional_config={"dsa_offload": {}})
+    scheduler.block_size = 2
     scheduler.requests = {
         "new": make_request([b"new-0"], [1]),
         "cached": make_request([b"cached-0"], [2]),
@@ -176,14 +177,21 @@ def test_scheduler_attaches_committed_updates_and_candidate_keys(
 
     output = scheduler.schedule()
 
-    assert output.dsa_offload_metadata.committed_updates == {
-        "new": (0, (module.make_block_key(b"new-0"),)),
-        "cached": (0, (module.make_block_key(b"cached-0"),)),
-        "load": (0, (module.make_block_key(b"load-0"),)),
+    assert output.block_hash_updates == {
+        "new": module.BlockHashUpdate(
+            base_count=0, hashes=(b"new-0",), replace=True
+        ),
+        "cached": module.BlockHashUpdate(
+            base_count=0, hashes=(b"cached-0",), replace=True
+        ),
+        "load": module.BlockHashUpdate(
+            base_count=0, hashes=(b"load-0",), replace=True
+        ),
+        "mtp": module.BlockHashUpdate(
+            base_count=0, hashes=(b"committed-0",), replace=True
+        ),
     }
-    assert output.dsa_offload_metadata.candidate_keys == {
-        "mtp": (module.make_block_key(b"candidate-1"),)
-    }
+    assert output.dsa_offload_candidate_block_hashes == {"mtp": [b"candidate-1"]}
     assert seen_candidates[0]._all_token_ids == [5, 6, 7, 8]
     assert seen_candidates[0].block_hashes == [b"committed-0"]
 
@@ -196,7 +204,7 @@ def test_disabled_scheduler_returns_original_output(monkeypatch) -> None:
     scheduler.requests = {}
 
     assert scheduler.schedule() is scheduler.output
-    assert not hasattr(scheduler.output, "dsa_offload_metadata")
+    assert not hasattr(scheduler.output, "block_hash_updates")
 
 
 def test_connector_free_scheduler_publishes_scheduled_requests(
@@ -217,12 +225,12 @@ def test_connector_free_scheduler_publishes_scheduled_requests(
         make_fallback_hash_state(module)
     )
 
-    output = module.attach_dsa_offload_metadata(
+    output = module.attach_block_hashes(
         scheduler,
         scheduler.output,
     )
 
-    assert set(output.dsa_offload_metadata.committed_updates) == {
+    assert set(output.block_hash_updates) == {
         "new",
         "cached",
     }
@@ -270,9 +278,9 @@ def test_async_scheduler_attaches_incomplete_decode_block_context(
         finished_req_ids=set(),
     )
 
-    module.attach_dsa_offload_metadata(scheduler, output)
+    module.attach_block_hashes(scheduler, output)
 
-    assert output.dsa_offload_metadata.decode_contexts == {
+    assert output.dsa_offload_decode_hash_contexts == {
         "request": (1, b"block-0", (5, 6, 7), ("extra",))
     }
 
@@ -299,11 +307,13 @@ def test_connector_free_scheduler_generates_incremental_dsa_hashes(
         finished_req_ids=set(),
     )
 
-    module.attach_dsa_offload_metadata(scheduler, output)
+    module.attach_block_hashes(scheduler, output)
 
-    first_key = module.make_block_key(bytes([1, 2]))
-    assert output.dsa_offload_metadata.committed_updates == {
-        "request": (0, (first_key,))
+    first_hash = bytes([1, 2])
+    assert output.block_hash_updates == {
+        "request": module.BlockHashUpdate(
+            base_count=0, hashes=(first_hash,), replace=True
+        )
     }
     assert request.block_hashes == []
 
@@ -314,28 +324,29 @@ def test_connector_free_scheduler_generates_incremental_dsa_hashes(
         req_ids=["request"],
         resumed_req_ids=set(),
     )
-    module.attach_dsa_offload_metadata(scheduler, output)
+    module.attach_block_hashes(scheduler, output)
 
-    assert output.dsa_offload_metadata.committed_updates == {
-        "request": (
-            1,
-            (module.make_block_key(bytes([3, 4])),),
+    assert output.block_hash_updates == {
+        "request": module.BlockHashUpdate(
+            base_count=1,
+            hashes=(bytes([3, 4]),),
         )
     }
     assert request.block_hashes == []
 
-    module.attach_dsa_offload_metadata(scheduler, output)
-    assert output.dsa_offload_metadata.committed_updates == {}
+    module.attach_block_hashes(scheduler, output)
+    assert output.block_hash_updates is None
 
     output.scheduled_cached_reqs.resumed_req_ids = {"request"}
-    module.attach_dsa_offload_metadata(scheduler, output)
-    assert output.dsa_offload_metadata.committed_updates == {
-        "request": (
-            0,
-            (
-                first_key,
-                module.make_block_key(bytes([3, 4])),
+    module.attach_block_hashes(scheduler, output)
+    assert output.block_hash_updates == {
+        "request": module.BlockHashUpdate(
+            base_count=0,
+            hashes=(
+                first_hash,
+                bytes([3, 4]),
             ),
+            replace=True,
         )
     }
 
@@ -344,6 +355,7 @@ def test_connector_free_mtp_uses_dsa_hash_state(monkeypatch) -> None:
     module, Scheduler = load_scheduler_module(monkeypatch)
     scheduler = Scheduler()
     scheduler.vllm_config = SimpleNamespace(additional_config={"dsa_offload": {}})
+    scheduler.block_size = 2
     request = make_request([], [1, 2, 3])
     scheduler.requests = {"request": request}
     scheduler._vllm_ascend_dsa_offload_hash_state = make_fallback_hash_state(
@@ -360,10 +372,10 @@ def test_connector_free_mtp_uses_dsa_hash_state(monkeypatch) -> None:
         finished_req_ids=set(),
     )
 
-    module.attach_dsa_offload_metadata(scheduler, output)
+    module.attach_block_hashes(scheduler, output)
 
-    assert output.dsa_offload_metadata.candidate_keys == {
-        "request": (module.make_block_key(bytes([3, 4])),)
+    assert output.dsa_offload_candidate_block_hashes == {
+        "request": [bytes([3, 4])]
     }
 
 
@@ -385,12 +397,11 @@ def test_connector_free_hash_state_is_released(monkeypatch) -> None:
         finished_req_ids={"request"},
     )
 
-    module.attach_dsa_offload_metadata(scheduler, output)
+    module.attach_block_hashes(scheduler, output)
 
-    assert output.dsa_offload_metadata.committed_updates
-    assert state.canonical_by_request == {}
-    assert state.keys_by_request == {}
-    assert state.published_by_request == {}
+    assert output.block_hash_updates
+    assert state.committed_by_request == {}
+    assert scheduler._vllm_ascend_dsa_offload_published_hash_counts == {}
 
 
 def test_publish_metadata_is_consumed_before_request_finish(monkeypatch) -> None:

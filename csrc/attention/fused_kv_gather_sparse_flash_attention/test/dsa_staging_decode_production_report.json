@@ -1,0 +1,65 @@
+{
+  "fused_sfa_accuracy_verified": false,
+  "shape": {
+    "batch_size": 12,
+    "host_miss_rate": 0.1,
+    "miss_layout": "interleaved",
+    "query_rows": 48,
+    "sequence_length": 65536,
+    "sfa_included": true,
+    "speculative_tokens": 3,
+    "topk": 2048
+  },
+  "timings": {
+    "AsuKvGatherInstallFromHost": {
+      "max_us": 227.64000296592712,
+      "mean_us": 199.08500015735626,
+      "median_us": 197.6500004529953,
+      "min_us": 196.1199939250946,
+      "p95_us": 199.4599997997284
+    },
+    "AsuKvGatherInstallFromStaging": {
+      "max_us": 92.45999902486801,
+      "mean_us": 79.23900038003922,
+      "median_us": 78.54000106453896,
+      "min_us": 72.7199986577034,
+      "p95_us": 87.14000135660172
+    },
+    "DsaKVGather": {
+      "max_us": 465.1600122451782,
+      "mean_us": 429.3270006775856,
+      "median_us": 428.50999534130096,
+      "min_us": 422.5600063800812,
+      "p95_us": 430.3799867630005
+    },
+    "DsaLookup": {
+      "max_us": 254.29999828338623,
+      "mean_us": 243.77300068736076,
+      "median_us": 242.65999346971512,
+      "min_us": 239.02000486850739,
+      "p95_us": 251.57999992370605
+    },
+    "DsaUpdate": {
+      "max_us": 304.14000153541565,
+      "mean_us": 264.9079978466034,
+      "median_us": 262.63000071048737,
+      "min_us": 261.0200047492981,
+      "p95_us": 266.31999015808105
+    },
+    "FusedKVGatherSparseFlashAttention": {
+      "max_us": 304.9199879169464,
+      "mean_us": 249.00199994444847,
+      "median_us": 246.2100014090538,
+      "min_us": 244.10000443458557,
+      "p95_us": 247.70000576972961
+    },
+    "SparseFlashAttention": {
+      "max_us": 96.17999941110611,
+      "mean_us": 84.9239993840456,
+      "median_us": 84.72999930381775,
+      "min_us": 74.07999783754349,
+      "p95_us": 95.88000178337097
+    }
+  },
+  "trace_dir": "/tmp/dsa-staging-decode-profile-final"
+}

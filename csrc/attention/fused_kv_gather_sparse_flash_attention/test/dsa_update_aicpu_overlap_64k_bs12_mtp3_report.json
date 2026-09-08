@@ -1,0 +1,100 @@
+{
+  "fused_sfa_accuracy_verified": false,
+  "shape": {
+    "batch_size": 12,
+    "host_miss_rate": 0.1,
+    "miss_layout": "interleaved",
+    "query_rows": 48,
+    "sequence_length": 65536,
+    "sfa_included": true,
+    "speculative_tokens": 3,
+    "topk": 2048
+  },
+  "timings": {
+    "AsuKvGatherInstallFromHost": {
+      "max_us": 221.4599996805191,
+      "mean_us": 197.9299987355868,
+      "median_us": 197.17999547719955,
+      "min_us": 192.71999597549438,
+      "p95_us": 199.12000000476837
+    },
+    "AsuKvGatherInstallFromStaging": {
+      "max_us": 94.15999799966812,
+      "mean_us": 75.93800102670987,
+      "median_us": 74.79999959468842,
+      "min_us": 69.1400021314621,
+      "p95_us": 92.16000139713287
+    },
+    "DsaKVGather": {
+      "max_us": 461.8000090122223,
+      "mean_us": 426.82333290576935,
+      "median_us": 426.6799986362457,
+      "min_us": 420.8599925041199,
+      "p95_us": 429.7800064086914
+    },
+    "DsaLookup": {
+      "max_us": 275.64001083374023,
+      "mean_us": 244.0033346414566,
+      "median_us": 241.99000000953674,
+      "min_us": 237.9399985074997,
+      "p95_us": 252.4999976158142
+    },
+    "DsaUpdate": {
+      "max_us": 303.9200007915497,
+      "mean_us": 264.4446671009064,
+      "median_us": 262.8699988126755,
+      "min_us": 261.00000739097595,
+      "p95_us": 266.03999733924866
+    },
+    "DsaUpdateAicpu": {
+      "max_us": 416.6800081729889,
+      "mean_us": 345.3893343607585,
+      "median_us": 343.49000453948975,
+      "min_us": 323.28000664711,
+      "p95_us": 374.55999851226807
+    },
+    "DsaUpdateAicpuOverlappedWithFusedSFA": {
+      "max_us": 457.43998885154724,
+      "mean_us": 355.3966671228409,
+      "median_us": 350.57999193668365,
+      "min_us": 338.93999457359314,
+      "p95_us": 371.43999338150024
+    },
+    "DsaUpdateAicpuThenFusedSFA": {
+      "max_us": 660.7800126075745,
+      "mean_us": 584.3233386675516,
+      "median_us": 580.1200270652771,
+      "min_us": 571.8399882316589,
+      "p95_us": 614.1999959945679
+    },
+    "DsaUpdateOverlappedWithFusedSFA": {
+      "max_us": 740.9200072288513,
+      "mean_us": 728.6040047804514,
+      "median_us": 732.7300012111664,
+      "min_us": 583.9800238609314,
+      "p95_us": 740.4000163078308
+    },
+    "DsaUpdateThenFusedSFA": {
+      "max_us": 546.2999939918518,
+      "mean_us": 516.1273340384165,
+      "median_us": 514.5800113677979,
+      "min_us": 512.3999714851379,
+      "p95_us": 518.779993057251
+    },
+    "FusedKVGatherSparseFlashAttention": {
+      "max_us": 307.779997587204,
+      "mean_us": 249.30999924739203,
+      "median_us": 247.14000523090363,
+      "min_us": 245.059996843338,
+      "p95_us": 251.19999051094055
+    },
+    "SparseFlashAttention": {
+      "max_us": 112.53999918699265,
+      "mean_us": 81.9200004140536,
+      "median_us": 81.14000037312508,
+      "min_us": 63.440002501010895,
+      "p95_us": 93.47999840974808
+    }
+  },
+  "trace_dir": null
+}

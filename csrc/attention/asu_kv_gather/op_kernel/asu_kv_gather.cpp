@@ -27,7 +27,7 @@ constexpr uint32_t kSwapJitterLevelCount =
     sizeof(kSwapJitterLevels) / sizeof(kSwapJitterLevels[0]);
 constexpr uint32_t kSwapJitterBaseUs = 79U;
 // 编译期开关: true=注入随机忙等, false=关闭
-constexpr bool kSwapJitterEnabled = true;
+constexpr bool kSwapJitterEnabled = false;
 // 忙等迭代数/微秒: 已在 238 (Ascend910B2) 上通过 msprof 校准 (2026-08-18)。
 constexpr uint32_t kItersPerUs = 189U;
 

@@ -1821,7 +1821,7 @@ void store_kv_block(
 {
     return;
 
-} 
+}
 
 std::tuple<at::Tensor, at::Tensor> dsa_offload_lookup_update(
     at::Tensor& index,
@@ -1896,6 +1896,61 @@ std::tuple<at::Tensor, at::Tensor> asu_kv_gather(
     (void)block_size;
     (void)req_num;
     return {destination_kv_cache, destination_k_rope};
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+fused_kv_gather_sparse_flash_attention(
+    const at::Tensor& query, const at::Tensor& key, const at::Tensor& value,
+    const at::Tensor& sparse_indices, double scale_value,
+    const c10::optional<at::Tensor>& block_table,
+    const c10::optional<at::Tensor>& actual_seq_lengths_query,
+    const c10::optional<at::Tensor>& actual_seq_lengths_kv,
+    const c10::optional<at::Tensor>& query_rope,
+    const c10::optional<at::Tensor>& key_rope,
+    const at::Tensor& host_key, const at::Tensor& host_key_rope,
+    const at::Tensor& host_block_table,
+    const at::Tensor& query_pool_entries,
+    const at::Tensor& hot_source_rows, const at::Tensor& route_plan,
+    at::Tensor& install_staging_key, at::Tensor& install_staging_rope,
+    int64_t sparse_block_size, c10::string_view layout_query,
+    c10::string_view layout_kv, int64_t sparse_mode, int64_t pre_tokens,
+    int64_t next_tokens, int64_t attention_mode, bool return_softmax_lse)
+{
+    (void)value;
+    (void)sparse_indices;
+    (void)scale_value;
+    (void)block_table;
+    (void)actual_seq_lengths_query;
+    (void)actual_seq_lengths_kv;
+    (void)query_rope;
+    (void)key_rope;
+    (void)host_key;
+    (void)host_key_rope;
+    (void)host_block_table;
+    (void)query_pool_entries;
+    (void)hot_source_rows;
+    (void)route_plan;
+    (void)install_staging_key;
+    (void)install_staging_rope;
+    (void)sparse_block_size;
+    (void)layout_query;
+    (void)layout_kv;
+    (void)sparse_mode;
+    (void)pre_tokens;
+    (void)next_tokens;
+    (void)attention_mode;
+    at::Tensor attention_out = at::empty_like(query);
+    const auto float_options = query.options().dtype(at::kFloat);
+    if (!return_softmax_lse) {
+        at::Tensor empty = at::empty({0}, float_options);
+        return {attention_out, empty, at::empty({0}, float_options)};
+    }
+    const c10::SymInt heads = key.sym_size(2);
+    const c10::SymInt tokens = query.sym_size(0);
+    const c10::SymInt groups = query.sym_size(1) / heads;
+    return {attention_out,
+            at::empty_symint({heads, tokens, groups}, float_options),
+            at::empty_symint({heads, tokens, groups}, float_options)};
 }
 
 std::tuple<at::Tensor, at::Tensor> dsa_sparse_turbo_lookup_update_batch(
@@ -2184,6 +2239,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
              &vllm_ascend::meta::dsa_offload_lookup_update_batch);
     ops.impl("asu_kv_gather",
              &vllm_ascend::meta::asu_kv_gather);
+    ops.impl("fused_kv_gather_sparse_flash_attention",
+             &vllm_ascend::meta::fused_kv_gather_sparse_flash_attention);
     ops.impl("dsa_sparse_turbo_lookup_update_batch",
              &vllm_ascend::meta::dsa_sparse_turbo_lookup_update_batch);
     ops.impl("dsa_sparse_turbo_prefetch_lookup_update_batch",

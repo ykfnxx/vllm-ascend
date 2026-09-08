@@ -111,6 +111,14 @@ def issue_follower_gathers(
     behind the entry event recorded in ``issue_leader_gather``.
     """
     stream = batch.gather_stream
+    if stream is not None and leader_layer_id not in batch.gather_events:
+        # The leader's gather was absorbed by the fused SFA operator, so the
+        # entry fork in ``issue_leader_gather`` never ran.  Fork the compute
+        # stream here: without it the side stream is not joined to the
+        # capture stream (graph capture fails with "stream not joined"), and
+        # the follower gathers would race the compute stream producing plan.
+        stream.wait_event(torch.npu.current_stream().record_event())
+        _record_plan_stream(plan, stream)
     for layer_id in cohort.layer_ids:
         if layer_id == leader_layer_id:
             continue

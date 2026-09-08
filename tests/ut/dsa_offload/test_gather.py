@@ -36,8 +36,8 @@ def make_batch(gather_stream) -> DSAOffloadBatch:
         query_ranges=((0, 1),),
         query_positions=torch.tensor([8], dtype=torch.int64),
         is_mtp=False,
-        committed_block_keys={"decode": []},
-        candidate_block_keys={},
+        committed_block_hashes={"decode": []},
+        candidate_block_hashes={},
         gather_stream=gather_stream,
     )
 

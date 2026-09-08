@@ -55,6 +55,7 @@
 #include "attention/dsa_offload_lookup_update/dsa_offload_lookup_update_torch_adpt.h"
 #include "attention/dsa_offload_lookup_update_batch/dsa_offload_lookup_update_batch_torch_adpt.h"
 #include "attention/asu_kv_gather/asu_kv_gather_torch_adpt.h"
+#include "attention/fused_kv_gather_sparse_flash_attention/fused_kv_gather_sparse_flash_attention_torch_adpt.h"
 #include "attention/dsa_sparse_turbo_lookup_update_batch/dsa_sparse_turbo_lookup_update_batch_torch_adpt.h"
 #include "attention/dsa_sparse_turbo_prefetch_lookup_update_batch/dsa_sparse_turbo_prefetch_lookup_update_batch_torch_adpt.h"
 #include "attention/dsa_sparse_turbo_fused_lookup_update_batch/dsa_sparse_turbo_fused_lookup_update_batch_torch_adpt.h"
@@ -3035,6 +3036,25 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "asu_kv_gather",
         torch::kPrivateUse1,
         &vllm_ascend::asu_kv_gather);
+
+    ops.def(
+        "fused_kv_gather_sparse_flash_attention("
+            "Tensor query, Tensor key, Tensor value, Tensor sparse_indices, "
+            "float scale_value, Tensor? block_table, "
+            "Tensor? actual_seq_lengths_query, Tensor? actual_seq_lengths_kv, "
+            "Tensor? query_rope, Tensor? key_rope, Tensor host_key, "
+            "Tensor host_key_rope, Tensor host_block_table, "
+            "Tensor query_pool_entries, Tensor hot_source_rows, Tensor route_plan, "
+            "Tensor(a!) install_staging_key, Tensor(b!) install_staging_rope, "
+            "int sparse_block_size, str layout_query, str layout_kv, "
+            "int sparse_mode, int pre_tokens, int next_tokens, "
+            "int attention_mode, bool return_softmax_lse"
+        ") -> (Tensor attention_out, Tensor softmax_max, Tensor softmax_sum)"
+    );
+    ops.impl(
+        "fused_kv_gather_sparse_flash_attention",
+        torch::kPrivateUse1,
+        &vllm_ascend::fused_kv_gather_sparse_flash_attention);
 
     ops.def(
         "dsa_sparse_turbo_lookup_update_batch("

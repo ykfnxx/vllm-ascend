@@ -227,6 +227,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "dsa_offload_lookup_update"
         "dsa_offload_lookup_update_batch"
         "asu_kv_gather"
+        "fused_kv_gather_sparse_flash_attention"
         "dsa_sparse_turbo_lookup_update_batch"
         "dsa_sparse_turbo_prefetch_lookup_update_batch"
         "dsa_sparse_turbo_fused_lookup_update_batch"

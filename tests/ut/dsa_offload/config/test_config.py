@@ -77,6 +77,7 @@ def test_feature_gate_and_valid_config() -> None:
     assert config.enable_turbo_fused_prefetch_lookup
     assert not config.enable_cohort_kvgather
     assert config.cohort_kvgather_aiv_limit == 4
+    assert config.fuse_kvgather_sfa
 
 
 def test_cohort_kvgather_aiv_limit_validation() -> None:
@@ -117,6 +118,7 @@ def test_cohort_kvgather_flag_and_role_gate() -> None:
         "enable_turbo_fused_lookup",
         "enable_turbo_fused_prefetch_lookup",
         "enable_cohort_kvgather",
+        "fuse_kvgather_sfa",
     ],
 )
 def test_fused_lookup_flags_require_boolean(name: str) -> None:
@@ -125,6 +127,16 @@ def test_fused_lookup_flags_require_boolean(name: str) -> None:
 
     with pytest.raises(TypeError, match=name):
         load_dsa_offload_config(vllm_config)
+
+
+def test_fuse_kvgather_sfa_can_be_disabled() -> None:
+    vllm_config = make_config()
+    vllm_config.additional_config["dsa_offload"]["fuse_kvgather_sfa"] = False
+
+    config = load_dsa_offload_config(vllm_config)
+
+    assert config is not None
+    assert not config.fuse_kvgather_sfa
 
 
 def test_connector_free_config_uses_local_mixed_role() -> None:

@@ -199,6 +199,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSlidingWindowMLASpec,
 )
 from vllm_ascend.dsa_offload.config import load_dsa_offload_config
+from vllm_ascend.dsa_offload.constants import QUERY_WIDTH
 from vllm_ascend.dsa_offload.decode_hash import DecodeBlockHashState
 from vllm_ascend.dsa_offload.external_main import (
     add_decode_external_main_cache,
@@ -383,6 +384,7 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_offload_layout: HotCacheLayout | None = None
         self._dsa_offload_hot_cache: HotCacheState | None = None
         self._dsa_offload_sfa_workspace: SFAAddressingWorkspace | None = None
+        self._dsa_offload_fused_staging: tuple[torch.Tensor, torch.Tensor] | None = None
         self._dsa_offload_graph_request_rows: torch.Tensor | None = None
         self._dsa_offload_graph_batches: dict[
             BatchDescriptor, DSAOffloadBatch
@@ -822,6 +824,7 @@ class NPUModelRunner(GPUModelRunner):
         self._dsa_offload_io = None
         self._dsa_offload_hot_cache = None
         self._dsa_offload_sfa_workspace = None
+        self._dsa_offload_fused_staging = None
         self._dsa_offload_graph_request_rows = None
         self._dsa_offload_graph_batches = {}
         self._dsa_offload_lookup_states = {}
@@ -893,6 +896,38 @@ class NPUModelRunner(GPUModelRunner):
                 layout,
                 layer_caches,
             )
+            if config.fuse_kvgather_sfa and config.io_backend == "kvgather_sim":
+                # One shared flat install-staging buffer for every fused
+                # kvgather+SFA call; fused layers run serially on the compute
+                # stream so reuse across layers is safe.
+                sample_planes = next(iter(layer_caches.values()))
+                key_plane, rope_plane = sample_planes[0], sample_planes[1]
+                staging_rows = self.max_num_reqs * config.max_verify_tokens_per_request
+                staging_blocks = staging_rows * (QUERY_WIDTH // self.block_size)
+                self._dsa_offload_fused_staging = (
+                    torch.zeros(
+                        (staging_blocks, self.block_size, 1, key_plane.shape[-1]),
+                        dtype=key_plane.dtype,
+                        device=key_plane.device,
+                    ),
+                    torch.zeros(
+                        (staging_blocks, self.block_size, 1, rope_plane.shape[-1]),
+                        dtype=rope_plane.dtype,
+                        device=rope_plane.device,
+                    ),
+                )
+                logger.info(
+                    "DSA_OFFLOAD_FUSE_KVGATHER_SFA_ACTIVE "
+                    "staging_blocks=%d rows=%d",
+                    staging_blocks,
+                    staging_rows,
+                )
+            elif config.fuse_kvgather_sfa:
+                logger.info(
+                    "DSA_OFFLOAD_FUSE_KVGATHER_SFA_IGNORED io_backend=%s "
+                    "(fused kvgather+SFA requires the kvgather_sim backend)",
+                    config.io_backend,
+                )
             block_tables = getattr(self.input_batch.block_table, "block_tables", None)
             if block_tables is None:
                 block_tables = (self.input_batch.block_table,)
@@ -1239,6 +1274,8 @@ class NPUModelRunner(GPUModelRunner):
             enable_turbo_fused_prefetch_lookup=(
                 config.enable_turbo_fused_prefetch_lookup
             ),
+            fuse_kvgather_sfa=config.fuse_kvgather_sfa,
+            fused_staging_cache=self._dsa_offload_fused_staging,
         )
         graph_rows = self._dsa_offload_graph_request_rows
         if graph_rows is not None:
@@ -1314,6 +1351,8 @@ class NPUModelRunner(GPUModelRunner):
             enable_turbo_fused_prefetch_lookup=(
                 config.enable_turbo_fused_prefetch_lookup
             ),
+            fuse_kvgather_sfa=config.fuse_kvgather_sfa,
+            fused_staging_cache=self._dsa_offload_fused_staging,
         )
         graph_batch.packed_decode = pack_graph_decode_metadata(graph_batch)
         self._dsa_offload_graph_batches[batch_desc] = graph_batch

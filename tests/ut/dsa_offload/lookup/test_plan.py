@@ -39,8 +39,8 @@ def test_packed_addressing_metadata_is_shared_within_decode_step(
         query_ranges=((0, 2), (2, 3)),
         query_positions=torch.tensor([7, 8, 12], dtype=torch.int64),
         is_mtp=True,
-        committed_block_keys={"first": [], "second": []},
-        candidate_block_keys={},
+        committed_block_hashes={"first": [], "second": []},
+        candidate_block_hashes={},
         graph_query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
     )
 
@@ -80,8 +80,8 @@ def test_new_decode_batch_recomputes_growing_sequence_metadata(spy_io) -> None:
             query_ranges=((0, 1),),
             query_positions=torch.tensor([position], dtype=torch.int64),
             is_mtp=False,
-            committed_block_keys={"request": []},
-            candidate_block_keys={},
+            committed_block_hashes={"request": []},
+            candidate_block_hashes={},
         )
 
     previous = get_packed_addressing_metadata(make_batch(7))
@@ -108,8 +108,8 @@ def test_decode_block_table_reuse_is_isolated_by_metadata_source(
         query_ranges=((0, 1), (1, 2)),
         query_positions=torch.tensor([0, 8], dtype=torch.int64),
         is_mtp=False,
-        committed_block_keys={"prefill": [], "decode": []},
-        candidate_block_keys={},
+        committed_block_hashes={"prefill": [], "decode": []},
+        candidate_block_hashes={},
     )
     first_source = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
     second_source = torch.tensor([[5, 6], [7, 8]], dtype=torch.int32)
@@ -145,8 +145,8 @@ def test_history_tail_and_miss_are_mapped_to_fixed_hot_slots(spy_io) -> None:
         query_ranges=((0, 1),),
         query_positions=torch.tensor([8], dtype=torch.int64),
         is_mtp=False,
-        committed_block_keys={"decode": [101, 102]},
-        candidate_block_keys={},
+        committed_block_hashes={"decode": [b"\x01" * 32, b"\x02" * 32]},
+        candidate_block_hashes={},
     )
     semantic = torch.tensor([[1, 5, 8, -1]], dtype=torch.int32)
     slots = torch.tensor([[0, 8192, -1, -1]], dtype=torch.int32)
@@ -193,8 +193,8 @@ def test_graph_plan_keeps_dense_lookup_and_gather_metadata(spy_io) -> None:
         query_ranges=((0, 2), (2, 3)),
         query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
         is_mtp=False,
-        committed_block_keys={"first": [], "second": []},
-        candidate_block_keys={},
+        committed_block_hashes={"first": [], "second": []},
+        candidate_block_hashes={},
         graph_query_start_loc=query_start_loc,
         enable_turbo_lookup=True,
     )
@@ -229,6 +229,112 @@ def test_graph_plan_keeps_dense_lookup_and_gather_metadata(spy_io) -> None:
     assert plan.miss_positions.numel() == 0
 
 
+def test_graph_plan_builds_route_plan_when_fuse_enabled(spy_io) -> None:
+    layout = HotCacheLayout(4, 2, 2)
+    spy_io.gather_history_misses = lambda **_: True
+    cohort = IndexCacheCohort("leader", "leader", ("leader",), (7,))
+    state = LookupState(
+        index=torch.empty((2, 1), dtype=torch.int32),
+        slot_to_index=torch.empty((2, 1), dtype=torch.int32),
+        free_slots=torch.empty((2, 1), dtype=torch.int32),
+        free_head=torch.empty((2, 1), dtype=torch.int32),
+    )
+    batch = DSAOffloadBatch(
+        layout=layout,
+        hot_cache=None,
+        io_backend=spy_io,
+        cohorts=(cohort,),
+        lookup_states={"leader": state},
+        request_ids=("first", "second"),
+        request_rows=torch.tensor([1, 0], dtype=torch.int32),
+        decode_request_indices=(0, 1),
+        query_ranges=((0, 2), (2, 3)),
+        query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
+        is_mtp=False,
+        committed_block_hashes={"first": [], "second": []},
+        candidate_block_hashes={},
+        graph_query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
+        fuse_kvgather_sfa=True,
+    )
+    semantic = torch.tensor(
+        [[1, -1], [0, 3], [5, 6]],
+        dtype=torch.int32,
+    )
+    slots = torch.zeros_like(semantic)
+    misses = torch.tensor(
+        [[1, 0], [0, 1], [1, 0]],
+        dtype=torch.int32,
+    )
+
+    with patch(
+        "vllm_ascend.dsa_offload.lookup.lookup_update",
+        return_value=(slots, misses),
+    ):
+        plan = make_lookup_plan(
+            semantic_topk=semantic,
+            cohort=cohort,
+            batch=batch,
+        )
+
+    route_plan = plan.route_plan
+    assert route_plan is not None
+    assert route_plan.dtype == torch.int32
+    assert route_plan.shape == semantic.shape
+    assert plan.lookup_slots is not None
+    # History misses route to the Host source with the original token id.
+    assert route_plan[0, 0].item() == (2 << 29) | 1
+    assert route_plan[1, 1].item() == (2 << 29) | 3
+    assert route_plan[2, 0].item() == (2 << 29) | 5
+    # Pool hits route to the Hot source with the in-row lookup slot.
+    assert route_plan[1, 0].item() == (1 << 29) | plan.lookup_slots[1, 0].item()
+    assert route_plan[2, 1].item() == (1 << 29) | plan.lookup_slots[2, 1].item()
+    # Invalid tokens stay unrouted.
+    assert route_plan[0, 1].item() == 0
+
+
+def test_graph_plan_skips_route_plan_when_fuse_disabled(spy_io) -> None:
+    layout = HotCacheLayout(4, 2, 2)
+    spy_io.gather_history_misses = lambda **_: True
+    cohort = IndexCacheCohort("leader", "leader", ("leader",), (7,))
+    state = LookupState(
+        index=torch.empty((2, 1), dtype=torch.int32),
+        slot_to_index=torch.empty((2, 1), dtype=torch.int32),
+        free_slots=torch.empty((2, 1), dtype=torch.int32),
+        free_head=torch.empty((2, 1), dtype=torch.int32),
+    )
+    batch = DSAOffloadBatch(
+        layout=layout,
+        hot_cache=None,
+        io_backend=spy_io,
+        cohorts=(cohort,),
+        lookup_states={"leader": state},
+        request_ids=("first", "second"),
+        request_rows=torch.tensor([1, 0], dtype=torch.int32),
+        decode_request_indices=(0, 1),
+        query_ranges=((0, 2), (2, 3)),
+        query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
+        is_mtp=False,
+        committed_block_hashes={"first": [], "second": []},
+        candidate_block_hashes={},
+        graph_query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
+    )
+    semantic = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
+    slots = torch.zeros_like(semantic)
+    misses = torch.ones_like(semantic)
+
+    with patch(
+        "vllm_ascend.dsa_offload.lookup.lookup_update",
+        return_value=(slots, misses),
+    ):
+        plan = make_lookup_plan(
+            semantic_topk=semantic,
+            cohort=cohort,
+            batch=batch,
+        )
+
+    assert plan.route_plan is None
+
+
 def test_mtp_fused_lookup_consumes_shared_compact_metadata(spy_io) -> None:
     layout = HotCacheLayout(4, 2, 2)
     spy_io.gather_history_misses = lambda **_: True
@@ -251,8 +357,8 @@ def test_mtp_fused_lookup_consumes_shared_compact_metadata(spy_io) -> None:
         query_ranges=((0, 2), (2, 3)),
         query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
         is_mtp=True,
-        committed_block_keys={"first": [], "second": []},
-        candidate_block_keys={},
+        committed_block_hashes={"first": [], "second": []},
+        candidate_block_hashes={},
         graph_query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
         enable_turbo_lookup=True,
         enable_turbo_fused_lookup=True,
@@ -319,8 +425,8 @@ def test_mtp_fused_lookup_keeps_mapped_slot_in_eager_miss_plan(spy_io) -> None:
         query_ranges=((0, 1),),
         query_positions=torch.tensor([8], dtype=torch.int64),
         is_mtp=True,
-        committed_block_keys={"decode": []},
-        candidate_block_keys={},
+        committed_block_hashes={"decode": []},
+        candidate_block_hashes={},
         enable_turbo_lookup=True,
         enable_turbo_fused_lookup=True,
     )
@@ -368,8 +474,8 @@ def test_fused_lookup_flag_does_not_bypass_disabled_turbo(spy_io) -> None:
         query_ranges=((0, 1),),
         query_positions=torch.tensor([8], dtype=torch.int64),
         is_mtp=True,
-        committed_block_keys={"decode": []},
-        candidate_block_keys={},
+        committed_block_hashes={"decode": []},
+        candidate_block_hashes={},
         enable_turbo_lookup=False,
         enable_turbo_fused_lookup=True,
     )
@@ -430,8 +536,8 @@ def test_graph_prefetch_plan_uses_fixed_dense_gather_metadata(spy_io) -> None:
         query_ranges=((0, 2), (2, 3)),
         query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
         is_mtp=False,
-        committed_block_keys={"first": [], "second": []},
-        candidate_block_keys={},
+        committed_block_hashes={"first": [], "second": []},
+        candidate_block_hashes={},
         graph_query_start_loc=query_start_loc,
         enable_turbo_prefetch_lookup=True,
     )
@@ -509,8 +615,8 @@ def test_mtp_fused_prefetch_consumes_only_shared_tail_anchor(spy_io) -> None:
         query_ranges=((0, 2), (2, 3)),
         query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
         is_mtp=True,
-        committed_block_keys={"first": [], "second": []},
-        candidate_block_keys={},
+        committed_block_hashes={"first": [], "second": []},
+        candidate_block_hashes={},
         graph_query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
         enable_turbo_prefetch_lookup=True,
         enable_turbo_fused_prefetch_lookup=True,
@@ -551,7 +657,7 @@ def test_mtp_fused_prefetch_consumes_only_shared_tail_anchor(spy_io) -> None:
     assert plan.dense_miss_mask is misses
 
 
-def test_candidate_keys_extend_committed_prefix(spy_io) -> None:
+def test_candidate_hashes_extend_committed_prefix(spy_io) -> None:
     batch = DSAOffloadBatch(
         layout=HotCacheLayout(4, 1, 2),
         hot_cache=None,
@@ -564,11 +670,11 @@ def test_candidate_keys_extend_committed_prefix(spy_io) -> None:
         query_ranges=((0, 1),),
         query_positions=torch.tensor([0]),
         is_mtp=True,
-        committed_block_keys={"request": [101, 102]},
-        candidate_block_keys={"request": [103]},
+        committed_block_hashes={"request": [b"\x01" * 32, b"\x02" * 32]},
+        candidate_block_hashes={"request": [b"\x03" * 32]},
     )
 
-    assert batch.block_keys(0) == (101, 102, 103)
+    assert batch.block_hashes(0) == (b"\x01" * 32, b"\x02" * 32, b"\x03" * 32)
 
 
 def test_lookup_hit_does_not_call_io(spy_io) -> None:
@@ -584,8 +690,8 @@ def test_lookup_hit_does_not_call_io(spy_io) -> None:
         query_ranges=((0, 1),),
         query_positions=torch.tensor([0]),
         is_mtp=False,
-        committed_block_keys={"request": []},
-        candidate_block_keys={},
+        committed_block_hashes={"request": []},
+        candidate_block_hashes={},
     )
     empty = torch.empty(0, dtype=torch.int64)
     plan = LookupPlan(
@@ -603,7 +709,7 @@ def test_lookup_hit_does_not_call_io(spy_io) -> None:
     assert spy_io.get_calls == []
 
 
-def test_lookup_miss_rejects_missing_block_key(spy_io) -> None:
+def test_lookup_miss_rejects_missing_block_hash(spy_io) -> None:
     batch = DSAOffloadBatch(
         layout=HotCacheLayout(4, 1, 1),
         hot_cache=None,
@@ -616,8 +722,8 @@ def test_lookup_miss_rejects_missing_block_key(spy_io) -> None:
         query_ranges=((0, 1),),
         query_positions=torch.tensor([0]),
         is_mtp=False,
-        committed_block_keys={"request": []},
-        candidate_block_keys={},
+        committed_block_hashes={"request": []},
+        candidate_block_hashes={},
     )
     plan = LookupPlan(
         mapped_indices=torch.empty((1, 0), dtype=torch.int32),
@@ -631,6 +737,6 @@ def test_lookup_miss_rejects_missing_block_key(spy_io) -> None:
 
     with pytest.raises(
         RuntimeError,
-        match=r"miss load for request request requires 2 block keys",
+        match=r"miss load for request request requires 2 block hashes",
     ):
         load_plan_misses(plan, 0, batch)

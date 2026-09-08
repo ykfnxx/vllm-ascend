@@ -10,6 +10,7 @@ from . import lookup as _lookup
 from . import pd as _pd
 
 __all__ = [
+    "FusedSFAInputs",
     "SFAAddressingView",
     "SFAAddressingWorkspace",
     "maybe_start_group_prefetch",
@@ -17,6 +18,7 @@ __all__ = [
     "prepare_indexer_cache_write",
     "publish_prefill_layer",
     "resolve_sfa_inputs",
+    "should_fuse_kvgather_sfa",
 ]
 
 
@@ -25,6 +27,20 @@ class SFAAddressingView:
     sparse_indices: torch.Tensor
     block_table: torch.Tensor
     actual_seq_lengths_kv: torch.Tensor
+    fused: "FusedSFAInputs | None" = None
+
+
+@dataclass(frozen=True)
+class FusedSFAInputs:
+    """Extra operands for the fused kvgather+SFA operator on a fused layer."""
+
+    route_plan: torch.Tensor
+    request_rows: torch.Tensor
+    host_key: torch.Tensor
+    host_rope: torch.Tensor
+    host_block_table: torch.Tensor
+    staging_key: torch.Tensor
+    staging_rope: torch.Tensor
 
 
 @dataclass
@@ -317,6 +333,37 @@ def prepare_indexer_cache_write(
     return True
 
 
+_QUANT_CACHE_DTYPES = (torch.int8, torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def should_fuse_kvgather_sfa(
+    *,
+    batch: _lookup.DSAOffloadBatch,
+    plan: _lookup.LookupPlan,
+    layer_name: str,
+    is_leader: bool,
+) -> bool:
+    """Whether this layer's gather+SFA runs as the fused operator.
+
+    The fused path requires the graph-mode route plan (dense-gather backend,
+    i.e. kvgather_sim), a shared staging buffer, and a non-quantized KV cache.
+    With cohort kvgather enabled only the cohort leader fuses; the follower
+    gathers keep their early issue.  Without it every layer fuses.
+    """
+
+    if not (batch.fuse_kvgather_sfa and plan.route_plan is not None):
+        return False
+    if batch.fused_staging_cache is None or batch.hot_cache is None:
+        return False
+    # Only the kvgather_sim backend exposes Host-side planes.
+    if not hasattr(batch.io_backend, "host_cache_planes"):
+        return False
+    if batch.enable_cohort_kvgather and not is_leader:
+        return False
+    layer_key = batch.hot_cache.layer_caches[layer_name][0]
+    return layer_key.dtype not in _QUANT_CACHE_DTYPES
+
+
 def resolve_sfa_inputs(
     *,
     layer_name: str,
@@ -335,7 +382,8 @@ def resolve_sfa_inputs(
     cohort = next(cohort for cohort in batch.cohorts if layer_name in cohort.layer_names)
     plan = batch.lookup_plans.get(cohort.cohort_id)
     layer_id = cohort.layer_ids[cohort.layer_names.index(layer_name)]
-    if plan is None:
+    is_leader = plan is None
+    if is_leader:
         if batch.prefetch_runtime is not None:
             batch.prefetch_runtime.wait_before_exact_lookup(layer_name)
         plan = _lookup.make_lookup_plan(
@@ -344,19 +392,31 @@ def resolve_sfa_inputs(
             batch=batch,
         )
         batch.lookup_plans[cohort.cohort_id] = plan
-        if batch.enable_cohort_kvgather:
-            # The leader's own gather stays a standalone call site: it will
-            # later be fused with neighbouring operators.  The follower
-            # gathers are an independent block so the fusion cannot disturb
-            # their early issue.
+    assert plan is not None
+    fuse_this_layer = should_fuse_kvgather_sfa(
+        batch=batch,
+        plan=plan,
+        layer_name=layer_name,
+        is_leader=is_leader,
+    )
+    if is_leader and batch.enable_cohort_kvgather:
+        if not fuse_this_layer:
+            # The leader's own gather stays a standalone call site unless it
+            # is absorbed by the fused operator below.  The follower gathers
+            # are an independent block so the fusion cannot disturb their
+            # early issue.
             _gather.issue_leader_gather(plan=plan, layer_id=layer_id, batch=batch)
-            _gather.issue_follower_gathers(
-                plan=plan,
-                cohort=cohort,
-                leader_layer_id=layer_id,
-                batch=batch,
-            )
-    if not batch.enable_cohort_kvgather:
+        _gather.issue_follower_gathers(
+            plan=plan,
+            cohort=cohort,
+            leader_layer_id=layer_id,
+            batch=batch,
+        )
+    if fuse_this_layer:
+        # The fused operator reads Hot/Host sources directly via route_plan;
+        # no standalone gather runs for this layer.
+        pass
+    elif not batch.enable_cohort_kvgather:
         _lookup.load_plan_misses(plan, layer_id, batch)
     else:
         if layer_id not in batch.gather_events:
@@ -367,6 +427,48 @@ def resolve_sfa_inputs(
         _gather.wait_layer_gather(batch=batch, layer_id=layer_id)
     if batch.prefetch_runtime is not None:
         batch.prefetch_runtime.release_after_exact_load(layer_name)
+    if fuse_this_layer:
+        hot_cache = batch.hot_cache
+        assert hot_cache is not None
+        packed = batch.packed_decode
+        assert packed is not None
+        assert plan.route_plan is not None
+        staging_cache = batch.fused_staging_cache
+        assert staging_cache is not None
+        staging_key, staging_rope = staging_cache
+        host_key, host_rope = batch.io_backend.host_cache_planes(layer_id=layer_id)
+        sparse_indices = semantic_topk
+        if sparse_indices.dtype != torch.int32:
+            sparse_indices = sparse_indices.to(torch.int32)
+        # The kernel reads query_pool_entries/hot_source_rows by sequence
+        # index (boIdx), so the values stay per-request; the tiling check
+        # additionally requires their length to equal the query row count
+        # (route_plan.shape[0]), which exceeds the request count under MTP.
+        # Pad with -1: those entries are never indexed, and a negative
+        # sourceRow makes the kernel skip the route defensively.
+        request_rows = packed.request_rows
+        num_query_rows = plan.route_plan.shape[0]
+        if request_rows.shape[0] != num_query_rows:
+            padded_rows = request_rows.new_full((num_query_rows,), -1)
+            padded_rows[: request_rows.shape[0]] = request_rows
+            request_rows = padded_rows
+        return SFAAddressingView(
+            # The fused operator resolves payload addresses through
+            # route_plan, so sparse_indices keep the original token positions
+            # and the KV length stays in the request's own address space.
+            sparse_indices=sparse_indices,
+            block_table=hot_cache.hot_block_table,
+            actual_seq_lengths_kv=default_actual_seq_lengths_kv,
+            fused=FusedSFAInputs(
+                route_plan=plan.route_plan,
+                request_rows=request_rows,
+                host_key=host_key,
+                host_rope=host_rope,
+                host_block_table=batch.io_backend.host_block_table(layer_id=layer_id),
+                staging_key=staging_key,
+                staging_rope=staging_rope,
+            ),
+        )
     sfa_block_table, sfa_actual_seq_lengths_kv = _prepare_sfa_addressing_view(
         batch=batch,
         default_block_table=default_block_table,

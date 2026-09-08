@@ -41,6 +41,7 @@ from vllm_ascend.attention.utils import (
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.dsa_offload.ops import fused_kv_gather_sparse_flash_attention
 from vllm_ascend.dsa_offload.sfa import (
     maybe_start_group_prefetch,
     prepare_indexer_cache_write,
@@ -2042,16 +2043,41 @@ class AscendSFAImpl(MLAAttentionImpl):
             default_actual_seq_lengths_kv=actual_seq_lengths_key,
             batch=attn_metadata.dsa_offload_batch,
         )
-        attn_output = self._execute_sparse_flash_attention_process(
-            ql_nope,
-            q_pe,
-            kv_cache,
-            sfa_addressing.sparse_indices,
-            attn_metadata,
-            actual_seq_lengths_query,
-            sfa_addressing.actual_seq_lengths_kv,
-            block_table=sfa_addressing.block_table,
-        )
+        if sfa_addressing.fused is not None:
+            # Fused kvgather+SFA: the operator gathers each selected token
+            # from the Hot or Host source per route_plan while running the
+            # ordinary SFA pipeline; no standalone gather runs on this layer.
+            # The adapter requires contiguous inputs; ql_nope is a transposed
+            # bmm view, so normalize the query tensors here (no-op when
+            # already contiguous).
+            fused_inputs = sfa_addressing.fused
+            attn_output, _, _ = fused_kv_gather_sparse_flash_attention(
+                ql_nope.contiguous(),
+                q_pe.contiguous(),
+                (kv_cache[0], kv_cache[1]),
+                sfa_addressing.block_table,
+                (fused_inputs.host_key, fused_inputs.host_rope),
+                fused_inputs.host_block_table,
+                fused_inputs.request_rows,
+                fused_inputs.request_rows,
+                fused_inputs.route_plan,
+                (fused_inputs.staging_key, fused_inputs.staging_rope),
+                sfa_addressing.sparse_indices,
+                actual_seq_lengths_query,
+                sfa_addressing.actual_seq_lengths_kv,
+                scale_value=self.scale,
+            )
+        else:
+            attn_output = self._execute_sparse_flash_attention_process(
+                ql_nope,
+                q_pe,
+                kv_cache,
+                sfa_addressing.sparse_indices,
+                attn_metadata,
+                actual_seq_lengths_query,
+                sfa_addressing.actual_seq_lengths_kv,
+                block_table=sfa_addressing.block_table,
+            )
 
         attn_output = self._v_up_proj(attn_output)
         weight_prefetch_method = get_weight_prefetch_method()

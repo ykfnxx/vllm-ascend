@@ -16,7 +16,7 @@ def test_final_prefill_puts_full_blocks_and_captures_last_topk_and_tail(spy_io) 
         scheduled_token_counts=(2, 2),
         stored_token_counts=(6, 5),
         publish_requests=(True, False),
-        committed_block_keys={"final": [101], "middle": [102]},
+        committed_block_hashes={"final": [b"\x01" * 32], "middle": [b"\x02" * 32]},
         io_backend=spy_io,
         tp_rank=1,
     )
@@ -33,7 +33,7 @@ def test_final_prefill_puts_full_blocks_and_captures_last_topk_and_tail(spy_io) 
     assert spy_io.put_calls[0]["layer_id"] == 7
     assert spy_io.put_calls[0]["source_block_ids"].tolist() == [2]
     assert spy_io.put_calls[0]["storage_ids"].tolist() == [
-        make_storage_id(101, 7)
+        make_storage_id(b"\x01" * 32, 7)
     ]
     assert state.layer_topk["layer"]["final"] == semantic_topk[1].tolist()
     assert state.partial_tail_blocks["layer"] == {"final": 3}
@@ -57,7 +57,7 @@ def test_intermediate_prefill_does_not_publish(spy_io) -> None:
         scheduled_token_counts=(2,),
         stored_token_counts=(2,),
         publish_requests=(False,),
-        committed_block_keys={"request": []},
+        committed_block_hashes={"request": []},
         io_backend=spy_io,
         tp_rank=0,
     )
@@ -79,7 +79,7 @@ def test_short_final_prefill_captures_handoff_without_empty_put(spy_io) -> None:
         scheduled_token_counts=(2,),
         stored_token_counts=(2,),
         publish_requests=(True,),
-        committed_block_keys={"request": []},
+        committed_block_hashes={"request": []},
         io_backend=spy_io,
         tp_rank=0,
     )
@@ -103,14 +103,14 @@ def test_full_block_publish_rejects_missing_keys(spy_io) -> None:
         scheduled_token_counts=(4,),
         stored_token_counts=(4,),
         publish_requests=(True,),
-        committed_block_keys={"request": []},
+        committed_block_hashes={"request": []},
         io_backend=spy_io,
         tp_rank=0,
     )
 
     with pytest.raises(
         RuntimeError,
-        match=r"Prefill publish for request request requires 1 block keys",
+        match=r"Prefill publish for request request requires 1 block hashes",
     ):
         state.publish_layer(
             layer_name="layer",

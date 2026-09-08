@@ -15,6 +15,9 @@ from .constants import (
     LOOKUP_SLOTS,
     REPLACEABLE_SLOTS,
     RESIDENT_SLOTS,
+    ROUTE_KIND_HOST_MISS,
+    ROUTE_KIND_POOL_HIT,
+    ROUTE_KIND_SHIFT,
 )
 from .hot_cache import HotCacheLayout, HotCacheState
 from .io import IOBackend, make_storage_ids, require_block_hashes
@@ -162,6 +165,9 @@ class LookupPlan:
     query_indices: torch.Tensor | None = None
     lookup_slots: torch.Tensor | None = None
     dense_miss_mask: torch.Tensor | None = None
+    # [T, QUERY_WIDTH] int32 route table for the fused kvgather+SFA operator;
+    # only built in graph mode on the dense-gather (kvgather_sim) backend.
+    route_plan: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -262,6 +268,11 @@ class DSAOffloadBatch:
     gather_stream: object | None = None
     gather_events: dict[int, object | None] = field(default_factory=dict)
     enable_cohort_kvgather: bool = False
+    fuse_kvgather_sfa: bool = False
+    # Shared flat staging buffer consumed as the install-staging side output of
+    # the fused kvgather+SFA operator; layers run serially so one buffer is
+    # reused by every fused layer.  See model_runner_v1.py.
+    fused_staging_cache: tuple[torch.Tensor, torch.Tensor] | None = None
 
     def block_hashes(self, request_index: int) -> Sequence[bytes]:
         request_id = self.request_ids[request_index]
@@ -293,6 +304,8 @@ def build_dsa_offload_batch(
     enable_turbo_prefetch_lookup: bool = False,
     enable_turbo_fused_lookup: bool = False,
     enable_turbo_fused_prefetch_lookup: bool = False,
+    fuse_kvgather_sfa: bool = False,
+    fused_staging_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> DSAOffloadBatch:
     query_ends = tuple(accumulate(query_counts))
     query_ranges = tuple(zip((0, *query_ends[:-1]), query_ends))
@@ -337,6 +350,8 @@ def build_dsa_offload_batch(
         enable_turbo_prefetch_lookup=enable_turbo_prefetch_lookup,
         enable_turbo_fused_lookup=enable_turbo_fused_lookup,
         enable_turbo_fused_prefetch_lookup=enable_turbo_fused_prefetch_lookup,
+        fuse_kvgather_sfa=fuse_kvgather_sfa,
+        fused_staging_cache=fused_staging_cache,
     )
     batch.packed_decode = pack_decode_metadata(batch)
     return batch
@@ -764,6 +779,22 @@ def make_lookup_plan(
             torch.int32
         )
 
+    # The fused kvgather+SFA operator consumes a per-query route table in
+    # place of a standalone gather.  It exists only in graph mode on the
+    # dense-gather backend, where packed_topk already covers every query row
+    # of the captured decode batch.
+    route_plan: torch.Tensor | None = None
+    if graph_mode and use_dense_gather and batch.fuse_kvgather_sfa:
+        assert dense_miss_mask is not None
+        valid_route = (packed_topk >= 0) & (packed_topk < INDEX_CAPACITY)
+        host_route = packed_topk | (ROUTE_KIND_HOST_MISS << ROUTE_KIND_SHIFT)
+        pool_route = mapped | (ROUTE_KIND_POOL_HIT << ROUTE_KIND_SHIFT)
+        route_plan = torch.where(
+            dense_miss_mask.ne(0) & valid_route,
+            host_route,
+            torch.where(valid_route, pool_route, torch.zeros_like(packed_topk)),
+        ).to(torch.int32).contiguous()
+
     return LookupPlan(
         mapped_indices=merged_indices.reshape(topk_shape),
         query_indices=packed_topk if use_dense_gather else None,
@@ -779,6 +810,7 @@ def make_lookup_plan(
         miss_destination_slots=miss_destination_slots,
         miss_batch_indices=miss_batch_indices,
         query_request_rows=query_request_rows,
+        route_plan=route_plan,
     )
 
 

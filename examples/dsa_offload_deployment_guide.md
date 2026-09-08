@@ -188,6 +188,7 @@ Prefill、Decode 和代理之间的 HTTP 端口，以及 Mooncake 的 `kv_port` 
 | `dsa_offload` | 是 | 存在该对象即启用 DSA Offload |
 | `dsa_offload.io_backend` | 否 | 默认 `mock`；首次冒烟用 `mock`，真实部署填 `kvio` |
 | `dsa_offload.kvio_model_id` | 否 | 非负整数，默认 0；同一模型的 P/D 必须一致，不同并行服务建议使用不同 ID |
+| `dsa_offload.fuse_kvgather_sfa` | 否 | 默认 `true`；cohort leader 层（`enable_cohort_kvgather=false` 时为所有层）将 kvgather 与 SFA 融合为单个算子，目前仅 `kvgather_sim` 后端生效，其余后端自动回退 |
 | `ascend_compilation_config.enable_npugraph_ex` | 否 | 不是 DSA 新参数；首次验证建议为 `false`，稳定后再单独验证图模式 |
 
 `enable_sparse_sfa_c8`、`enable_sparse_li_c8` 和

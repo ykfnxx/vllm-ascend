@@ -52,29 +52,23 @@ def main() -> None:
         request_id: list(history + appended)
         for request_id in range(args.requests)
     }
-    appended_keys = tuple(
-        metadata.make_block_key(block_hash) for block_hash in appended
-    )
-    delta = metadata.DSAOffloadStepMetadata(
-        committed_updates={
-            str(request_id): (args.history_blocks, appended_keys)
-            for request_id in range(args.requests)
-        },
-        decode_contexts={},
-        candidate_keys={},
-    )
+    delta = {
+        str(request_id): metadata.BlockHashUpdate(
+            base_count=args.history_blocks,
+            hashes=tuple(appended),
+        )
+        for request_id in range(args.requests)
+    }
     legacy_bytes = pickle.dumps(legacy, protocol=pickle.HIGHEST_PROTOCOL)
     delta_bytes = pickle.dumps(delta, protocol=pickle.HIGHEST_PROTOCOL)
     committed = {
-        request_id: [
-            metadata.make_block_key(block_hash) for block_hash in history
-        ]
-        for request_id in delta.committed_updates
+        request_id: list(history)
+        for request_id in delta
     }
 
     def apply_delta() -> None:
-        for request_id, update in delta.committed_updates.items():
-            metadata.apply_committed_update(
+        for request_id, update in delta.items():
+            metadata.apply_block_hash_update(
                 request_id,
                 committed[request_id],
                 update,
