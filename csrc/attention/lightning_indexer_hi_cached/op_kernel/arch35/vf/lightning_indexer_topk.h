@@ -144,10 +144,9 @@ public:
         return LICommon::Align(topK, 256U) * sizeof(uint32_t);
     }
 
-    __aicore__ inline void Init(uint32_t topK, uint32_t trunkLen)
+    __aicore__ inline void Init(uint32_t topK)
     {
         topK_ = topK;
-        trunkLen_ = trunkLen;
     }
 
     __aicore__ inline void InitBuffers(LocalTensor<uint32_t> &sharedTmpBuffer)
@@ -181,7 +180,6 @@ private:
     LocalTensor<uint32_t> nkValueLocal_;
     LocalTensor<uint16_t> tmpIndexLocal_;
     uint32_t topK_ = 0;
-    uint32_t trunkLen_ = 0;
 };
 
 // Native LI's multi-trunk BF16 TopK, with indices in the compact HI token
@@ -220,9 +218,8 @@ public:
         if (windowIdx == 0) {
             Cast(historyIndices_[nextHistory], tmpIndices_, RoundMode::CAST_NONE, TOPK);
         } else {
-            topkb16gather::LiTopKGatherVF(historyIndices_[nextHistory], historyKeys, inputKeys,
-                                          tmpIndices_, historyIndices_[windowIdx % 2], TOPK,
-                                          windowIdx * TRUNK_LEN - TOPK, inputCount);
+            topkb16gather::LiTopKGatherVF(historyIndices_[nextHistory], tmpIndices_,
+                                          historyIndices_[windowIdx % 2], TOPK, windowIdx * TRUNK_LEN - TOPK);
         }
         PipeBarrier<PIPE_V>();
         if (isLastWindow) {

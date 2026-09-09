@@ -10,7 +10,7 @@
 
 /*!
  * \file lightning_indexer_service_cube.h
- * \brief use 5 buffer for matmul l1, better pipeline
+ * \brief Stage1 key-mean QK and Stage2 token QK, with GM or direct-UB output.
  */
 #ifndef LIGHTNING_INDEXER_HI_CACHED_ARCH35_SERVICE_CUBE_H
 #define LIGHTNING_INDEXER_HI_CACHED_ARCH35_SERVICE_CUBE_H
@@ -30,23 +30,27 @@ public:
     using Q_T = typename LIT::queryType;
     using K_T = typename LIT::keyType;
 
-    __aicore__ inline LIMatmul(){};
     __aicore__ inline void InitBuffers(TPipe *pipe);
-    __aicore__ inline void InitMm1GlobalTensor(const GlobalTensor<int32_t> &blkTableGm, const GlobalTensor<K_T> &keyGm,
-                                               const GlobalTensor<K_T> &stage1MeanKeyGm,
-                                               const GlobalTensor<K_T> &stage1MeanCacheGm,
-                                               const GlobalTensor<Q_T> &queryGm, const GlobalTensor<float> &mm1ResGm);
+    __aicore__ inline void InitStage2QkUb(TPipe *pipe);
+    __aicore__ inline void InitGlobalTensors(
+        const GlobalTensor<int32_t> &blkTableGm, const GlobalTensor<K_T> &keyGm,
+        const GlobalTensor<K_T> &keyMeanGm, const GlobalTensor<Q_T> &queryGm,
+        const GlobalTensor<float> &qkWorkspaceGm);
     __aicore__ inline void InitParams(const ConstInfo &constInfo);
-    __aicore__ inline void AllocEventID();
-    __aicore__ inline void FreeEventID();
-    __aicore__ inline void ComputeMm1(const LICommon::RunInfo &runInfo, bool reluPre = false);
-    __aicore__ inline void ComputeMm1Stage1(const LICommon::RunInfo &runInfo, uint32_t localBlockNum);
+    __aicore__ inline void InitPipelineEvents();
+    __aicore__ inline void DrainPipelineEvents();
+    __aicore__ inline void ComputeQkTile(const LICommon::RunInfo &runInfo, bool reluPre = false);
+    __aicore__ inline void ComputeStage1QkTile(const LICommon::RunInfo &runInfo, uint32_t localBlockNum);
     __aicore__ inline void LoadQueryTile(const LICommon::RunInfo &runInfo);
     __aicore__ inline void ReleaseQueryTile(const LICommon::RunInfo &runInfo);
-    __aicore__ inline void ComputeMm1ByRangeWithCachedQuery(const LICommon::RunInfo &runInfo,
-                                                            uint64_t s2SrcBaseOffset, uint64_t s2ProcessSize,
-                                                            uint64_t s2DstBaseOffset, uint64_t s2DstStride,
-                                                            uint64_t queryMOffset);
+    template <bool SHARE_QUERY_PAIR = false>
+    __aicore__ inline void ComputeStage2BlockPairToUb(const LICommon::RunInfo &runInfo,
+                                                     const GlobalTensor<int32_t> &blockIndices,
+                                                     uint64_t blockOffset);
+    template <bool TO_UB = false, uint32_t QUERY_COUNT = 1>
+    __aicore__ inline void ComputeStage2QkRange(
+        const LICommon::RunInfo &runInfo, uint64_t s2SrcBaseOffset, uint64_t s2ProcessSize,
+        uint64_t s2DstBaseOffset, uint64_t s2DstStride, uint64_t queryMOffset);
 
     static constexpr uint64_t KEY_BUF_NUM = 3;
     static constexpr uint64_t QUERY_BUF_NUM = 2;
@@ -58,6 +62,8 @@ public:
 
     static constexpr uint32_t MTE2_MTE1_EVENT = EVENT_ID2;
     static constexpr uint32_t MTE1_M_EVENT = EVENT_ID2;
+    static constexpr uint32_t M_FIX_EVENT = EVENT_ID0;
+    static constexpr uint32_t FIX_M_EVENT = EVENT_ID0;
 
     static constexpr uint64_t M_BASIC_BLOCK = 256;
     static constexpr uint64_t D_BASIC_BLOCK = 128;
@@ -74,27 +80,29 @@ public:
     static constexpr uint64_t L0C_BUFFER_OFFSET = M_BASIC_BLOCK_L0 * S2_BASIC_BLOCK_L0;
 
 protected:
-    __aicore__ inline void Fixp(uint64_t s1gGmOffset, uint64_t s2GmOffset, uint64_t s1gL0RealSize,
-                                uint64_t s2L0RealSize, const LICommon::RunInfo &runInfo, bool reluPre);
-    __aicore__ inline void FixpWithDst(uint64_t s1gGmOffset, uint64_t s2DstGmOffset, uint64_t s1gL0RealSize,
-                                       uint64_t s2L0RealSize, uint64_t s2DstStride,
-                                       const LICommon::RunInfo &runInfo, bool reluPre);
-    __aicore__ inline void ComuteL0c(uint64_t s1gL0RealSize, uint64_t s2L0RealSize, const LICommon::RunInfo &runInfo);
-    __aicore__ inline void LoadKeyToL0b(uint64_t s2L0Offset, uint64_t s2L1RealSize, uint64_t s2L0RealSize,
-                                        const LICommon::RunInfo &runInfo);
-    __aicore__ inline void LoadQueryToL0a(uint64_t s1gL1Offset, uint64_t s1gL0Offset, uint64_t s1gL1RealSize,
-                                          uint64_t s1gL0RealSize, const LICommon::RunInfo &runInfo);
-    __aicore__ inline void QueryNd2Nz(uint64_t s1gL1RealSize, uint64_t s1gL1Offset, const LICommon::RunInfo &runInfo);
-    __aicore__ inline void KeyNd2Nz(uint64_t s2L1RealSize, uint64_t s2GmOffset, const LICommon::RunInfo &runInfo);
-    __aicore__ inline void KeyNd2NzFromStage1(uint64_t s2L1RealSize, uint64_t s2GmOffset,
-                                              const LICommon::RunInfo &runInfo);
-    __aicore__ inline void KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset, const LICommon::RunInfo &runInfo);
+    static constexpr AscendC::FixpipeConfig STAGE2_QK_UB_CONFIG = {AscendC::CO2Layout::ROW_MAJOR, true};
+
+    __aicore__ inline void CopyQkToGm(uint64_t s1gGmOffset, uint64_t s2GmOffset, uint64_t s1gL0RealSize,
+                                        uint64_t s2L0RealSize, const LICommon::RunInfo &runInfo, bool reluPre);
+    __aicore__ inline void CopyQkToGmWithStride(
+        uint64_t s1gGmOffset, uint64_t s2DstGmOffset, uint64_t s1gL0RealSize,
+        uint64_t s2L0RealSize, uint64_t s2DstStride, const LICommon::RunInfo &runInfo, bool reluPre);
+    __aicore__ inline void CopyQkToUb(uint64_t mSize, uint64_t nSize, const LICommon::RunInfo &runInfo,
+                                    uint32_t nOffset = 0, bool shareQueryPair = false);
+    __aicore__ inline void ComputeQkToL0C(uint64_t s1gL0RealSize, uint64_t s2L0RealSize,
+                                        bool useUnitFlag = true);
+    __aicore__ inline void LoadKeyToL0B(uint64_t s2L1Offset, uint64_t s2L1RealSize, uint64_t s2L0RealSize);
+    __aicore__ inline void LoadQueryToL0A(uint64_t s1gL1Offset, uint64_t s1gL1RealSize, uint64_t s1gL0RealSize);
+    __aicore__ inline void LoadQueryToL1(uint64_t s1gL1RealSize, uint64_t s1gL1Offset, const LICommon::RunInfo &runInfo);
+    __aicore__ inline void LoadKeyToL1(uint64_t s2L1RealSize, uint64_t s2GmOffset, const LICommon::RunInfo &runInfo);
+    __aicore__ inline void LoadKeyMeanToL1(uint64_t s2L1RealSize, uint64_t s2GmOffset,
+                                         const LICommon::RunInfo &runInfo);
+    __aicore__ inline void LoadPagedKeyToL1(uint64_t s2L1RealSize, uint64_t s2GmOffset, const LICommon::RunInfo &runInfo);
     GlobalTensor<int32_t> blkTableGm_;
     GlobalTensor<K_T> keyGm_;
-    GlobalTensor<K_T> stage1MeanKeyGm_;
-    GlobalTensor<K_T> stage1MeanCacheGm_;
+    GlobalTensor<K_T> keyMeanGm_;
     GlobalTensor<Q_T> queryGm_;
-    GlobalTensor<float> mm1ResGm_;
+    GlobalTensor<float> qkWorkspaceGm_;
 
     TBuf<TPosition::A1> bufQL1_;
     LocalTensor<Q_T> queryL1_;
@@ -108,6 +116,9 @@ protected:
 
     TBuf<TPosition::CO1> bufL0C_;
     LocalTensor<float> cL0_;
+    TBuf<TPosition::VECCALC> stage2QkBuf_;
+    LocalTensor<float> stage2QkUb_;
+    bool stage2QkToUb_ = false;
 
     uint64_t keyL1BufIdx_ = 0;
     uint64_t queryL1Mte2BufIdx_ = 0;
@@ -144,22 +155,30 @@ __aicore__ inline void LIMatmul<LIT>::InitBuffers(TPipe *pipe)
 }
 
 template <typename LIT>
-__aicore__ inline void
-LIMatmul<LIT>::InitMm1GlobalTensor(const GlobalTensor<int32_t> &blkTableGm, const GlobalTensor<K_T> &keyGm,
-                                   const GlobalTensor<K_T> &stage1MeanKeyGm,
-                                   const GlobalTensor<K_T> &stage1MeanCacheGm, const GlobalTensor<Q_T> &queryGm,
-                                   const GlobalTensor<float> &mm1ResGm)
+__aicore__ inline void LIMatmul<LIT>::InitStage2QkUb(TPipe *pipe)
 {
-    blkTableGm_ = blkTableGm;
-    keyGm_ = keyGm;
-    stage1MeanKeyGm_ = stage1MeanKeyGm;
-    stage1MeanCacheGm_ = stage1MeanCacheGm;
-    queryGm_ = queryGm;
-    mm1ResGm_ = mm1ResGm;
+    // No Cube-side UB was allocated during Stage1. AIV resets its pipe before
+    // allocating this same region, so both sides address UB offset zero.
+    pipe->InitBuffer(stage2QkBuf_, Stage2QkUb::BufferBytes(constInfo_.gSize));
+    stage2QkUb_ = stage2QkBuf_.Get<float>();
+    stage2QkToUb_ = true;
 }
 
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInfo, bool reluPre)
+__aicore__ inline void LIMatmul<LIT>::InitGlobalTensors(
+    const GlobalTensor<int32_t> &blkTableGm, const GlobalTensor<K_T> &keyGm,
+    const GlobalTensor<K_T> &keyMeanGm, const GlobalTensor<Q_T> &queryGm,
+    const GlobalTensor<float> &qkWorkspaceGm)
+{
+    blkTableGm_ = blkTableGm;
+    keyGm_ = keyGm;
+    keyMeanGm_ = keyMeanGm;
+    queryGm_ = queryGm;
+    qkWorkspaceGm_ = qkWorkspaceGm;
+}
+
+template <typename LIT>
+__aicore__ inline void LIMatmul<LIT>::ComputeQkTile(const LICommon::RunInfo &runInfo, bool reluPre)
 {
     uint64_t s2GmBaseOffset = runInfo.s2Idx * constInfo_.s2BaseSize;
     uint64_t s1gProcessSize = runInfo.actMBaseSize;
@@ -169,9 +188,9 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInf
         uint64_t s2L1RealSize =
             s2GmOffset + S2_BASIC_BLOCK > s2ProcessSize ? s2ProcessSize - s2GmOffset : S2_BASIC_BLOCK;
         if (PAGE_ATTENTION) {
-            KeyNd2NzForPA(s2L1RealSize, s2GmBaseOffset + s2GmOffset, runInfo);
-        }else {
-            KeyNd2Nz(s2L1RealSize, s2GmOffset, runInfo);
+            LoadPagedKeyToL1(s2L1RealSize, s2GmBaseOffset + s2GmOffset, runInfo);
+        } else {
+            LoadKeyToL1(s2L1RealSize, s2GmOffset, runInfo);
         }
 
         SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
@@ -183,7 +202,7 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInf
                 queryL1Mte2BufIdx_++;
                 queryL1Mte1BufIdx_ = queryL1Mte2BufIdx_;
                 WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + queryL1Mte2BufIdx_ % QUERY_BUF_NUM);
-                QueryNd2Nz(s1gL1RealSize, s1gGmOffset, runInfo);
+                LoadQueryToL1(s1gL1RealSize, s1gGmOffset, runInfo);
                 SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
                 WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
             } else {
@@ -197,18 +216,18 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1(const LICommon::RunInfo &runInf
                     WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
                     uint64_t s1gL0RealSize =
                         s1gL1Offset + M_BASIC_BLOCK_L0 > s1gL1RealSize ? s1gL1RealSize - s1gL1Offset : M_BASIC_BLOCK_L0;
-                    LoadQueryToL0a(s1gGmOffset, s1gL1Offset, s1gL1RealSize, s1gL0RealSize, runInfo);
-                    LoadKeyToL0b(s2L1Offset, s2L1RealSize, s2L0RealSize, runInfo);
+                    LoadQueryToL0A(s1gL1Offset, s1gL1RealSize, s1gL0RealSize);
+                    LoadKeyToL0B(s2L1Offset, s2L1RealSize, s2L0RealSize);
 
                     SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
                     WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
 
-                    ComuteL0c(s1gL0RealSize, s2L0RealSize, runInfo);
+                    ComputeQkToL0C(s1gL0RealSize, s2L0RealSize);
 
                     SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
 
-                    Fixp(s1gGmOffset + s1gL1Offset, s2GmOffset + s2L1Offset, s1gL0RealSize, s2L0RealSize, runInfo,
-                         reluPre);
+                    CopyQkToGm(s1gGmOffset + s1gL1Offset, s2GmOffset + s2L1Offset, s1gL0RealSize, s2L0RealSize, runInfo,
+                               reluPre);
                     l0BufIdx_++;
                 }
             }
@@ -232,7 +251,7 @@ __aicore__ inline void LIMatmul<LIT>::LoadQueryTile(const LICommon::RunInfo &run
         queryL1Mte2BufIdx_++;
         queryL1Mte1BufIdx_ = queryL1Mte2BufIdx_;
         WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + queryL1Mte2BufIdx_ % QUERY_BUF_NUM);
-        QueryNd2Nz(s1gL1RealSize, s1gGmOffset, runInfo);
+        LoadQueryToL1(s1gL1RealSize, s1gGmOffset, runInfo);
         SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
         WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
     }
@@ -249,7 +268,83 @@ __aicore__ inline void LIMatmul<LIT>::ReleaseQueryTile(const LICommon::RunInfo &
 }
 
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::ComputeMm1ByRangeWithCachedQuery(
+template <bool SHARE_QUERY_PAIR>
+__aicore__ inline void LIMatmul<LIT>::ComputeStage2BlockPairToUb(
+    const LICommon::RunInfo &runInfo, const GlobalTensor<int32_t> &blockIndices, uint64_t blockOffset)
+{
+    constexpr uint32_t PAIR_TOKENS = 2 * Stage2QkUb::TILE_TOKENS;
+    // BF16 [256,128] occupies all 64 KiB of L0B. Borrow both existing
+    // L1 K slots and both L0B credits; no K split or extra allocation.
+    WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT);
+    WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 1);
+    for (uint32_t block = 0; block < 2; ++block) {
+        int32_t logicalBlock = blockIndices.GetValue(blockOffset + block);
+        if constexpr (SHARE_QUERY_PAIR) {
+            logicalBlock >>= 2;
+        }
+        uint32_t tokenStart = static_cast<uint32_t>(logicalBlock) * Stage2QkUb::TILE_TOKENS;
+        if (logicalBlock < 0 || tokenStart >= runInfo.actS2Size) {
+            continue;
+        }
+        uint64_t physicalBlock = blkTableGm_.GetValue(
+            runInfo.bIdx * constInfo_.maxBlockNumPerBatch + logicalBlock);
+        uint64_t keyOffset = physicalBlock * constInfo_.kCacheBlockSize *
+                             constInfo_.kHeadNum * constInfo_.headDim;
+        Nd2NzParams copy;
+        copy.ndNum = 1;
+        copy.nValue = Min(Stage2QkUb::TILE_TOKENS, runInfo.actS2Size - tokenStart);
+        copy.dValue = constInfo_.headDim;
+        copy.srcDValue = constInfo_.headDim;
+        copy.dstNzC0Stride = PAIR_TOKENS;
+        copy.dstNzNStride = 1;
+        copy.srcNdMatrixStride = 0;
+        copy.dstNzMatrixStride = 0;
+        DataCopy(keyL1_[block * Stage2QkUb::TILE_TOKENS * FP16_BLOCK_CUBE], keyGm_[keyOffset], copy);
+    }
+    SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+    WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+    WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT);
+    WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + 1);
+    queryL1Mte1BufIdx_ = queryL1Mte2BufIdx_;
+    uint32_t mSize = constInfo_.gSize * (SHARE_QUERY_PAIR ? 2U : 1U);
+    LoadQueryToL0A(0, mSize, mSize);
+    LoadData2DParamsV2 load;
+    load.mStartPosition = 0;
+    load.kStartPosition = 0;
+    load.mStep = PAIR_TOKENS / BLOCK_CUBE;
+    load.kStep = constInfo_.headDim / FP16_BLOCK_CUBE;
+    load.srcStride = PAIR_TOKENS / BLOCK_CUBE;
+    load.dstStride = PAIR_TOKENS / BLOCK_CUBE;
+    load.ifTranspose = false;
+    LoadData(keyL0_, keyL1_, load);
+    SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT);
+    SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 1);
+    SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
+    WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
+    WaitFlag<HardEvent::FIX_M>(FIX_M_EVENT + l0BufIdx_ % L0_BUF_NUM);
+    MmadParams params;
+    params.m = mSize;
+    params.n = PAIR_TOKENS;
+    params.k = constInfo_.headDim;
+    params.cmatrixInitVal = true;
+    params.cmatrixSource = false;
+    params.unitFlag = 0;
+    Mmad(cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET],
+         queryL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET], keyL0_, params);
+    SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT);
+    SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + 1);
+    // Keep the established two 128-token UB slots and reduction order.
+    CopyQkToUb(mSize, Stage2QkUb::TILE_TOKENS, runInfo, 0, SHARE_QUERY_PAIR);
+    LICommon::RunInfo second = runInfo;
+    ++second.loop;
+    CopyQkToUb(mSize, Stage2QkUb::TILE_TOKENS, second, Stage2QkUb::TILE_TOKENS, SHARE_QUERY_PAIR);
+    SetFlag<HardEvent::FIX_M>(FIX_M_EVENT + l0BufIdx_ % L0_BUF_NUM);
+    ++l0BufIdx_;
+}
+
+template <typename LIT>
+template <bool TO_UB, uint32_t QUERY_COUNT>
+__aicore__ inline void LIMatmul<LIT>::ComputeStage2QkRange(
     const LICommon::RunInfo &runInfo, uint64_t s2SrcBaseOffset, uint64_t s2ProcessSize, uint64_t s2DstBaseOffset,
     uint64_t s2DstStride, uint64_t queryMOffset)
 {
@@ -260,8 +355,7 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1ByRangeWithCachedQuery(
         queryChunkBase + M_BASIC_BLOCK > runInfo.actMBaseSize ? runInfo.actMBaseSize - queryChunkBase : M_BASIC_BLOCK;
     uint64_t queryOffsetInChunk = queryMOffset - queryChunkBase;
     uint64_t queryRealSize =
-        queryOffsetInChunk + constInfo_.gSize > queryChunkRealSize ? queryChunkRealSize - queryOffsetInChunk :
-                                                                     constInfo_.gSize;
+        Min(static_cast<uint64_t>(constInfo_.gSize * QUERY_COUNT), queryChunkRealSize - queryOffsetInChunk);
     if (queryRealSize == 0) {
         return;
     }
@@ -272,9 +366,9 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1ByRangeWithCachedQuery(
         uint64_t s2L1RealSize =
             s2GmOffset + S2_BASIC_BLOCK > s2ProcessSize ? s2ProcessSize - s2GmOffset : S2_BASIC_BLOCK;
         if (PAGE_ATTENTION) {
-            KeyNd2NzForPA(s2L1RealSize, s2SrcBaseOffset + s2GmOffset, runInfo);
+            LoadPagedKeyToL1(s2L1RealSize, s2SrcBaseOffset + s2GmOffset, runInfo);
         } else {
-            KeyNd2Nz(s2L1RealSize, s2GmOffset, runInfo);
+            LoadKeyToL1(s2L1RealSize, s2GmOffset, runInfo);
         }
 
         SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
@@ -283,18 +377,26 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1ByRangeWithCachedQuery(
             uint64_t s2L0RealSize =
                 s2L1Offset + S2_BASIC_BLOCK_L0 > s2L1RealSize ? s2L1RealSize - s2L1Offset : S2_BASIC_BLOCK_L0;
             WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
-            LoadQueryToL0a(queryChunkBase, queryOffsetInChunk, queryChunkRealSize, queryRealSize, runInfo);
-            LoadKeyToL0b(s2L1Offset, s2L1RealSize, s2L0RealSize, runInfo);
+            LoadQueryToL0A(queryOffsetInChunk, queryChunkRealSize, queryRealSize);
+            LoadKeyToL0B(s2L1Offset, s2L1RealSize, s2L0RealSize);
 
             SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
             WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
 
-            ComuteL0c(queryRealSize, s2L0RealSize, runInfo);
+            if constexpr (TO_UB) {
+                WaitFlag<HardEvent::FIX_M>(FIX_M_EVENT + l0BufIdx_ % L0_BUF_NUM);
+            }
+            ComputeQkToL0C(queryRealSize, s2L0RealSize, !TO_UB);
 
             SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
 
-            FixpWithDst(queryMOffset, s2DstBaseOffset + s2GmOffset + s2L1Offset, queryRealSize,
-                        s2L0RealSize, s2DstStride, runInfo, true);
+            if constexpr (TO_UB) {
+                CopyQkToUb(queryRealSize, s2L0RealSize, runInfo, 0, QUERY_COUNT == 2);
+                SetFlag<HardEvent::FIX_M>(FIX_M_EVENT + l0BufIdx_ % L0_BUF_NUM);
+            } else {
+                CopyQkToGmWithStride(queryMOffset, s2DstBaseOffset + s2GmOffset + s2L1Offset, queryRealSize,
+                            s2L0RealSize, s2DstStride, runInfo, true);
+            }
             l0BufIdx_++;
         }
 
@@ -304,7 +406,7 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1ByRangeWithCachedQuery(
 }
 
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::KeyNd2Nz(uint64_t s2L1RealSize, uint64_t s2GmOffset,
+__aicore__ inline void LIMatmul<LIT>::LoadKeyToL1(uint64_t s2L1RealSize, uint64_t s2GmOffset,
                                                     const LICommon::RunInfo &runInfo)
 {
     uint64_t s2L1Offset = 0;
@@ -338,7 +440,7 @@ __aicore__ inline void LIMatmul<LIT>::KeyNd2Nz(uint64_t s2L1RealSize, uint64_t s
 }
 
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::KeyNd2NzFromStage1(uint64_t s2L1RealSize, uint64_t s2GmOffset,
+__aicore__ inline void LIMatmul<LIT>::LoadKeyMeanToL1(uint64_t s2L1RealSize, uint64_t s2GmOffset,
                                                          const LICommon::RunInfo &runInfo)
 {
     uint64_t stage1BaseBlock = runInfo.stage1BaseBlockIdx;
@@ -387,14 +489,14 @@ __aicore__ inline void LIMatmul<LIT>::KeyNd2NzFromStage1(uint64_t s2L1RealSize, 
                         (s2L1Offset >= S2_BASIC_BLOCK_L0 ?
                              S2_BASIC_BLOCK_L0 * D_BASIC_BLOCK_L0 + (s2L1Offset - S2_BASIC_BLOCK_L0) * BLOCK_CUBE :
                              s2L1Offset * BLOCK_CUBE)],
-                 stage1MeanCacheGm_[keyGmOffset], nd2nzPara);
+                 keyMeanGm_[keyGmOffset], nd2nzPara);
         s2L1Offset += s2Mte2Size;
     }
 }
 
 // blkNum, blkSize, N2, D
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uint64_t s2GmOffset,
+__aicore__ inline void LIMatmul<LIT>::LoadPagedKeyToL1(uint64_t s2L1RealSize, uint64_t s2GmOffset,
                                                     const LICommon::RunInfo &runInfo)
 {
     uint64_t s2L1Offset = 0;
@@ -433,7 +535,7 @@ __aicore__ inline void LIMatmul<LIT>::KeyNd2NzForPA(uint64_t s2L1RealSize, uint6
 }
 
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::ComputeMm1Stage1(const LICommon::RunInfo &runInfo, uint32_t localBlockNum)
+__aicore__ inline void LIMatmul<LIT>::ComputeStage1QkTile(const LICommon::RunInfo &runInfo, uint32_t localBlockNum)
 {
     if (localBlockNum == 0) {
         return;
@@ -444,7 +546,7 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1Stage1(const LICommon::RunInfo &
         WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
         uint64_t s2L1RealSize =
             s2GmOffset + S2_BASIC_BLOCK > s2ProcessSize ? s2ProcessSize - s2GmOffset : S2_BASIC_BLOCK;
-        KeyNd2NzFromStage1(s2L1RealSize, s2GmOffset, runInfo);
+        LoadKeyMeanToL1(s2L1RealSize, s2GmOffset, runInfo);
 
         SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
         WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
@@ -455,7 +557,7 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1Stage1(const LICommon::RunInfo &
                 queryL1Mte2BufIdx_++;
                 queryL1Mte1BufIdx_ = queryL1Mte2BufIdx_;
                 WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + queryL1Mte2BufIdx_ % QUERY_BUF_NUM);
-                QueryNd2Nz(s1gL1RealSize, s1gGmOffset, runInfo);
+                LoadQueryToL1(s1gL1RealSize, s1gGmOffset, runInfo);
                 SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
                 WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
             } else {
@@ -469,17 +571,17 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1Stage1(const LICommon::RunInfo &
                     WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
                     uint64_t s1gL0RealSize =
                         s1gL1Offset + M_BASIC_BLOCK_L0 > s1gL1RealSize ? s1gL1RealSize - s1gL1Offset : M_BASIC_BLOCK_L0;
-                    LoadQueryToL0a(s1gGmOffset, s1gL1Offset, s1gL1RealSize, s1gL0RealSize, runInfo);
-                    LoadKeyToL0b(s2L1Offset, s2L1RealSize, s2L0RealSize, runInfo);
+                    LoadQueryToL0A(s1gL1Offset, s1gL1RealSize, s1gL0RealSize);
+                    LoadKeyToL0B(s2L1Offset, s2L1RealSize, s2L0RealSize);
 
                     SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
                     WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
 
-                    ComuteL0c(s1gL0RealSize, s2L0RealSize, runInfo);
+                    ComputeQkToL0C(s1gL0RealSize, s2L0RealSize);
 
                     SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
 
-                    Fixp(s1gGmOffset + s1gL1Offset, s2GmOffset + s2L1Offset, s1gL0RealSize, s2L0RealSize, runInfo,
+                    CopyQkToGm(s1gGmOffset + s1gL1Offset, s2GmOffset + s2L1Offset, s1gL0RealSize, s2L0RealSize, runInfo,
                          false);
                     l0BufIdx_++;
                 }
@@ -496,8 +598,8 @@ __aicore__ inline void LIMatmul<LIT>::ComputeMm1Stage1(const LICommon::RunInfo &
 
 // batch, s1, n2, g, d
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::QueryNd2Nz(uint64_t s1gL1RealSize, uint64_t s1gGmOffset,
-                                                 const LICommon::RunInfo &runInfo)
+__aicore__ inline void LIMatmul<LIT>::LoadQueryToL1(uint64_t s1gL1RealSize, uint64_t s1gGmOffset,
+                                                  const LICommon::RunInfo &runInfo)
 {
     Nd2NzParams nd2nzPara;
     nd2nzPara.ndNum = 1;
@@ -513,8 +615,8 @@ __aicore__ inline void LIMatmul<LIT>::QueryNd2Nz(uint64_t s1gL1RealSize, uint64_
 }
 
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::LoadQueryToL0a(uint64_t s1gGmOffset, uint64_t s1gL1Offset, uint64_t s1gL1RealSize,
-                                                     uint64_t s1gL0RealSize, const LICommon::RunInfo &runInfo)
+__aicore__ inline void LIMatmul<LIT>::LoadQueryToL0A(uint64_t s1gL1Offset, uint64_t s1gL1RealSize,
+                                                   uint64_t s1gL0RealSize)
 {
     LoadData2DParamsV2 loadDataParams;
     loadDataParams.mStartPosition = CeilDiv(s1gL1Offset, BLOCK_CUBE);
@@ -529,8 +631,8 @@ __aicore__ inline void LIMatmul<LIT>::LoadQueryToL0a(uint64_t s1gGmOffset, uint6
 }
 
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::LoadKeyToL0b(uint64_t s2L1Offset, uint64_t s2L1RealSize, uint64_t s2L0RealSize,
-                                                   const LICommon::RunInfo &runInfo)
+__aicore__ inline void LIMatmul<LIT>::LoadKeyToL0B(uint64_t s2L1Offset, uint64_t s2L1RealSize,
+                                                 uint64_t s2L0RealSize)
 {
     LoadData2DParamsV2 loadDataParams;
     loadDataParams.mStartPosition = CeilDiv(s2L1Offset, BLOCK_CUBE);
@@ -545,8 +647,8 @@ __aicore__ inline void LIMatmul<LIT>::LoadKeyToL0b(uint64_t s2L1Offset, uint64_t
 }
 
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::ComuteL0c(uint64_t s1gL0RealSize, uint64_t s2L0RealSize,
-                                                const LICommon::RunInfo &runInfo)
+__aicore__ inline void LIMatmul<LIT>::ComputeQkToL0C(uint64_t s1gL0RealSize, uint64_t s2L0RealSize,
+                                                   bool useUnitFlag)
 {
     MmadParams mmadParams;
     mmadParams.m = CeilAlign(s1gL0RealSize, BLOCK_CUBE);
@@ -554,7 +656,7 @@ __aicore__ inline void LIMatmul<LIT>::ComuteL0c(uint64_t s1gL0RealSize, uint64_t
     mmadParams.k = constInfo_.headDim;
     mmadParams.cmatrixInitVal = true;
     mmadParams.cmatrixSource = false;
-    mmadParams.unitFlag = 0b11;
+    mmadParams.unitFlag = useUnitFlag ? 0b11 : 0;
     Mmad(cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], queryL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET],
          keyL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET], mmadParams);
     if ((mmadParams.m / 16) * (mmadParams.n / 16) < 10) {
@@ -563,29 +665,18 @@ __aicore__ inline void LIMatmul<LIT>::ComuteL0c(uint64_t s1gL0RealSize, uint64_t
 }
 
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::Fixp(uint64_t s1gGmOffset, uint64_t s2GmOffset, uint64_t s1gL0RealSize,
-                                           uint64_t s2L0RealSize, const LICommon::RunInfo &runInfo, bool reluPre)
+__aicore__ inline void LIMatmul<LIT>::CopyQkToGm(
+    uint64_t s1gGmOffset, uint64_t s2GmOffset, uint64_t s1gL0RealSize,
+    uint64_t s2L0RealSize, const LICommon::RunInfo &runInfo, bool reluPre)
 {
-    AscendC::DataCopyCO12DstParams intriParams;
-    intriParams.mSize = CeilAlign(s1gL0RealSize, BLOCK_CUBE);
-    intriParams.nSize = s2L0RealSize;
-    intriParams.dstStride = runInfo.actualSingleProcessSInnerSizeAlign;
-    intriParams.srcStride = CeilAlign(s1gL0RealSize, BLOCK_CUBE);
-    // set mode according to dtype
-    intriParams.quantPre = QuantMode_t::NoQuant;
-    intriParams.nz2ndEn = true;
-    intriParams.unitFlag = 0b11; // 3 unitflag
-    intriParams.reluPre = reluPre ? 1 : 0;
-    AscendC::SetFixpipeNz2ndFlag(1, 1, 1);
-    AscendC::DataCopy(mm1ResGm_[(runInfo.loop % 2) * constInfo_.mBaseSizeAlign * constInfo_.s2BaseSize +
-                                s1gGmOffset * intriParams.dstStride + s2GmOffset],
-                      cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], intriParams);
+    CopyQkToGmWithStride(s1gGmOffset, s2GmOffset, s1gL0RealSize, s2L0RealSize,
+                        runInfo.actualSingleProcessSInnerSizeAlign, runInfo, reluPre);
 }
 
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::FixpWithDst(uint64_t s1gGmOffset, uint64_t s2DstGmOffset, uint64_t s1gL0RealSize,
-                                                  uint64_t s2L0RealSize, uint64_t s2DstStride,
-                                                  const LICommon::RunInfo &runInfo, bool reluPre)
+__aicore__ inline void LIMatmul<LIT>::CopyQkToGmWithStride(
+    uint64_t s1gGmOffset, uint64_t s2DstGmOffset, uint64_t s1gL0RealSize,
+    uint64_t s2L0RealSize, uint64_t s2DstStride, const LICommon::RunInfo &runInfo, bool reluPre)
 {
     AscendC::DataCopyCO12DstParams intriParams;
     intriParams.mSize = CeilAlign(s1gL0RealSize, BLOCK_CUBE);
@@ -597,14 +688,42 @@ __aicore__ inline void LIMatmul<LIT>::FixpWithDst(uint64_t s1gGmOffset, uint64_t
     intriParams.unitFlag = 0b11;
     intriParams.reluPre = reluPre ? 1 : 0;
     AscendC::SetFixpipeNz2ndFlag(1, 1, 1);
-    AscendC::DataCopy(mm1ResGm_[(runInfo.loop % 2) * constInfo_.mBaseSizeAlign * constInfo_.s2BaseSize +
-                                s1gGmOffset * intriParams.dstStride + s2DstGmOffset],
+    AscendC::DataCopy(qkWorkspaceGm_[(runInfo.loop % 2) * constInfo_.mBaseSizeAlign * constInfo_.s2BaseSize +
+                                  s1gGmOffset * intriParams.dstStride + s2DstGmOffset],
                       cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], intriParams);
 }
 
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::AllocEventID()
+__aicore__ inline void LIMatmul<LIT>::CopyQkToUb(
+    uint64_t mSize, uint64_t nSize, const LICommon::RunInfo &runInfo, uint32_t nOffset, bool shareQueryPair)
 {
+    SetFlag<HardEvent::M_FIX>(M_FIX_EVENT + l0BufIdx_ % L0_BUF_NUM);
+    WaitFlag<HardEvent::M_FIX>(M_FIX_EVENT + l0BufIdx_ % L0_BUF_NUM);
+    FixpipeParamsC310<CO2Layout::ROW_MAJOR> params;
+    params.mSize = CeilAlign(mSize, BLOCK_CUBE);
+    params.nSize = CeilAlign(nSize, BLOCK_CUBE);
+    params.srcStride = params.mSize;
+    params.dstStride = Stage2QkUb::TILE_TOKENS;
+    params.dualDstCtl = shareQueryPair ? 1 : 0;
+    params.subBlockId = 0;
+    // C310 dual-destination Fixpipe cannot apply ReLU. Both direct-UB paths
+    // apply it in AIV before weighting, as native LI does.
+    params.reluEn = false;
+    // Match native LI's explicit M/FIX events, not legacy unitFlag signalling.
+    params.unitFlag = 0;
+    uint32_t offset = (runInfo.loop % Stage2QkUb::BUFFER_NUM) *
+                      constInfo_.gSize * Stage2QkUb::TILE_TOKENS;
+    Fixpipe<float, float, STAGE2_QK_UB_CONFIG>(stage2QkUb_[offset],
+                                  cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET + nOffset * params.mSize], params);
+}
+
+template <typename LIT>
+__aicore__ inline void LIMatmul<LIT>::InitPipelineEvents()
+{
+    if (stage2QkToUb_) {
+        SetFlag<HardEvent::FIX_M>(FIX_M_EVENT);
+        SetFlag<HardEvent::FIX_M>(FIX_M_EVENT + 1);
+    }
     SetMMLayoutTransform(true);
     SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 0);
     SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 1);
@@ -618,8 +737,12 @@ __aicore__ inline void LIMatmul<LIT>::AllocEventID()
 }
 
 template <typename LIT>
-__aicore__ inline void LIMatmul<LIT>::FreeEventID()
+__aicore__ inline void LIMatmul<LIT>::DrainPipelineEvents()
 {
+    if (stage2QkToUb_) {
+        WaitFlag<HardEvent::FIX_M>(FIX_M_EVENT);
+        WaitFlag<HardEvent::FIX_M>(FIX_M_EVENT + 1);
+    }
     SetMMLayoutTransform(false);
     WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 0);
     WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 1);

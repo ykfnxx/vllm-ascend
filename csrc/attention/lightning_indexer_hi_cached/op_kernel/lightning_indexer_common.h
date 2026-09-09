@@ -16,6 +16,27 @@
 #define LIGHTNING_INDEXER_HI_CACHED_COMMON_H
 
 namespace LICommon {
+#if (__CCE_AICORE__ == 310)
+// AIC and AIV allocate this buffer first in UB, at the same local address.
+// One complete query/head group is sent to AIV0; no cross-AIV head reduction.
+struct Stage2QkUb {
+    static constexpr uint32_t TILE_TOKENS = 128;
+    static constexpr uint32_t BUFFER_NUM = 2;
+    static constexpr uint32_t SYNC_MODE = 4;
+    static constexpr uint32_t READY_EVENT = 2;
+    static constexpr uint32_t FREE_EVENT = 0;
+    static constexpr uint32_t AIV_EVENT_OFFSET = 16;
+    static constexpr uint32_t SHARED_LIST_READY_EVENT = 6;
+    static constexpr uint32_t SHARED_LIST_BROADCAST_EVENT = 4;
+    static constexpr uint32_t STAGE1_LIST_READY_EVENT = 8;
+
+    __aicore__ static inline uint32_t BufferBytes(uint32_t heads)
+    {
+        return BUFFER_NUM * heads * TILE_TOKENS * sizeof(float);
+    }
+};
+#endif
+
 enum class LI_LAYOUT {
     BSND = 0,
     TND = 1,

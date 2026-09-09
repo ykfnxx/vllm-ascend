@@ -9,20 +9,19 @@
   */
 
 /*!
-* \file vf_top_k_16_gather.h
-* \brief
+* \file vf_topk_16_gather.h
+* \brief Native LI BF16 sortable-key selection and history-index gather.
 */
 
-#ifndef VF_TOP_K_16_GATHER_H
-#define VF_TOP_K_16_GATHER_H
+#ifndef LIGHTNING_INDEXER_HI_CACHED_ARCH35_VF_TOPK_16_GATHER_H
+#define LIGHTNING_INDEXER_HI_CACHED_ARCH35_VF_TOPK_16_GATHER_H
 
 namespace topkb16gather {
 using namespace AscendC;
 
-template<typename T>
 __simd_vf__ void HistogramsHighVFImpl(__ubuf__ uint32_t* histogramsBuf,
                                       __ubuf__ uint16_t* inputBuf,
-                                      uint16_t vfLoop, bool init)
+                                      uint16_t vfLoop)
 {
     MicroAPI::MaskReg pregB32 = MicroAPI::CreateMask<uint32_t, MicroAPI::MaskPattern::ALL>();
     MicroAPI::MaskReg pregB16 = MicroAPI::CreateMask<uint16_t, MicroAPI::MaskPattern::ALL>();
@@ -131,10 +130,9 @@ __simd_vf__ void FindHighTargetBinVFImpl(__ubuf__ uint32_t* idxHighBuf,
     MicroAPI::StoreAlign<uint32_t, MicroAPI::StoreDist::DIST_NORM>(nkValueBuf, nextK, pregB32);
 }
 
-template<typename T>
 __simd_vf__ void HistogramsLowVFImpl(__ubuf__ uint32_t* histogramsBuf,
                                      __ubuf__ uint16_t* inputBuf, __ubuf__ uint32_t* idxHighBuf,
-                                     uint16_t vfLoop, bool init)
+                                     uint16_t vfLoop)
 {
     MicroAPI::MaskReg pregB32 = MicroAPI::CreateMask<uint32_t, MicroAPI::MaskPattern::ALL>();
     MicroAPI::MaskReg pregB16 = MicroAPI::CreateMask<uint16_t, MicroAPI::MaskPattern::ALL>();
@@ -396,23 +394,19 @@ __aicore__ inline void LiTopKVF(const LocalTensor<uint16_t>& tmpIdxLocal,
     __ubuf__ uint32_t* nkValueBuf = (__ubuf__ uint32_t*)nkValueLocal.GetPhyAddr();
 
     uint32_t bottomK = validLen - topK + 1;
-    uint32_t beginIdx = 0;
-    bool flag = true;
 
     const uint16_t repeatSize8 = 256;
     const uint16_t repeatSize16 = 128;
-    const uint16_t repeatSize32 = 64;
 
     uint16_t histogramsLoopNum = (validLen + repeatSize8 - 1) / repeatSize8;
     uint16_t inputLoopNum = (validLen + repeatSize16 - 1) / repeatSize16;
-    uint16_t topkLoopNum = (topK + repeatSize32 - 1) / repeatSize32;
     uint16_t topkLoopNum16 = (topK + repeatSize16 - 1) / repeatSize16;
 
     // find kth-value
-    HistogramsHighVFImpl<uint16_t>(histogramsBuf, inputValueBuf, histogramsLoopNum, flag);
+    HistogramsHighVFImpl(histogramsBuf, inputValueBuf, histogramsLoopNum);
     FindHighTargetBinVFImpl(idxHighBuf, nkValueBuf, histogramsBuf, bottomK);
 
-    HistogramsLowVFImpl<uint16_t>(histogramsBuf, inputValueBuf, idxHighBuf, histogramsLoopNum, flag);
+    HistogramsLowVFImpl(histogramsBuf, inputValueBuf, idxHighBuf, histogramsLoopNum);
     FindKthVFImpl(nkValueBuf, histogramsBuf, idxHighBuf, idxLowBuf);
 
     // filter
@@ -431,36 +425,26 @@ __aicore__ inline void LiTopKVF(const LocalTensor<uint16_t>& tmpIdxLocal,
 
 /**
  * @brief 通过idx_tmp gather出实际的TopKIndex，s2SeqLen > 16K才会执行
- * @param outputIdxLocal 输出Idx 有效:topK * 2B
- * @param outputValueLocal 输出Value topK * 2B(以后需要输出实际value使用)
- * @param inputValueLocal 输入Value validLen * 2B
- * @param tmpIdxLocal 本轮tmpIdx输入 validLen * 2B (0 ~ validLen - 1)
+ * @param outputIdxLocal 输出Idx 有效:topK * 4B
+ * @param tmpIdxLocal 本轮选中位置 topK * 2B，指向当前窗口内的元素
  * @param hisIdxLocal 上一轮实际Idx输入 有效:topK * 4B
  * @param topK topK元素个数
  * @param loopBasicIdx 当前循环需要加上得基准Index
- * @param validLen 有效元素个数
  */
 __aicore__ inline void LiTopKGatherVF(const LocalTensor<uint32_t>& outputIdxLocal,
-                                      const LocalTensor<uint16_t>& outputValueLocal,
-                                      const LocalTensor<uint16_t>& inputValueLocal,
                                       const LocalTensor<uint16_t>& tmpIdxLocal,
                                       const LocalTensor<uint32_t>& hisIdxLocal,
                                       uint32_t topK,
-                                      uint32_t loopBasicIdx,
-                                      uint32_t validLen)
+                                      uint32_t loopBasicIdx)
 {
     __ubuf__ uint32_t* outputIdxBuf = (__ubuf__ uint32_t*)outputIdxLocal.GetPhyAddr();
-    __ubuf__ uint16_t* outputValueBuf = (__ubuf__ uint16_t*)outputValueLocal.GetPhyAddr();
-    __ubuf__ uint16_t* inputValueBuf = (__ubuf__ uint16_t*)inputValueLocal.GetPhyAddr();
     __ubuf__ uint16_t* tmpIdxBuf = (__ubuf__ uint16_t*)tmpIdxLocal.GetPhyAddr();
     __ubuf__ uint32_t* hisIdxBuf = (__ubuf__ uint32_t*)hisIdxLocal.GetPhyAddr();
 
     const uint16_t repeatSize32 = 64;
-    const uint16_t repeatSize16 = 128;
-    uint16_t topkLoopNum16 = (topK + repeatSize16 - 1) / repeatSize16;
     uint16_t topkLoopNum32 = (topK + repeatSize32 - 1) / repeatSize32;
 
     FindRealIndexVFImpl(outputIdxBuf, tmpIdxBuf, hisIdxBuf, topK, loopBasicIdx, topkLoopNum32);
 }
-}
-#endif
+} // namespace topkb16gather
+#endif // LIGHTNING_INDEXER_HI_CACHED_ARCH35_VF_TOPK_16_GATHER_H

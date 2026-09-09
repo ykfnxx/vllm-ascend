@@ -10,7 +10,7 @@
 
 /*!
  * \file lightning_indexer_service_vector.h
- * \brief
+ * \brief Weighted score reduction, Stage1 block TopM and Stage2 token TopK.
  */
 #ifndef LIGHTNING_INDEXER_HI_CACHED_ARCH35_SERVICE_VECTOR_H
 #define LIGHTNING_INDEXER_HI_CACHED_ARCH35_SERVICE_VECTOR_H
@@ -23,19 +23,17 @@
 #include "../lightning_indexer_common.h"
 #include "vf/lightning_indexer_vector.h"
 #include "vf/lightning_indexer_topk.h"
-#include "vf/vf_stage2_reduce.h"
 
 namespace LIKernel {
 using namespace LICommon;
 using namespace LIServiceVec;
 constexpr uint32_t BASE_TOPK = 2048;
-constexpr uint32_t LD_MERGE_PARAM_NUM = 16;
+constexpr uint32_t PARTIAL_TOPK_METADATA_FIELDS = 16;
 constexpr int32_t TOPK_LIST_COMPONENTS = 2;
 
 template <typename LIT>
 class LIVector {
 public:
-    using Q_T = typename LIT::queryType;
     using K_T = typename LIT::keyType;
     static constexpr LI_LAYOUT LAYOUT_T = LIT::layout;
     static constexpr int32_t MAX_LOCAL_BLOCKS_PER_TILE = 32;
@@ -44,14 +42,12 @@ public:
 
     using MM1_OUT_T = float;
 
-    __aicore__ inline LIVector(){};
     // Stage1 AIV path for q * mean(k): reduce weighted heads into HI block scores
     // and maintain the per-row top-m block list.
     __aicore__ inline void SelectStage1HiBlocks(const LICommon::RunInfo &info);
     // Stage1 fallback for non-PA layouts where block scores are built from token scores.
     __aicore__ inline void SelectStage1TokenBlocks(const LICommon::RunInfo &info);
-    // LdMerge means Local/Distributed partial-topK merge, not GM/UB load.
-    // Stage1 LdMerge: combine partial HI block top-m from multiple coarse tiles.
+    // Combine partial HI block TopM from multiple coarse tiles/cores.
     __aicore__ inline void MergeStage1BlockTopM();
     // Stage2 AIV path: reduce weighted token scores and maintain token-level top-k.
     __aicore__ inline void SelectStage2TokenTopK(const LICommon::RunInfo &info);
@@ -59,50 +55,50 @@ public:
     __aicore__ inline void SelectDecodeStage2HiTokens(const LICommon::RunInfo &info, int32_t chunkIdx,
                                                       int32_t groupStartChunk, int32_t groupEndChunk,
                                                       int64_t partialTopkOffset, bool writePartialTopk,
-                                                      bool keepPartialTopk, bool hiFullCoverage);
+                                                      bool keepPartialTopk, bool hiFullCoverage,
+                                                      int32_t sharedBlockCount = 0);
     // Merge multi-way decode HI partial token top-k results back to the final row.
     __aicore__ inline void MergeDecodeStage2HiPartials(const LICommon::RunInfo &info,
                                                        int64_t partialTopkBaseOffset,
                                                        uint32_t hiGroupNum,
                                                        bool firstPartialInUb);
-    // Stage2 LdMerge: combine token-level partial top-k from multiple S2 tiles.
+    // Combine token-level partial TopK from multiple S2 tiles/cores.
     __aicore__ inline void MergeStage2TokenTopK();
-    __aicore__ inline void InitBuffers(TPipe *pipe, uint32_t stage2ChunkSize = 0);
-    __aicore__ inline void InitParams(const struct LICommon::ConstInfo &constInfo,
-                                      const LIHiCachedTilingData *__restrict tilingData);
+    __aicore__ inline void InitBuffers(TPipe *pipe, uint32_t stage2ChunkSize = 0, bool qkToUb = false,
+                                       bool shareMtpQueries = false);
+    __aicore__ inline void BuildMtpSharedBlocks(const LICommon::RunInfo &info);
+    __aicore__ inline uint32_t LoadMtpSharedBlocks(const LICommon::RunInfo &info);
+    __aicore__ inline void LoadStage2Weights(const LICommon::RunInfo &info);
+    __aicore__ inline void ReduceStage2QkUb(uint32_t slot, uint32_t scoreOffset, int32_t sharedBlockPos = -1);
+    __aicore__ inline void InitParams(const LICommon::ConstInfo &constInfo);
     __aicore__ inline void SetDecodeStage2HiFastPathEligible(bool eligible);
-    __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<float> vec1ResGm,
-                                                GlobalTensor<int64_t> vec1ParamGm, GlobalTensor<int32_t> blockIndiceGm,
-                                                GlobalTensor<int32_t> externalHiMaskGm,
-                                                GlobalTensor<K_T> weightsGm, GlobalTensor<int32_t> indiceOutGm,
-                                                GlobalTensor<int32_t> blockTableGm, GlobalTensor<K_T> keyGm,
-                                                GlobalTensor<K_T> stage1MeanKeyGm,
-                                                GlobalTensor<K_T> stage1MeanCacheGm,
-                                                GlobalTensor<Q_T> queryGm);
+    __aicore__ inline void InitGlobalTensors(
+        GlobalTensor<MM1_OUT_T> qkWorkspaceGm, GlobalTensor<float> partialTopkGm,
+        GlobalTensor<int64_t> partialTopkMetadataGm, GlobalTensor<int32_t> blockIndiceGm,
+        GlobalTensor<int32_t> externalHiMaskGm, GlobalTensor<K_T> weightsGm, GlobalTensor<int32_t> indiceOutGm);
     __aicore__ inline void CleanInvalidOutput(int64_t invalidS1offset);
-    __aicore__ inline void InitLdMergeBuffers(TPipe *pipe);
+    __aicore__ inline void InitPartialTopkMergeBuffers(TPipe *pipe);
 
 protected:
-    GlobalTensor<MM1_OUT_T> mm1ResGm;
-    GlobalTensor<float> vec1ResGm;
-    GlobalTensor<int64_t> vec1ParamGm;
+    GlobalTensor<MM1_OUT_T> qkWorkspaceGm;
+    GlobalTensor<float> partialTopkGm;
+    GlobalTensor<int64_t> partialTopkMetadataGm;
     GlobalTensor<int32_t> blockIndiceGm;
     GlobalTensor<int32_t> externalHiMaskGm;
     GlobalTensor<K_T> weightsGm;
     GlobalTensor<int32_t> indiceOutGm;
-    GlobalTensor<int32_t> blockTableGm;
-    GlobalTensor<K_T> keyGm;
-    GlobalTensor<K_T> stage1MeanKeyGm;
-    GlobalTensor<K_T> stage1MeanCacheGm;
-    GlobalTensor<Q_T> queryGm;
 
 private:
     // queue
     TQue<QuePosition::VECIN, 1> inQueue_;
     TQue<QuePosition::VECOUT, 1> outQueue_;
+    TBuf<TPosition::VECCALC> stage2QkBuf_;
+    TBuf<TPosition::VECCALC> stage2WeightsBuf_;
+    LocalTensor<float> stage2QkUb_;
+    bool stage2QkToUb_ = false;
 
     // tmp buff for vector
-    TBuf<TPosition::VECCALC> sortOutBuf_;
+    TBuf<TPosition::VECCALC> topkStateBuf_;
     TBuf<TPosition::VECCALC> indexBuf_;
     TBuf<TPosition::VECCALC> reduceOutBuf_;
     TBuf<TPosition::VECCALC> brcBuf_;
@@ -113,13 +109,13 @@ private:
     TBuf<TPosition::VECCALC> regBaseOutputIdxBuf_;
     TBuf<TPosition::VECCALC> regBaseTopkTmpBuf_;
 
-    // Temporary buffers for LdMerge tasks.
-    TBuf<> ldMergeInputBuf_;
-    TBuf<> ldMergeOutIdxBuf_;
+    // Temporary buffers for cross-core partial TopK merging.
+    TBuf<> partialTopkInputBuf_;
+    TBuf<> partialTopkOutputIndexBuf_;
 
-    LocalTensor<int32_t> globalTopkIndice_;
-    LocalTensor<float> globalTopkUb_;
-    LocalTensor<float> SortedBasicBlock_;
+    LocalTensor<int32_t> tileIndices_;
+    LocalTensor<float> runningTopk_;
+    LocalTensor<float> tileTopkCache_;
 
     int32_t blockId_ = -1;
     // para for vector
@@ -140,9 +136,6 @@ private:
     bool useMtpTopKStream_ = false;
     topk::LITopk regBaseTileTopk_;
     topk::LITopkStream mtpTopKStream_;
-
-    // Parameters for LdMerge tasks.
-    uint32_t ldMergeParamNum_ = 16;
 
     constexpr static uint32_t REDUCE_BANK_CONFLICT_OFFSETS = 256;
     constexpr static uint32_t REDUCE_BANK_CONFLICT_NUM = REDUCE_BANK_CONFLICT_OFFSETS / sizeof(float);
@@ -216,12 +209,20 @@ private:
 };
 
 template <typename LIT>
-__aicore__ inline void LIVector<LIT>::InitBuffers(TPipe *pipe, uint32_t stage2ChunkSize)
+__aicore__ inline void LIVector<LIT>::InitBuffers(TPipe *pipe, uint32_t stage2ChunkSize, bool qkToUb,
+                                                 bool shareMtpQueries)
 {
+    stage2QkToUb_ = qkToUb;
+    if (stage2QkToUb_) {
+        // Keep this allocation first: Cube writes to the identical UB offset.
+        pipe->InitBuffer(stage2QkBuf_, Stage2QkUb::BufferBytes(gSize_));
+        stage2QkUb_ = stage2QkBuf_.Get<float>();
+        pipe->InitBuffer(stage2WeightsBuf_, gSize_ * (sizeof(float) + sizeof(K_T)));
+    }
     // No split-group merge consumes FP32 history in this topology. Stage1,
     // uniform decode and small MTP batches retain their existing buffers.
     useMtpTopKStream_ = stage2ChunkSize == 512 && constInfo_.sparseCount == BASE_TOPK &&
-                       constInfo_.hiBlockSize == 128 && constInfo_.hiBlockNum > 2 * BASE_TOPK / 128 &&
+                       constInfo_.hiBlockSize == 128 && constInfo_.hiBlockNum > BASE_TOPK / 128 &&
                        constInfo_.s1Size * constInfo_.kHeadNum >= GetBlockNum();
     uint32_t bufferWidth = LICommon::Max(static_cast<uint32_t>(s2BaseSize_), stage2ChunkSize);
     uint32_t bufferRowNum = stage2ChunkSize > 0 ? 1U : static_cast<uint32_t>(localTopKRowNum_);
@@ -238,14 +239,16 @@ __aicore__ inline void LIVector<LIT>::InitBuffers(TPipe *pipe, uint32_t stage2Ch
         outNeedBufSize = hiScratchSize > outNeedBufSize ? hiScratchSize : outNeedBufSize;
     }
 
-    pipe->InitBuffer(inQueue_, 2,
-                     groupInner_ * bufferWidth * sizeof(float) + bufferWidth * sizeof(float));
+    if (!stage2QkToUb_) {
+        pipe->InitBuffer(inQueue_, 2,
+                         groupInner_ * bufferWidth * sizeof(float) + bufferWidth * sizeof(float));
+    }
     pipe->InitBuffer(outQueue_, 1, outNeedBufSize);                                            // 32KB  extract
     // Keep independent storage for each local row's running TopK and its
     // four-tile cache. A5 uses S1=4, so reusing the old single-region formula
-    // would place SortedBasicBlock_ exactly past the end of this TBuf.
+    // would place tileTopkCache_ exactly past the end of this TBuf.
     uint32_t topkListNum = useMtpTopKStream_ ? 1U : bufferRowNum * 2;
-    pipe->InitBuffer(sortOutBuf_, topkListNum * BASE_TOPK * TOPK_LIST_COMPONENTS * sizeof(float));
+    pipe->InitBuffer(topkStateBuf_, topkListNum * BASE_TOPK * TOPK_LIST_COMPONENTS * sizeof(float));
     pipe->InitBuffer(indexBuf_, bufferWidth * sizeof(int32_t));
     pipe->InitBuffer(reduceOutBuf_, bufferWidth * 2 * sizeof(float));
     pipe->InitBuffer(brcBuf_, groupInner_ * 8 * sizeof(float));
@@ -255,7 +258,10 @@ __aicore__ inline void LIVector<LIT>::InitBuffers(TPipe *pipe, uint32_t stage2Ch
         // The compact list is capped by sparseCount; Stage2 never reads its mask.
         paramBufElemNum = LICommon::Min(static_cast<uint32_t>(constInfo_.hiBlockNum), BASE_TOPK);
     }
-    uint32_t paramBufSize = LICommon::Max(static_cast<uint32_t>(LD_MERGE_PARAM_NUM * sizeof(int64_t)),
+    if (shareMtpQueries) {
+        paramBufElemNum = LICommon::Max(paramBufElemNum, constInfo_.maxBlockNumPerBatch);
+    }
+    uint32_t paramBufSize = LICommon::Max(static_cast<uint32_t>(PARTIAL_TOPK_METADATA_FIELDS * sizeof(int64_t)),
                                           paramBufElemNum * sizeof(int32_t));
     pipe->InitBuffer(paramBuf_, paramBufSize);
     if (useMtpTopKStream_) {
@@ -268,24 +274,68 @@ __aicore__ inline void LIVector<LIT>::InitBuffers(TPipe *pipe, uint32_t stage2Ch
         InitRegBaseTopKBuffers(pipe);
     }
 
-    //
-    globalTopkIndice_ = indexBuf_.Get<int32_t>();
-    globalTopkUb_ = sortOutBuf_.Get<float>();
+    tileIndices_ = indexBuf_.Get<int32_t>();
+    runningTopk_ = topkStateBuf_.Get<float>();
     if (!useMtpTopKStream_) {
-        SortedBasicBlock_ = globalTopkUb_[bufferRowNum * BASE_TOPK * TOPK_LIST_COMPONENTS];
+        tileTopkCache_ = runningTopk_[bufferRowNum * BASE_TOPK * TOPK_LIST_COMPONENTS];
     }
 
-    ArithProgression<int32_t>(globalTopkIndice_, 0, 1, bufferWidth);
-    InitTopKLists(globalTopkUb_, BASE_TOPK, bufferRowNum);
+    ArithProgression<int32_t>(tileIndices_, 0, 1, bufferWidth);
+    InitTopKLists(runningTopk_, BASE_TOPK, bufferRowNum);
     LocalTensor<float> tmpfBuff = outQueue_.AllocTensor<float>();
-    Duplicate(tmpfBuff.template ReinterpretCast<int32_t>(), -1, 2 * (s1BaseSize_ / 2) * ldMergeParamNum_ * 2);
-    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-    int64_t wsInfoOffset = (blockId_ / 2) * s1BaseSize_ * 2 * ldMergeParamNum_ +
-                           (blockId_ % 2) * (s1BaseSize_ / 2) * 2 * ldMergeParamNum_;
-    DataCopyPad(vec1ParamGm[wsInfoOffset], tmpfBuff.template ReinterpretCast<int64_t>(),
-                {1, static_cast<uint16_t>((s1BaseSize_ / 2) * 2 * ldMergeParamNum_ * sizeof(int64_t)), 0, 0});
-    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+    Duplicate(tmpfBuff.template ReinterpretCast<int32_t>(), -1, 2 * (s1BaseSize_ / 2) * PARTIAL_TOPK_METADATA_FIELDS * 2);
+    SetWaitFlag<HardEvent::V_MTE3>();
+    int64_t wsInfoOffset = (blockId_ / 2) * s1BaseSize_ * 2 * PARTIAL_TOPK_METADATA_FIELDS +
+                           (blockId_ % 2) * (s1BaseSize_ / 2) * 2 * PARTIAL_TOPK_METADATA_FIELDS;
+    DataCopyPad(partialTopkMetadataGm[wsInfoOffset], tmpfBuff.template ReinterpretCast<int64_t>(),
+                {1, static_cast<uint16_t>((s1BaseSize_ / 2) * 2 * PARTIAL_TOPK_METADATA_FIELDS * sizeof(int64_t)), 0, 0});
+    SetWaitFlag<HardEvent::MTE3_V>();
     outQueue_.FreeTensor(tmpfBuff);
+}
+
+template <typename LIT>
+__aicore__ inline void LIVector<LIT>::LoadStage2Weights(const LICommon::RunInfo &info)
+{
+    LocalTensor<float> weights = stage2WeightsBuf_.Get<float>();
+    LocalTensor<K_T> input = weights[gSize_].template ReinterpretCast<K_T>();
+    SetWaitFlag<HardEvent::V_MTE2>();
+    DataCopyPad(input, weightsGm[info.tensorWeightsOffset],
+                {1, static_cast<uint16_t>(gSize_ * sizeof(K_T)), 0, 0}, {false, 0, 0, 0});
+    SetWaitFlag<HardEvent::MTE2_V>();
+    Cast(weights, input, RoundMode::CAST_NONE, gSize_);
+    PipeBarrier<PIPE_V>();
+}
+
+template <typename LIT>
+__aicore__ inline void LIVector<LIT>::ReduceStage2QkUb(uint32_t slot, uint32_t scoreOffset, int32_t sharedBlockPos)
+{
+    // The caller still waits/returns this slot's credit. Selection below fills
+    // non-member scores with -inf, so their QK data need not be read/reduced.
+    if (sharedBlockPos >= 0 && paramBuf_.Get<int32_t>().GetValue(sharedBlockPos) < 0) {
+        return;
+    }
+    constexpr uint32_t width = Stage2QkUb::TILE_TOKENS;
+    LocalTensor<float> scores = reduceOutBuf_.Get<float>()[scoreOffset];
+    LocalTensor<float> qk = stage2QkUb_[slot * gSize_ * width];
+    LocalTensor<float> weights = stage2WeightsBuf_.Get<float>();
+    LocalTensor<float> partial = outQueue_.AllocTensor<float>();
+    if (gSize_ == 32) {
+        LIServiceVec::Stage2WeightedReduce32VF((__ubuf__ float *)scores.GetPhyAddr(),
+                                              (__ubuf__ float *)partial[REDUCE_BANK_CONFLICT_NUM].GetPhyAddr(),
+                                              (__ubuf__ float *)qk.GetPhyAddr(),
+                                              (__ubuf__ float *)weights.GetPhyAddr());
+        PipeBarrier<PIPE_V>();
+        outQueue_.FreeTensor(partial);
+        return;
+    }
+    // Same 16-head groups and FP32 Mul/Add tree as the GM path. Only the
+    // transport tile is 128 tokens; the 512/2048/16K TopK windows do not change.
+    for (int32_t head = 0; head < gSize_; head += groupInner_) {
+        LIServiceVec::Stage2WeightedReduce<true>(scores, partial[REDUCE_BANK_CONFLICT_NUM],
+                                           qk[head * width], weights[head], weights[head], width,
+                                           head == 0, head + groupInner_ == gSize_);
+    }
+    outQueue_.FreeTensor(partial);
 }
 
 template <typename LIT>
@@ -367,10 +417,9 @@ __aicore__ inline void LIVector<LIT>::FinalizeTopKList(const LocalTensor<float> 
     PipeBarrier<PIPE_V>();
 
     LocalTensor<uint32_t> selectedPositions = regBaseOutputIdxBuf_.Get<uint32_t>();
-    // The native LI TopK scratch offsets depend on both runtime TopK and
-    // trunk length. Rebind the preallocated max-size scratch for each merge
-    // instead of retaining offsets initialized for a different list size.
-    regBaseTileTopk_.Init(selectedCount, alignedInputCount);
+    // Bind this merge's selection count and the preallocated VF scratch.
+    // Buffer sizing still covers the full input and all kth-score ties.
+    regBaseTileTopk_.Init(selectedCount);
     LocalTensor<uint32_t> regBaseTopkTmp = regBaseTopkTmpBuf_.Get<uint32_t>();
     regBaseTileTopk_.InitBuffers(regBaseTopkTmp);
     // candidateScores is dead after the BF16 key conversion; reuse its first
@@ -389,12 +438,12 @@ __aicore__ inline void LIVector<LIT>::FinalizeTopKList(const LocalTensor<float> 
                                 realIndices, vectorCount);
         PipeBarrier<PIPE_V>();
     }
-    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+    SetWaitFlag<HardEvent::V_S>();
     for (int32_t i = vectorCount; i < selectedCount; ++i) {
         uint32_t selectedPosition = selectedPositions.GetValue(i);
         GetTopKIndices(dst, outputCapacity).SetValue(i, realIndices.GetValue(selectedPosition));
     }
-    SetWaitFlag<HardEvent::S_V>(HardEvent::S_V);
+    SetWaitFlag<HardEvent::S_V>();
 }
 
 template <typename LIT>
@@ -436,8 +485,8 @@ __aicore__ inline void LIVector<LIT>::AccumulateDecodeStage2TopK(
     int32_t tilesPerWindow = BASE_TOPK / chunkSize;
     int32_t windowTileIdx = localChunkIdx % tilesPerWindow;
     int32_t offset = windowTileIdx * chunkSize;
-    Adds(SortedBasicBlock_[offset], scores, 0.0f, chunkSize);
-    Adds(GetTopKIndices(SortedBasicBlock_, BASE_TOPK)[offset], indices, 0, chunkSize);
+    Adds(tileTopkCache_[offset], scores, 0.0f, chunkSize);
+    Adds(GetTopKIndices(tileTopkCache_, BASE_TOPK)[offset], indices, 0, chunkSize);
     PipeBarrier<PIPE_V>();
     if (windowTileIdx + 1 != tilesPerWindow && !isLastChunk) {
         return;
@@ -449,11 +498,11 @@ __aicore__ inline void LIVector<LIT>::AccumulateDecodeStage2TopK(
     if (previousCount == 0) {
         // All candidates fit. Their order is not consumed by the VF merge;
         // quantization can wait until an actual selection is required.
-        CopyTopKList(globalTopkUb_, BASE_TOPK, SortedBasicBlock_, BASE_TOPK, windowCount);
+        CopyTopKList(runningTopk_, BASE_TOPK, tileTopkCache_, BASE_TOPK, windowCount);
     } else {
-        MergeTopKLists(globalTopkUb_, BASE_TOPK,
-                       globalTopkUb_, BASE_TOPK, previousCount,
-                       SortedBasicBlock_, BASE_TOPK, windowCount, BASE_TOPK);
+        MergeTopKLists(runningTopk_, BASE_TOPK,
+                       runningTopk_, BASE_TOPK, previousCount,
+                       tileTopkCache_, BASE_TOPK, windowCount, BASE_TOPK);
     }
 }
 
@@ -486,8 +535,8 @@ __aicore__ inline void LIVector<LIT>::AccumulateMtpStage2TopK(
     if (isLastChunk) {
         // Candidate positions retain their block-list order across all windows.
         // Only the final TopK needs a logical-token mapping, never a dense key scan.
-        SetWaitFlag<HardEvent::S_V>(HardEvent::S_V);
-        topk::MapHiTokenIndices(GetTopKIndices(globalTopkUb_, BASE_TOPK), positions,
+        SetWaitFlag<HardEvent::S_V>();
+        topk::MapHiTokenIndices(GetTopKIndices(runningTopk_, BASE_TOPK), positions,
                                 paramBuf_.Get<int32_t>(), hiBlockCount, keyLen);
         PipeBarrier<PIPE_V>();
     }
@@ -529,20 +578,21 @@ __aicore__ inline void LIVector<LIT>::MergeTopKLists(const LocalTensor<float> &d
 }
 
 template <typename LIT>
-__aicore__ inline void LIVector<LIT>::InitLdMergeBuffers(TPipe *pipe)
+__aicore__ inline void LIVector<LIT>::InitPartialTopkMergeBuffers(TPipe *pipe)
 {
     pipe->Reset();
-    pipe->InitBuffer(ldMergeInputBuf_, 4 * BASE_TOPK * sizeof(float)); // two score/index lists
-    pipe->InitBuffer(ldMergeOutIdxBuf_, BASE_TOPK * sizeof(int32_t));
-    uint32_t paramBufSize = LICommon::Max(static_cast<uint32_t>(LD_MERGE_PARAM_NUM * sizeof(int64_t)),
+    pipe->InitBuffer(partialTopkInputBuf_, 4 * BASE_TOPK * sizeof(float)); // two score/index lists
+    // Stage1 reuses output-index scratch for all cores' metadata until emit.
+    pipe->InitBuffer(partialTopkOutputIndexBuf_, LICommon::Max(
+        BASE_TOPK * sizeof(int32_t), GetBlockNum() * 2 * PARTIAL_TOPK_METADATA_FIELDS * sizeof(int64_t)));
+    uint32_t paramBufSize = LICommon::Max(static_cast<uint32_t>(PARTIAL_TOPK_METADATA_FIELDS * sizeof(int64_t)),
                                           constInfo_.externalHiMaskWordNum * sizeof(int32_t));
     pipe->InitBuffer(paramBuf_, paramBufSize);
     InitRegBaseTopKBuffers(pipe);
 }
 
 template <typename LIT>
-__aicore__ inline void LIVector<LIT>::InitParams(const struct LICommon::ConstInfo &constInfo,
-                                                 const LIHiCachedTilingData *__restrict tilingData)
+__aicore__ inline void LIVector<LIT>::InitParams(const LICommon::ConstInfo &constInfo)
 {
     this->constInfo_ = constInfo;
     blockS2StartIdx_ = 0;
@@ -654,7 +704,7 @@ __aicore__ inline void LIVector<LIT>::EmitSelectedBlockListToTensor(const LocalT
     }
     Duplicate(scratchInt, constInfo_.INVALID_IDX, maxOutCount);
     PipeBarrier<PIPE_V>();
-    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+    SetWaitFlag<HardEvent::V_S>();
 
     int32_t sinkCount = GetSinkBlockCount(totalBlockNum);
     int32_t recentCount = GetRecentBlockCount(totalBlockNum, sinkCount);
@@ -680,11 +730,11 @@ __aicore__ inline void LIVector<LIT>::EmitSelectedBlockListToTensor(const LocalT
         }
         scratchInt.SetValue(outCount++, blockId);
     }
-    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-    SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+    SetWaitFlag<HardEvent::V_MTE3>();
+    SetWaitFlag<HardEvent::S_MTE3>();
     LIServiceVec::CopyOut(blockIndiceGm[outOffset], scratchInt, maxOutCount);
-    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-    SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+    SetWaitFlag<HardEvent::MTE3_V>();
+    SetWaitFlag<HardEvent::MTE3_S>();
     PipeBarrier<PIPE_ALL>();
 }
 
@@ -702,7 +752,7 @@ __aicore__ inline void LIVector<LIT>::EmitSelectedBlocksAndEmbeddedMaskToTensor(
     Duplicate(scratchInt, constInfo_.INVALID_IDX, maskOffset);
     Duplicate(scratchInt[maskOffset], 0, maskWordCount);
     PipeBarrier<PIPE_V>();
-    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+    SetWaitFlag<HardEvent::V_S>();
 
     int32_t sinkCount = GetSinkBlockCount(totalBlockNum);
     int32_t recentCount = GetRecentBlockCount(totalBlockNum, sinkCount);
@@ -731,11 +781,11 @@ __aicore__ inline void LIVector<LIT>::EmitSelectedBlocksAndEmbeddedMaskToTensor(
         scratchInt.SetValue(outCount++, blockId);
         MarkHiMask(scratchInt, maskOffset, blockId);
     }
-    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-    SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+    SetWaitFlag<HardEvent::V_MTE3>();
+    SetWaitFlag<HardEvent::S_MTE3>();
     LIServiceVec::CopyOut(blockIndiceGm[outOffset], scratchInt, copyCount);
-    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-    SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+    SetWaitFlag<HardEvent::MTE3_V>();
+    SetWaitFlag<HardEvent::MTE3_S>();
     PipeBarrier<PIPE_ALL>();
 }
 
@@ -752,7 +802,7 @@ __aicore__ inline void LIVector<LIT>::EmitSelectedBlocksAndExternalMaskToTensor(
     Duplicate(scratchInt, constInfo_.INVALID_IDX, maxOutCount);
     Duplicate(maskScratch, 0, maskWordCount);
     PipeBarrier<PIPE_V>();
-    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+    SetWaitFlag<HardEvent::V_S>();
 
     int32_t sinkCount = GetSinkBlockCount(totalBlockNum);
     int32_t recentCount = GetRecentBlockCount(totalBlockNum, sinkCount);
@@ -781,38 +831,28 @@ __aicore__ inline void LIVector<LIT>::EmitSelectedBlocksAndExternalMaskToTensor(
         scratchInt.SetValue(outCount++, blockId);
         MarkHiMask(maskScratch, 0, blockId);
     }
-    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-    SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+    SetWaitFlag<HardEvent::V_MTE3>();
+    SetWaitFlag<HardEvent::S_MTE3>();
     LIServiceVec::CopyOut(blockIndiceGm[outOffset], scratchInt, maxOutCount);
     LIServiceVec::CopyOut(externalHiMaskGm[GetExternalHiMaskRowOffset(outOffset)], maskScratch, maskWordCount);
-    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-    SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+    SetWaitFlag<HardEvent::MTE3_V>();
+    SetWaitFlag<HardEvent::MTE3_S>();
     PipeBarrier<PIPE_ALL>();
 }
 
 template <typename LIT>
-__aicore__ inline void
-LIVector<LIT>::InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<float> vec1ResGm,
-                                    GlobalTensor<int64_t> vec1ParamGm, GlobalTensor<int32_t> blockIndiceGm,
-                                    GlobalTensor<int32_t> externalHiMaskGm,
-                                    GlobalTensor<K_T> weightsGm, GlobalTensor<int32_t> indiceOutGm,
-                                    GlobalTensor<int32_t> blockTableGm, GlobalTensor<K_T> keyGm,
-                                    GlobalTensor<K_T> stage1MeanKeyGm,
-                                    GlobalTensor<K_T> stage1MeanCacheGm,
-                                    GlobalTensor<Q_T> queryGm)
+__aicore__ inline void LIVector<LIT>::InitGlobalTensors(
+    GlobalTensor<MM1_OUT_T> qkWorkspaceGm, GlobalTensor<float> partialTopkGm,
+    GlobalTensor<int64_t> partialTopkMetadataGm, GlobalTensor<int32_t> blockIndiceGm,
+    GlobalTensor<int32_t> externalHiMaskGm, GlobalTensor<K_T> weightsGm, GlobalTensor<int32_t> indiceOutGm)
 {
-    this->mm1ResGm = mm1ResGm;
-    this->vec1ResGm = vec1ResGm;
-    this->vec1ParamGm = vec1ParamGm;
+    this->qkWorkspaceGm = qkWorkspaceGm;
+    this->partialTopkGm = partialTopkGm;
+    this->partialTopkMetadataGm = partialTopkMetadataGm;
     this->blockIndiceGm = blockIndiceGm;
     this->externalHiMaskGm = externalHiMaskGm;
     this->weightsGm = weightsGm;
     this->indiceOutGm = indiceOutGm;
-    this->blockTableGm = blockTableGm;
-    this->keyGm = keyGm;
-    this->stage1MeanKeyGm = stage1MeanKeyGm;
-    this->stage1MeanCacheGm = stage1MeanCacheGm;
-    this->queryGm = queryGm;
 }
 
 template <typename LIT>
@@ -824,9 +864,9 @@ __aicore__ inline void LIVector<LIT>::CleanInvalidOutput(int64_t invalidS1offset
     Duplicate(idxULocal1, constInfo_.INVALID_IDX, constInfo_.sparseCount);
     outQueue_.EnQue<float>(valueULocal);
     valueULocal = outQueue_.DeQue<float>();
-    SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
+    SetWaitFlag<HardEvent::V_MTE3>();
     LIServiceVec::CopyOut(indiceOutGm[invalidS1offset], idxULocal1, constInfo_.sparseCount);
-    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+    SetWaitFlag<HardEvent::MTE3_V>();
     outQueue_.FreeTensor(valueULocal);
 }
 
@@ -854,7 +894,7 @@ __aicore__ inline void LIVector<LIT>::AccumulateStage1MeanBlockScores(const LICo
         LocalTensor<float> mmInUb = inQueue_.AllocTensor<float>();
         LocalTensor<float> weightsInUb = mmInUb[procGnum * mmRowWidth];
         LocalTensor<K_T> weightsInTUb = weightsInUb.template ReinterpretCast<K_T>()[groupInner_];
-        LIServiceVec::CopyIn(mmInUb, weightsInTUb, mm1ResGm, weightsGm,
+        LIServiceVec::CopyQkAndWeights(mmInUb, weightsInTUb, qkWorkspaceGm, weightsGm,
                              mmGmOffset + innerS1Idx * gSize_ * info.actualSingleProcessSInnerSizeAlign +
                                  outerGidx * groupInner_ * info.actualSingleProcessSInnerSizeAlign,
                              weightGmOffset + innerS1Idx * gSize_ + outerGidx * groupInner_, procGnum,
@@ -862,11 +902,11 @@ __aicore__ inline void LIVector<LIT>::AccumulateStage1MeanBlockScores(const LICo
 
         inQueue_.EnQue<float>(mmInUb);
         mmInUb = inQueue_.DeQue<float>();
-        SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+        SetWaitFlag<HardEvent::MTE2_S>();
         weightsInUb = mmInUb[procGnum * mmRowWidth];
         AscendC::Cast(weightsInUb, weightsInTUb, RoundMode::CAST_NONE, procGnum);
         PipeBarrier<PIPE_V>();
-        SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+        SetWaitFlag<HardEvent::V_S>();
         if (mmRowWidth == 16) {
             Maxs(stage1TmpScoreUb, mmInUb, 0.0f, procGnum * mmRowWidth);
             PipeBarrier<PIPE_V>();
@@ -880,7 +920,7 @@ __aicore__ inline void LIVector<LIT>::AccumulateStage1MeanBlockScores(const LICo
                 B32_BLOCK_ALIGN_NUM, procGnum, {1, 1, 1, 2, 2, 1});
             PipeBarrier<PIPE_V>();
             LocalTensor<float> stage1OuterReduceUb = reduceOutInner[localHiBlockNumAlign];
-            LIServiceVec::DoReduce(stage1TmpScoreUb, stage1OuterReduceUb, procGnum, mmRowWidth);
+            LIServiceVec::ReduceHeads(stage1TmpScoreUb, stage1OuterReduceUb, procGnum, mmRowWidth);
             Add(reduceOutInner, reduceOutInner, stage1OuterReduceUb, localHiBlockNumAlign);
             PipeBarrier<PIPE_V>();
         } else {
@@ -894,7 +934,7 @@ __aicore__ inline void LIVector<LIT>::AccumulateStage1MeanBlockScores(const LICo
         }
         inQueue_.FreeTensor(mmInUb);
     }
-    SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+    SetWaitFlag<HardEvent::V_S>();
 }
 
 template <typename LIT>
@@ -914,7 +954,7 @@ __aicore__ inline void LIVector<LIT>::AccumulateStage1TokenBlockScores(const LIC
         LocalTensor<float> mmInUb = inQueue_.AllocTensor<float>();
         LocalTensor<float> weightsInUb = mmInUb[procGnum * mmRowWidth];
         LocalTensor<K_T> weightsInTUb = weightsInUb.template ReinterpretCast<K_T>()[groupInner_];
-        LIServiceVec::CopyIn(mmInUb, weightsInTUb, mm1ResGm, weightsGm,
+        LIServiceVec::CopyQkAndWeights(mmInUb, weightsInTUb, qkWorkspaceGm, weightsGm,
                              mmGmOffset + innerS1Idx * gSize_ * info.actualSingleProcessSInnerSizeAlign +
                                  outerGidx * groupInner_ * info.actualSingleProcessSInnerSizeAlign,
                              weightGmOffset + innerS1Idx * gSize_ + outerGidx * groupInner_, procGnum,
@@ -922,11 +962,11 @@ __aicore__ inline void LIVector<LIT>::AccumulateStage1TokenBlockScores(const LIC
 
         inQueue_.EnQue<float>(mmInUb);
         mmInUb = inQueue_.DeQue<float>();
-        SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+        SetWaitFlag<HardEvent::MTE2_S>();
         weightsInUb = mmInUb[procGnum * s2BaseSize_];
         AscendC::Cast(weightsInUb, weightsInTUb, RoundMode::CAST_NONE, procGnum);
         PipeBarrier<PIPE_V>();
-        SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+        SetWaitFlag<HardEvent::V_S>();
         for (int32_t gIdx = 0; gIdx < procGnum; ++gIdx) {
             float gate = weightsInUb.GetValue(gIdx);
             int32_t gOffset = gIdx * mmRowWidth;
@@ -974,10 +1014,10 @@ __aicore__ inline void LIVector<LIT>::SelectStage1BlocksImpl(const LICommon::Run
     if (isNewStage1Group) {
         int32_t stage1TopCapacity = topBlockBufElems_ / TOPK_LIST_COMPONENTS;
         for (int32_t rowIdx = 0; rowIdx < localTopKRowNum_; ++rowIdx) {
-            InitTopKList(globalTopkUb_[rowIdx * BASE_TOPK * TOPK_LIST_COMPONENTS], stage1TopCapacity);
+            InitTopKList(runningTopk_[rowIdx * BASE_TOPK * TOPK_LIST_COMPONENTS], stage1TopCapacity);
         }
         PipeBarrier<PIPE_V>();
-        SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+        SetWaitFlag<HardEvent::V_S>();
         blockS2StartIdx_ = info.s2Idx;
         stage1ActiveBN2Idx_ = info.bN2Idx;
         stage1ActiveGS1Idx_ = info.gS1Idx;
@@ -1029,7 +1069,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage1BlocksImpl(const LICommon::Run
             PipeBarrier<PIPE_V>();
             Duplicate(reduceOutInner, 0.0f, localHiBlockNumAlign);
             PipeBarrier<PIPE_V>();
-            SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+            SetWaitFlag<HardEvent::V_S>();
             if constexpr (useStage1BlockMean) {
                 AccumulateStage1MeanBlockScores(info, innerS1Idx, mmGmOffset, weightGmOffset, outerG, mmRowWidth,
                                                 localHiBlockNumAlign, reduceOutInner, stage1TmpScoreUb, brcBuf);
@@ -1042,7 +1082,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage1BlocksImpl(const LICommon::Run
                 (blockBase + localHiBlockNum >= totalBlockNum) :
                 (cuBaseS2Idx + s2BaseSize_ >= cuRealAcSeq);
 
-            LocalTensor<float> rowTopBuf = globalTopkUb_[innerS1Idx * BASE_TOPK * 2];
+            LocalTensor<float> rowTopBuf = runningTopk_[innerS1Idx * BASE_TOPK * 2];
             int32_t sinkCount = GetSinkBlockCount(totalBlockNum);
             int32_t recentCount = GetRecentBlockCount(totalBlockNum, sinkCount);
             int32_t middleBlockEnd = totalBlockNum - recentCount;
@@ -1064,7 +1104,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage1BlocksImpl(const LICommon::Run
                                        stage1BlockScoreTableRequiredLen <= stage1BlockScoreTableLimit &&
                                        (!isLargeStage1ScoreTable || allowLargeStage1ScoreTable);
             LocalTensor<float> stage1ScoreTable =
-                SortedBasicBlock_[innerS1Idx * BASE_TOPK * TOPK_LIST_COMPONENTS];
+                tileTopkCache_[innerS1Idx * BASE_TOPK * TOPK_LIST_COMPONENTS];
             LocalTensor<int32_t> stage1IndexTable =
                 stage1ScoreTable[stage1BlockScoreTableLen].template ReinterpretCast<int32_t>();
             if (useStage1ScoreTable && info.s2Idx == blockS2StartIdx_) {
@@ -1072,7 +1112,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage1BlocksImpl(const LICommon::Run
                           stage1BlockScoreTableLen);
                 Duplicate(stage1IndexTable, constInfo_.INVALID_IDX, stage1BlockScoreTableLen);
                 PipeBarrier<PIPE_V>();
-                SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+                SetWaitFlag<HardEvent::V_S>();
             }
             if (useStage1ScoreTable) {
                 int32_t validStart = LICommon::Min(localHiBlockNum, LICommon::Max(0, sinkCount - blockBase));
@@ -1100,7 +1140,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage1BlocksImpl(const LICommon::Run
                         stage1ScoreTable.SetValue(globalBlockId, reduceOutInner.GetValue(localBlockIdx));
                         stage1IndexTable.SetValue(globalBlockId, globalBlockId);
                     }
-                    SetWaitFlag<HardEvent::S_V>(HardEvent::S_V);
+                    SetWaitFlag<HardEvent::S_V>();
                 }
             } else if (scoredBlockCount > 0 && localHiBlockNum <= s2BaseSize_) {
                 int32_t localSortLen = LICommon::Align(localHiBlockNum, STAGE1_SORT_LEN);
@@ -1114,7 +1154,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage1BlocksImpl(const LICommon::Run
                     static_cast<int32_t>(info.s2Idx - blockS2StartIdx_) % STAGE1_TILE_CACHE_COUNT : 0;
                 int32_t cacheOffset = cacheTileIdx * s2BaseSize_;
                 LocalTensor<float> stage1TileCache =
-                    SortedBasicBlock_[innerS1Idx * BASE_TOPK * TOPK_LIST_COMPONENTS];
+                    tileTopkCache_[innerS1Idx * BASE_TOPK * TOPK_LIST_COMPONENTS];
                 LocalTensor<int32_t> stage1TileIndexCache =
                     stage1TileCache[BASE_TOPK].template ReinterpretCast<int32_t>();
                 LocalTensor<float> tmpSortBuf;
@@ -1132,7 +1172,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage1BlocksImpl(const LICommon::Run
                 Duplicate(sortScoreUb.template ReinterpretCast<int32_t>(), LIServiceVec::NEG_INF, sortInitLen);
                 Duplicate(sortIndiceUbInt, constInfo_.INVALID_IDX, sortInitLen);
                 PipeBarrier<PIPE_V>();
-                SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+                SetWaitFlag<HardEvent::V_S>();
                 int32_t validStart = LICommon::Min(localHiBlockNum, LICommon::Max(0, sinkCount - blockBase));
                 int32_t validEnd = LICommon::Min(localHiBlockNum, LICommon::Max(0, middleBlockEnd - blockBase));
                 int32_t validCount = validEnd - validStart;
@@ -1158,7 +1198,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage1BlocksImpl(const LICommon::Run
                         sortScoreUb.SetValue(localBlockIdx, reduceOutInner.GetValue(localBlockIdx));
                         sortIndiceUbInt.SetValue(localBlockIdx, globalBlockId);
                     }
-                    SetWaitFlag<HardEvent::S_V>(HardEvent::S_V);
+                    SetWaitFlag<HardEvent::S_V>();
                 }
                 PipeBarrier<PIPE_V>();
                 int32_t localTopCount = LICommon::Min(validCount, scoredBlockCount);
@@ -1244,19 +1284,19 @@ __aicore__ inline void LIVector<LIT>::SelectStage1BlocksImpl(const LICommon::Run
                 outQueue_.FreeTensor(scratch);
                 ResetTopBlocks(rowTopBuf);
             } else if (needCopyWsGm) {
-                // vec1Res Gm = [aic, s1BaseSize_, 2, 2, topkOut_] float32
-                // vec1Param Gm = [aic, s1BaseSize_, 2, 16] int64
+                // partialTopkGm = [aic, s1BaseSize_, 2, 2, BASE_TOPK] float32
+                // partialTopkMetadataGm = [aic, s1BaseSize_, 2, 16] int64
                 //     16 = [needMerge, s2AcSeq, s2Start, s2End, isS2End, bn2idx, s1Idx, S1ProcNum, ......]
 
                 int64_t wsOffset = (blockId_ / 2) * s1BaseSize_ * 2 * 2 * BASE_TOPK +
                                    (blockId_ % 2) * (s1BaseSize_ / 2) * 2 * 2 * BASE_TOPK +
                                    (ldS1Offset + innerS1Idx) * 2 * 2 * BASE_TOPK;
-                int64_t wsInfoOffset = (blockId_ / 2) * s1BaseSize_ * 2 * ldMergeParamNum_ +
-                                       (blockId_ % 2) * (s1BaseSize_ / 2) * 2 * ldMergeParamNum_ +
-                                       (ldS1Offset + innerS1Idx) * 2 * ldMergeParamNum_;
+                int64_t wsInfoOffset = (blockId_ / 2) * s1BaseSize_ * 2 * PARTIAL_TOPK_METADATA_FIELDS +
+                                       (blockId_ % 2) * (s1BaseSize_ / 2) * 2 * PARTIAL_TOPK_METADATA_FIELDS +
+                                       (ldS1Offset + innerS1Idx) * 2 * PARTIAL_TOPK_METADATA_FIELDS;
 
                 LocalTensor<int64_t> tmpiBuff = paramBuf_.Get<int64_t>();
-                SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+                SetWaitFlag<HardEvent::MTE3_S>();
                 tmpiBuff.SetValue(0, static_cast<int64_t>(0));
                 tmpiBuff.SetValue(1, static_cast<int64_t>(cuRealAcSeq));
                 tmpiBuff.SetValue(2, static_cast<int64_t>(blockS2StartIdx_));
@@ -1275,23 +1315,23 @@ __aicore__ inline void LIVector<LIT>::SelectStage1BlocksImpl(const LICommon::Run
                 tmpiBuff.SetValue(9, static_cast<int64_t>(partialTopCount));
                 bool isTailReduce = blockS2StartIdx_ == 0;
                 if (isTailReduce) {
-                    wsInfoOffset += ldMergeParamNum_;
+                    wsInfoOffset += PARTIAL_TOPK_METADATA_FIELDS;
                     wsOffset += 2 * BASE_TOPK;
                 }
-                SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-                SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+                SetWaitFlag<HardEvent::V_MTE3>();
+                SetWaitFlag<HardEvent::S_MTE3>();
                 if (partialTopCount > 0) {
                     int32_t topListCapacity = topBlockBufElems_ / TOPK_LIST_COMPONENTS;
-                    LIServiceVec::CopyOut(vec1ResGm[wsOffset], rowTopBuf, partialTopCount);
-                    LIServiceVec::CopyOut(vec1ResGm[wsOffset + topListCapacity],
+                    LIServiceVec::CopyOut(partialTopkGm[wsOffset], rowTopBuf, partialTopCount);
+                    LIServiceVec::CopyOut(partialTopkGm[wsOffset + topListCapacity],
                                           rowTopBuf[topListCapacity], partialTopCount);
                 }
-                SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+                SetWaitFlag<HardEvent::MTE3_V>();
                 PipeBarrier<PIPE_ALL>();
                 tmpiBuff.SetValue(0, static_cast<int64_t>(1));
-                SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-                LIServiceVec::CopyOut(vec1ParamGm[wsInfoOffset], tmpiBuff, 16);
-                SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+                SetWaitFlag<HardEvent::S_MTE3>();
+                LIServiceVec::CopyOut(partialTopkMetadataGm[wsInfoOffset], tmpiBuff, 16);
+                SetWaitFlag<HardEvent::MTE3_S>();
                 PipeBarrier<PIPE_ALL>();
             }
         } else if (cuRealAcSeq <= 0) {
@@ -1346,25 +1386,24 @@ __aicore__ inline void LIVector<LIT>::MergeStage1BlockTopM()
     int64_t needMerge;
     int64_t wsOffset;
     int64_t wsInfoOffset = 0;
-    int64_t isS2End;
     int64_t outOffset = 0;
 
-    LocalTensor<float> mergedTopUb = ldMergeInputBuf_.Get<float>();
+    LocalTensor<float> mergedTopUb = partialTopkInputBuf_.Get<float>();
     LocalTensor<float> tmpTopUb = mergedTopUb[2 * BASE_TOPK];
     LocalTensor<int64_t> paramSlotLocal = paramBuf_.Get<int64_t>();
-    LocalTensor<int32_t> ldScratchIdx = ldMergeOutIdxBuf_.Get<int32_t>();
+    LocalTensor<int32_t> ldScratchIdx = partialTopkOutputIndexBuf_.Get<int32_t>();
 
     uint32_t s1MergeStartIdx = 0;
     uint32_t s1ProcNum = 0;
-    uint64_t paramGmCoreOffset = curCubeId * s1BaseSize_ * 2 * ldMergeParamNum_;
+    uint64_t paramGmCoreOffset = curCubeId * s1BaseSize_ * 2 * PARTIAL_TOPK_METADATA_FIELDS;
     bool foundActiveSlot = false;
     for (uint32_t innerS1Idx = 0; innerS1Idx < s1BaseSize_; innerS1Idx++) {
-        int64_t slotInfoOffset = paramGmCoreOffset + innerS1Idx * 2 * ldMergeParamNum_ + ldMergeParamNum_;
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-        SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
-        DataCopyPad(paramSlotLocal, vec1ParamGm[slotInfoOffset],
-                    {1, static_cast<uint16_t>(ldMergeParamNum_ * sizeof(int64_t)), 0, 0}, {true, 0, 0, 0});
-        SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+        int64_t slotInfoOffset = paramGmCoreOffset + innerS1Idx * 2 * PARTIAL_TOPK_METADATA_FIELDS + PARTIAL_TOPK_METADATA_FIELDS;
+        SetWaitFlag<HardEvent::V_MTE2>();
+        SetWaitFlag<HardEvent::S_MTE2>();
+        DataCopyPad(paramSlotLocal, partialTopkMetadataGm[slotInfoOffset],
+                    {1, static_cast<uint16_t>(PARTIAL_TOPK_METADATA_FIELDS * sizeof(int64_t)), 0, 0}, {true, 0, 0, 0});
+        SetWaitFlag<HardEvent::MTE2_S>();
         needMerge = paramSlotLocal.GetValue(0);
         if (needMerge == 1) {
             foundActiveSlot = true;
@@ -1384,12 +1423,12 @@ __aicore__ inline void LIVector<LIT>::MergeStage1BlockTopM()
         s1VecNum = s1ProcNum - s1VecNum;
     }
     for (uint32_t innerS1Idx = s1MergeStartIdx; innerS1Idx < s1MergeStartIdx + s1VecNum; innerS1Idx++) {
-        wsInfoOffset = curCubeId * s1BaseSize_ * 2 * ldMergeParamNum_ + innerS1Idx * 2 * ldMergeParamNum_ + ldMergeParamNum_;
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-        SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
-        DataCopyPad(paramSlotLocal, vec1ParamGm[wsInfoOffset],
-                    {1, static_cast<uint16_t>(ldMergeParamNum_ * sizeof(int64_t)), 0, 0}, {true, 0, 0, 0});
-        SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+        wsInfoOffset = curCubeId * s1BaseSize_ * 2 * PARTIAL_TOPK_METADATA_FIELDS + innerS1Idx * 2 * PARTIAL_TOPK_METADATA_FIELDS + PARTIAL_TOPK_METADATA_FIELDS;
+        SetWaitFlag<HardEvent::V_MTE2>();
+        SetWaitFlag<HardEvent::S_MTE2>();
+        DataCopyPad(paramSlotLocal, partialTopkMetadataGm[wsInfoOffset],
+                    {1, static_cast<uint16_t>(PARTIAL_TOPK_METADATA_FIELDS * sizeof(int64_t)), 0, 0}, {true, 0, 0, 0});
+        SetWaitFlag<HardEvent::MTE2_S>();
         int64_t baseBN2Idx = paramSlotLocal.GetValue(5);
         int64_t baseS1Idx = paramSlotLocal.GetValue(6);
         int64_t baseS2AcSeq = paramSlotLocal.GetValue(1);
@@ -1403,84 +1442,65 @@ __aicore__ inline void LIVector<LIT>::MergeStage1BlockTopM()
         wsOffset = curCubeId * s1BaseSize_ * 2 * 2 * BASE_TOPK +
                    innerS1Idx * 2 * 2 * BASE_TOPK + 2 * BASE_TOPK;
         if (mergedCandidateCount > 0) {
-            SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-            SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
-            DataCopyPad(mergedTopUb, vec1ResGm[wsOffset],
+            SetWaitFlag<HardEvent::V_MTE2>();
+            SetWaitFlag<HardEvent::S_MTE2>();
+            DataCopyPad(mergedTopUb, partialTopkGm[wsOffset],
                         {1, static_cast<uint16_t>(mergedCandidateCount * sizeof(float)), 0, 0},
                         {true, 0, 0, 0});
-            DataCopyPad(mergedTopUb[topListCapacity], vec1ResGm[wsOffset + topListCapacity],
+            DataCopyPad(mergedTopUb[topListCapacity], partialTopkGm[wsOffset + topListCapacity],
                         {1, static_cast<uint16_t>(mergedCandidateCount * sizeof(int32_t)), 0, 0},
                         {true, 0, 0, 0});
-            SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+            SetWaitFlag<HardEvent::MTE2_S>();
         }
-        uint64_t mergedCubeMask = (curCubeId < 64) ? (1ULL << curCubeId) : 0ULL;
-        bool hasEndPartial = false;
-        constexpr int32_t LD_MERGE_METADATA_RETRY_TIMES = 1;
-        for (int32_t retry = 0; retry < LD_MERGE_METADATA_RETRY_TIMES; ++retry) {
-            bool foundNewPartial = false;
-            for (int32_t tmpCubeId = 0; tmpCubeId < cubeNum; ++tmpCubeId) {
-                if (tmpCubeId < 64 && ((mergedCubeMask >> tmpCubeId) & 1ULL) != 0) {
-                    continue;
-                }
-                int32_t matchedSlotIdx = -1;
-                int32_t matchedHalfIdx = -1;
-                int32_t partialCandidateCount = 0;
-                int32_t slotIdx = static_cast<int32_t>(innerS1Idx);
-                for (int32_t halfIdx = 0; halfIdx < 2; ++halfIdx) {
-                    if (tmpCubeId == curCubeId && slotIdx == static_cast<int32_t>(innerS1Idx) && halfIdx == 1) {
-                        continue;
-                    }
-                    wsInfoOffset = tmpCubeId * s1BaseSize_ * 2 * ldMergeParamNum_ +
-                                   slotIdx * 2 * ldMergeParamNum_ + halfIdx * ldMergeParamNum_;
-                    SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-                    SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
-                    DataCopyPad(paramSlotLocal, vec1ParamGm[wsInfoOffset],
-                                {1, static_cast<uint16_t>(ldMergeParamNum_ * sizeof(int64_t)), 0, 0}, {true, 0, 0, 0});
-                    SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
-                    needMerge = paramSlotLocal.GetValue(0);
-                    int64_t curBN2Idx = paramSlotLocal.GetValue(5);
-                    int64_t curS1Idx = paramSlotLocal.GetValue(6);
-                    if (needMerge == 1 && curBN2Idx == baseBN2Idx && curS1Idx == baseS1Idx) {
-                        matchedSlotIdx = slotIdx;
-                        matchedHalfIdx = halfIdx;
-                        isS2End = paramSlotLocal.GetValue(4);
-                        partialCandidateCount = LICommon::Max(
-                            0, LICommon::Min(static_cast<int32_t>(paramSlotLocal.GetValue(9)), topListCapacity));
-                        break;
-                    }
-                }
-                if (matchedSlotIdx < 0) {
-                    continue;
-                }
-                if (tmpCubeId < 64) {
-                    mergedCubeMask |= (1ULL << tmpCubeId);
-                }
-                foundNewPartial = true;
-                hasEndPartial = hasEndPartial || (isS2End == 1);
-                wsOffset = tmpCubeId * s1BaseSize_ * 2 * 2 * BASE_TOPK +
-                           matchedSlotIdx * 2 * 2 * BASE_TOPK + matchedHalfIdx * 2 * BASE_TOPK;
-                if (scoredBlockCount > 0 && partialCandidateCount > 0) {
-                    SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-                    SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
-                    DataCopyPad(tmpTopUb, vec1ResGm[wsOffset],
-                                {1, static_cast<uint16_t>(partialCandidateCount * sizeof(float)), 0, 0},
-                                {true, 0, 0, 0});
-                    DataCopyPad(tmpTopUb[topListCapacity], vec1ResGm[wsOffset + topListCapacity],
-                                {1, static_cast<uint16_t>(partialCandidateCount * sizeof(int32_t)), 0, 0},
-                                {true, 0, 0, 0});
-                    SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
-                    MergeTopKLists(mergedTopUb, topListCapacity,
-                                   mergedTopUb, topListCapacity, mergedCandidateCount,
-                                   tmpTopUb, topListCapacity, partialCandidateCount, scoredBlockCount);
-                    mergedCandidateCount = LICommon::Min(
-                        scoredBlockCount, mergedCandidateCount + partialCandidateCount);
+        // Stage1 writers have finished before this merge. Fetch both halves
+        // for this query slot from every core in one strided DMA; matching and
+        // TopM merging retain their original core/half order.
+        auto metadata = partialTopkOutputIndexBuf_.Get<int64_t>();
+        uint32_t coreMetadataBytes = 2 * PARTIAL_TOPK_METADATA_FIELDS * sizeof(int64_t);
+        DataCopyExtParams metadataCopy{static_cast<uint16_t>(cubeNum), coreMetadataBytes,
+                                      (s1BaseSize_ - 1) * coreMetadataBytes, 0, 0};
+        SetWaitFlag<HardEvent::V_MTE2>();
+        SetWaitFlag<HardEvent::S_MTE2>();
+        DataCopyPad(metadata, partialTopkMetadataGm[innerS1Idx * 2 * PARTIAL_TOPK_METADATA_FIELDS],
+                    metadataCopy, DataCopyPadExtParams<int64_t>{false, 0, 0, 0});
+        SetWaitFlag<HardEvent::MTE2_S>();
+        for (int32_t tmpCubeId = 0; tmpCubeId < cubeNum; ++tmpCubeId) {
+            if (tmpCubeId == curCubeId) {
+                continue;
+            }
+            int32_t matchedHalfIdx = -1;
+            int32_t partialCandidateCount = 0;
+            for (int32_t halfIdx = 0; halfIdx < 2; ++halfIdx) {
+                auto params = metadata[(tmpCubeId * 2 + halfIdx) * PARTIAL_TOPK_METADATA_FIELDS];
+                if (params.GetValue(0) == 1 && params.GetValue(5) == baseBN2Idx &&
+                    params.GetValue(6) == baseS1Idx) {
+                    matchedHalfIdx = halfIdx;
+                    partialCandidateCount = LICommon::Max(
+                        0, LICommon::Min(static_cast<int32_t>(params.GetValue(9)), topListCapacity));
+                    break;
                 }
             }
-            if (hasEndPartial && !foundNewPartial) {
-                break;
+            if (matchedHalfIdx < 0 || scoredBlockCount <= 0 || partialCandidateCount <= 0) {
+                continue;
             }
-            PipeBarrier<PIPE_ALL>();
+            wsOffset = tmpCubeId * s1BaseSize_ * 2 * 2 * BASE_TOPK +
+                       innerS1Idx * 2 * 2 * BASE_TOPK + matchedHalfIdx * 2 * BASE_TOPK;
+            SetWaitFlag<HardEvent::V_MTE2>();
+            SetWaitFlag<HardEvent::S_MTE2>();
+            DataCopyPad(tmpTopUb, partialTopkGm[wsOffset],
+                        {1, static_cast<uint16_t>(partialCandidateCount * sizeof(float)), 0, 0},
+                        {true, 0, 0, 0});
+            DataCopyPad(tmpTopUb[topListCapacity], partialTopkGm[wsOffset + topListCapacity],
+                        {1, static_cast<uint16_t>(partialCandidateCount * sizeof(int32_t)), 0, 0},
+                        {true, 0, 0, 0});
+            SetWaitFlag<HardEvent::MTE2_S>();
+            MergeTopKLists(mergedTopUb, topListCapacity,
+                           mergedTopUb, topListCapacity, mergedCandidateCount,
+                           tmpTopUb, topListCapacity, partialCandidateCount, scoredBlockCount);
+            mergedCandidateCount = LICommon::Min(
+                scoredBlockCount, mergedCandidateCount + partialCandidateCount);
         }
+        PipeBarrier<PIPE_ALL>();
 
         if (decodeStage2HiFastPathEligible_) {
             EmitSelectedBlockListToTensor(mergedTopUb, outOffset, ldScratchIdx, totalBlockNum);
@@ -1493,17 +1513,83 @@ __aicore__ inline void LIVector<LIT>::MergeStage1BlockTopM()
 }
 
 template <typename LIT>
+__aicore__ inline void LIVector<LIT>::BuildMtpSharedBlocks(const LICommon::RunInfo &info)
+{
+    // Both original rows are consumed before reusing their internal Stage1
+    // workspace. The first row holds (logical block << 2) | membership bits;
+    // the second row's first element holds the union length.
+    LocalTensor<float> scratch = outQueue_.AllocTensor<float>();
+    auto input = scratch.template ReinterpretCast<int32_t>();
+    auto membership = input[2 * BASE_TOPK];
+    auto merged = input[3 * BASE_TOPK];
+    uint32_t blockCount = LICommon::Min(static_cast<uint32_t>(constInfo_.hiBlockNum), BASE_TOPK);
+    uint32_t visibleBlocks = LICommon::CeilDiv(info.actS2Size, 128U);
+    SetWaitFlag<HardEvent::V_MTE2>();
+    SetWaitFlag<HardEvent::S_MTE2>();
+    for (uint32_t row = 0; row < 2; ++row) {
+        DataCopyPad(input[row * BASE_TOPK], blockIndiceGm[info.indiceOutOffset + row * BASE_TOPK],
+                    {1, static_cast<uint16_t>(blockCount * sizeof(int32_t)), 0, 0}, {false, 0, 0, 0});
+    }
+    SetWaitFlag<HardEvent::MTE2_S>();
+    Duplicate(membership, 0, visibleBlocks);
+    SetWaitFlag<HardEvent::V_S>();
+    for (uint32_t row = 0; row < 2; ++row) {
+        for (uint32_t pos = 0; pos < blockCount; ++pos) {
+            int32_t block = input.GetValue(row * BASE_TOPK + pos);
+            if (block >= 0 && static_cast<uint32_t>(block) < visibleBlocks) {
+                membership.SetValue(block, membership.GetValue(block) | (1 << row));
+            }
+        }
+    }
+    uint32_t count = 0;
+    for (uint32_t block = 0; block < visibleBlocks; ++block) {
+        int32_t selected = membership.GetValue(block);
+        if (selected != 0) {
+            merged.SetValue(count++, (block << 2) | selected);
+        }
+    }
+    input.SetValue(0, count);
+    SetWaitFlag<HardEvent::S_MTE3>();
+    LIServiceVec::CopyOut(blockIndiceGm[info.indiceOutOffset], merged, count);
+    LIServiceVec::CopyOut(blockIndiceGm[info.indiceOutOffset + BASE_TOPK], input, 1);
+    SetWaitFlag<HardEvent::MTE3_V>();
+    SetWaitFlag<HardEvent::MTE3_S>();
+    outQueue_.FreeTensor(scratch);
+}
+
+template <typename LIT>
+__aicore__ inline uint32_t LIVector<LIT>::LoadMtpSharedBlocks(const LICommon::RunInfo &info)
+{
+    auto blocks = paramBuf_.Get<int32_t>();
+    SetWaitFlag<HardEvent::V_MTE2>();
+    SetWaitFlag<HardEvent::S_MTE2>();
+    DataCopyPad(blocks, blockIndiceGm[info.indiceOutOffset + BASE_TOPK], {1, 4, 0, 0}, {false, 0, 0, 0});
+    SetWaitFlag<HardEvent::MTE2_S>();
+    uint32_t count = blocks.GetValue(0);
+    SetWaitFlag<HardEvent::S_MTE2>();
+    DataCopyPad(blocks, blockIndiceGm[info.indiceOutOffset],
+                {1, static_cast<uint16_t>(count * sizeof(int32_t)), 0, 0}, {false, 0, 0, 0});
+    SetWaitFlag<HardEvent::MTE2_S>();
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t packed = blocks.GetValue(i);
+        blocks.SetValue(i, (packed & (1U << (blockId_ & 1))) != 0 ? static_cast<int32_t>(packed >> 2) : -1);
+    }
+    SetWaitFlag<HardEvent::S_V>();
+    return count;
+}
+
+template <typename LIT>
 __aicore__ inline void LIVector<LIT>::SelectDecodeStage2HiTokens(const LICommon::RunInfo &info,
                                                                  int32_t chunkIdx, int32_t groupStartChunk,
                                                                  int32_t groupEndChunk,
                                                                  int64_t partialTopkOffset,
                                                                  bool writePartialTopk,
                                                                  bool keepPartialTopk,
-                                                                 bool hiFullCoverage)
+                                                                 bool hiFullCoverage, int32_t sharedBlockCount)
 {
     // Decode HI path: one query row is owned by the AIV pair for this
     // AIC. Keep the odd AIV in the synchronization protocol but do no work.
-    if ((blockId_ & 1) != 0) {
+    if ((blockId_ & 1) != 0 && sharedBlockCount == 0) {
         return;
     }
 
@@ -1512,6 +1598,9 @@ __aicore__ inline void LIVector<LIT>::SelectDecodeStage2HiTokens(const LICommon:
     int32_t blocksPerChunk = chunkSize / hiBlockSize;
     int32_t visibleHiBlockNum = LICommon::CeilDiv(static_cast<int32_t>(info.actS2Size), hiBlockSize);
     int32_t hiBlockCount = hiFullCoverage ? visibleHiBlockNum : GetHiBlockCount(visibleHiBlockNum);
+    if (sharedBlockCount > 0) {
+        hiBlockCount = sharedBlockCount;
+    }
     int32_t hiBlockStart = chunkIdx * blocksPerChunk;
     if (hiBlockStart >= hiBlockCount) {
         return;
@@ -1535,56 +1624,60 @@ __aicore__ inline void LIVector<LIT>::SelectDecodeStage2HiTokens(const LICommon:
     if (localChunkIdx == 0) {
         // Decode owns a single query row here; initialize only that row's
         // running topK instead of the 4-row general vector buffer.
-        InitTopKList(globalTopkUb_, BASE_TOPK);
+        InitTopKList(runningTopk_, BASE_TOPK);
         blockS2StartIdx_ = 0;
         decodeStage2CacheMask_ = 0;
-        if (!hiFullCoverage) {
+        if (!hiFullCoverage && sharedBlockCount == 0) {
             // The same HI block list is consumed by every Stage2 token chunk
             // in this row/group.  Copy it once into a small dedicated UB buffer so
             // the hot chunk loop avoids repeated GM scalar reads.
-            SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
+            SetWaitFlag<HardEvent::S_MTE2>();
             DataCopyPad(hiBlockUb, blockIndiceGm[rowOutOffset],
                         {1, static_cast<uint16_t>(hiBlockCount * sizeof(int32_t)), 0, 0},
                         {true, 0, 0, 0});
-            SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+            SetWaitFlag<HardEvent::MTE2_S>();
         }
     }
 
-    PipeBarrier<PIPE_V>();
-    LocalTensor<float> reduceCacheBuf = outQueue_.AllocTensor<float>();
-    const bool useVfReduce = groupInner_ == 16 && gSize_ % 16 == 0;
-    for (int outerGidx = 0; outerGidx < outerG; ++outerGidx) {
-        int32_t procGnum = outerGidx != outerG - 1 ? groupInner_ : gSize_ - outerGidx * groupInner_;
-        LocalTensor<float> mmInUb = inQueue_.AllocTensor<float>();
-        LocalTensor<float> weightsInUb = mmInUb[procGnum * chunkSize];
-        LocalTensor<K_T> weightsInTUb = weightsInUb.template ReinterpretCast<K_T>()[groupInner_];
-        int64_t mmOffset = mmGmOffset + outerGidx * groupInner_ * mmRowWidth;
-        LIServiceVec::CopyIn(mmInUb, weightsInTUb, mm1ResGm, weightsGm, mmOffset,
-                             weightGmOffset + outerGidx * groupInner_, procGnum, mmRowWidth, 0);
+    if (!stage2QkToUb_) {
+        PipeBarrier<PIPE_V>();
+        LocalTensor<float> reduceCacheBuf = outQueue_.AllocTensor<float>();
+        const bool useVfReduce = groupInner_ == 16 && gSize_ % 16 == 0;
+        for (int outerGidx = 0; outerGidx < outerG; ++outerGidx) {
+            int32_t procGnum = outerGidx != outerG - 1 ? groupInner_ : gSize_ - outerGidx * groupInner_;
+            LocalTensor<float> mmInUb = inQueue_.AllocTensor<float>();
+            LocalTensor<float> weightsInUb = mmInUb[procGnum * chunkSize];
+            LocalTensor<K_T> weightsInTUb = weightsInUb.template ReinterpretCast<K_T>()[groupInner_];
+            int64_t mmOffset = mmGmOffset + outerGidx * groupInner_ * mmRowWidth;
+            LIServiceVec::CopyQkAndWeights(mmInUb, weightsInTUb, qkWorkspaceGm, weightsGm, mmOffset,
+                                 weightGmOffset + outerGidx * groupInner_, procGnum, mmRowWidth, 0);
 
-        inQueue_.EnQue<float>(mmInUb);
-        mmInUb = inQueue_.DeQue<float>();
-        weightsInUb = mmInUb[procGnum * chunkSize];
-        if (useVfReduce) {
-            LIServiceVec::Stage2WeightedReduce(sortScoreUb, reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM],
-                                               mmInUb, weightsInUb, weightsInTUb, chunkSize,
-                                               outerGidx == 0, outerGidx + 1 == outerG);
-        } else {
-            LIServiceVec::DoScale(reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM], mmInUb, weightsInUb, weightsInTUb,
-                                  brcBuf, procGnum, chunkSize, outerGidx);
+            inQueue_.EnQue<float>(mmInUb);
+            mmInUb = inQueue_.DeQue<float>();
+            weightsInUb = mmInUb[procGnum * chunkSize];
+            if (useVfReduce) {
+                LIServiceVec::Stage2WeightedReduce(sortScoreUb, reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM],
+                                                   mmInUb, weightsInUb, weightsInTUb, chunkSize,
+                                                   outerGidx == 0, outerGidx + 1 == outerG);
+            } else {
+                LIServiceVec::AccumulateWeightedHeads(reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM], mmInUb, weightsInUb, weightsInTUb,
+                                      brcBuf, procGnum, chunkSize, outerGidx);
+            }
+            inQueue_.FreeTensor(mmInUb);
         }
-        inQueue_.FreeTensor(mmInUb);
+
+        int32_t gRedCnt = groupInner_ > gSize_ ? gSize_ : groupInner_;
+        if (!useVfReduce) {
+            LIServiceVec::ReduceHeads(reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM], sortScoreUb, gRedCnt, chunkSize);
+        }
+        outQueue_.FreeTensor(reduceCacheBuf);
     }
 
-    int32_t gRedCnt = groupInner_ > gSize_ ? gSize_ : groupInner_;
-    if (!useVfReduce) {
-        LIServiceVec::DoReduce(reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM], sortScoreUb, gRedCnt, chunkSize);
+    PipeBarrier<PIPE_V>();
+    if (!useMtpTopKStream_) {
+        Duplicate(sortIndiceUbInt, LIServiceVec::INVALID_INDEX, sortDataLen);
+        PipeBarrier<PIPE_V>();
     }
-    outQueue_.FreeTensor(reduceCacheBuf);
-
-    PipeBarrier<PIPE_V>();
-    Duplicate(sortIndiceUbInt, LIServiceVec::INVALID_INDEX, sortDataLen);
-    PipeBarrier<PIPE_V>();
 
     bool hasHiBlock = false;
     int32_t selectedTokenStart[MAX_LOCAL_BLOCKS_PER_TILE] = {0};
@@ -1596,6 +1689,9 @@ __aicore__ inline void LIVector<LIT>::SelectDecodeStage2HiTokens(const LICommon:
         }
         int32_t selectedBlock = hiFullCoverage ? hiBlockPos : hiBlockUb.GetValue(hiBlockPos);
         if (selectedBlock < 0) {
+            if (sharedBlockCount > 0) {
+                continue;
+            }
             break;
         }
         int32_t tokenStart = selectedBlock * hiBlockSize;
@@ -1616,7 +1712,7 @@ __aicore__ inline void LIVector<LIT>::SelectDecodeStage2HiTokens(const LICommon:
             continue;
         }
         if (!useMtpTopKStream_) {
-            Adds(sortIndiceUbInt[packedStart], globalTopkIndice_, selectedTokenStart[localBlockIdx], tokenCount);
+            Adds(sortIndiceUbInt[packedStart], tileIndices_, selectedTokenStart[localBlockIdx], tokenCount);
         }
         if (tokenCount < hiBlockSize) {
             // Keep all vector instructions aligned: back up the whole HI block,
@@ -1643,7 +1739,7 @@ __aicore__ inline void LIVector<LIT>::SelectDecodeStage2HiTokens(const LICommon:
         LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
         int64_t globalTopkUbCacheIdx = localChunkIdx % 4;
         LocalTensor<float> cacheSortedBlock =
-            SortedBasicBlock_[globalTopkUbCacheIdx * s2BaseSize_ * 2];
+            tileTopkCache_[globalTopkUbCacheIdx * s2BaseSize_ * 2];
         if (hasHiBlock) {
             int32_t validTokenCount = 0;
             for (int32_t localBlockIdx = 0; localBlockIdx < blocksPerChunk; ++localBlockIdx) {
@@ -1659,24 +1755,24 @@ __aicore__ inline void LIVector<LIT>::SelectDecodeStage2HiTokens(const LICommon:
         if (isChunkGroupEnd) {
             int32_t groupListCount = static_cast<int32_t>(globalTopkUbCacheIdx + 1);
             int32_t groupCandidateCount = s2BaseSize_;
-            CopyTopKList(tmpSortBuf, BASE_TOPK, SortedBasicBlock_, s2BaseSize_, s2BaseSize_);
+            CopyTopKList(tmpSortBuf, BASE_TOPK, tileTopkCache_, s2BaseSize_, s2BaseSize_);
             for (int32_t listIdx = 1; listIdx < groupListCount; ++listIdx) {
                 int32_t nextCandidateCount = LICommon::Min(BASE_TOPK, groupCandidateCount + s2BaseSize_);
                 MergeTopKLists(tmpSortBuf, BASE_TOPK,
                                tmpSortBuf, BASE_TOPK, groupCandidateCount,
-                               SortedBasicBlock_[listIdx * s2BaseSize_ * TOPK_LIST_COMPONENTS],
+                               tileTopkCache_[listIdx * s2BaseSize_ * TOPK_LIST_COMPONENTS],
                                s2BaseSize_, s2BaseSize_, nextCandidateCount);
                 groupCandidateCount = nextCandidateCount;
             }
             int32_t previousCandidateCount = LICommon::Min(
                 BASE_TOPK, LICommon::Max(0, localChunkIdx - static_cast<int32_t>(globalTopkUbCacheIdx)) * s2BaseSize_);
             if (previousCandidateCount == 0) {
-                DataCopy(globalTopkUb_, tmpSortBuf, BASE_TOPK * TOPK_LIST_COMPONENTS);
+                DataCopy(runningTopk_, tmpSortBuf, BASE_TOPK * TOPK_LIST_COMPONENTS);
             } else {
                 int32_t mergedCandidateCount = LICommon::Min(
                     BASE_TOPK, previousCandidateCount + groupCandidateCount);
-                MergeTopKLists(globalTopkUb_, BASE_TOPK,
-                               globalTopkUb_, BASE_TOPK, previousCandidateCount,
+                MergeTopKLists(runningTopk_, BASE_TOPK,
+                               runningTopk_, BASE_TOPK, previousCandidateCount,
                                tmpSortBuf, BASE_TOPK, groupCandidateCount, mergedCandidateCount);
             }
         }
@@ -1687,9 +1783,9 @@ __aicore__ inline void LIVector<LIT>::SelectDecodeStage2HiTokens(const LICommon:
 
     if (chunkIdx == groupEndChunk - 1) {
         if (writePartialTopk) {
-            SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-            LIServiceVec::CopyOut(vec1ResGm[partialTopkOffset], globalTopkUb_, BASE_TOPK * 2);
-            SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+            SetWaitFlag<HardEvent::V_MTE3>();
+            LIServiceVec::CopyOut(partialTopkGm[partialTopkOffset], runningTopk_, BASE_TOPK * 2);
+            SetWaitFlag<HardEvent::MTE3_V>();
             return;
         }
         if (keepPartialTopk) {
@@ -1697,15 +1793,15 @@ __aicore__ inline void LIVector<LIT>::SelectDecodeStage2HiTokens(const LICommon:
         }
         LocalTensor<float> valueULocal = outQueue_.AllocTensor<float>();
         LocalTensor<int32_t> idxULocal = valueULocal.template ReinterpretCast<int32_t>()[BASE_TOPK];
-        Adds(idxULocal, GetTopKIndices(globalTopkUb_, BASE_TOPK), 0, BASE_TOPK);
+        Adds(idxULocal, GetTopKIndices(runningTopk_, BASE_TOPK), 0, BASE_TOPK);
         PipeBarrier<PIPE_V>();
-        InitTopKList(globalTopkUb_, BASE_TOPK);
+        InitTopKList(runningTopk_, BASE_TOPK);
         outQueue_.EnQue<float>(valueULocal);
         valueULocal = outQueue_.DeQue<float>();
         LocalTensor<int32_t> idxULocal1 = valueULocal.template ReinterpretCast<int32_t>()[BASE_TOPK];
         LIServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset], idxULocal1, constInfo_.sparseCount);
-        SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-        SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+        SetWaitFlag<HardEvent::MTE3_V>();
+        SetWaitFlag<HardEvent::MTE3_S>();
         outQueue_.FreeTensor(valueULocal);
     }
 }
@@ -1721,36 +1817,36 @@ __aicore__ inline void LIVector<LIT>::MergeDecodeStage2HiPartials(const LICommon
     LocalTensor<float> mergeTmp = outQueue_.AllocTensor<float>();
     uint32_t firstGmGroupIdx = 1U;
     if (!firstPartialInUb) {
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-        SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
-        DataCopyPad(globalTopkUb_, vec1ResGm[partialTopkBaseOffset],
+        SetWaitFlag<HardEvent::V_MTE2>();
+        SetWaitFlag<HardEvent::S_MTE2>();
+        DataCopyPad(runningTopk_, partialTopkGm[partialTopkBaseOffset],
                     {1, static_cast<uint16_t>(BASE_TOPK * 2 * sizeof(float)), 0, 0},
                     {true, 0, 0, 0});
-        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        SetWaitFlag<HardEvent::MTE2_V>();
     }
     for (uint32_t groupIdx = firstGmGroupIdx; groupIdx < hiGroupNum; ++groupIdx) {
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-        SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
-        DataCopyPad(SortedBasicBlock_, vec1ResGm[partialTopkBaseOffset + groupIdx * BASE_TOPK * 2],
+        SetWaitFlag<HardEvent::V_MTE2>();
+        SetWaitFlag<HardEvent::S_MTE2>();
+        DataCopyPad(tileTopkCache_, partialTopkGm[partialTopkBaseOffset + groupIdx * BASE_TOPK * 2],
                     {1, static_cast<uint16_t>(BASE_TOPK * 2 * sizeof(float)), 0, 0},
                     {true, 0, 0, 0});
-        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
-        MergeTopKLists(globalTopkUb_, BASE_TOPK,
-                       globalTopkUb_, BASE_TOPK, BASE_TOPK,
-                       SortedBasicBlock_, BASE_TOPK, BASE_TOPK, BASE_TOPK);
+        SetWaitFlag<HardEvent::MTE2_V>();
+        MergeTopKLists(runningTopk_, BASE_TOPK,
+                       runningTopk_, BASE_TOPK, BASE_TOPK,
+                       tileTopkCache_, BASE_TOPK, BASE_TOPK, BASE_TOPK);
         PipeBarrier<PIPE_V>();
     }
 
     LocalTensor<float> valueULocal = mergeTmp;
     LocalTensor<int32_t> idxULocal = valueULocal.template ReinterpretCast<int32_t>()[BASE_TOPK];
-    Adds(idxULocal, GetTopKIndices(globalTopkUb_, BASE_TOPK), 0, BASE_TOPK);
+    Adds(idxULocal, GetTopKIndices(runningTopk_, BASE_TOPK), 0, BASE_TOPK);
     PipeBarrier<PIPE_V>();
     outQueue_.EnQue<float>(valueULocal);
     valueULocal = outQueue_.DeQue<float>();
     LocalTensor<int32_t> idxULocal1 = valueULocal.template ReinterpretCast<int32_t>()[BASE_TOPK];
     LIServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset], idxULocal1, constInfo_.sparseCount);
-    SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-    SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+    SetWaitFlag<HardEvent::MTE3_V>();
+    SetWaitFlag<HardEvent::MTE3_S>();
     outQueue_.FreeTensor(valueULocal);
 }
 
@@ -1779,10 +1875,10 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
 
     bool isNewStage2Group = (info.bN2Idx != stage2ActiveBN2Idx_) || (info.gS1Idx != stage2ActiveGS1Idx_);
     if (isNewStage2Group) {
-        InitTopKLists(globalTopkUb_, BASE_TOPK, localTopKRowNum_);
-        ArithProgression<int32_t>(globalTopkIndice_, 0, 1, s2BaseSize_);
+        InitTopKLists(runningTopk_, BASE_TOPK, localTopKRowNum_);
+        ArithProgression<int32_t>(tileIndices_, 0, 1, s2BaseSize_);
         PipeBarrier<PIPE_V>();
-        SetWaitFlag<HardEvent::V_S>(HardEvent::V_S);
+        SetWaitFlag<HardEvent::V_S>();
         blockS2StartIdx_ = info.s2Idx;
         decodeStage2CacheMask_ = 0;
         stage2ActiveBN2Idx_ = info.bN2Idx;
@@ -1934,12 +2030,12 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
                         int64_t mmOffset =
                             mmGmOffset + innerS1Idx * gSize_ * mmRowWidth + outerGidx * groupInner_ * mmRowWidth;
                         if (useHiPackedMm) {
-                            LIServiceVec::CopyInWithSrcStride(
-                                mmInUb, weightsInTUb, mm1ResGm, weightsGm, mmOffset,
+                            LIServiceVec::CopyQkAndWeightsWithStride(
+                                mmInUb, weightsInTUb, qkWorkspaceGm, weightsGm, mmOffset,
                                 weightGmOffset + innerS1Idx * gSize_ + outerGidx * groupInner_, procGnum,
                                 mmReduceWidth, mmRowWidth);
                         } else {
-                            LIServiceVec::CopyIn(mmInUb, weightsInTUb, mm1ResGm, weightsGm,
+                            LIServiceVec::CopyQkAndWeights(mmInUb, weightsInTUb, qkWorkspaceGm, weightsGm,
                                                  mmOffset,
                                                  weightGmOffset + innerS1Idx * gSize_ + outerGidx * groupInner_, procGnum,
                                                  mmRowWidth, mmUbStride);
@@ -1953,7 +2049,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
                                                                mmInUb, weightsInUb, weightsInTUb, mmReduceWidth,
                                                                outerGidx == 0, outerGidx + 1 == outerG);
                         } else {
-                            LIServiceVec::DoScale(reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM], mmInUb, weightsInUb, weightsInTUb,
+                            LIServiceVec::AccumulateWeightedHeads(reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM], mmInUb, weightsInUb, weightsInTUb,
                                                   brcBuf, procGnum, mmReduceWidth, outerGidx);
                         }
                         inQueue_.FreeTensor(mmInUb);
@@ -1961,7 +2057,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
 
                     int32_t gRedCnt = groupInner_ > gSize_ ? gSize_ : groupInner_;
                     if (!useVfReduce) {
-                        LIServiceVec::DoReduce(reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM], reduceDstUb, gRedCnt,
+                        LIServiceVec::ReduceHeads(reduceCacheBuf[REDUCE_BANK_CONFLICT_NUM], reduceDstUb, gRedCnt,
                                                mmReduceWidth);
                     }
                     outQueue_.FreeTensor(reduceCacheBuf);
@@ -1981,7 +2077,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
                             Duplicate(sortIndiceUbInt, -1, sortDataLen);
                             PipeBarrier<PIPE_V>();
                         }
-                        Adds(sortIndiceUbInt, globalTopkIndice_, static_cast<int32_t>(cuBaseS2Idx), cuS2Len);
+                        Adds(sortIndiceUbInt, tileIndices_, static_cast<int32_t>(cuBaseS2Idx), cuS2Len);
                     } else if (useHiPackedMm) {
                         if (needFullSortPadding) {
                             for (int32_t rangeIdx = 0; rangeIdx < selectedRangeCount; ++rangeIdx) {
@@ -2000,7 +2096,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
                             int32_t tokenStart = selectedRangeTokenStart[rangeIdx];
                             int32_t tokenCount = selectedRangeTokenCount[rangeIdx];
                             int32_t packedStart = selectedRangePackedStart[rangeIdx];
-                            Adds(sortIndiceUbInt[packedStart], globalTopkIndice_[tokenStart],
+                            Adds(sortIndiceUbInt[packedStart], tileIndices_[tokenStart],
                                  static_cast<int32_t>(cuBaseS2Idx), tokenCount);
                         }
                     } else {
@@ -2020,7 +2116,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
                             int32_t tokenStart = selectedRangeTokenStart[rangeIdx];
                             int32_t tokenCount = selectedRangeTokenCount[rangeIdx];
                             int32_t packedStart = selectedRangePackedStart[rangeIdx];
-                            Adds(sortIndiceUbInt[packedStart], globalTopkIndice_[tokenStart],
+                            Adds(sortIndiceUbInt[packedStart], tileIndices_[tokenStart],
                                  static_cast<int32_t>(cuBaseS2Idx), tokenCount);
                         }
                     }
@@ -2031,7 +2127,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
             if (info.actS1Size > 4) {
                 if (hasSelectedHiTokens) {
                     LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
-                    LocalTensor<float> rowTopBuf = globalTopkUb_[innerS1Idx * BASE_TOPK * 2];
+                    LocalTensor<float> rowTopBuf = runningTopk_[innerS1Idx * BASE_TOPK * 2];
                     bool isFirstStage2S2Tile = (info.s2Idx == blockS2StartIdx_);
                     int32_t prevRowTopUpper = LICommon::Min(
                         BASE_TOPK, static_cast<int32_t>(info.s2Idx - blockS2StartIdx_) * s2BaseSize_);
@@ -2053,7 +2149,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
                 LocalTensor<float> tmpSortBuf = outQueue_.AllocTensor<float>();
                 int64_t globalTopkUbCacheIdx = (info.s2Idx - blockS2StartIdx_) % 4;
                 LocalTensor<float> cacheSortedBlock =
-                    SortedBasicBlock_[innerS1Idx * BASE_TOPK * 2 + globalTopkUbCacheIdx * s2BaseSize_ * 2];
+                    tileTopkCache_[innerS1Idx * BASE_TOPK * 2 + globalTopkUbCacheIdx * s2BaseSize_ * 2];
                 if (hasSelectedHiTokens) {
                     if (info.actS1Size == 1) {
                         decodeStage2CacheMask_ |= static_cast<uint8_t>(1U << globalTopkUbCacheIdx);
@@ -2067,7 +2163,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
                     bool skipEmptyDecodeMerge = (info.actS1Size == 1 && decodeStage2CacheMask_ == 0);
                     if (!skipEmptyDecodeMerge) {
                         LocalTensor<float> rowCache =
-                            SortedBasicBlock_[innerS1Idx * BASE_TOPK * TOPK_LIST_COMPONENTS];
+                            tileTopkCache_[innerS1Idx * BASE_TOPK * TOPK_LIST_COMPONENTS];
                         int32_t groupListCount = static_cast<int32_t>(globalTopkUbCacheIdx + 1);
                         int32_t groupCandidateCount = s2BaseSize_;
                         CopyTopKList(tmpSortBuf, BASE_TOPK, rowCache, s2BaseSize_, s2BaseSize_);
@@ -2086,7 +2182,7 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
                             BASE_TOPK,
                             LICommon::Max(0, tileIdx - static_cast<int32_t>(globalTopkUbCacheIdx)) * s2BaseSize_);
                         LocalTensor<float> rowTopBuf =
-                            globalTopkUb_[innerS1Idx * BASE_TOPK * TOPK_LIST_COMPONENTS];
+                            runningTopk_[innerS1Idx * BASE_TOPK * TOPK_LIST_COMPONENTS];
                         if (previousCandidateCount == 0) {
                             DataCopy(rowTopBuf, tmpSortBuf, BASE_TOPK * TOPK_LIST_COMPONENTS);
                         } else {
@@ -2111,28 +2207,28 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
                 LocalTensor<float> valueULocal = outQueue_.AllocTensor<float>();
                 LocalTensor<int32_t> idxULocal = valueULocal.template ReinterpretCast<int32_t>()[BASE_TOPK];
                 Adds(idxULocal,
-                     GetTopKIndices(globalTopkUb_[innerS1Idx * BASE_TOPK * 2], BASE_TOPK),
+                     GetTopKIndices(runningTopk_[innerS1Idx * BASE_TOPK * 2], BASE_TOPK),
                      0, BASE_TOPK);
                 PipeBarrier<PIPE_V>();
-                InitTopKList(globalTopkUb_[innerS1Idx * BASE_TOPK * 2], BASE_TOPK);
+                InitTopKList(runningTopk_[innerS1Idx * BASE_TOPK * 2], BASE_TOPK);
                 outQueue_.EnQue<float>(valueULocal);
                 valueULocal = outQueue_.DeQue<float>();
                 LocalTensor<int32_t> idxULocal1 = valueULocal.template ReinterpretCast<int32_t>()[BASE_TOPK];
                 LIServiceVec::CopyOut(indiceOutGm[info.indiceOutOffset + cuS1Idx * constInfo_.sparseCount],
                                       idxULocal1, constInfo_.sparseCount);
-                SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-                SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+                SetWaitFlag<HardEvent::MTE3_V>();
+                SetWaitFlag<HardEvent::MTE3_S>();
                 outQueue_.FreeTensor(valueULocal);
             } else if (needCopyWsGm) {
                 int64_t wsOffset = (blockId_ / 2) * s1BaseSize_ * 2 * 2 * BASE_TOPK +
                                    (blockId_ % 2) * (s1BaseSize_ / 2) * 2 * 2 * BASE_TOPK +
                                    (ldS1Offset + innerS1Idx) * 2 * 2 * BASE_TOPK;
-                int64_t wsInfoOffset = (blockId_ / 2) * s1BaseSize_ * 2 * ldMergeParamNum_ +
-                                       (blockId_ % 2) * (s1BaseSize_ / 2) * 2 * ldMergeParamNum_ +
-                                       (ldS1Offset + innerS1Idx) * 2 * ldMergeParamNum_;
+                int64_t wsInfoOffset = (blockId_ / 2) * s1BaseSize_ * 2 * PARTIAL_TOPK_METADATA_FIELDS +
+                                       (blockId_ % 2) * (s1BaseSize_ / 2) * 2 * PARTIAL_TOPK_METADATA_FIELDS +
+                                       (ldS1Offset + innerS1Idx) * 2 * PARTIAL_TOPK_METADATA_FIELDS;
 
                 LocalTensor<int64_t> tmpiBuff = paramBuf_.Get<int64_t>();
-                SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+                SetWaitFlag<HardEvent::MTE3_S>();
                 tmpiBuff.SetValue(0, static_cast<int64_t>(0));
                 tmpiBuff.SetValue(1, static_cast<int64_t>(cuRealAcSeq));
                 tmpiBuff.SetValue(2, static_cast<int64_t>(blockS2StartIdx_));
@@ -2144,18 +2240,18 @@ __aicore__ inline void LIVector<LIT>::SelectStage2TokenTopK(const LICommon::RunI
                 tmpiBuff.SetValue(8, static_cast<int64_t>(info.indiceOutOffset + cuS1Idx * constInfo_.sparseCount));
                 bool isTailReduce = blockS2StartIdx_ == 0;
                 if (isTailReduce) {
-                    wsInfoOffset += ldMergeParamNum_;
+                    wsInfoOffset += PARTIAL_TOPK_METADATA_FIELDS;
                     wsOffset += 2 * BASE_TOPK;
                 }
-                SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-                SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-                LIServiceVec::CopyOut(vec1ResGm[wsOffset], globalTopkUb_[innerS1Idx * BASE_TOPK * 2], 2 * BASE_TOPK);
-                SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
+                SetWaitFlag<HardEvent::V_MTE3>();
+                SetWaitFlag<HardEvent::S_MTE3>();
+                LIServiceVec::CopyOut(partialTopkGm[wsOffset], runningTopk_[innerS1Idx * BASE_TOPK * 2], 2 * BASE_TOPK);
+                SetWaitFlag<HardEvent::MTE3_V>();
                 PipeBarrier<PIPE_ALL>();
                 tmpiBuff.SetValue(0, static_cast<int64_t>(1));
-                SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
-                LIServiceVec::CopyOut(vec1ParamGm[wsInfoOffset], tmpiBuff, 16);
-                SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+                SetWaitFlag<HardEvent::S_MTE3>();
+                LIServiceVec::CopyOut(partialTopkMetadataGm[wsInfoOffset], tmpiBuff, 16);
+                SetWaitFlag<HardEvent::MTE3_S>();
                 PipeBarrier<PIPE_ALL>();
             }
         } else if (cuRealAcSeq <= 0) {
@@ -2203,21 +2299,21 @@ __aicore__ inline void LIVector<LIT>::MergeStage2TokenTopK()
     int64_t wsInfoOffset = 0;
     int64_t outOffset = 0;
 
-    LocalTensor<float> curValueIdxUb = ldMergeInputBuf_.Get<float>();
+    LocalTensor<float> curValueIdxUb = partialTopkInputBuf_.Get<float>();
     LocalTensor<float> partialValueIdxUb = curValueIdxUb[2 * BASE_TOPK];
     LocalTensor<int64_t> paramSlotLocal = paramBuf_.Get<int64_t>();
 
     uint32_t s1MergeStartIdx = 0;
     uint32_t s1ProcNum = 0;
-    uint64_t paramGmCoreOffset = curCubeId * s1BaseSize_ * 2 * ldMergeParamNum_;
+    uint64_t paramGmCoreOffset = curCubeId * s1BaseSize_ * 2 * PARTIAL_TOPK_METADATA_FIELDS;
     bool foundActiveSlot = false;
     for (uint32_t innerS1Idx = 0; innerS1Idx < s1BaseSize_; innerS1Idx++) {
-        int64_t slotInfoOffset = paramGmCoreOffset + innerS1Idx * 2 * ldMergeParamNum_ + ldMergeParamNum_;
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-        SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
-        DataCopyPad(paramSlotLocal, vec1ParamGm[slotInfoOffset],
-                    {1, static_cast<uint16_t>(ldMergeParamNum_ * sizeof(int64_t)), 0, 0}, {true, 0, 0, 0});
-        SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+        int64_t slotInfoOffset = paramGmCoreOffset + innerS1Idx * 2 * PARTIAL_TOPK_METADATA_FIELDS + PARTIAL_TOPK_METADATA_FIELDS;
+        SetWaitFlag<HardEvent::V_MTE2>();
+        SetWaitFlag<HardEvent::S_MTE2>();
+        DataCopyPad(paramSlotLocal, partialTopkMetadataGm[slotInfoOffset],
+                    {1, static_cast<uint16_t>(PARTIAL_TOPK_METADATA_FIELDS * sizeof(int64_t)), 0, 0}, {true, 0, 0, 0});
+        SetWaitFlag<HardEvent::MTE2_S>();
         needMerge = paramSlotLocal.GetValue(0);
         if (needMerge == 1) {
             foundActiveSlot = true;
@@ -2237,22 +2333,22 @@ __aicore__ inline void LIVector<LIT>::MergeStage2TokenTopK()
         s1VecNum = s1ProcNum - s1VecNum;
     }
     for (uint32_t innerS1Idx = s1MergeStartIdx; innerS1Idx < s1MergeStartIdx + s1VecNum; innerS1Idx++) {
-        wsInfoOffset = curCubeId * s1BaseSize_ * 2 * ldMergeParamNum_ + innerS1Idx * 2 * ldMergeParamNum_ + ldMergeParamNum_;
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-        SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
-        DataCopyPad(paramSlotLocal, vec1ParamGm[wsInfoOffset],
-                    {1, static_cast<uint16_t>(ldMergeParamNum_ * sizeof(int64_t)), 0, 0}, {true, 0, 0, 0});
-        SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+        wsInfoOffset = curCubeId * s1BaseSize_ * 2 * PARTIAL_TOPK_METADATA_FIELDS + innerS1Idx * 2 * PARTIAL_TOPK_METADATA_FIELDS + PARTIAL_TOPK_METADATA_FIELDS;
+        SetWaitFlag<HardEvent::V_MTE2>();
+        SetWaitFlag<HardEvent::S_MTE2>();
+        DataCopyPad(paramSlotLocal, partialTopkMetadataGm[wsInfoOffset],
+                    {1, static_cast<uint16_t>(PARTIAL_TOPK_METADATA_FIELDS * sizeof(int64_t)), 0, 0}, {true, 0, 0, 0});
+        SetWaitFlag<HardEvent::MTE2_S>();
         int64_t baseBN2Idx = paramSlotLocal.GetValue(5);
         s1Idx = paramSlotLocal.GetValue(6);
         outOffset = paramSlotLocal.GetValue(8);
         wsOffset = curCubeId * s1BaseSize_ * 2 * 2 * BASE_TOPK +
                    innerS1Idx * 2 * 2 * BASE_TOPK + 2 * BASE_TOPK;
-        SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-        SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
-        DataCopyPad(curValueIdxUb, vec1ResGm[wsOffset],
+        SetWaitFlag<HardEvent::V_MTE2>();
+        SetWaitFlag<HardEvent::S_MTE2>();
+        DataCopyPad(curValueIdxUb, partialTopkGm[wsOffset],
                     {1, static_cast<uint16_t>(2 * BASE_TOPK * sizeof(int32_t)), 0, 0}, {true, 0, 0, 0});
-        SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+        SetWaitFlag<HardEvent::MTE2_V>();
         PipeBarrier<PIPE_V>();
         uint64_t mergedCubeMask = (curCubeId < 64) ? (1ULL << curCubeId) : 0ULL;
         bool hasEndPartial = false;
@@ -2270,13 +2366,13 @@ __aicore__ inline void LIVector<LIT>::MergeStage2TokenTopK()
                     if (tmpCubeId == curCubeId && slotIdx == static_cast<int32_t>(innerS1Idx) && halfIdx == 1) {
                         continue;
                     }
-                    wsInfoOffset = tmpCubeId * s1BaseSize_ * 2 * ldMergeParamNum_ +
-                                   slotIdx * 2 * ldMergeParamNum_ + halfIdx * ldMergeParamNum_;
-                    SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-                    SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
-                    DataCopyPad(paramSlotLocal, vec1ParamGm[wsInfoOffset],
-                                {1, static_cast<uint16_t>(ldMergeParamNum_ * sizeof(int64_t)), 0, 0}, {true, 0, 0, 0});
-                    SetWaitFlag<HardEvent::MTE2_S>(HardEvent::MTE2_S);
+                    wsInfoOffset = tmpCubeId * s1BaseSize_ * 2 * PARTIAL_TOPK_METADATA_FIELDS +
+                                   slotIdx * 2 * PARTIAL_TOPK_METADATA_FIELDS + halfIdx * PARTIAL_TOPK_METADATA_FIELDS;
+                    SetWaitFlag<HardEvent::V_MTE2>();
+                    SetWaitFlag<HardEvent::S_MTE2>();
+                    DataCopyPad(paramSlotLocal, partialTopkMetadataGm[wsInfoOffset],
+                                {1, static_cast<uint16_t>(PARTIAL_TOPK_METADATA_FIELDS * sizeof(int64_t)), 0, 0}, {true, 0, 0, 0});
+                    SetWaitFlag<HardEvent::MTE2_S>();
                     needMerge = paramSlotLocal.GetValue(0);
                     int64_t curBN2Idx = paramSlotLocal.GetValue(5);
                     int64_t curS1Idx = paramSlotLocal.GetValue(6);
@@ -2297,12 +2393,12 @@ __aicore__ inline void LIVector<LIT>::MergeStage2TokenTopK()
                 hasEndPartial = hasEndPartial || (isS2End == 1);
                 wsOffset = tmpCubeId * s1BaseSize_ * 2 * 2 * BASE_TOPK +
                            matchedSlotIdx * 2 * 2 * BASE_TOPK + matchedHalfIdx * 2 * BASE_TOPK;
-                SetWaitFlag<HardEvent::V_MTE2>(HardEvent::V_MTE2);
-                SetWaitFlag<HardEvent::S_MTE2>(HardEvent::S_MTE2);
-                DataCopyPad(partialValueIdxUb, vec1ResGm[wsOffset],
+                SetWaitFlag<HardEvent::V_MTE2>();
+                SetWaitFlag<HardEvent::S_MTE2>();
+                DataCopyPad(partialValueIdxUb, partialTopkGm[wsOffset],
                             {1, static_cast<uint16_t>(2 * BASE_TOPK * sizeof(int32_t)), 0, 0},
                             {true, 0, 0, 0});
-                SetWaitFlag<HardEvent::MTE2_V>(HardEvent::MTE2_V);
+                SetWaitFlag<HardEvent::MTE2_V>();
                 MergeTopKLists(curValueIdxUb, BASE_TOPK,
                                curValueIdxUb, BASE_TOPK, BASE_TOPK,
                                partialValueIdxUb, BASE_TOPK, BASE_TOPK, BASE_TOPK);
@@ -2313,15 +2409,15 @@ __aicore__ inline void LIVector<LIT>::MergeStage2TokenTopK()
             PipeBarrier<PIPE_ALL>();
         }
 
-        LocalTensor<int32_t> idxULocal1 = ldMergeOutIdxBuf_.Get<int32_t>();
+        LocalTensor<int32_t> idxULocal1 = partialTopkOutputIndexBuf_.Get<int32_t>();
         Adds(idxULocal1, GetTopKIndices(curValueIdxUb, BASE_TOPK), 0, BASE_TOPK);
         PipeBarrier<PIPE_V>();
-        SetWaitFlag<HardEvent::V_MTE3>(HardEvent::V_MTE3);
-        SetWaitFlag<HardEvent::S_MTE3>(HardEvent::S_MTE3);
+        SetWaitFlag<HardEvent::V_MTE3>();
+        SetWaitFlag<HardEvent::S_MTE3>();
         DataCopyPad(indiceOutGm[outOffset], idxULocal1,
                     {1, static_cast<uint16_t>(constInfo_.sparseCount * sizeof(int32_t)), 0, 0});
-        SetWaitFlag<HardEvent::MTE3_V>(HardEvent::MTE3_V);
-        SetWaitFlag<HardEvent::MTE3_S>(HardEvent::MTE3_S);
+        SetWaitFlag<HardEvent::MTE3_V>();
+        SetWaitFlag<HardEvent::MTE3_S>();
     }
 }
 } // namespace LIKernel

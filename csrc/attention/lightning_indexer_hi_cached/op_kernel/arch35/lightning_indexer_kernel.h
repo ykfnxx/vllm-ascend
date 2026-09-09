@@ -51,10 +51,9 @@ struct TempLoopInfo {
 template <typename LIT>
 class LIPreload {
 public:
-    __aicore__ inline LIPreload(){};
     __aicore__ inline void Init(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
                                 __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
-                                __gm__ uint8_t *blockTable, __gm__ uint8_t *stage1MeanCache,
+                                __gm__ uint8_t *blockTable, __gm__ uint8_t *keyMean,
                                 __gm__ uint8_t *sparseIndices, __gm__ uint8_t *workspace,
                                 const LIHiCachedTilingData *__restrict tiling, TPipe *tPipe);
     __aicore__ inline void Process();
@@ -81,9 +80,9 @@ public:
     static constexpr uint32_t GM_ALIGN_BYTES = 512;
     static constexpr uint32_t S1_BASE_SIZE = 4;
     static constexpr uint32_t BLOCK_CUBE_SIZE = 16;
-    static constexpr int64_t LD_MERGE_PREFETCH_LEN = 2;
-    // for workspace double
-    static constexpr uint32_t WS_DOBULE = 2;
+    static constexpr int64_t PARTIAL_TOPK_MERGE_PREFETCH_LEN = 2;
+    // Ping-pong slots; keep in sync with Host workspace sizing.
+    static constexpr uint32_t WORKSPACE_BUFFER_NUM = 2;
 
 protected:
     TPipe *pipe = nullptr;
@@ -104,13 +103,12 @@ protected:
     GlobalTensor<uint32_t> actualSeqLengthsGmQ;
     GlobalTensor<uint32_t> actualSeqLengthsGm;
     // workspace
-    GlobalTensor<MM1_OUT_T> mm1ResGm;
-    GlobalTensor<float> vec1ResGm;
-    GlobalTensor<int64_t> vec1ParamGm;
+    GlobalTensor<MM1_OUT_T> qkWorkspaceGm;
+    GlobalTensor<float> partialTopkGm;
+    GlobalTensor<int64_t> partialTopkMetadataGm;
     GlobalTensor<int32_t> blockIndiceGm;
     GlobalTensor<int32_t> externalHiMaskGm;
-    GlobalTensor<K_T> stage1MeanKeyGm;
-    GlobalTensor<K_T> stage1MeanCacheGm;
+    GlobalTensor<K_T> keyMeanGm;
 
     // aic、aiv kernel info
     uint32_t tmpBlockIdx = 0U;
@@ -127,6 +125,8 @@ protected:
     // Zero selects the general mapping for mixed lengths or metadata padding.
     uint32_t decodeQueryTokensPerRequest = 0U;
     uint32_t decodeStage2ChunkSize = S2_BASE_SIZE;
+    bool shareMtpStage2Queries = false;
+    bool stage2QkToUb = false;
     bool stage1SingleScoreTile = false;
     bool stage1PartialTopkMergeSkippable = false;
     bool stage2PartialTopkMergeSkippable = false;
@@ -154,11 +154,12 @@ protected:
     __aicore__ inline bool CalcCanSkipStage1PartialTopkMerge();
     __aicore__ inline void InitSplitHints();
     __aicore__ inline bool Stage1UsesSingleScoreTile();
-    // PartialTopkMerge is named LdMerge in the legacy vector service.
+    // Shared arch32/arch35 RunInfo calls cross-core partial TopK merge "LdMerge".
     __aicore__ inline bool CanSkipStage1PartialTopkMerge();
     __aicore__ inline bool CanSkipStage2PartialTopkMerge();
-    __aicore__ inline bool CanUseDecodeStage2HiFastPath();
+    __aicore__ inline bool InitDecodeStage2FastPathHints();
     __aicore__ inline uint32_t GetDecodeStage2HiFastPathRowNum();
+    __aicore__ inline uint32_t GetDecodeStage2GroupNum(uint32_t queryRowNum);
     __aicore__ inline uint32_t MapDecodeStage2HiFastPathRowToBN2(uint32_t rowOrdinal, uint32_t &queryIdx);
     // ================================Process functions================================
     // Stage1 coarse filtering: AIC computes q * mean(k), AIV applies weights
@@ -170,6 +171,7 @@ protected:
     // Decode/MTP fast path that scores only the fixed HI block list instead
     // of replaying the full S2 tile schedule.
     __aicore__ inline bool RunDecodeStage2HiFastPath();
+    __aicore__ inline void RunMtpSharedStage2();
     // One Stage1 S2 tile: q * mean(k), followed by block-score reduction.
     __aicore__ inline void RunStage1Tile(uint32_t loop, uint64_t s2LoopIdx, LICommon::RunInfo &runInfo);
     // One Stage2 S2 tile: dense if HI covers all visible tokens, otherwise
@@ -439,7 +441,7 @@ __aicore__ inline void LIPreload<LIT>::InitSplitHints()
         stage2WorkRowNum = CountStage2WorkRows();
         stage1SingleScoreTile = CalcStage1UsesSingleScoreTile();
         stage1PartialTopkMergeSkippable = CalcCanSkipStage1PartialTopkMerge();
-        decodeStage2HiFastPathEligible = CanUseDecodeStage2HiFastPath();
+        decodeStage2HiFastPathEligible = InitDecodeStage2FastPathHints();
         // Row-only Stage2 scheduling needs enough independent request rows to
         // keep all cores balanced. Multiple gS1 tiles from one long prefill
         // request are not equivalent: treating them as independent rows makes
@@ -792,7 +794,7 @@ __aicore__ inline void LIPreload<LIT>::DealActSeqLenIsZero(uint32_t bIdx, uint32
 template <typename LIT>
 __aicore__ inline void LIPreload<LIT>::Init(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
                                             __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
-                                            __gm__ uint8_t *blockTable, __gm__ uint8_t *stage1MeanCache,
+                                            __gm__ uint8_t *blockTable, __gm__ uint8_t *keyMean,
                                             __gm__ uint8_t *sparseIndices, __gm__ uint8_t *workspace,
                                             const LIHiCachedTilingData *__restrict tiling,
                                             TPipe *tPipe)
@@ -816,15 +818,15 @@ __aicore__ inline void LIPreload<LIT>::Init(__gm__ uint8_t *query, __gm__ uint8_
     pipe = tPipe;
     uint64_t offset = 0;
     uint64_t singleCoreMm1ResSize =
-        WS_DOBULE * constInfo.mBaseSizeAlign * constInfo.s2BaseSize * sizeof(MM1_OUT_T);
-    mm1ResGm.SetGlobalBuffer((__gm__ MM1_OUT_T *)(workspace + offset + aiCoreIdx * singleCoreMm1ResSize));
+        WORKSPACE_BUFFER_NUM * constInfo.mBaseSizeAlign * constInfo.s2BaseSize * sizeof(MM1_OUT_T);
+    qkWorkspaceGm.SetGlobalBuffer((__gm__ MM1_OUT_T *)(workspace + offset + aiCoreIdx * singleCoreMm1ResSize));
     offset += GetBlockNum() * singleCoreMm1ResSize;
 
-    vec1ResGm.SetGlobalBuffer((__gm__ float *)(workspace + offset));
-    offset += GetBlockNum() * constInfo.s1BaseSize * WS_DOBULE * WS_DOBULE * BASE_TOPK * sizeof(float);
+    partialTopkGm.SetGlobalBuffer((__gm__ float *)(workspace + offset));
+    offset += GetBlockNum() * constInfo.s1BaseSize * WORKSPACE_BUFFER_NUM * WORKSPACE_BUFFER_NUM * BASE_TOPK * sizeof(float);
 
-    vec1ParamGm.SetGlobalBuffer((__gm__ int64_t *)(workspace + offset));
-    offset += GetBlockNum() * constInfo.s1BaseSize * WS_DOBULE * LD_MERGE_PARAM_NUM * sizeof(int64_t);
+    partialTopkMetadataGm.SetGlobalBuffer((__gm__ int64_t *)(workspace + offset));
+    offset += GetBlockNum() * constInfo.s1BaseSize * WORKSPACE_BUFFER_NUM * PARTIAL_TOPK_METADATA_FIELDS * sizeof(int64_t);
 
     blockIndiceGm.SetGlobalBuffer((__gm__ int32_t *)(workspace + offset));
     // TND row ids are global T offsets, so the stage-1 HI block workspace is
@@ -834,14 +836,9 @@ __aicore__ inline void LIPreload<LIT>::Init(__gm__ uint8_t *query, __gm__ uint8_
     offset += blockIndiceRows * constInfo.kHeadNum * constInfo.sparseCount * sizeof(int32_t);
     externalHiMaskGm.SetGlobalBuffer((__gm__ int32_t *)(workspace + offset));
     offset += blockIndiceRows * constInfo.kHeadNum * constInfo.externalHiMaskWordNum * sizeof(int32_t);
-    uint64_t stage1BlockNumPerBatch = LICommon::Align(
-        static_cast<uint64_t>(constInfo.maxBlockNumPerBatch),
-        static_cast<uint64_t>(LICommon::ConstInfo::CUBE_BLOCK_ELEM_NUM));
-    uint64_t stage1MeanSize = constInfo.bSize * constInfo.kHeadNum *
-                              stage1BlockNumPerBatch * constInfo.headDim * sizeof(K_T);
-    stage1MeanKeyGm.SetGlobalBuffer((__gm__ K_T *)(workspace + offset));
-    stage1MeanCacheGm.SetGlobalBuffer((__gm__ K_T *)stage1MeanCache);
-    offset += stage1MeanSize;
+    // Host still reserves the legacy mean-workspace tail. Cached HI consumes
+    // the external keyMean directly; no kernel descriptor uses that tail.
+    keyMeanGm.SetGlobalBuffer((__gm__ K_T *)keyMean);
 
     if constexpr (PAGE_ATTENTION) {
         blockTableGm.SetGlobalBuffer((__gm__ int32_t *)blockTable);
@@ -850,15 +847,14 @@ __aicore__ inline void LIPreload<LIT>::Init(__gm__ uint8_t *query, __gm__ uint8_
     queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
 
     if ASCEND_IS_AIV {
-        vectorService.InitParams(constInfo, tiling);
+        vectorService.InitParams(constInfo);
         indiceOutGm.SetGlobalBuffer((__gm__ int32_t *)sparseIndices);
         weightsGm.SetGlobalBuffer((__gm__ K_T *)weights);
-        vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, vec1ParamGm, blockIndiceGm, externalHiMaskGm,
-                                           weightsGm, indiceOutGm, blockTableGm, keyGm, stage1MeanKeyGm,
-                                           stage1MeanCacheGm, queryGm);
+        vectorService.InitGlobalTensors(qkWorkspaceGm, partialTopkGm, partialTopkMetadataGm, blockIndiceGm,
+                                       externalHiMaskGm, weightsGm, indiceOutGm);
     } else {
         matmulService.InitParams(constInfo);
-        matmulService.InitMm1GlobalTensor(blockTableGm, keyGm, stage1MeanKeyGm, stage1MeanCacheGm, queryGm, mm1ResGm);
+        matmulService.InitGlobalTensors(blockTableGm, keyGm, keyMeanGm, queryGm, qkWorkspaceGm);
     }
     InitBuffers();
 }
@@ -1039,7 +1035,7 @@ __aicore__ inline bool LIPreload<LIT>::CanSkipStage2PartialTopkMerge()
 }
 
 template <typename LIT>
-__aicore__ inline bool LIPreload<LIT>::CanUseDecodeStage2HiFastPath()
+__aicore__ inline bool LIPreload<LIT>::InitDecodeStage2FastPathHints()
 {
     if constexpr (!(LAYOUT_T == LI_LAYOUT::TND && LIT::pageAttention)) {
         return false;
@@ -1051,6 +1047,8 @@ __aicore__ inline bool LIPreload<LIT>::CanUseDecodeStage2HiFastPath()
     uint32_t firstQueryLen = 0;
     bool uniformQueryLen = true;
     bool hasMtpQuery = false;
+    bool hasFullCoverageQuery = false;
+    bool denseMtpCandidates = true;
     // Reinterpret the existing [4 * G, 128] ping-pong slot as [G, 512].
     // Aligned G keeps Fixpipe's padded M rows inside the same allocation.
     bool canBatchMtpBlocks = constInfo.gSize % BLOCK_CUBE_SIZE == 0 &&
@@ -1070,18 +1068,19 @@ __aicore__ inline bool LIPreload<LIT>::CanUseDecodeStage2HiFastPath()
             (actS1Size > 1 && constInfo.kHeadNum != 1)) {
             return false;
         }
-        // FULL_DECODE_ONLY graph capture may warm up with actual_k=[1,0,...].
-        // That full-coverage degenerate case has no HI filtering benefit and
-        // must use the stable dense Stage2 path instead of the HI fast path.
-        // Every MTP query needs a materialized Stage1 list. If even the first
-        // query has full coverage, retain the existing tiled path for this call.
+        // Tiny capture inputs retain the stable tiled path. A full-coverage
+        // single query can enumerate logical blocks directly, without reading
+        // an unmaterialized Stage1 list. MTP still requires per-query lists.
         uint32_t firstVisibleS2 = constInfo.attenMaskFlag ? actS2Size - actS1Size + 1 : actS2Size;
-        if (IsHiFullCoverage(firstVisibleS2)) {
+        if (IsHiFullCoverage(firstVisibleS2) &&
+            (actS1Size != 1 || firstVisibleS2 <= constInfo.sparseCount)) {
             return false;
         }
+        hasFullCoverageQuery = hasFullCoverageQuery || IsHiFullCoverage(firstVisibleS2);
         // Compare handshakes, not blocks: an MTP chunk can batch four blocks
         // while the general path still synchronizes after each 128-token tile.
         uint32_t visibleBlockNum = LICommon::CeilDiv(firstVisibleS2, static_cast<uint32_t>(constInfo.hiBlockSize));
+        denseMtpCandidates = denseMtpCandidates && constInfo.hiBlockNum * 2 + 1 >= visibleBlockNum;
         uint32_t hiChunkNum = LICommon::CeilDiv(static_cast<uint32_t>(constInfo.hiBlockNum), mtpBlocksPerChunk);
         if (actS1Size > 1 && static_cast<uint64_t>(hiChunkNum) * actS1Size > visibleBlockNum) {
             return false;
@@ -1093,8 +1092,18 @@ __aicore__ inline bool LIPreload<LIT>::CanUseDecodeStage2HiFastPath()
         uniformQueryLen = uniformQueryLen && actS1Size == firstQueryLen;
         queryTokenNum += actS1Size;
     }
+    if (hasMtpQuery && hasFullCoverageQuery) {
+        return false;
+    }
     decodeQueryTokensPerRequest = uniformQueryLen ? firstQueryLen : 0;
     decodeStage2ChunkSize = hasMtpQuery ? mtpBlocksPerChunk * S2_BASE_SIZE : S2_BASE_SIZE;
+    // Share K only for uniform query pairs with substantial candidate overlap.
+    // Enough rows avoid a second partial-TopK merge; the union fits one existing
+    // Stage1 output row. Other shapes retain independent query scheduling.
+    shareMtpStage2Queries = canBatchMtpBlocks && denseMtpCandidates && uniformQueryLen &&
+        (firstQueryLen == 2 || firstQueryLen == 4) && constInfo.gSize >= 16 && constInfo.gSize <= 64 &&
+        constInfo.maxBlockNumPerBatch <= BASE_TOPK && constInfo.hiBlockNum > 32 &&
+        queryTokenNum >= GetBlockNum();
     return queryTokenNum == constInfo.s1Size && queryTokenNum > 0;
 }
 
@@ -1108,6 +1117,28 @@ __aicore__ inline uint32_t LIPreload<LIT>::GetDecodeStage2HiFastPathRowNum()
         return 0;
     }
     return constInfo.s1Size * constInfo.kHeadNum;
+}
+
+template <typename LIT>
+__aicore__ inline uint32_t LIPreload<LIT>::GetDecodeStage2GroupNum(uint32_t queryRowNum)
+{
+    // Both idle-core routing and active-core execution must use this split.
+    constexpr uint32_t MAX_GROUP_NUM = 8;
+    uint32_t blocksPerChunk = decodeStage2ChunkSize / constInfo.hiBlockSize;
+    uint32_t hiBlockCount = LICommon::Min(
+        static_cast<uint32_t>(constInfo.hiBlockNum), static_cast<uint32_t>(constInfo.sparseCount));
+    uint32_t chunkCount = LICommon::Max(1U, LICommon::CeilDiv(hiBlockCount, blocksPerChunk));
+    uint32_t groupNum = 1U;
+    if (queryRowNum > 0) {
+        if (GetBlockNum() >= queryRowNum * MAX_GROUP_NUM) {
+            groupNum = MAX_GROUP_NUM;
+        } else if (GetBlockNum() >= queryRowNum * 4U) {
+            groupNum = 4U;
+        } else if (GetBlockNum() >= queryRowNum * 2U) {
+            groupNum = 2U;
+        }
+    }
+    return LICommon::Min(groupNum, chunkCount);
 }
 
 template <typename LIT>
@@ -1198,7 +1229,7 @@ __aicore__ inline void LIPreload<LIT>::RunStage1()
             CrossCoreSetFlag<LICommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
         }
     } else {
-        matmulService.AllocEventID();
+        matmulService.InitPipelineEvents();
     }
 
     LICommon::RunInfo runInfo;
@@ -1230,10 +1261,126 @@ __aicore__ inline void LIPreload<LIT>::RunStage1()
     }
 
     if ASCEND_IS_AIC {
-        matmulService.FreeEventID();
+        matmulService.DrainPipelineEvents();
         if constexpr (!useStage1BlockMean) {
             CrossCoreWaitFlag(constInfo.syncV1C1);
             CrossCoreWaitFlag(constInfo.syncV1C1);
+        }
+    }
+}
+
+template <typename LIT>
+__aicore__ inline void LIPreload<LIT>::RunMtpSharedStage2()
+{
+    uint32_t pairCount = GetDecodeStage2HiFastPathRowNum() / 2;
+    uint32_t transferIdx = 0;
+    uint32_t lane = tmpBlockIdx & 1;
+    for (uint32_t pair = aiCoreIdx; pair < pairCount; pair += GetBlockNum()) {
+        uint32_t queryIdx = 0;
+        uint32_t bN2Idx = MapDecodeStage2HiFastPathRowToBN2(2 * pair, queryIdx);
+        splitCoreInfo.bN2Start = bN2Idx;
+        splitCoreInfo.bN2End = bN2Idx;
+        splitCoreInfo.gS1Start = 0;
+        splitCoreInfo.gS1End = 0;
+        splitCoreInfo.s2Start = 0;
+        splitCoreInfo.s2End = 0;
+        splitCoreInfo.isLdMergeCore = false;
+        splitCoreInfo.isStage1 = false;
+        CalcGS1LoopParams(bN2Idx);
+        CalcS2LoopParams(bN2Idx, 0);
+        LICommon::RunInfo info;
+        CalcRunInfo(0, 0, info);
+        info.tensorQueryOffset += static_cast<uint64_t>(queryIdx) * constInfo.qHeadNum * constInfo.headDim;
+        info.tensorWeightsOffset += static_cast<uint64_t>(queryIdx) * constInfo.qHeadNum;
+        info.indiceOutOffset += static_cast<uint64_t>(queryIdx) * BASE_TOPK;
+        if (constInfo.attenMaskFlag) {
+            info.actS2Size -= info.actS1Size - queryIdx - 2;
+        }
+        info.actS1Size = 2;
+        info.actMBaseSize = 2 * constInfo.gSize;
+        info.actualSingleProcessSInnerSize = 512;
+        info.actualSingleProcessSInnerSizeAlign = 512;
+        info.isFirstS2InnerLoop = true;
+        info.isLastS2InnerLoop = true;
+        info.isAllLoopEnd = true;
+        info.isLdMergeCore = false;
+
+        uint32_t sharedBlockCount = 0;
+        LICommon::RunInfo queryInfo = info;
+        if ASCEND_IS_AIC {
+            CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_S>(Stage2QkUb::SHARED_LIST_READY_EVENT);
+            sharedBlockCount = blockIndiceGm.GetValue(info.indiceOutOffset + BASE_TOPK);
+            CrossCoreSetFlag<Stage2QkUb::SYNC_MODE, PIPE_S>(Stage2QkUb::SHARED_LIST_BROADCAST_EVENT);
+            CrossCoreSetFlag<Stage2QkUb::SYNC_MODE, PIPE_S>(
+                Stage2QkUb::SHARED_LIST_BROADCAST_EVENT + Stage2QkUb::AIV_EVENT_OFFSET);
+            matmulService.LoadQueryTile(info);
+        } else {
+            if (lane == 0) {
+                vectorService.BuildMtpSharedBlocks(info);
+                CrossCoreSetFlag<Stage2QkUb::SYNC_MODE, PIPE_MTE3>(Stage2QkUb::SHARED_LIST_READY_EVENT);
+            }
+            CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_S>(Stage2QkUb::SHARED_LIST_BROADCAST_EVENT);
+            sharedBlockCount = vectorService.LoadMtpSharedBlocks(info);
+            queryInfo.tensorQueryOffset += static_cast<uint64_t>(lane) * constInfo.qHeadNum * constInfo.headDim;
+            queryInfo.tensorWeightsOffset += static_cast<uint64_t>(lane) * constInfo.qHeadNum;
+            queryInfo.indiceOutOffset += lane * BASE_TOPK;
+            queryInfo.actS1Size = 1;
+            queryInfo.actMBaseSize = constInfo.gSize;
+            if (constInfo.attenMaskFlag) {
+                queryInfo.actS2Size -= 1 - lane;
+            }
+            vectorService.LoadStage2Weights(queryInfo);
+        }
+
+        uint32_t chunks = LICommon::CeilDiv(sharedBlockCount, 4U);
+        for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+            uint32_t tiles = LICommon::Min(4U, sharedBlockCount - chunk * 4);
+            for (uint32_t local = 0; local < tiles;) {
+                LICommon::RunInfo tileInfo = info;
+                tileInfo.loop = transferIdx;
+                // [2*G,256] must fit the existing 64 KiB L0C slot.
+                uint32_t blockPair = constInfo.gSize <= 32 && local + 1 < tiles ? 2U : 1U;
+                if ASCEND_IS_AIC {
+                    for (uint32_t block = 0; block < blockPair; ++block) {
+                        uint32_t slot = (transferIdx + block) % 2;
+                        CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_FIX>(Stage2QkUb::FREE_EVENT + slot);
+                        CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_FIX>(
+                            Stage2QkUb::FREE_EVENT + slot + Stage2QkUb::AIV_EVENT_OFFSET);
+                    }
+                    uint64_t blockOffset = info.indiceOutOffset + chunk * 4 + local;
+                    if (blockPair == 2) {
+                        matmulService.template ComputeStage2BlockPairToUb<true>(tileInfo, blockIndiceGm, blockOffset);
+                    } else {
+                        uint32_t logicalBlock = static_cast<uint32_t>(blockIndiceGm.GetValue(blockOffset)) >> 2;
+                        uint32_t start = logicalBlock * 128;
+                        uint32_t count = LICommon::Min(128U, info.actS2Size - start);
+                        matmulService.template ComputeStage2QkRange<true, 2>(
+                            tileInfo, start, count, 0, 128, 0);
+                    }
+                    for (uint32_t block = 0; block < blockPair; ++block) {
+                        uint32_t slot = (transferIdx + block) % 2;
+                        CrossCoreSetFlag<Stage2QkUb::SYNC_MODE, PIPE_FIX>(Stage2QkUb::READY_EVENT + slot);
+                        CrossCoreSetFlag<Stage2QkUb::SYNC_MODE, PIPE_FIX>(
+                            Stage2QkUb::READY_EVENT + slot + Stage2QkUb::AIV_EVENT_OFFSET);
+                    }
+                } else {
+                    for (uint32_t block = 0; block < blockPair; ++block) {
+                        uint32_t slot = (transferIdx + block) % 2;
+                        CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_V>(Stage2QkUb::READY_EVENT + slot);
+                        vectorService.ReduceStage2QkUb(slot, (local + block) * 128, chunk * 4 + local + block);
+                        CrossCoreSetFlag<Stage2QkUb::SYNC_MODE, PIPE_V>(Stage2QkUb::FREE_EVENT + slot);
+                    }
+                }
+                transferIdx += blockPair;
+                local += blockPair;
+            }
+            if ASCEND_IS_AIV {
+                vectorService.SelectDecodeStage2HiTokens(
+                    queryInfo, chunk, 0, chunks, 0, false, false, false, sharedBlockCount);
+            }
+        }
+        if ASCEND_IS_AIC {
+            matmulService.ReleaseQueryTile(info);
         }
     }
 }
@@ -1249,31 +1396,21 @@ __aicore__ inline bool LIPreload<LIT>::RunDecodeStage2HiFastPath()
     if (!decodeStage2HiFastPathEligible) {
         return false;
     }
+    if (shareMtpStage2Queries) {
+        RunMtpSharedStage2();
+        return true;
+    }
 
     uint32_t totalRowNum = GetDecodeStage2HiFastPathRowNum();
     if (totalRowNum == 0) {
         return false;
     }
 
-    constexpr uint32_t DECODE_HI_MAX_GROUP_NUM = 8;
-    uint32_t blocksPerChunkForGroup = decodeStage2ChunkSize / constInfo.hiBlockSize;
-    uint32_t configuredHiBlockCount = LICommon::Min(
-        static_cast<uint32_t>(constInfo.hiBlockNum), static_cast<uint32_t>(constInfo.sparseCount));
-    uint32_t configuredChunkCount = LICommon::Max(1U, LICommon::CeilDiv(configuredHiBlockCount, blocksPerChunkForGroup));
-    uint32_t hiGroupNum = 1U;
-    if (GetBlockNum() >= totalRowNum * DECODE_HI_MAX_GROUP_NUM) {
-        hiGroupNum = DECODE_HI_MAX_GROUP_NUM;
-    } else if (GetBlockNum() >= totalRowNum * 4U) {
-        hiGroupNum = 4U;
-    } else if (GetBlockNum() >= totalRowNum * 2U) {
-        hiGroupNum = 2U;
-    }
-    hiGroupNum = LICommon::Min(hiGroupNum, configuredChunkCount);
+    uint32_t hiGroupNum = GetDecodeStage2GroupNum(totalRowNum);
     // When rows already outnumber Cube cores, stride scheduling naturally keeps
     // the hardware busy. Splitting every row again would add partial topK GM
     // traffic and a global merge, so reserve multi-way split for small batches.
     uint32_t totalTaskNum = totalRowNum * hiGroupNum;
-    bool useLocalPartialMerge = (hiGroupNum > 1);
     if (aiCoreIdx >= totalTaskNum && hiGroupNum > 1) {
         if ASCEND_IS_AIV {
             SyncAll();
@@ -1326,7 +1463,8 @@ __aicore__ inline bool LIPreload<LIT>::RunDecodeStage2HiFastPath()
 
         uint32_t visibleHiBlockNum =
             LICommon::CeilDiv(runInfo.actS2Size, static_cast<uint32_t>(constInfo.hiBlockSize));
-        uint32_t hiBlockCount = LICommon::Min(
+        bool hiFullCoverage = IsHiFullCoverage(runInfo.actS2Size);
+        uint32_t hiBlockCount = hiFullCoverage ? visibleHiBlockNum : LICommon::Min(
             static_cast<uint32_t>(constInfo.hiBlockNum),
             LICommon::Min(static_cast<uint32_t>(constInfo.sparseCount), visibleHiBlockNum));
         uint32_t blocksPerChunk = decodeStage2ChunkSize / constInfo.hiBlockSize;
@@ -1347,12 +1485,75 @@ __aicore__ inline bool LIPreload<LIT>::RunDecodeStage2HiFastPath()
         // by stride so large batches still use the HI-only Stage2 path.
         if ASCEND_IS_AIC {
             matmulService.LoadQueryTile(runInfo);
+        } else if (stage2QkToUb && (tmpBlockIdx & 1) == 0) {
+            vectorService.LoadStage2Weights(runInfo);
         }
         for (uint32_t chunkIdx = groupStartChunk; chunkIdx < groupEndChunk; ++chunkIdx) {
             LICommon::RunInfo chunkRunInfo = runInfo;
             // Keep ping-pong parity across MTP rows with odd chunk counts.
             // The two C/V credits protect the last two chunks, not row ids.
             chunkRunInfo.loop = decodeStage2ChunkSize > constInfo.s2BaseSize ? stage2Loop++ : chunkIdx;
+            if (stage2QkToUb) {
+                uint32_t hiBlockStart = chunkIdx * blocksPerChunk;
+                uint32_t tileCount = LICommon::Min(blocksPerChunk, hiBlockCount - hiBlockStart);
+                for (uint32_t localBlockIdx = 0; localBlockIdx < tileCount;) {
+                    LICommon::RunInfo tileInfo = chunkRunInfo;
+                    tileInfo.loop = chunkRunInfo.loop * blocksPerChunk + localBlockIdx;
+                    uint32_t slot = tileInfo.loop % Stage2QkUb::BUFFER_NUM;
+                    bool useBlockPair = blocksPerChunk > 1 && localBlockIdx + 1 < tileCount;
+                    if (useBlockPair) {
+                        if ASCEND_IS_AIC {
+                            CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_FIX>(Stage2QkUb::FREE_EVENT);
+                            CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_FIX>(Stage2QkUb::FREE_EVENT + 1);
+                            matmulService.ComputeStage2BlockPairToUb(
+                                tileInfo, blockIndiceGm, runInfo.indiceOutOffset + hiBlockStart + localBlockIdx);
+                            CrossCoreSetFlag<Stage2QkUb::SYNC_MODE, PIPE_FIX>(Stage2QkUb::READY_EVENT + slot);
+                            CrossCoreSetFlag<Stage2QkUb::SYNC_MODE, PIPE_FIX>(Stage2QkUb::READY_EVENT + (slot ^ 1U));
+                        } else if ((tmpBlockIdx & 1) == 0) {
+                            for (uint32_t block = 0; block < 2; ++block) {
+                                uint32_t blockSlot = (slot + block) % Stage2QkUb::BUFFER_NUM;
+                                CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_V>(Stage2QkUb::READY_EVENT + blockSlot);
+                                vectorService.ReduceStage2QkUb(
+                                    blockSlot, (localBlockIdx + block) * Stage2QkUb::TILE_TOKENS);
+                                CrossCoreSetFlag<Stage2QkUb::SYNC_MODE, PIPE_V>(Stage2QkUb::FREE_EVENT + blockSlot);
+                            }
+                        }
+                        localBlockIdx += 2;
+                        continue;
+                    }
+                    if ASCEND_IS_AIC {
+                        CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_FIX>(Stage2QkUb::FREE_EVENT + slot);
+                        int32_t selectedBlock = hiFullCoverage ? hiBlockStart + localBlockIdx :
+                            blockIndiceGm.GetValue(runInfo.indiceOutOffset + hiBlockStart + localBlockIdx);
+                        uint32_t tokenStart = static_cast<uint32_t>(selectedBlock) * constInfo.hiBlockSize;
+                        if (selectedBlock >= 0 && tokenStart < runInfo.actS2Size) {
+                            uint32_t tokenCount = LICommon::Min(
+                                static_cast<uint32_t>(constInfo.hiBlockSize), runInfo.actS2Size - tokenStart);
+                            matmulService.template ComputeStage2QkRange<true>(
+                                tileInfo, tokenStart, tokenCount, 0, Stage2QkUb::TILE_TOKENS, 0);
+                        }
+                        // Publish a credit even for a masked tile: the consumer
+                        // follows the same fixed block-list extent on both sides.
+                        CrossCoreSetFlag<Stage2QkUb::SYNC_MODE, PIPE_FIX>(Stage2QkUb::READY_EVENT + slot);
+                    } else if ((tmpBlockIdx & 1) == 0) {
+                        CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_V>(Stage2QkUb::READY_EVENT + slot);
+                        vectorService.ReduceStage2QkUb(slot, localBlockIdx * Stage2QkUb::TILE_TOKENS);
+                        // QK has been reduced into separate score storage. Cube
+                        // may reuse this slot while AIV executes the next TopK.
+                        CrossCoreSetFlag<Stage2QkUb::SYNC_MODE, PIPE_V>(Stage2QkUb::FREE_EVENT + slot);
+                    }
+                    ++localBlockIdx;
+                }
+                if ASCEND_IS_AIV {
+                    if ((tmpBlockIdx & 1) == 0) {
+                        bool keepPartialTopk = hiGroupNum > 1 && hiGroupIdx == 0;
+                        vectorService.SelectDecodeStage2HiTokens(
+                            chunkRunInfo, chunkIdx, groupStartChunk, groupEndChunk, partialTopkOffset,
+                            hiGroupNum > 1 && !keepPartialTopk, keepPartialTopk, hiFullCoverage);
+                    }
+                }
+                continue;
+            }
             if ASCEND_IS_AIC {
                 CrossCoreWaitFlag(constInfo.syncV1C1);
                 uint32_t hiBlockStart = chunkIdx * blocksPerChunk;
@@ -1361,7 +1562,8 @@ __aicore__ inline bool LIPreload<LIT>::RunDecodeStage2HiFastPath()
                     if (hiBlockPos >= hiBlockCount) {
                         break;
                     }
-                    int32_t selectedBlock = blockIndiceGm.GetValue(runInfo.indiceOutOffset + hiBlockPos);
+                    int32_t selectedBlock = hiFullCoverage ? hiBlockPos :
+                        blockIndiceGm.GetValue(runInfo.indiceOutOffset + hiBlockPos);
                     if (selectedBlock < 0) {
                         break;
                     }
@@ -1372,7 +1574,7 @@ __aicore__ inline bool LIPreload<LIT>::RunDecodeStage2HiFastPath()
                     uint32_t tokenCount = LICommon::Min(
                         static_cast<uint32_t>(constInfo.hiBlockSize), runInfo.actS2Size - tokenStart);
                     uint32_t packedOffset = localBlockIdx * constInfo.hiBlockSize;
-                    matmulService.ComputeMm1ByRangeWithCachedQuery(
+                    matmulService.ComputeStage2QkRange(
                         chunkRunInfo, tokenStart, tokenCount, packedOffset, decodeStage2ChunkSize, 0);
                 }
                 PipeBarrier<PIPE_FIX>();
@@ -1387,12 +1589,12 @@ __aicore__ inline bool LIPreload<LIT>::RunDecodeStage2HiFastPath()
                                                              partialTopkOffset,
                                                              hiGroupNum > 1 && !keepPartialTopk,
                                                              keepPartialTopk,
-                                                             false);
+                                                             hiFullCoverage);
                 }
                 CrossCoreSetFlag<LICommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
             }
         }
-        if (hiGroupNum > 1 && useLocalPartialMerge) {
+        if (hiGroupNum > 1) {
             if ASCEND_IS_AIV {
                 SyncAll();
                 if ((tmpBlockIdx & 1) == 0 && hiGroupIdx == 0) {
@@ -1426,23 +1628,7 @@ __aicore__ inline void LIPreload<LIT>::RunStage2()
     bool skipDecodeStage2HiIdleAic = false;
     if constexpr (LAYOUT_T == LI_LAYOUT::TND && LIT::pageAttention) {
         uint32_t totalRowNum = GetDecodeStage2HiFastPathRowNum();
-        constexpr uint32_t DECODE_HI_MAX_GROUP_NUM = 8;
-        uint32_t blocksPerChunkForGroup = decodeStage2ChunkSize / constInfo.hiBlockSize;
-        uint32_t configuredHiBlockCount = LICommon::Min(
-            static_cast<uint32_t>(constInfo.hiBlockNum), static_cast<uint32_t>(constInfo.sparseCount));
-        uint32_t configuredChunkCount =
-            LICommon::Max(1U, LICommon::CeilDiv(configuredHiBlockCount, blocksPerChunkForGroup));
-        uint32_t hiGroupNum = 1U;
-        if (totalRowNum > 0) {
-            if (GetBlockNum() >= totalRowNum * DECODE_HI_MAX_GROUP_NUM) {
-                hiGroupNum = DECODE_HI_MAX_GROUP_NUM;
-            } else if (GetBlockNum() >= totalRowNum * 4U) {
-                hiGroupNum = 4U;
-            } else if (GetBlockNum() >= totalRowNum * 2U) {
-                hiGroupNum = 2U;
-            }
-        }
-        hiGroupNum = LICommon::Min(hiGroupNum, configuredChunkCount);
+        uint32_t hiGroupNum = GetDecodeStage2GroupNum(totalRowNum);
         uint32_t fastPathTaskNum = totalRowNum * hiGroupNum;
         // Stage1 emits a compact HI block list whenever the decode fast path is
         // eligible.  Stage2 must consume the same representation even when the
@@ -1471,24 +1657,43 @@ __aicore__ inline void LIPreload<LIT>::RunStage2()
         return;
     }
 
+    stage2QkToUb = runDecodeStage2HiFastPath && !joinDecodeStage2HiIdleAiv &&
+                   constInfo.hiBlockSize == Stage2QkUb::TILE_TOKENS &&
+                   constInfo.gSize >= 16 && constInfo.gSize <= 64 && constInfo.gSize % 16 == 0;
     if ASCEND_IS_AIV {
         bool useWideMtpChunks = decodeStage2HiFastPathEligible && decodeStage2ChunkSize > constInfo.s2BaseSize;
-        if (!CanSkipStage1PartialTopkMerge() || useWideMtpChunks) {
-            // PartialTopkMerge resets the pipe to legacy LdMerge buffers.
+        if (!CanSkipStage1PartialTopkMerge() || useWideMtpChunks || stage2QkToUb) {
+            // Partial TopK merge resets the pipe to its own scratch buffers.
             // Pure decode skips that merge, so keep the normal vector buffers
             // and avoid a second TPipe reset/init before Stage2.
             pipe->Reset();
-            vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, vec1ParamGm, blockIndiceGm, externalHiMaskGm,
-                                               weightsGm, indiceOutGm, blockTableGm, keyGm, stage1MeanKeyGm,
-                                               stage1MeanCacheGm, queryGm);
+            vectorService.InitGlobalTensors(qkWorkspaceGm, partialTopkGm, partialTopkMetadataGm, blockIndiceGm,
+                                           externalHiMaskGm, weightsGm, indiceOutGm);
             // Wide MTP Stage2 needs one running TopK row, not the two local
             // Stage1 rows. Reuse that UB budget for the wider score buffer.
-            vectorService.InitBuffers(pipe, useWideMtpChunks ? decodeStage2ChunkSize : 0U);
+            vectorService.InitBuffers(pipe, useWideMtpChunks || stage2QkToUb ? decodeStage2ChunkSize : 0U,
+                                       stage2QkToUb, shareMtpStage2Queries);
         }
-        CrossCoreSetFlag<LICommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
-        CrossCoreSetFlag<LICommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
+        if (stage2QkToUb) {
+            if ((tmpBlockIdx & 1) == 0) {
+                CrossCoreSetFlag<Stage2QkUb::SYNC_MODE, PIPE_MTE3>(Stage2QkUb::STAGE1_LIST_READY_EVENT);
+            }
+            if ((tmpBlockIdx & 1) == 0 || shareMtpStage2Queries) {
+                CrossCoreSetFlag<Stage2QkUb::SYNC_MODE, PIPE_V>(Stage2QkUb::FREE_EVENT);
+                CrossCoreSetFlag<Stage2QkUb::SYNC_MODE, PIPE_V>(Stage2QkUb::FREE_EVENT + 1);
+            }
+        } else {
+            CrossCoreSetFlag<LICommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
+            CrossCoreSetFlag<LICommon::ConstInfo::FIA_SYNC_MODE2, PIPE_MTE2>(constInfo.syncV1C1);
+        }
     } else {
-        matmulService.AllocEventID();
+        if (stage2QkToUb) {
+            // FIX credits only protect QK UB reuse. Scalar must separately wait
+            // for Stage1's GM block list before issuing candidate/key loads.
+            CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_S>(Stage2QkUb::STAGE1_LIST_READY_EVENT);
+            matmulService.InitStage2QkUb(pipe);
+        }
+        matmulService.InitPipelineEvents();
     }
 
     bool handledDecodeStage2HiFastPath = RunDecodeStage2HiFastPath();
@@ -1517,9 +1722,20 @@ __aicore__ inline void LIPreload<LIT>::RunStage2()
     }
 
     if ASCEND_IS_AIC {
-        matmulService.FreeEventID();
-        CrossCoreWaitFlag(constInfo.syncV1C1);
-        CrossCoreWaitFlag(constInfo.syncV1C1);
+        matmulService.DrainPipelineEvents();
+        if (stage2QkToUb) {
+            CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_FIX>(Stage2QkUb::FREE_EVENT);
+            CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_FIX>(Stage2QkUb::FREE_EVENT + 1);
+            if (shareMtpStage2Queries) {
+                CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_FIX>(
+                    Stage2QkUb::FREE_EVENT + Stage2QkUb::AIV_EVENT_OFFSET);
+                CrossCoreWaitFlag<Stage2QkUb::SYNC_MODE, PIPE_FIX>(
+                    Stage2QkUb::FREE_EVENT + 1 + Stage2QkUb::AIV_EVENT_OFFSET);
+            }
+        } else {
+            CrossCoreWaitFlag(constInfo.syncV1C1);
+            CrossCoreWaitFlag(constInfo.syncV1C1);
+        }
     }
 }
 
@@ -1534,7 +1750,6 @@ __aicore__ inline void LIPreload<LIT>::RunStage1Tile(uint32_t loop, uint64_t s2L
     }
     constexpr bool useStage1BlockMean = LIT::pageAttention;
     LICommon::RunInfo stage1RunInfo = runInfo;
-    LICommon::RunInfo stage1MeanRunInfo = runInfo;
     uint32_t localBlockNum = 0;
     uint32_t localBlockNumAlign = 0;
     if constexpr (useStage1BlockMean) {
@@ -1547,20 +1762,18 @@ __aicore__ inline void LIPreload<LIT>::RunStage1Tile(uint32_t loop, uint64_t s2L
         }
         localBlockNum = LICommon::Min(constInfo.s2BaseSize, totalHiBlockNum - stage1BaseBlockIdx);
         localBlockNumAlign = LICommon::Align(localBlockNum, LICommon::ConstInfo::CUBE_BLOCK_ELEM_NUM);
-        stage1MeanRunInfo.stage1BufIdx = runInfo.s2Idx & 1;
-        stage1MeanRunInfo.stage1LocalBlockNum = localBlockNum;
-        stage1MeanRunInfo.stage1BaseBlockIdx = stage1BaseBlockIdx;
-
-        stage1RunInfo = stage1MeanRunInfo;
+        stage1RunInfo.stage1BufIdx = runInfo.s2Idx & 1;
+        stage1RunInfo.stage1LocalBlockNum = localBlockNum;
+        stage1RunInfo.stage1BaseBlockIdx = stage1BaseBlockIdx;
         stage1RunInfo.actualSingleProcessSInnerSize = localBlockNum;
         stage1RunInfo.actualSingleProcessSInnerSizeAlign = localBlockNumAlign;
     }
     if ASCEND_IS_AIC {
         CrossCoreWaitFlag(constInfo.syncV1C1);
         if constexpr (useStage1BlockMean) {
-            matmulService.ComputeMm1Stage1(stage1RunInfo, localBlockNumAlign);
+            matmulService.ComputeStage1QkTile(stage1RunInfo, localBlockNumAlign);
         } else {
-            matmulService.ComputeMm1(runInfo, false);
+            matmulService.ComputeQkTile(runInfo, false);
         }
         PipeBarrier<PIPE_FIX>();
         CrossCoreSetFlag<LICommon::ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(constInfo.syncC1V1);
@@ -1591,7 +1804,7 @@ __aicore__ inline void LIPreload<LIT>::RunStage2Tile(uint32_t loop, uint64_t s2L
             // If HI blocks cover the whole visible sequence, dense stage-2
             // is the exact HISA degenerate case and keeps the efficient
             // original path.
-            matmulService.ComputeMm1(runInfo, true);
+            matmulService.ComputeQkTile(runInfo, true);
         } else {
             if (runInfo.isFirstS2InnerLoop) {
                 matmulService.LoadQueryTile(runInfo);
@@ -1746,14 +1959,14 @@ __aicore__ inline void LIPreload<LIT>::RunStage2Tile(uint32_t loop, uint64_t s2L
                     (mergedCount > 1 && packedHiTokenCount * 4 > cuS2Len * 3) ||
                     (packedHiTokenCount == cuS2Len);
                 if (useDenseMaskedStage2) {
-                    matmulService.ComputeMm1ByRangeWithCachedQuery(
+                    matmulService.ComputeStage2QkRange(
                         runInfo, s2TileBaseOffset, static_cast<uint64_t>(cuS2Len), 0,
                         runInfo.actualSingleProcessSInnerSizeAlign, queryMOffset);
                 } else {
                     for (int32_t idx = 0; idx < mergedCount; ++idx) {
                         uint64_t segSrcOffset = s2TileBaseOffset + static_cast<uint64_t>(mergedStart[idx]);
                         uint64_t segTokenCount = static_cast<uint64_t>(mergedTokenCount[idx]);
-                        matmulService.ComputeMm1ByRangeWithCachedQuery(
+                        matmulService.ComputeStage2QkRange(
                             runInfo, segSrcOffset, segTokenCount, packedDstOffset,
                             runInfo.actualSingleProcessSInnerSizeAlign, queryMOffset);
                         packedDstOffset += segTokenCount;
@@ -1764,7 +1977,7 @@ __aicore__ inline void LIPreload<LIT>::RunStage2Tile(uint32_t loop, uint64_t s2L
                 matmulService.ReleaseQueryTile(runInfo);
             }
         }
-        // Ensure stage-2 mm1 writes are globally visible before releasing AIV.
+        // Ensure Stage2 QK writes are globally visible before releasing AIV.
         PipeBarrier<PIPE_FIX>();
         CrossCoreSetFlag<LICommon::ConstInfo::FIA_SYNC_MODE2, PIPE_FIX>(constInfo.syncC1V1);
     } else {
@@ -1784,10 +1997,10 @@ __aicore__ inline void LIPreload<LIT>::MergeStage1Blocks()
             return;
         }
         // Close stage-1 writer-side GM traffic before resetting buffers and
-        // starting legacy LdMerge buffers on another AIV.
+        // initializing partial TopK merge buffers on another AIV.
         PipeBarrier<PIPE_ALL>();
-        vectorService.InitLdMergeBuffers(pipe);
-        ICachePreLoad(LD_MERGE_PREFETCH_LEN);
+        vectorService.InitPartialTopkMergeBuffers(pipe);
+        ICachePreLoad(PARTIAL_TOPK_MERGE_PREFETCH_LEN);
         SyncAll();
         if (splitCoreInfo.isLdMergeCore) {
             vectorService.MergeStage1BlockTopM();
@@ -1808,10 +2021,10 @@ __aicore__ inline void LIPreload<LIT>::MergeStage2Tokens()
             return;
         }
         // Close stage-2 writer-side GM traffic before resetting buffers and
-        // starting legacy LdMerge buffers on another AIV.
+        // initializing partial TopK merge buffers on another AIV.
         PipeBarrier<PIPE_ALL>();
-        vectorService.InitLdMergeBuffers(pipe);
-        ICachePreLoad(LD_MERGE_PREFETCH_LEN);
+        vectorService.InitPartialTopkMergeBuffers(pipe);
+        ICachePreLoad(PARTIAL_TOPK_MERGE_PREFETCH_LEN);
         SyncAll();
         if (splitCoreInfo.isLdMergeCore) {
             vectorService.MergeStage2TokenTopK();
