@@ -60,6 +60,7 @@ GPU_MEMORY_UTILIZATION="0.50"
 STARTUP_TIMEOUT="900"
 LOG_DIR=""
 VERIFY_PATH="0"
+PROFILE_ONLY="0"
 RUN_UNIT_TESTS="0"
 SKIP_CONCURRENT="0"
 LOCAL_SHM_DIR="/dev/shm/vllm-ascend-local-kv"
@@ -139,6 +140,10 @@ Core options:
   --log-dir DIR               Keep artifacts in DIR. Default: /tmp directory
   --verify-path               Profile runtime and require DSA lookup + SFA;
                               with kvio also require PUT/GET operator evidence.
+  --profile                   Profile runtime (start/stop profiler, export and
+                              analyze ASCEND_PROFILER_OUTPUT) without requiring
+                              DSA operator evidence. Combinable with
+                              --no-dsa-offload for full-HBM baselines.
   --run-unit-tests             Run tests/ut/dsa_offload before the NPU probe.
   --skip-concurrent            In kv_both mode, skip the concurrent workload.
 
@@ -405,6 +410,10 @@ while (($# > 0)); do
             ;;
         --verify-path)
             VERIFY_PATH="1"
+            shift
+            ;;
+        --profile)
+            PROFILE_ONLY="1"
             shift
             ;;
         --run-unit-tests)
@@ -1041,7 +1050,7 @@ PY
     else
         dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false}}"
     fi
-    if [[ "$VERIFY_PATH" == "1" ]] \
+    if [[ "$VERIFY_PATH" == "1" || "$PROFILE_ONLY" == "1" ]] \
         && [[ "$kv_role" != "kv_producer" || "$IO_BACKEND" == "kvio" ]]; then
         mkdir -p "$profile_dir"
         profiler_config="$(python3 - "$profile_dir" <<'PY'
@@ -1100,7 +1109,7 @@ PREFILL_PROFILE_DIR="$LOG_DIR/prefill-profile"
 DECODE_PROFILE_DIR="$LOG_DIR/decode-profile"
 BOTH_PROFILE_DIR="$LOG_DIR/both-profile"
 
-if [[ "$VERIFY_PATH" == "1" ]]; then
+if [[ "$VERIFY_PATH" == "1" || "$PROFILE_ONLY" == "1" ]]; then
     for profile_dir in \
         "$PREFILL_PROFILE_DIR" \
         "$DECODE_PROFILE_DIR" \
@@ -1196,7 +1205,7 @@ else
     REQUEST_BASE_URL="http://127.0.0.1:$BOTH_HTTP_PORT"
 fi
 
-if [[ "$VERIFY_PATH" == "1" ]]; then
+if [[ "$VERIFY_PATH" == "1" || "$PROFILE_ONLY" == "1" ]]; then
     echo "Starting runtime profiler(s)..."
     for port in "${PROFILE_PORTS[@]}"; do
         curl --fail --silent --show-error \
@@ -1402,7 +1411,7 @@ else:
 )
 PY
 
-if [[ "$VERIFY_PATH" == "1" ]]; then
+if [[ "$VERIFY_PATH" == "1" || "$PROFILE_ONLY" == "1" ]]; then
     if [[ "$SCENARIO" == "pd" ]]; then
         GRAPH_REPLAY_LOG="$DECODE_LOG"
     else
@@ -1446,7 +1455,9 @@ for trace_directory in trace_directories:
     analyse(str(trace_directory))
 PY
     done
+fi
 
+if [[ "$VERIFY_PATH" == "1" ]]; then
     python3 - \
         "$SCENARIO" \
         "$IO_BACKEND" \
