@@ -1039,7 +1039,7 @@ PY
     if [[ "$DSA_OFFLOAD_ENABLED" == "1" ]]; then
         dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false},\"dsa_offload\":{\"io_backend\":\"$IO_BACKEND\",\"kvio_model_id\":$KVIO_MODEL_ID,\"enable_prefetch_with_hidden_states\":$prefetch_enabled,\"prefetch_top_k\":$PREFETCH_TOP_K,\"enable_cohort_kvgather\":$cohort_kvgather_enabled,\"cohort_kvgather_aiv_limit\":$COHORT_KVGATHER_AIV_LIMIT,\"fuse_kvgather_sfa\":$fuse_kvgather_sfa_enabled}}"
     else
-        dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false}"
+        dsa_config="{\"ascend_compilation_config\":{\"enable_npugraph_ex\":false}}"
     fi
     if [[ "$VERIFY_PATH" == "1" ]] \
         && [[ "$kv_role" != "kv_producer" || "$IO_BACKEND" == "kvio" ]]; then
