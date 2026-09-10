@@ -223,7 +223,7 @@ def prepare_main_slot_mapping(
         tail_slots = (
             row_blocks * batch.layout.block_size
             + batch.layout.tail_slots(addressing.query_positions)
-        )
+        ).to(dtype=main_slot_mapping.dtype)
         if batch.graph_query_start_loc is not None:
             total_queries = addressing.query_positions.shape[0]
             main_slot_mapping[:total_queries] = tail_slots

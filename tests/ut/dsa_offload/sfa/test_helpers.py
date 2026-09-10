@@ -3,6 +3,7 @@
 
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 
 from vllm_ascend.dsa_offload.hot_cache import HotCacheLayout, HotCacheState
@@ -121,9 +122,10 @@ def test_prefetch_target_key_write_updates_mean_cache() -> None:
     assert update_mean.call_args.args[3] is key_mean
 
 
-def test_mixed_batch_keeps_prefill_mapping_and_redirects_decode_tail(spy_io) -> None:
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_mixed_batch_keeps_prefill_mapping_and_redirects_decode_tail(spy_io, dtype) -> None:
     batch, row = make_mixed_batch(spy_io)
-    default = torch.tensor([10, 11, 12], dtype=torch.int64)
+    default = torch.tensor([10, 11, 12], dtype=dtype)
 
     mapped = prepare_main_slot_mapping(
         batch=batch,
@@ -136,18 +138,21 @@ def test_mixed_batch_keeps_prefill_mapping_and_redirects_decode_tail(spy_io) -> 
 
     assert batch.packed_addressing is not None
     assert reused is mapped
+    assert mapped.dtype == dtype
     assert mapped[:2].tolist() == [10, 11]
     assert mapped[2].item() == batch.layout.tail_block(row, 1) * 4 + 1
     assert default.tolist() == [10, 11, 12]
 
 
-def test_mtp_verification_writes_tail_without_touching_prefill(spy_io) -> None:
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_mtp_verification_writes_tail_without_touching_prefill(spy_io, dtype) -> None:
     batch, row = make_mixed_batch(spy_io, is_mtp=True)
     mapped = prepare_main_slot_mapping(
         batch=batch,
-        default_slot_mapping=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
+        default_slot_mapping=torch.tensor([10, 11, 12, 13], dtype=dtype),
     )
 
+    assert mapped.dtype == dtype
     assert mapped.tolist() == [
         10,
         11,
@@ -198,7 +203,8 @@ def test_step_addressing_reuses_only_matching_metadata_group(spy_io) -> None:
     assert compose.call_count == 2
 
 
-def test_graph_mtp_mapping_uses_runtime_request_rows(spy_io) -> None:
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_graph_mtp_mapping_uses_runtime_request_rows(spy_io, dtype) -> None:
     layout = HotCacheLayout(4, 2, 2)
     batch = DSAOffloadBatch(
         layout=layout,
@@ -219,9 +225,10 @@ def test_graph_mtp_mapping_uses_runtime_request_rows(spy_io) -> None:
 
     mapped = prepare_main_slot_mapping(
         batch=batch,
-        default_slot_mapping=torch.full((3,), -1, dtype=torch.int64),
+        default_slot_mapping=torch.full((3,), -1, dtype=dtype),
     )
 
+    assert mapped.dtype == dtype
     assert mapped.tolist() == [
         layout.tail_block(1, 2) * 4,
         layout.tail_block(1, 2) * 4 + 1,
