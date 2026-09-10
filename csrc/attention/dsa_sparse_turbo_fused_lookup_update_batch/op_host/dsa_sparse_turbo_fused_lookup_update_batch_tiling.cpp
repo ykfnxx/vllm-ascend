@@ -306,7 +306,7 @@ static ge::graphStatus DsaSparseTurboFusedLookupUpdateBatchTilingFunc(
         block_size);
     tiling_data->fallbackSlot =
         tiling_data->tailBase + static_cast<int32_t>(block_size);
-    tiling_data->stagingBase = tiling_data->fallbackSlot + 1;
+    tiling_data->blockSize = static_cast<int32_t>(block_size);
 
     const uint64_t workspace_bytes = static_cast<uint64_t>(
         platform.GetLibApiWorkSpaceSize());

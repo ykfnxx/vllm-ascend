@@ -73,6 +73,6 @@ extern "C" __global__ __aicore__ void dsa_sparse_turbo_fused_lookup_update_batch
         tiling_data.replaceableBase,
         tiling_data.tailBase,
         tiling_data.fallbackSlot,
-        tiling_data.stagingBase);
+        tiling_data.blockSize);
 #endif
 }

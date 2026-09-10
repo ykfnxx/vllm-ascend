@@ -198,9 +198,7 @@ class PackedAddressingMetadata:
     cumulative_query_lengths: torch.Tensor
     verify_starts: torch.Tensor
     tail_starts: torch.Tensor
-    expanded_verify_starts: torch.Tensor | None
     expanded_tail_starts: torch.Tensor | None
-    expanded_query_starts: torch.Tensor | None
     gather_destination_block_table: torch.Tensor | None
 
 
@@ -248,6 +246,7 @@ class DSAOffloadBatch:
     committed_block_hashes: Mapping[str, Sequence[bytes]]
     candidate_block_hashes: Mapping[str, Sequence[bytes]]
     query_end_positions: tuple[int, ...] = ()
+    query_position_slack: int = 0
     prefill_state: object | None = None
     sfa_workspace: "SFAAddressingWorkspace | None" = None
     decode_request_indices_tensor: torch.Tensor | None = None
@@ -295,6 +294,7 @@ def build_dsa_offload_batch(
     is_mtp: bool,
     committed_block_hashes: Mapping[str, Sequence[bytes]],
     candidate_block_hashes: Mapping[str, Sequence[bytes]],
+    query_position_slack: int = 0,
     prefill_state: object | None = None,
     sfa_workspace: "SFAAddressingWorkspace | None" = None,
     prefetch_runtime: object | None = None,
@@ -336,6 +336,7 @@ def build_dsa_offload_batch(
         query_end_positions=tuple(
             int(query_positions_cpu[end - 1]) for end in query_ends
         ),
+        query_position_slack=query_position_slack,
         prefill_state=prefill_state,
         sfa_workspace=sfa_workspace,
         decode_request_indices_tensor=torch.tensor(
@@ -508,15 +509,6 @@ def get_packed_addressing_metadata(
         )
         * batch.layout.block_size
     )
-    expanded_query_starts = (
-        torch.repeat_interleave(
-            query_start_loc[:-1],
-            query_lengths,
-            output_size=total_queries,
-        )
-        if batch.is_mtp
-        else None
-    )
     gather_destination_block_table = (
         batch.layout.block_table(query_request_rows)
         if hasattr(batch.io_backend, "gather_history_misses")
@@ -530,39 +522,28 @@ def get_packed_addressing_metadata(
         cumulative_query_lengths=cumulative_query_lengths,
         verify_starts=verify_starts,
         tail_starts=tail_starts,
-        expanded_verify_starts=None,
         expanded_tail_starts=None,
-        expanded_query_starts=expanded_query_starts,
         gather_destination_block_table=gather_destination_block_table,
     )
     batch.packed_addressing = cached
     return cached
 
 
-def get_expanded_lookup_boundaries(
+def get_expanded_tail_starts(
     batch: DSAOffloadBatch,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Materialize fallback-only per-query boundaries at most once."""
 
     addressing = get_packed_addressing_metadata(batch)
-    if addressing.expanded_verify_starts is None:
+    if addressing.expanded_tail_starts is None:
         total_queries = addressing.query_positions.shape[0]
-        addressing.expanded_verify_starts = torch.repeat_interleave(
-            addressing.verify_starts,
-            addressing.query_lengths,
-            output_size=total_queries,
-        )
         addressing.expanded_tail_starts = torch.repeat_interleave(
             addressing.tail_starts,
             addressing.query_lengths,
             output_size=total_queries,
         )
-    assert addressing.expanded_verify_starts is not None
     assert addressing.expanded_tail_starts is not None
-    return (
-        addressing.expanded_verify_starts,
-        addressing.expanded_tail_starts,
-    )
+    return addressing.expanded_tail_starts
 
 
 def get_decode_block_table(
@@ -653,9 +634,7 @@ def make_lookup_plan(
         dense_miss_mask = fused_dense_miss if use_dense_gather else None
         miss_lookup_offsets = mapped
     else:
-        expanded_verify_starts, tail_starts = (
-            get_expanded_lookup_boundaries(batch)
-        )
+        tail_starts = get_expanded_tail_starts(batch)
         current_positions = addressing.query_positions.unsqueeze(1)
         valid_mask = (packed_topk >= 0) & (packed_topk < INDEX_CAPACITY)
         history_mask = valid_mask & (
@@ -664,20 +643,8 @@ def make_lookup_plan(
         tail_mask = (
             valid_mask
             & (packed_topk >= tail_starts.unsqueeze(1))
-            & (packed_topk < expanded_verify_starts.unsqueeze(1))
-        )
-        staging_mask = (
-            valid_mask
-            & batch.is_mtp
-            & (packed_topk >= expanded_verify_starts.unsqueeze(1))
             & (packed_topk <= current_positions)
         )
-        if not batch.is_mtp:
-            tail_mask = (
-                valid_mask
-                & (packed_topk >= tail_starts.unsqueeze(1))
-                & (packed_topk <= current_positions)
-            )
 
         lookup_mask = history_mask.to(torch.int32).contiguous()
         if batch.is_mtp:
@@ -711,23 +678,12 @@ def make_lookup_plan(
             ),
             lookup_offsets,
         )
-        tail_offsets = (
-            batch.layout.tail_base
-            + packed_topk
-            - tail_starts.unsqueeze(1)
-        )
-        staging_offsets = (
-            batch.layout.staging_base
-            + packed_topk
-            - expanded_verify_starts.unsqueeze(1)
+        tail_offsets = batch.layout.tail_slots(packed_topk)
+        mapped = torch.where(
+            tail_mask, tail_offsets, lookup_offsets,
         )
         mapped = torch.where(
-            staging_mask,
-            staging_offsets,
-            torch.where(tail_mask, tail_offsets, lookup_offsets),
-        )
-        mapped = torch.where(
-            valid_mask,
+            history_mask | tail_mask,
             mapped,
             torch.full_like(mapped, INVALID_INDEX),
         )
@@ -859,7 +815,7 @@ def make_prefetch_lookup_plan(
         # indexes miss rows.
         dense_miss_mask = fused_dense_miss if use_dense_gather else None
     else:
-        _, tail_starts = get_expanded_lookup_boundaries(batch)
+        tail_starts = get_expanded_tail_starts(batch)
         valid_mask = (query_indices >= 0) & (query_indices < INDEX_CAPACITY)
         lookup_mask = (
             valid_mask & (query_indices < tail_starts.unsqueeze(1))

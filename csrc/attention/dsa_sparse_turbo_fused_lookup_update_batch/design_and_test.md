@@ -67,7 +67,7 @@ mapped_indices, miss_mask = torch.ops._C_ascend.dsa_sparse_turbo_fused_lookup_up
 - `query_positions`、`verify_starts` 和 `tail_starts` 直接复用框架每个
   Decode 步在主流生成的 `PackedAddressingMetadata`。算子不再重复执行
   `floor(verify_start / block_size) * block_size`。
-- layout 常量（`tail_base`/`staging_base`/`fallback_slot`/`replaceable_base`）
+- layout 常量（`tail_base`/`fallback_slot`/`replaceable_base`）
   由 host tiling 按内建常量推导，attr 只传 `block_size`：
 
 ```
@@ -76,10 +76,10 @@ replaceable_blocks = ceil(REPLACEABLE_SLOTS / block_size)   # 2048
 replaceable_base  = resident_blocks * block_size
 tail_base         = (resident_blocks + replaceable_blocks) * block_size
 fallback_slot     = tail_base + block_size
-staging_base      = fallback_slot + 1
+tail_slot(token)  = tail_base + (token // block_size % 2) * (2 * block_size) + token % block_size
 ```
 
-（block_size=128 时分别为 8192/10240/10368/10369，与框架
+（block_size=128 时 replaceable/tail/fallback 起点分别为 8192/10240/10368，第二块 tail 起点为 10496，与框架
 `HotCacheLayout` 逐项一致。）
 
 ### 2.2 核内分类语义（与框架 where 链逐位对齐）
@@ -91,9 +91,7 @@ staging_base      = fallback_slot + 1
 ```
 token < 0 或 token >= index_capacity          → mapped = INVALID(-1),      miss = 0
 token < tail_start                            → history（lookup 路径）
-tail_start <= token < verify_start            → tail:    mapped = tail_base + token - tail_start
-verify_start <= token <= current_position     → staging(MTP):   staging_base + token - verify_start
-                                                tail(non-MTP):  tail_base + token - tail_start
+tail_start <= token <= current_position       → tail: mapped = tail_slot(token)
 token > current_position                      → mapped = INVALID(-1),      miss = 0
 ```
 
@@ -125,9 +123,8 @@ flush（累计分配逼近 FREE_SLOT_COUNT 时提前 maintain）、溢出撤销
 ## 3. 正确性论证
 
 - **分类对拍**：核内分类与框架
-  `valid_mask / history_mask / tail_mask / staging_mask → mapped` 的 where 链
-  逐位一致（见 §2.2 表）；`is_mtp=0` 时 staging 段合并进 tail（框架
-  `tail_mask = valid & tail_start <= token <= current_position`）。
+  `history_mask / tail_mask → mapped` 的 where 链逐位一致（见 §2.2 表）。
+  MTP 与非 MTP 使用相同的奇偶块寻址；拒绝后缀由因果边界隔离，下一轮原地覆盖。
 - **hit/miss/fallback 输出**：与框架 `slot_out/miss_out → lookup_offsets
   → fallback → where 链` 的映射一致（Q=1 时输出+后状态与 turbo 位精确
   可继承；Q≥2 与 batch 不变量等价）。

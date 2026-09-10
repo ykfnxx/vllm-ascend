@@ -44,7 +44,7 @@ def test_rank_local_mmap_transfers_scheduler_kv_and_partial_tail(tmp_path: Path)
     source_kv = torch.arange(24, dtype=torch.float32).reshape(4, 2, 3)
     source_main = torch.arange(100, 124, dtype=torch.float32).reshape(4, 2, 3)
     destination_kv = torch.zeros_like(source_kv)
-    layout = HotCacheLayout(2, 1, 0)
+    layout = HotCacheLayout(2, 1, 1)
     destination_hot = torch.zeros((layout.hot_blocks, 2, 3), dtype=torch.float32)
 
     handoff = DSAOffloadPDHandoff(
@@ -91,7 +91,7 @@ def test_rank_local_mmap_transfers_scheduler_kv_and_partial_tail(tmp_path: Path)
 
     torch.testing.assert_close(destination_kv[1], source_kv[2])
     torch.testing.assert_close(destination_kv[3], source_kv[0])
-    tail_block = layout.tail_block_offset
+    tail_block = layout.tail_block(0, 1)
     torch.testing.assert_close(destination_hot[tail_block, 0], source_main[1, 0])
     assert not list(tmp_path.iterdir())
 

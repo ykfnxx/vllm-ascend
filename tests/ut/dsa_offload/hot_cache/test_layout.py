@@ -26,14 +26,13 @@ def test_d_only_and_mixed_layout() -> None:
 
     assert d_only.resident_blocks == 64
     assert d_only.replaceable_blocks == 16
-    assert d_only.transient_blocks == 1
-    assert d_only.hot_blocks_per_row == 82
+    assert d_only.hot_blocks_per_row == 83
     assert d_only.tail_base == 10240
     assert d_only.fallback_slot == 10368
-    assert d_only.staging_base == 10369
-    assert d_only.row_stride == 10496
+    assert d_only.tail_slots(torch.tensor([127, 128, 255, 256])).tolist() == [10367, 10496, 10623, 10240]
+    assert d_only.row_stride == 10624
     assert mixed.row_block_base(0) == 100
-    assert mixed.row_block_base(1) == 182
+    assert mixed.row_block_base(1) == 183
     assert mixed.block_table(torch.tensor([0, 1], dtype=torch.int32))[0, :3].tolist() == [100, 101, 102]
 
 

@@ -285,16 +285,14 @@ __simt_callee__ inline void MaintainRequest(
 //
 //   token < 0 || token >= index_capacity      -> mapped = -1,        miss = 0
 //   token < tail_start                        -> history (lookup path)
-//   tail_start <= token < verify_start        -> tail    (tail_base + token - tail_start)
-//   verify_start <= token <= current_position -> staging (MTP: staging_base + token - verify_start)
-//                                                tail    (non-MTP: tail_base + token - tail_start)
+//   tail_start <= token <= current_position  -> even/odd tail block
 //   token > current_position                  -> mapped = -1,        miss = 0
 //
 // The final mapped_indices/miss_mask pair is exactly the framework's
 // `mapped` / `dense_miss_mask` (see make_lookup_plan in lookup.py):
 // history hit -> lookup_offsets(slot); history miss allocated ->
 // lookup_offsets(slot) with miss_mask=1; history miss budget-capped or
-// reverted -> fallback_slot with miss_mask=0; tail/staging/invalid -> their
+// reverted -> fallback_slot with miss_mask=0; tail/invalid -> their
 // direct offsets with miss_mask=0.
 //
 // The maintain semantics (request-level, flush, overflow fallback) are
@@ -318,7 +316,7 @@ __simt_callee__ inline void ProcessQuery(
     int32_t replaceable_base,
     int32_t tail_base,
     int32_t fallback_slot,
-    int32_t staging_base)
+    int32_t block_size)
 {
     const uint32_t tid = static_cast<uint32_t>(threadIdx.x);
     constexpr uint32_t query_chunk =
@@ -329,7 +327,6 @@ __simt_callee__ inline void ProcessQuery(
         DSA_SPARSE_TURBO_FUSED_QUERY_WIDTH;
     const uint32_t query_begin = tid * query_chunk;
 
-    const int32_t verify_start = scalars[kVerifyStartScalar];
     const int32_t tail_start = scalars[kTailStartScalar];
     const int32_t current_position = query_positions[query_id];
 
@@ -355,16 +352,11 @@ __simt_callee__ inline void ProcessQuery(
         } else if (token < tail_start) {
             query_is_history[local_entry] = 1;
             local_mapped[local_entry] = kInvalidIndex;
-        } else if (token < verify_start) {
-            query_is_history[local_entry] = 0;
-            local_mapped[local_entry] =
-                tail_base + token - tail_start;
         } else if (token <= current_position) {
             query_is_history[local_entry] = 0;
             local_mapped[local_entry] =
-                is_mtp != 0
-                    ? staging_base + token - verify_start
-                    : tail_base + token - tail_start;
+                tail_base + ((token / block_size) % 2) * (2 * block_size)
+                + token % block_size;
         } else {
             query_is_history[local_entry] = 0;
             local_mapped[local_entry] = kInvalidIndex;
@@ -567,7 +559,7 @@ __simt_callee__ inline void ProcessRequest(
     int32_t replaceable_base,
     int32_t tail_base,
     int32_t fallback_slot,
-    int32_t staging_base)
+    int32_t block_size)
 {
     const uint32_t tid = static_cast<uint32_t>(threadIdx.x);
     const uint32_t thread_count = static_cast<uint32_t>(blockDim.x);
@@ -681,7 +673,7 @@ __simt_callee__ inline void ProcessRequest(
             replaceable_base,
             tail_base,
             fallback_slot,
-            staging_base);
+            block_size);
         asc_syncthreads();
     }
 
@@ -727,7 +719,7 @@ DsaSparseTurboFusedLookupUpdateBatchSimt(
     int32_t replaceable_base,
     int32_t tail_base,
     int32_t fallback_slot,
-    int32_t staging_base)
+    int32_t block_size)
 {
     const uint32_t request_stride = static_cast<uint32_t>(gridDim.x);
     for (uint32_t req_id = static_cast<uint32_t>(blockIdx.x);
@@ -756,7 +748,7 @@ DsaSparseTurboFusedLookupUpdateBatchSimt(
             replaceable_base,
             tail_base,
             fallback_slot,
-            staging_base);
+            block_size);
     }
 }
 

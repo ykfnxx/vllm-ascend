@@ -17,7 +17,7 @@ struct DsaSparseTurboFusedLookupUpdateBatchTilingData {
     int32_t replaceableBase;
     int32_t tailBase;
     int32_t fallbackSlot;
-    int32_t stagingBase;
+    int32_t blockSize;
 };
 
 struct DsaSparseTurboFusedLookupUpdateBatchCompileInfo {};

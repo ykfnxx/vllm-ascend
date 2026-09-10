@@ -137,11 +137,11 @@ def test_mixed_batch_keeps_prefill_mapping_and_redirects_decode_tail(spy_io) -> 
     assert batch.packed_addressing is not None
     assert reused is mapped
     assert mapped[:2].tolist() == [10, 11]
-    assert mapped[2].item() == batch.layout.global_slot(row, batch.layout.tail_base + 1)
+    assert mapped[2].item() == batch.layout.tail_block(row, 1) * 4 + 1
     assert default.tolist() == [10, 11, 12]
 
 
-def test_mtp_verification_writes_staging_without_touching_prefill(spy_io) -> None:
+def test_mtp_verification_writes_tail_without_touching_prefill(spy_io) -> None:
     batch, row = make_mixed_batch(spy_io, is_mtp=True)
     mapped = prepare_main_slot_mapping(
         batch=batch,
@@ -151,8 +151,8 @@ def test_mtp_verification_writes_staging_without_touching_prefill(spy_io) -> Non
     assert mapped.tolist() == [
         10,
         11,
-        batch.layout.global_slot(row, batch.layout.staging_base),
-        batch.layout.global_slot(row, batch.layout.staging_base + 1),
+        batch.layout.tail_block(row, 1) * 4 + 1,
+        batch.layout.tail_block(row, 1) * 4 + 2,
     ]
 
 
@@ -223,9 +223,9 @@ def test_graph_mtp_mapping_uses_runtime_request_rows(spy_io) -> None:
     )
 
     assert mapped.tolist() == [
-        layout.global_slot(1, layout.staging_base),
-        layout.global_slot(1, layout.staging_base + 1),
-        layout.global_slot(0, layout.staging_base),
+        layout.tail_block(1, 2) * 4,
+        layout.tail_block(1, 2) * 4 + 1,
+        layout.tail_block(0, 3) * 4,
     ]
 
 
@@ -396,10 +396,10 @@ def test_fixed_hot_addressing_does_not_depend_on_model_block_table_width() -> No
         batch=batch,
     )
 
-    assert effective_table.shape == (2, 82)
+    assert effective_table.shape == (2, layout.hot_blocks_per_row)
     assert effective_table[0, :32].tolist() == ordinary_table[0].tolist()
     assert torch.count_nonzero(effective_table[0, 32:]) == 0
     assert torch.equal(effective_table[1], hot_cache.hot_block_table[row])
-    assert effective_seq_lens.tolist() == [128, 10496]
+    assert effective_seq_lens.tolist() == [128, layout.row_stride]
     assert ordinary_table.shape == (2, 32)
     assert ordinary_seq_lens.tolist() == [128, 4096]

@@ -12,7 +12,7 @@ from vllm_ascend.dsa_offload.lookup import (
     IndexCacheCohort,
     LookupPlan,
     get_decode_block_table,
-    get_expanded_lookup_boundaries,
+    get_expanded_tail_starts,
     get_packed_addressing_metadata,
     load_plan_misses,
     load_prefetch_misses,
@@ -46,8 +46,8 @@ def test_packed_addressing_metadata_is_shared_within_decode_step(
 
     first = get_packed_addressing_metadata(batch)
     second = get_packed_addressing_metadata(batch)
-    expanded_verify, expanded_tail = get_expanded_lookup_boundaries(batch)
-    reused_verify, reused_tail = get_expanded_lookup_boundaries(batch)
+    expanded_tail = get_expanded_tail_starts(batch)
+    reused_tail = get_expanded_tail_starts(batch)
 
     assert second is first
     assert first.query_lengths.tolist() == [2, 1]
@@ -56,12 +56,8 @@ def test_packed_addressing_metadata_is_shared_within_decode_step(
     assert first.cumulative_query_lengths.tolist() == [2, 3]
     assert first.verify_starts.tolist() == [7, 12]
     assert first.tail_starts.tolist() == [4, 12]
-    assert expanded_verify.tolist() == [7, 7, 12]
     assert expanded_tail.tolist() == [4, 4, 12]
-    assert reused_verify is expanded_verify
     assert reused_tail is expanded_tail
-    assert first.expanded_query_starts is not None
-    assert first.expanded_query_starts.tolist() == [0, 0, 2]
 
 
 def test_new_decode_batch_recomputes_growing_sequence_metadata(spy_io) -> None:
@@ -91,6 +87,33 @@ def test_new_decode_batch_recomputes_growing_sequence_metadata(spy_io) -> None:
     assert previous.tail_starts.tolist() == [4]
     assert current.verify_starts.tolist() == [8]
     assert current.tail_starts.tolist() == [8]
+
+
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_mtp_tail_mapping_crosses_blocks_and_masks_future_tokens(spy_io, graph_mode) -> None:
+    layout = HotCacheLayout(4, 1, 3)
+    cohort = IndexCacheCohort("layer", "layer", ("layer",), (0,))
+    batch = DSAOffloadBatch(
+        layout=layout, hot_cache=None, io_backend=spy_io,
+        cohorts=(cohort,), lookup_states={"layer": None},
+        request_ids=("request",), request_rows=torch.tensor([0], dtype=torch.int32),
+        decode_request_indices=(0,), query_ranges=((0, 3),),
+        query_positions=torch.tensor([7, 8, 9]), is_mtp=True,
+        committed_block_hashes={"request": []}, candidate_block_hashes={},
+        graph_query_start_loc=torch.tensor([0, 3], dtype=torch.int32) if graph_mode else None,
+    )
+    topk = torch.tensor([[6, 7, 8, 9, -1]] * 3, dtype=torch.int32)
+    with patch(
+        "vllm_ascend.dsa_offload.lookup.lookup_update_batch",
+        return_value=(torch.zeros_like(topk), torch.zeros_like(topk)),
+    ):
+        plan = make_lookup_plan(semantic_topk=topk, cohort=cohort, batch=batch)
+    tail = layout.tail_base
+    assert plan.mapped_indices.tolist() == [
+        [tail + 10, tail + 11, -1, -1, -1],
+        [tail + 10, tail + 11, tail, -1, -1],
+        [tail + 10, tail + 11, tail, tail + 1, -1],
+    ]
 
 
 def test_decode_block_table_reuse_is_isolated_by_metadata_source(
@@ -388,7 +411,6 @@ def test_mtp_fused_lookup_consumes_shared_compact_metadata(spy_io) -> None:
 
     addressing = batch.packed_addressing
     assert addressing is not None
-    assert addressing.expanded_verify_starts is None
     assert addressing.expanded_tail_starts is None
     assert batch.packed_decode is not None
     assert fused.call_args.args[0] is state
@@ -644,7 +666,6 @@ def test_mtp_fused_prefetch_consumes_only_shared_tail_anchor(spy_io) -> None:
 
     addressing = batch.packed_addressing
     assert addressing is not None
-    assert addressing.expanded_verify_starts is None
     assert addressing.expanded_tail_starts is None
     assert batch.packed_decode is not None
     assert fused.call_args.args[0] is state

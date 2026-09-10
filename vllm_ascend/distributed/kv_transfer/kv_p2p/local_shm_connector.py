@@ -528,8 +528,8 @@ class LocalShmConnectorWorker:
 
         if self._dsa_offload_layout is None:
             raise RuntimeError("LocalShmConnector has no DSA Offload Hot Cache layout")
-        destination_block = (
-            self._dsa_offload_layout.row_block_base(request_row) + self._dsa_offload_layout.tail_block_offset
+        destination_block = self._dsa_offload_layout.tail_block(
+            request_row, handoff.stored_token_count // handoff.block_size
         )
         plane = self._dsa_offload_aux_caches[layer_name][plane_index]
         if destination_block < 0 or destination_block >= plane.shape[0]:

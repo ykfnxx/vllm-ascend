@@ -32,6 +32,10 @@ class HotCacheLayout:
     max_verify_tokens_per_request: int
     hot_block_base: int = 0
 
+    def __post_init__(self) -> None:
+        if not 1 <= self.max_verify_tokens_per_request <= self.block_size:
+            raise ValueError("DSA Offload verification must fit within one block.")
+
     @property
     def resident_blocks(self) -> int:
         return _cdiv(RESIDENT_SLOTS, self.block_size)
@@ -41,12 +45,8 @@ class HotCacheLayout:
         return _cdiv(REPLACEABLE_SLOTS, self.block_size)
 
     @property
-    def transient_blocks(self) -> int:
-        return _cdiv(1 + self.max_verify_tokens_per_request, self.block_size)
-
-    @property
     def hot_blocks_per_row(self) -> int:
-        return self.resident_blocks + self.replaceable_blocks + 1 + self.transient_blocks
+        return self.resident_blocks + self.replaceable_blocks + 3
 
     @property
     def hot_blocks(self) -> int:
@@ -64,9 +64,17 @@ class HotCacheLayout:
     def fallback_slot(self) -> int:
         return self.tail_base + self.block_size
 
-    @property
-    def staging_base(self) -> int:
-        return self.fallback_slot + 1
+    def tail_slots(self, positions: torch.Tensor) -> torch.Tensor:
+        # Even/odd logical blocks occupy the blocks on either side of fallback.
+        return (
+            self.tail_base
+            + torch.div(positions, self.block_size, rounding_mode="floor").remainder(2)
+            * (2 * self.block_size)
+            + positions.remainder(self.block_size)
+        )
+
+    def tail_block(self, row_id: int, logical_block: int) -> int:
+        return self.row_block_base(row_id) + self.tail_block_offset + 2 * (logical_block % 2)
 
     @property
     def row_stride(self) -> int:
@@ -215,8 +223,8 @@ def _put_tail_block(
     block_hash_resolver: Callable[..., bytes] | None = None,
 ) -> None:
     hot_cache = batch.hot_cache
-    row_id = int(batch.request_rows[request_index].item())
-    source_block_id = hot_cache.layout.row_block_base(row_id) + hot_cache.layout.tail_block_offset
+    row_id = hot_cache.request_to_row[batch.request_ids[request_index]]
+    source_block_id = hot_cache.layout.tail_block(row_id, logical_block)
     block_hashes = batch.block_hashes(request_index)
     request_id = batch.request_ids[request_index]
     if block_hash_resolver is None:
@@ -250,14 +258,42 @@ def _put_tail_block(
             )
 
 
+def tail_commit_request_indices(batch: "DSAOffloadBatch") -> tuple[int, ...]:
+    if batch.hot_cache is None:
+        return ()
+    if not batch.query_end_positions:
+        return batch.decode_request_indices
+    block_size = batch.layout.block_size
+    candidates = []
+    for index in batch.decode_request_indices:
+        begin, end = batch.query_ranges[index]
+        last = batch.query_end_positions[index]
+        # Async scheduling can overestimate positions by the previous draft span.
+        first = max(0, last - (end - begin) + 1 - batch.query_position_slack)
+        if end > begin and first // block_size != (last + 1) // block_size:
+            candidates.append(index)
+    return tuple(candidates)
+
+
 def commit_decode_tail(
     batch: "DSAOffloadBatch | None",
     block_hash_resolver: Callable[..., bytes] | None = None,
 ) -> None:
     if batch is None or batch.hot_cache is None or batch.is_mtp:
         return
-    for request_index in batch.decode_request_indices:
-        position = batch.query_end_positions[request_index]
+    candidates = tail_commit_request_indices(batch)
+    if not candidates:
+        return
+    if batch.query_end_positions and not batch.query_position_slack:
+        positions = [batch.query_end_positions[index] for index in candidates]
+    else:
+        indices = torch.tensor(
+            [batch.query_ranges[index][1] - 1 for index in candidates],
+            dtype=torch.int64,
+            device=batch.query_positions.device,
+        )
+        positions = batch.query_positions.index_select(0, indices).to("cpu").tolist()
+    for request_index, position in zip(candidates, positions):
         if (position + 1) % batch.layout.block_size == 0:
             _put_tail_block(
                 batch=batch,
@@ -269,47 +305,36 @@ def commit_decode_tail(
 
 def commit_mtp_tail(
     batch: "DSAOffloadBatch | None",
-    accepted_token_counts: Sequence[int],
+    accepted_token_counts: Sequence[int] | torch.Tensor,
     block_hash_resolver: Callable[..., bytes] | None = None,
 ) -> None:
     if batch is None or batch.hot_cache is None or not batch.is_mtp:
         return
-    for request_index in batch.decode_request_indices:
-        accepted = accepted_token_counts[request_index]
-        if accepted == 0:
-            continue
-        begin, _ = batch.query_ranges[request_index]
-        row_id = int(batch.request_rows[request_index].item())
-        row_slot_base = batch.layout.global_slot(row_id, 0)
-        copied = 0
-        while copied < accepted:
-            position = int(batch.query_positions[begin + copied].item())
-            tail_offset = position % batch.layout.block_size
-            copy_count = min(
-                accepted - copied,
-                batch.layout.block_size - tail_offset,
+    candidates = tail_commit_request_indices(batch)
+    if not candidates:
+        return
+    device = batch.query_positions.device
+    request_indices = torch.tensor(candidates, dtype=torch.int64, device=device)
+    query_indices = torch.tensor(
+        [batch.query_ranges[index][0] for index in candidates],
+        dtype=torch.int64,
+        device=device,
+    )
+    accepted = torch.as_tensor(accepted_token_counts, dtype=torch.int64, device=device)
+    boundaries = torch.stack((
+        batch.query_positions.index_select(0, query_indices).to(torch.int64),
+        accepted.index_select(0, request_indices),
+    ), dim=1).to("cpu").tolist()
+    for request_index, (first, count) in zip(candidates, boundaries):
+        begin, end = batch.query_ranges[request_index]
+        count = min(count, end - begin)
+        for logical_block in range(
+            first // batch.layout.block_size,
+            (first + count) // batch.layout.block_size,
+        ):
+            _put_tail_block(
+                batch=batch,
+                request_index=request_index,
+                logical_block=logical_block,
+                block_hash_resolver=block_hash_resolver,
             )
-            for cache_planes in batch.hot_cache.layer_caches.values():
-                for plane in cache_planes:
-                    slots = plane.flatten(0, 1)
-                    slots[
-                        row_slot_base + batch.layout.tail_base + tail_offset : row_slot_base
-                        + batch.layout.tail_base
-                        + tail_offset
-                        + copy_count
-                    ].copy_(
-                        slots[
-                            row_slot_base + batch.layout.staging_base + copied : row_slot_base
-                            + batch.layout.staging_base
-                            + copied
-                            + copy_count
-                        ]
-                    )
-            copied += copy_count
-            if tail_offset + copy_count == batch.layout.block_size:
-                _put_tail_block(
-                    batch=batch,
-                    request_index=request_index,
-                    logical_block=position // batch.layout.block_size,
-                    block_hash_resolver=block_hash_resolver,
-                )

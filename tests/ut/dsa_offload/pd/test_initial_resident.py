@@ -111,7 +111,7 @@ def test_local_admission_loads_full_history_and_copies_partial_tail(
         io_backend=spy_io,
     )
 
-    tail_block = layout.row_block_base(row_id) + layout.tail_block_offset
+    tail_block = layout.tail_block(row_id, 1)
     assert plane[tail_block, 0].item() == 37
     assert spy_io.get_calls[0]["destination_slots"].tolist() == [
         layout.global_slot(row_id, offset) for offset in range(4)

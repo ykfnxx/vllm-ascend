@@ -200,7 +200,7 @@ def prepare_main_slot_mapping(
         batch.prefetch_runtime is not None
         and not prefetch_uses_fused_lookup
     ):
-        _lookup.get_expanded_lookup_boundaries(batch)
+        _lookup.get_expanded_tail_starts(batch)
     prepared = batch.prepared_step_addressing
     if prepared is None:
         prepared = _lookup.PreparedStepAddressing()
@@ -216,53 +216,20 @@ def prepare_main_slot_mapping(
     )
     if main_slot_mapping is None:
         main_slot_mapping = default_slot_mapping.clone()
+        row_blocks = (
+            batch.layout.hot_block_base
+            + addressing.query_request_rows_long * batch.layout.hot_blocks_per_row
+        )
+        tail_slots = (
+            row_blocks * batch.layout.block_size
+            + batch.layout.tail_slots(addressing.query_positions)
+        )
         if batch.graph_query_start_loc is not None:
             total_queries = addressing.query_positions.shape[0]
-            query_rows = addressing.query_request_rows_long
-            if batch.is_mtp:
-                expanded_query_starts = addressing.expanded_query_starts
-                assert expanded_query_starts is not None
-                row_offsets = (
-                    batch.layout.staging_base
-                    + torch.arange(
-                        total_queries,
-                        dtype=torch.int32,
-                        device=main_slot_mapping.device,
-                    )
-                    - expanded_query_starts
-                )
-            else:
-                row_offsets = batch.layout.tail_base + torch.remainder(
-                    addressing.query_positions,
-                    batch.layout.block_size,
-                )
-            row_blocks = (
-                batch.layout.hot_block_base
-                + query_rows * batch.layout.hot_blocks_per_row
-            )
-            main_slot_mapping[:total_queries] = (
-                row_blocks * batch.layout.block_size + row_offsets
-            )
+            main_slot_mapping[:total_queries] = tail_slots
         else:
-            for request_index in batch.decode_request_indices:
-                begin, end = batch.query_ranges[request_index]
-                row_id = int(batch.request_rows[request_index].item())
-                if batch.is_mtp:
-                    row_offsets = batch.layout.staging_base + torch.arange(
-                        end - begin,
-                        dtype=torch.int64,
-                        device=main_slot_mapping.device,
-                    )
-                else:
-                    row_offsets = batch.layout.tail_base + torch.remainder(
-                        batch.query_positions[begin:end],
-                        batch.layout.block_size,
-                    )
-                main_slot_mapping[begin:end] = (
-                    batch.layout.row_block_base(row_id)
-                    * batch.layout.block_size
-                    + row_offsets
-                )
+            assert batch.packed_decode is not None
+            main_slot_mapping[batch.packed_decode.token_indices] = tail_slots
         prepared.main_slot_mappings[slot_mapping_key] = (
             default_slot_mapping,
             main_slot_mapping,

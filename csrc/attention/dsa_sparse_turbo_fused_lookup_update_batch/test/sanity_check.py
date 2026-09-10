@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Sanity check: turbo_fused (main) vs turbo + framework formula rebuild.
 
-The fused op folds lookup_mask generation, history/tail/staging
+The fused op folds lookup_mask generation, history/tail
 classification and the address mapping into the kernel and outputs
 mapped_indices + miss_mask.  This script rebuilds the framework's mapped /
 dense_miss_mask from the turbo baseline outputs (slot_out/miss_out) plus the
@@ -35,16 +35,15 @@ REPLACEABLE_BLOCKS = (REPLACEABLE_SLOTS + BLOCK_SIZE - 1) // BLOCK_SIZE
 REPLACEABLE_BASE = RESIDENT_BLOCKS * BLOCK_SIZE
 TAIL_BASE = (RESIDENT_BLOCKS + REPLACEABLE_BLOCKS) * BLOCK_SIZE
 FALLBACK_SLOT = TAIL_BASE + BLOCK_SIZE
-STAGING_BASE = FALLBACK_SLOT + 1
 INVALID_INDEX = -1
 
 
 def build_state(req_num, index_capacity, hit_rate, queries_per_request, seed,
-                mtp=True, staging_hits=8, tail_hits=16):
+                mtp=True, verify_hits=8, tail_hits=16):
     """Fresh state: resident tokens at the tail window of the KV sequence.
 
     Resident window = the last RESIDENT_SLOTS tokens of [0, index_capacity).
-    Each query additionally carries explicit tail (block tail) and staging
+    Each query additionally carries explicit tail (block tail) and current
     (MTP verify window) tokens so the classification boundaries are
     exercised, not just the history region.
     """
@@ -64,13 +63,13 @@ def build_state(req_num, index_capacity, hit_rate, queries_per_request, seed,
 
     total_queries = req_num * queries_per_request
     # Anchor the request's verify start inside the resident window so that
-    # tail/staging tokens are resident tokens already present in the index
+    # tail/current tokens are resident tokens already present in the index
     # table (framework semantics: they are classified, never looked up).
-    verify_start = resident_start + RESIDENT_SLOTS // 2
+    verify_start = resident_start + RESIDENT_SLOTS // 2 + (seed % 2) * BLOCK_SIZE + BLOCK_SIZE - 2
     tail_start = (verify_start // BLOCK_SIZE) * BLOCK_SIZE
     query = torch.full((total_queries, QUERY_WIDTH), NOT_FOUND, dtype=torch.int32)
     hit_n = max(1, int(QUERY_WIDTH * hit_rate))
-    special_n = tail_hits + (staging_hits if mtp else 0)
+    special_n = tail_hits + (verify_hits if mtp else 0)
     miss_n = QUERY_WIDTH - hit_n - special_n
     assert miss_n > 0
     miss_pool = torch.arange(0, resident_start, dtype=torch.int32)
@@ -85,16 +84,16 @@ def build_state(req_num, index_capacity, hit_rate, queries_per_request, seed,
         tail_tokens = torch.arange(tail_start, tail_start + tail_hits, dtype=torch.int32)
         row[perm[hit_n + miss_n : hit_n + miss_n + tail_hits]] = tail_tokens
         if mtp:
-            staging_tokens = torch.arange(
-                verify_start, verify_start + staging_hits, dtype=torch.int32)
-            row[perm[hit_n + miss_n + tail_hits :]] = staging_tokens
+            verify_tokens = torch.arange(
+                verify_start, verify_start + verify_hits, dtype=torch.int32)
+            row[perm[hit_n + miss_n + tail_hits :]] = verify_tokens
     query = query.to(dev)
     req_pool = torch.arange(req_num, dtype=torch.int32, device=dev)
     qsl = torch.arange(req_num + 1, dtype=torch.int32, device=dev) * queries_per_request
     verify_starts = torch.full((req_num,), verify_start, dtype=torch.int32, device=dev)
     tail_starts = torch.full((req_num,), tail_start, dtype=torch.int32, device=dev)
     query_positions = (
-        torch.arange(total_queries, dtype=torch.int32, device=dev) + verify_start
+        torch.arange(total_queries, dtype=torch.int32, device=dev) % queries_per_request + verify_start
     )
     return (query, query_positions, verify_starts, tail_starts, index, sti,
             free_slots, free_head, req_pool, qsl)
@@ -120,7 +119,7 @@ def rebuild_main_mapped(topk, slot_out, miss_out, query_positions,
                         verify_starts, qsl, index_capacity, is_mtp):
     """Framework make_lookup_plan rebuild on top of turbo slot_out/miss_out.
 
-    Mirrors lookup.py exactly: valid/history/tail/staging masks -> mapped
+    Mirrors lookup.py exactly: valid/history/tail masks -> mapped
     via the where chain, dense_miss_mask = miss & history & ~fallback.
     """
     topk64 = topk.to(torch.int64)
@@ -134,16 +133,7 @@ def rebuild_main_mapped(topk, slot_out, miss_out, query_positions,
 
     valid = (topk64 >= 0) & (topk64 < index_capacity)
     history = valid & (topk64 < tail_starts.unsqueeze(1))
-    tail = (
-        valid & (topk64 >= tail_starts.unsqueeze(1)) & (topk64 < verify.unsqueeze(1))
-    )
-    staging = (
-        valid & is_mtp & (topk64 >= verify.unsqueeze(1)) & (topk64 <= current_positions)
-    )
-    if not is_mtp:
-        tail = (
-            valid & (topk64 >= tail_starts.unsqueeze(1)) & (topk64 <= current_positions)
-        )
+    tail = valid & (topk64 >= tail_starts.unsqueeze(1)) & (topk64 <= current_positions)
     lookup_mask = history.to(torch.int64)
 
     # framework: lookup_offsets = layout.lookup_offsets(slot_out)
@@ -152,11 +142,9 @@ def rebuild_main_mapped(topk, slot_out, miss_out, query_positions,
     fallback_mask = valid & (slot64 == FALLBACK_SENTINEL)
     lookup_offsets = torch.where(
         fallback_mask, torch.full_like(lookup_offsets, FALLBACK_SLOT), lookup_offsets)
-    tail_offsets = TAIL_BASE + topk64 - tail_starts.unsqueeze(1)
-    staging_offsets = STAGING_BASE + topk64 - verify.unsqueeze(1)
-    mapped = torch.where(
-        staging, staging_offsets, torch.where(tail, tail_offsets, lookup_offsets))
-    mapped = torch.where(valid, mapped, torch.full_like(mapped, INVALID_INDEX))
+    tail_offsets = TAIL_BASE + (topk64 // BLOCK_SIZE % 2) * (2 * BLOCK_SIZE) + topk64 % BLOCK_SIZE
+    mapped = torch.where(tail, tail_offsets, lookup_offsets)
+    mapped = torch.where(history | tail, mapped, torch.full_like(mapped, INVALID_INDEX))
     dense_miss_mask = (
         miss64.bool() & lookup_mask.bool() & ~fallback_mask
     ).to(torch.int64)
@@ -189,7 +177,7 @@ def run_case(index_capacity, hit, qpr, seed, is_mtp, req_num=2):
         req_num, index_capacity, hit, qpr, seed, mtp=is_mtp)
     # ---- fused (full classification) vs turbo + framework rebuild ----
     # The turbo baseline receives the framework-generated history lookup_mask
-    # (valid && token < tail_start) exactly as in production; tail/staging
+    # (valid && token < tail_start) exactly as in production; tail/current
     # tokens never enter the turbo state.
     tail_start_q = ((vstarts[0].item() // BLOCK_SIZE) * BLOCK_SIZE)
     mask = (

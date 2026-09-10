@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
+import pytest
+
 from vllm_ascend.dsa_offload.constants import QUERY_WIDTH
 from vllm_ascend.dsa_offload.pd import (
     DSAOffloadPDHandoff,
@@ -18,7 +20,8 @@ def make_handoff(stored_tokens: int) -> DSAOffloadPDHandoff:
     )
 
 
-def test_partial_tail_uses_remote_source_local_hot_tail_and_valid_bytes() -> None:
+@pytest.mark.parametrize("stored_tokens, tail_offset", [(6, 10), (10, 8)])
+def test_partial_tail_uses_remote_source_local_hot_tail_and_valid_bytes(stored_tokens, tail_offset) -> None:
     local = {
         "layer": [
             {
@@ -44,7 +47,7 @@ def test_partial_tail_uses_remote_source_local_hot_tail_and_valid_bytes() -> Non
     lengths: list[int] = []
 
     append_partial_tail_transfer(
-        handoff=make_handoff(6),
+        handoff=make_handoff(stored_tokens),
         tp_rank=0,
         row_id=2,
         local_regions=local,
@@ -54,7 +57,7 @@ def test_partial_tail_uses_remote_source_local_hot_tail_and_valid_bytes() -> Non
         lengths=lengths,
     )
 
-    assert local_addresses == [1000 + (100 + 2 * 20 + 8) * 40]
+    assert local_addresses == [1000 + (100 + 2 * 20 + tail_offset) * 40]
     assert remote_addresses == [5000 + 7 * 40]
     assert lengths == [2 * 10]
 

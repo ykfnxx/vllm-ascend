@@ -424,7 +424,9 @@ def admit_local_from_prefill(
         )
         tail_tokens = handoff.stored_token_count % handoff.block_size
         if tail_tokens:
-            destination_block = hot_cache.layout.row_block_base(row_id) + hot_cache.layout.tail_block_offset
+            destination_block = hot_cache.layout.tail_block(
+                row_id, handoff.stored_token_count // handoff.block_size
+            )
             for layer_name, source_block in handoff.partial_tail_blocks.items():
                 for plane in hot_cache.layer_caches[layer_name]:
                     plane[destination_block, :tail_tokens].copy_(plane[source_block, :tail_tokens])
@@ -479,6 +481,7 @@ def append_partial_tail_transfer(
                 local_plane["hot_block_base"]
                 + row_id * local_plane["hot_blocks_per_row"]
                 + local_plane["tail_block_offset"]
+                + 2 * ((handoff.stored_token_count // handoff.block_size) % 2)
             )
             local_addresses.append(local_plane["base_addr"] + target_block_id * local_plane["block_stride"])
             remote_addresses.append(remote_plane["base_addr"] + source_block_id * remote_plane["block_stride"])

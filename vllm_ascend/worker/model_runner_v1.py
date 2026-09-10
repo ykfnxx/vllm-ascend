@@ -212,6 +212,7 @@ from vllm_ascend.dsa_offload.hot_cache import (
     commit_mtp_tail,
     fixed_memory_bytes,
     resize_target_tensors,
+    tail_commit_request_indices,
     validate_target_tensors,
 )
 from vllm_ascend.dsa_offload.io import create_io_backend
@@ -1261,6 +1262,10 @@ class NPUModelRunner(GPUModelRunner):
             ),
             committed_block_hashes=self._dsa_offload_committed_hashes,
             candidate_block_hashes=self._dsa_offload_candidate_hashes,
+            query_position_slack=(
+                config.max_verify_tokens_per_request
+                if self.use_async_spec_decode else 0
+            ),
             prefill_state=prefill_state,
             sfa_workspace=self._dsa_offload_sfa_workspace,
             prefetch_runtime=self._dsa_offload_prefetch_runtime,
@@ -3150,7 +3155,10 @@ class NPUModelRunner(GPUModelRunner):
             self._admit_local_dsa_offload_requests(
                 self._dsa_offload_batch
             )
-            if self._dsa_offload_batch.is_mtp:
+            if (
+                self._dsa_offload_batch.is_mtp
+                and tail_commit_request_indices(self._dsa_offload_batch)
+            ):
                 num_reqs = len(self._dsa_offload_batch.request_ids)
                 sampled_token_ids = sampler_output.sampled_token_ids[:num_reqs]
                 accepted_token_counts = (
@@ -3165,22 +3173,9 @@ class NPUModelRunner(GPUModelRunner):
                     self.discard_request_mask.gpu[:num_reqs],
                     0,
                 )
-                query_lengths = torch.tensor(
-                    [
-                        end - begin
-                        for begin, end in self._dsa_offload_batch.query_ranges
-                    ],
-                    dtype=torch.int32,
-                    device=accepted_token_counts.device,
-                )
                 commit_mtp_tail(
                     self._dsa_offload_batch,
-                    torch.minimum(
-                        accepted_token_counts,
-                        query_lengths,
-                    )
-                    .to("cpu")
-                    .tolist(),
+                    accepted_token_counts,
                     block_hash_resolver,
                 )
             else:
