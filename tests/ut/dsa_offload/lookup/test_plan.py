@@ -116,8 +116,9 @@ def test_mtp_tail_mapping_crosses_blocks_and_masks_future_tokens(spy_io, graph_m
     ]
 
 
+@pytest.mark.parametrize("all_decode", [False, True])
 def test_decode_block_table_reuse_is_isolated_by_metadata_source(
-    spy_io,
+    spy_io, all_decode,
 ) -> None:
     batch = DSAOffloadBatch(
         layout=HotCacheLayout(4, 2, 2),
@@ -126,25 +127,27 @@ def test_decode_block_table_reuse_is_isolated_by_metadata_source(
         cohorts=(),
         lookup_states={},
         request_ids=("prefill", "decode"),
-        request_rows=torch.tensor([-1, 0], dtype=torch.int32),
-        decode_request_indices=(1,),
+        request_rows=torch.tensor([1 if all_decode else -1, 0], dtype=torch.int32),
+        decode_request_indices=(0, 1) if all_decode else (1,),
         query_ranges=((0, 1), (1, 2)),
         query_positions=torch.tensor([0, 8], dtype=torch.int64),
         is_mtp=False,
         committed_block_hashes={"prefill": [], "decode": []},
         candidate_block_hashes={},
     )
-    first_source = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
-    second_source = torch.tensor([[5, 6], [7, 8]], dtype=torch.int32)
+    first_source = torch.tensor([[1, 2], [3, 4], [-1, -1]], dtype=torch.int32)
+    second_source = torch.tensor([[5, 6], [7, 8], [-1, -1]], dtype=torch.int32)
 
     first = get_decode_block_table(batch, first_source)
     reused = get_decode_block_table(batch, first_source)
     second = get_decode_block_table(batch, second_source)
 
     assert reused is first
-    assert first.tolist() == [[3, 4]]
-    assert second.tolist() == [[7, 8]]
+    assert first.tolist() == ([[1, 2], [3, 4]] if all_decode else [[3, 4]])
+    assert second.tolist() == ([[5, 6], [7, 8]] if all_decode else [[7, 8]])
     assert second is not first
+    if all_decode:
+        assert first.data_ptr() == first_source.data_ptr()
 
 
 def test_history_tail_and_miss_are_mapped_to_fixed_hot_slots(spy_io) -> None:

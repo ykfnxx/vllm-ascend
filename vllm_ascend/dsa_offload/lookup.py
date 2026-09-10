@@ -193,7 +193,6 @@ class PackedAddressingMetadata:
 
     query_lengths: torch.Tensor
     query_request_rows: torch.Tensor
-    query_request_rows_long: torch.Tensor
     query_positions: torch.Tensor
     cumulative_query_lengths: torch.Tensor
     verify_starts: torch.Tensor
@@ -517,7 +516,6 @@ def get_packed_addressing_metadata(
     cached = PackedAddressingMetadata(
         query_lengths=query_lengths,
         query_request_rows=query_request_rows,
-        query_request_rows_long=query_request_rows.to(torch.int64),
         query_positions=query_positions,
         cumulative_query_lengths=cumulative_query_lengths,
         verify_starts=verify_starts,
@@ -569,10 +567,13 @@ def get_decode_block_table(
             get_packed_addressing_metadata(batch)
             packed = batch.packed_decode
         assert packed is not None
-        decode_block_table = default_block_table.index_select(
-            0,
-            packed.request_indices.to(torch.int64),
-        )
+        if len(batch.decode_request_indices) == len(batch.request_ids):
+            decode_block_table = default_block_table[:len(batch.request_ids)]
+        else:
+            decode_block_table = default_block_table.index_select(
+                0,
+                packed.request_indices.to(torch.int64),
+            )
         prepared.decode_block_tables[cache_key] = (
             default_block_table,
             decode_block_table,

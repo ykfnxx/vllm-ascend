@@ -204,7 +204,9 @@ def test_step_addressing_reuses_only_matching_metadata_group(spy_io) -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_graph_mtp_mapping_uses_runtime_request_rows(spy_io, dtype) -> None:
+@pytest.mark.parametrize("graph_mode", [False, True])
+@pytest.mark.parametrize("padding", [0, 2])
+def test_decode_mtp_mapping_uses_runtime_request_rows(spy_io, dtype, graph_mode, padding) -> None:
     layout = HotCacheLayout(4, 2, 2)
     batch = DSAOffloadBatch(
         layout=layout,
@@ -216,24 +218,28 @@ def test_graph_mtp_mapping_uses_runtime_request_rows(spy_io, dtype) -> None:
         request_rows=torch.tensor([1, 0], dtype=torch.int32),
         decode_request_indices=(0, 1),
         query_ranges=((0, 2), (2, 3)),
-        query_positions=torch.tensor([8, 9, 12], dtype=torch.int64),
+        query_positions=torch.tensor([7, 8, 12], dtype=torch.int64),
         is_mtp=True,
         committed_block_hashes={"first": [], "second": []},
         candidate_block_hashes={},
-        graph_query_start_loc=torch.tensor([0, 2, 3], dtype=torch.int32),
+        graph_query_start_loc=(
+            torch.tensor([0, 2, 3], dtype=torch.int32) if graph_mode else None
+        ),
     )
 
+    default = torch.full((3 + padding,), -1, dtype=dtype)
     mapped = prepare_main_slot_mapping(
         batch=batch,
-        default_slot_mapping=torch.full((3,), -1, dtype=dtype),
+        default_slot_mapping=default,
     )
 
     assert mapped.dtype == dtype
     assert mapped.tolist() == [
+        layout.tail_block(1, 1) * 4 + 3,
         layout.tail_block(1, 2) * 4,
-        layout.tail_block(1, 2) * 4 + 1,
         layout.tail_block(0, 3) * 4,
-    ]
+    ] + [-1] * padding
+    assert default.tolist() == [-1] * (3 + padding)
 
 
 def test_leader_looks_up_once_and_follower_performs_own_get(spy_io) -> None:
@@ -369,14 +375,20 @@ def test_cohort_kvgather_issues_follower_gather_at_leader(spy_io) -> None:
     ]
 
 
-def test_fixed_hot_addressing_does_not_depend_on_model_block_table_width() -> None:
+@pytest.mark.parametrize("all_decode", [False, True])
+@pytest.mark.parametrize("wide_table", [False, True])
+def test_fixed_hot_addressing_does_not_depend_on_model_block_table_width(all_decode, wide_table) -> None:
     layout = HotCacheLayout(128, 2, 16)
     cache = torch.empty((layout.hot_blocks, layout.block_size, 1))
     hot_cache = HotCacheState(layout, {"layer": (cache,)})
     row = hot_cache.admit("decode")
+    if all_decode:
+        hot_cache.admit("prefill")
+    ordinary_width = layout.hot_blocks_per_row + 3 if wide_table else 32
+    required_width = max(ordinary_width, layout.hot_blocks_per_row)
     workspace = SFAAddressingWorkspace.create(
         max_num_seqs=layout.max_num_seqs,
-        max_block_table_width=layout.hot_blocks_per_row,
+        max_block_table_width=required_width,
         device="cpu",
     )
     batch = build_dsa_offload_batch(
@@ -394,8 +406,10 @@ def test_fixed_hot_addressing_does_not_depend_on_model_block_table_width() -> No
         candidate_block_hashes={},
         sfa_workspace=workspace,
     )
-    ordinary_table = torch.arange(64, dtype=torch.int32).reshape(2, 32)
+    ordinary_table = torch.arange(2 * ordinary_width, dtype=torch.int32).reshape(2, ordinary_width)
     ordinary_seq_lens = torch.tensor([128, 4096], dtype=torch.int32)
+    workspace.block_table.fill_(-9)
+    workspace.actual_seq_lengths_kv.fill_(-9)
 
     effective_table, effective_seq_lens = workspace.compose(
         default_block_table=ordinary_table,
@@ -403,10 +417,17 @@ def test_fixed_hot_addressing_does_not_depend_on_model_block_table_width() -> No
         batch=batch,
     )
 
-    assert effective_table.shape == (2, layout.hot_blocks_per_row)
-    assert effective_table[0, :32].tolist() == ordinary_table[0].tolist()
-    assert torch.count_nonzero(effective_table[0, 32:]) == 0
-    assert torch.equal(effective_table[1], hot_cache.hot_block_table[row])
-    assert effective_seq_lens.tolist() == [128, layout.row_stride]
-    assert ordinary_table.shape == (2, 32)
+    hot_width = layout.hot_blocks_per_row
+    assert effective_table.shape == (2, required_width)
+    assert effective_table.data_ptr() == workspace.block_table.data_ptr()
+    if all_decode:
+        assert torch.equal(effective_table[0, :hot_width], hot_cache.hot_block_table[1])
+        assert torch.count_nonzero(effective_table[0, hot_width:]) == 0
+    else:
+        assert effective_table[0, :ordinary_width].tolist() == ordinary_table[0].tolist()
+        assert torch.count_nonzero(effective_table[0, ordinary_width:]) == 0
+    assert torch.equal(effective_table[1, :hot_width], hot_cache.hot_block_table[row])
+    assert torch.count_nonzero(effective_table[1, hot_width:]) == 0
+    assert effective_seq_lens.tolist() == [layout.row_stride if all_decode else 128, layout.row_stride]
+    assert ordinary_table.tolist() == torch.arange(2 * ordinary_width).reshape(2, ordinary_width).tolist()
     assert ordinary_seq_lens.tolist() == [128, 4096]

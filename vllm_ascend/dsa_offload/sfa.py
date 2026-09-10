@@ -98,9 +98,19 @@ class SFAAddressingWorkspace:
             )
 
         effective_block_table = self.block_table[:num_reqs, :required_width]
+        effective_kv_lengths = self.actual_seq_lengths_kv[:num_reqs]
+        if len(batch.decode_request_indices) == num_reqs:
+            hot_rows = batch.request_rows.to(torch.int64)
+            effective_block_table[:, :hot_width].copy_(
+                hot_cache.hot_block_table.index_select(0, hot_rows)
+            )
+            if required_width > hot_width:
+                effective_block_table[:, hot_width:].zero_()
+            effective_kv_lengths.fill_(batch.layout.row_stride)
+            return effective_block_table, effective_kv_lengths
+
         effective_block_table.zero_()
         effective_block_table[:, :default_width].copy_(default_block_table)
-        effective_kv_lengths = self.actual_seq_lengths_kv[:num_reqs]
         effective_kv_lengths.copy_(default_actual_seq_lengths_kv)
 
         decode_indices = batch.decode_request_indices_tensor
@@ -215,28 +225,36 @@ def prepare_main_slot_mapping(
         else None
     )
     if main_slot_mapping is None:
-        main_slot_mapping = default_slot_mapping.clone()
         row_blocks = (
             batch.layout.hot_block_base
-            + addressing.query_request_rows_long * batch.layout.hot_blocks_per_row
+            + addressing.query_request_rows.to(default_slot_mapping.dtype)
+            * batch.layout.hot_blocks_per_row
         )
         tail_slots = (
             row_blocks * batch.layout.block_size
             + batch.layout.tail_slots(addressing.query_positions)
-        ).to(dtype=main_slot_mapping.dtype)
-        if batch.graph_query_start_loc is not None:
-            total_queries = addressing.query_positions.shape[0]
-            main_slot_mapping[:total_queries] = tail_slots
+        ).to(dtype=default_slot_mapping.dtype)
+        if (
+            len(batch.decode_request_indices) == len(batch.request_ids)
+            and tail_slots.shape == default_slot_mapping.shape
+        ):
+            main_slot_mapping = tail_slots
         else:
-            assert batch.packed_decode is not None
-            main_slot_mapping[batch.packed_decode.token_indices] = tail_slots
+            main_slot_mapping = default_slot_mapping.clone()
+            if batch.graph_query_start_loc is not None:
+                total_queries = addressing.query_positions.shape[0]
+                main_slot_mapping[:total_queries] = tail_slots
+            else:
+                assert batch.packed_decode is not None
+                main_slot_mapping[batch.packed_decode.token_indices] = tail_slots
         prepared.main_slot_mappings[slot_mapping_key] = (
             default_slot_mapping,
             main_slot_mapping,
         )
 
     if default_block_table is not None:
-        _lookup.get_decode_block_table(batch, default_block_table)
+        if batch.prefetch_runtime is not None:
+            _lookup.get_decode_block_table(batch, default_block_table)
         assert default_actual_seq_lengths_kv is not None
         _prepare_sfa_addressing_view(
             batch=batch,
