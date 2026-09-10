@@ -293,6 +293,8 @@ def build_dsa_offload_batch(
     is_mtp: bool,
     committed_block_hashes: Mapping[str, Sequence[bytes]],
     candidate_block_hashes: Mapping[str, Sequence[bytes]],
+    request_rows_buffer: torch.Tensor | None = None,
+    prepare_decode_metadata: bool = True,
     query_position_slack: int = 0,
     prefill_state: object | None = None,
     sfa_workspace: "SFAAddressingWorkspace | None" = None,
@@ -312,11 +314,21 @@ def build_dsa_offload_batch(
         row_values = [-1] * len(request_ids)
     else:
         row_values = [hot_cache.request_to_row.get(request_id, -1) for request_id in request_ids]
-    request_rows = torch.tensor(
-        row_values,
-        dtype=torch.int32,
-        device=query_positions.device,
-    )
+    if request_rows_buffer is None:
+        request_rows = torch.tensor(
+            row_values,
+            dtype=torch.int32,
+            device=query_positions.device,
+        )
+    else:
+        request_rows = request_rows_buffer[:len(request_ids)]
+        rows_cpu = torch.tensor(
+            row_values,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=request_rows.device.type != "cpu",
+        )
+        request_rows.copy_(rows_cpu, non_blocking=True)
     decode_request_indices = tuple(index for index, row_id in enumerate(row_values) if row_id >= 0)
     batch = DSAOffloadBatch(
         layout=layout,
@@ -342,7 +354,7 @@ def build_dsa_offload_batch(
             decode_request_indices,
             dtype=torch.int64,
             device=query_positions.device,
-        ),
+        ) if prepare_decode_metadata else None,
         prefetch_runtime=prefetch_runtime,
         gather_stream=gather_stream,
         enable_cohort_kvgather=enable_cohort_kvgather,
@@ -353,7 +365,8 @@ def build_dsa_offload_batch(
         fuse_kvgather_sfa=fuse_kvgather_sfa,
         fused_staging_cache=fused_staging_cache,
     )
-    batch.packed_decode = pack_decode_metadata(batch)
+    if prepare_decode_metadata:
+        batch.packed_decode = pack_decode_metadata(batch)
     return batch
 
 

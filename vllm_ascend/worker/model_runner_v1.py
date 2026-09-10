@@ -1210,6 +1210,7 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         num_scheduled_tokens: np.ndarray,
         total_num_scheduled_tokens: int,
+        cudagraph_mode: CUDAGraphMode,
     ):
         config = self.dsa_offload_config
         if config is None:
@@ -1262,6 +1263,11 @@ class NPUModelRunner(GPUModelRunner):
             ),
             committed_block_hashes=self._dsa_offload_committed_hashes,
             candidate_block_hashes=self._dsa_offload_candidate_hashes,
+            request_rows_buffer=self._dsa_offload_graph_request_rows,
+            prepare_decode_metadata=(
+                cudagraph_mode != CUDAGraphMode.FULL
+                or self.calculate_kv_scales
+            ),
             query_position_slack=(
                 config.max_verify_tokens_per_request
                 if self.use_async_spec_decode else 0
@@ -1282,10 +1288,6 @@ class NPUModelRunner(GPUModelRunner):
             fuse_kvgather_sfa=config.fuse_kvgather_sfa,
             fused_staging_cache=self._dsa_offload_fused_staging,
         )
-        graph_rows = self._dsa_offload_graph_request_rows
-        if graph_rows is not None:
-            graph_rows[: batch.request_rows.shape[0]].copy_(batch.request_rows)
-            batch.request_rows = graph_rows[: batch.request_rows.shape[0]]
         if self._dsa_offload_prefetch_runtime is not None:
             self._dsa_offload_prefetch_runtime.update_storage_ids(batch)
         return batch
@@ -2914,6 +2916,7 @@ class NPUModelRunner(GPUModelRunner):
                         scheduler_output,
                         num_scheduled_tokens_np,
                         total_num_scheduled_tokens,
+                        cudagraph_mode,
                     )
                     self._attach_dsa_offload_batch(
                         attn_metadata,

@@ -11,6 +11,7 @@ from vllm_ascend.dsa_offload.lookup import (
     DSAOffloadBatch,
     IndexCacheCohort,
     LookupPlan,
+    build_dsa_offload_batch,
     get_decode_block_table,
     get_expanded_tail_starts,
     get_packed_addressing_metadata,
@@ -21,6 +22,55 @@ from vllm_ascend.dsa_offload.lookup import (
     pack_graph_decode_metadata,
 )
 from vllm_ascend.dsa_offload.ops import LookupState
+
+
+@pytest.mark.parametrize("prepare_decode_metadata", [False, True])
+def test_batch_updates_fixed_rows_without_requiring_packed_metadata(spy_io, prepare_decode_metadata) -> None:
+    layout = HotCacheLayout(4, 3, 2)
+    hot_cache = HotCacheState(layout, {"layer": (torch.empty(layout.hot_blocks, 4, 1),)})
+    hot_cache.admit("second")
+    hot_cache.admit("first")
+    rows_buffer = torch.full((3,), -9, dtype=torch.int32)
+    committed = {"first": [b"a"], "second": [b"b"]}
+    candidate = {"first": [b"c"]}
+    batch = build_dsa_offload_batch(
+        layout=layout, hot_cache=hot_cache, io_backend=spy_io,
+        cohorts=(), lookup_states={}, request_ids=("first", "second"),
+        query_counts=(2, 1), query_positions=torch.tensor([3, 4, 7]),
+        query_positions_cpu=[3, 4, 7], is_mtp=True,
+        committed_block_hashes=committed, candidate_block_hashes=candidate,
+        request_rows_buffer=rows_buffer,
+        prepare_decode_metadata=prepare_decode_metadata,
+        query_position_slack=2,
+    )
+    assert batch.request_rows.data_ptr() == rows_buffer.data_ptr()
+    assert rows_buffer.tolist() == [1, 0, -9]
+    assert batch.decode_request_indices == (0, 1)
+    assert batch.query_ranges == ((0, 2), (2, 3))
+    assert batch.query_end_positions == (4, 7)
+    assert batch.query_position_slack == 2
+    assert batch.committed_block_hashes is committed
+    assert batch.candidate_block_hashes is candidate
+    assert (batch.packed_decode is not None) == prepare_decode_metadata
+    assert (batch.decode_request_indices_tensor is not None) == prepare_decode_metadata
+
+    addressing = get_packed_addressing_metadata(batch)
+    assert addressing.query_request_rows.tolist() == [1, 1, 0]
+    assert addressing.query_positions.tolist() == [3, 4, 7]
+
+    next_batch = build_dsa_offload_batch(
+        layout=layout, hot_cache=hot_cache, io_backend=spy_io,
+        cohorts=(), lookup_states={}, request_ids=("second", "prefill"),
+        query_counts=(1, 1), query_positions=torch.tensor([8, 0]),
+        query_positions_cpu=[8, 0], is_mtp=False,
+        committed_block_hashes=committed, candidate_block_hashes={},
+        request_rows_buffer=rows_buffer,
+        prepare_decode_metadata=prepare_decode_metadata,
+    )
+    assert next_batch.request_rows.data_ptr() == batch.request_rows.data_ptr()
+    assert rows_buffer.tolist() == [0, -1, -9]
+    assert next_batch.decode_request_indices == (0,)
+    assert get_packed_addressing_metadata(next_batch).query_positions.tolist() == [8]
 
 
 def test_packed_addressing_metadata_is_shared_within_decode_step(
